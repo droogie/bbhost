@@ -310,6 +310,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // The F10 screen's start-up settings, through the same calls it uses.
     host_options_load();
     int window_mode = std::max(0, host_opt_index("window_mode"));  // Windowed, Borderless, Fullscreen
+    bool stay_borderless = host_opt_get("stay_borderless");  // Windows' switch under the Window row, for Borderless
     bool skip_logos = host_opt_get("skip_logos");
     bool performance_mode = host_opt_get("performance_mode");
     bool debug_camera = host_opt_get("debug_camera");
@@ -574,6 +575,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         quick_reentry_was = quick_reentry;
         all_post_processors_was = all_post_processors;
         host_opt_set_index("window_mode", window_mode);
+        host_opt_set("stay_borderless", stay_borderless);
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("performance_mode", performance_mode);
         host_opt_set("debug_camera", debug_camera);
@@ -1051,18 +1053,48 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             const float online_rows = 8.5f + (server == 2 ? 4.0f : 0.0f) + (acct_detail.empty() ? 0.0f : 1.0f) +
                                       (cfg.profile.empty() ? 0.0f : 1.0f) + (si.in && si.refused ? 3.5f : 0.0f) +
                                       (si.in && si.unchecked ? 1.0f : 0.0f);
+            // Stay borderless's switch while Borderless is chosen (Windows).
+#if defined(_WIN32)
+            const bool stay_borderless_row = window_mode == 1;
+#else
+            const bool stay_borderless_row = false;
+#endif
             // A warning line or two under Frame rate and Frame generation (frame generation's limit).
             const float cards_h =
-                card_h(std::max(7.0f + 1.5f * static_cast<float>(host_frame_rate_warning_count(cap_choice, cap_custom, cap_custom_fps)),
+                card_h(std::max(7.0f + (stay_borderless_row ? 1.0f : 0.0f) +
+                                    1.5f * static_cast<float>(host_frame_rate_warning_count(cap_choice, cap_custom, cap_custom_fps)),
                                 online_rows));
             ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), cards_h), "DISPLAY");
             {
                 ui::row_label("Window", row_lw);
                 static const char* const kModes[] = {"Windowed", "Borderless", "Fullscreen"};
                 ui::segmented("##mode", &window_mode, kModes, 3, ImGui::GetContentRegionAvail().x);
-                ui::tooltip_for_item("Window mode", "Borderless fills the screen at the desktop's resolution and switches away "
-                                                    "at once. Fullscreen takes the display over at the mode nearest the "
-                                                    "Resolution, which can change the screen's resolution.");
+                ui::tooltip_for_item("Window mode",
+#if defined(_WIN32)
+                                     "Windowed is a window you can move and resize. Borderless fills the screen at the "
+                                     "desktop's resolution and switches away at once; the graphics driver may still "
+                                     "make it exclusive fullscreen (Stay borderless keeps it a window). Fullscreen "
+                                     "takes the display over at the mode nearest the Resolution, which can change the "
+                                     "screen's resolution. AMD cards: use Borderless or Fullscreen - in a window the "
+                                     "game has to draw hidden objects too and runs slower."
+#else
+                                     "Borderless fills the screen at the desktop's resolution and switches away "
+                                     "at once. Fullscreen takes the display over at the mode nearest the "
+                                     "Resolution, which can change the screen's resolution."
+#endif
+                );
+#if defined(_WIN32)
+                // Stay borderless (F10's row under Window mode): Borderless
+                // that the graphics driver never makes exclusive fullscreen
+                // (host/window.cpp). Shown while Borderless is chosen, as in F10.
+                if (window_mode == 1)
+                    ui::toggle_row("Stay borderless", nullptr, &stay_borderless,
+                                   "On: Borderless stays a window - the graphics driver never switches it to exclusive "
+                                   "fullscreen. Try it if the picture freezes for a few seconds while the game keeps "
+                                   "running, for example while another window has focus. AMD cards: leave it off "
+                                   "unless you need it - it may make the game draw hidden objects too, which lowers "
+                                   "the frame rate.");
+#endif
                 ui::row_label("Frame rate", row_lw);
                 // The list, or Custom limit's number, and its tick box - F10's own control.
                 host_frame_rate_control(&cap_choice, &cap_custom, &cap_custom_fps, ImGui::GetContentRegionAvail().x);
