@@ -11,7 +11,7 @@
 //   fov = 35.0          # vertical field of view, degrees
 //   height = 1.0        # the point looked at, metres above the hunter's feet
 //   follow = 0.08       # seconds the view takes to catch up with the hunter (0: at once)
-//   flatten = 0         # the view at this field of view, framed the same (under fov: telephoto), degrees; 0 off
+//   flatten = 0         # a narrower view from further back (telephoto), degrees; 0 off
 //   cutaway = true      # roofs and walls between the view and the hunter faded out
 //   cutaway_size = 2.0  # the cone's tip, metres across, just above the hunter
 //   cutaway_spread = 0.6  # metres wider for each metre toward the view
@@ -70,7 +70,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "iso",
     "Isometric",
-    "0.4.3",
+    "0.4.4",
     "Kyo",
     "A Diablo-like camera: high above the hunter at a fixed angle, turned by the right stick or the mouse, zoomed by the "
     "wheel, never pulled in by walls; the aim stays level. With the omni-roll built in.",
@@ -87,10 +87,10 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      3, 40},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "fov", "Field of view", "The view's vertical field of view, in degrees.", "35.0", 15, 75},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "flatten", "Flatten (telephoto)",
-     "The view's field of view set to this (degrees) and moved to frame the hunter as the Field of view at the Distance "
-     "does: under the Field of view, less perspective from further back - near orthographic at small values, which look "
-     "hazy (the game's fog grows with the distance); over it, more perspective from closer in. 0: off.",
-     "0", 0, 120},
+     "Less perspective: the view narrowed to this field of view (degrees) and moved back to frame the hunter as the Field "
+     "of view at the Distance does - near orthographic. 0: off. The game's fog grows with the distance, so small values "
+     "look hazy.",
+     "0", 0, 15},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "height", "Look-at height", "The point the view centres on, metres above the hunter's feet.",
      "1.0", 0, 2.5},
     {BB_OPT_BOOL | BB_OPT_LIVE, "cutaway", "Cutaway",
@@ -228,7 +228,7 @@ void read_options() {
     s.pitch = number("iso.pitch", 55.0f, 25, 89);
     s.distance = number("iso.distance", 14.0f, 3, 40);
     s.fov = number("iso.fov", 35.0f, 15, 75);
-    s.flatten = number("iso.flatten", 0, 0, 120);
+    s.flatten = number("iso.flatten", 0, 0, 15);
     s.height = number("iso.height", 1.0f, 0, 2.5f);
     s.follow = number("iso.follow", 0.08f, 0, 0.5f);
     const char* cu = api->config("iso.cutaway");
@@ -504,12 +504,12 @@ void on_view(BbCamera* c, void*) {
     float up[3] = {sy * sp, cp, cy * sp};
     float fov = s.fov * kPi / 180.0f;
     float dist = s.distance * view.zoom;
-    // Flatten: a narrower view from further back (or a wider one from closer
-    // in, over the field of view), framed the same at the hunter. The game's limits (its 38-48 degree clamp) are the follow
+    // Flatten: a narrower view from further back, framed the same at the
+    // hunter. The game's limits (its 38-48 degree clamp) are the follow
     // camera's; the drawn camera takes any field of view. A true orthographic
     // projection is not possible this way: the deferred passes rebuild
     // positions from depth as a perspective view does.
-    if (s.flatten > 0 && s.flatten != s.fov) {
+    if (s.flatten > 0 && s.flatten < s.fov) {
         const float narrow = s.flatten * kPi / 180.0f;
         dist *= std::tan(fov / 2) / std::tan(narrow / 2);
         fov = narrow;
