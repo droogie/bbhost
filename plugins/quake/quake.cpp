@@ -85,7 +85,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.17",
+    "0.3.22",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -205,6 +205,7 @@ constexpr float kStandHeight = 56.0f, kCrouchHeight = 40.0f;  // feet to the top
 constexpr int kStandEye = 50, kCrouchEye = 36;                // feet to the eye: Quake 3's view heights over its origin
 constexpr float kRadius = 0.3f;                               // the body's, metres (Quake 3's box is 0.47 m across)
 constexpr float kSkin = 0.01f;                                // what a move stops short of a surface by, metres
+constexpr float kSnap = 0.15f;                                // how far down a standing body follows its floor (a lift going down), metres
 constexpr double kMaxStep = 1.0 / 125.0;                      // the longest physics step
 constexpr double kMaxFrame = 0.05;                            // a hitch is not a run-up
 constexpr double kDoubleJumpSeconds = 0.4;                    // CPM's window
@@ -339,6 +340,10 @@ constexpr std::uint64_t kSphereCast = 0x1c090e0;     // (world, filter, from, de
 constexpr std::uint32_t kCastFilter = 0x25;  // the follow camera's: the shots, the blasts' line of sight
 constexpr std::uint32_t kBodyFilter = 0x29;  // the characters': the player's body
 std::uint32_t g_body_filter = kBodyFilter;   // QUAKE_FILTER=<hex> (a test) casts another
+// Layer 10: the characters' own collision - the invisible barriers along
+// ledges, and floors the map's solid leaves out (a beam over a drop). The
+// feet stand on its floors alone.
+constexpr std::uint32_t kFloorFilter = 0x2a;
 
 template <typename T>
 T& at(std::uint8_t* p, std::size_t off) {
@@ -486,15 +491,20 @@ bool sphere_cast(std::uint8_t* world, V3 from, V3 delta, float radius, float& fr
     return true;
 }
 
-// The body's cast, with the hunter's filter. `sphere` (0 the feet, 1 the
-// waist, 2 the head; -1 none) has the hit judged as that part of the body
-// meets it (body_trace).
-bool body_cast(std::uint8_t* world, V3 from, V3 delta, float radius, float& fraction, V3& normal, int sphere = -1) {
+bool body_cast_in(std::uint8_t* world, std::uint32_t filter, V3 from, V3 delta, float radius, float& fraction, V3& normal, int sphere) {
     const float len = length(delta);
     const V3 dir = len > 1e-6f ? delta * (1.0f / len) : V3{};
     float f = 1.0f;
     V3 n;
-    if (!sphere_cast(world, from, delta, radius, f, n, g_body_filter)) return false;
+    if (!sphere_cast(world, from, delta, radius, f, n, filter)) return false;
+    // The cast reports the nearest hit alone, and a surface the sphere
+    // already touches is nearest: a wall slid along hid the floor behind it,
+    // and the body fell through the floor beside the wall. A touch the move
+    // leaves (below) is cast past again from a hair out along its normal.
+    for (int k = 0; sphere >= 0 && k < 3 && f <= 0.0f && dot(n, dir) > -0.1f; ++k) {
+        from = from + n * (0.01f * static_cast<float>(k + 1));
+        if (!sphere_cast(world, from, delta, radius, f, n, filter)) return false;
+    }
     // Quake 3's body is a box, and only its bottom stands on anything: what
     // the waist's and the head's spheres meet under their middles - the top
     // edge of a chest-high wall, a lip beside the body - is the box's side
@@ -512,6 +522,25 @@ bool body_cast(std::uint8_t* world, V3 from, V3 delta, float radius, float& frac
     fraction = f;
     normal = n;
     return true;
+}
+
+// The body's cast, with the hunter's filter. `sphere` (0 the feet, 1 the
+// waist, 2 the head; -1 none) has the hit judged as that part of the body
+// meets it (body_trace). The feet also stand on the floors of the
+// characters' own layer (kFloorFilter) - beams and planks the map's solid
+// leaves out - but meet none of its walls (the invisible barriers the hunter
+// passes).
+bool body_cast(std::uint8_t* world, V3 from, V3 delta, float radius, float& fraction, V3& normal, int sphere = -1) {
+    bool hit = body_cast_in(world, g_body_filter, from, delta, radius, fraction, normal, sphere);
+    if (sphere != 0) return hit;
+    float f = 1.0f;
+    V3 n;
+    if (body_cast_in(world, kFloorFilter, from, delta, radius, f, n, sphere) && n.y >= kMinWalkNormal && (!hit || f < fraction)) {
+        fraction = f;
+        normal = n;
+        hit = true;
+    }
+    return hit;
 }
 
 struct Trace {
@@ -548,6 +577,13 @@ Trace body_trace(std::uint8_t* world, V3 from, V3 to, float height) {
                   static_cast<double>(delta.x), static_cast<double>(delta.y), static_cast<double>(delta.z),
                   static_cast<double>(n.x), static_cast<double>(n.y), static_cast<double>(n.z));
         }
+        if (hit && std::getenv("QUAKE_HITLOG") && logged < 400) {
+            ++logged;
+            g.log("quake: hit sphere %d from %.3f %.3f %.3f by %.3f %.3f %.3f at %.3f normal %.2f %.2f %.2f", k, static_cast<double>(from.x),
+                  static_cast<double>(from.y), static_cast<double>(from.z), static_cast<double>(delta.x), static_cast<double>(delta.y),
+                  static_cast<double>(delta.z), static_cast<double>(frac), static_cast<double>(n.x), static_cast<double>(n.y),
+                  static_cast<double>(n.z));
+        }
         if (hit && frac < t.fraction) {
             t.fraction = frac;
             t.normal = n;
@@ -563,7 +599,12 @@ Trace body_trace(std::uint8_t* world, V3 from, V3 to, float height) {
         V3 flat{t.normal.x, 0.0f, t.normal.z};
         if (normalize(flat) > 1e-3f) t.normal = flat;
     }
-    const float made = std::max(0.0f, t.fraction * len - kSkin);
+    // kSkin off the surface along its normal, as Quake 3's traces stop
+    // SURFACE_CLIP_EPSILON off the plane: kSkin along a move that grazes a
+    // surface left the sphere a hair from it, and the next cast, starting
+    // inside, saw nothing there.
+    const float into = std::max(-dot(dir, t.normal), 0.2f);
+    const float made = std::max(0.0f, t.fraction * len - kSkin / into);
     t.fraction = made / len;
     t.end = from + delta * t.fraction;
     return t;
@@ -833,10 +874,100 @@ void crash_land(float previous_vy) {
     pm.bob_cycle = 0.0f;
 }
 
+// What the body's flat bottom stands on, as Quake 3's box finds it: thin
+// casts down through its middle and four corners, from kRadius over the feet
+// to `below` under them, the highest walkable surface met. The corners take
+// only flat tops (a beam, a rafter, a step's edge the sphere would roll off);
+// the middle any slope the body walks. A cast that starts inside something
+// is no support.
+constexpr float kFoot = 0.2f;  // the corners' offset, inside the sphere's own radius
+struct Support {
+    bool found = false;
+    float y = 0.0f;  // the surface's height
+    V3 normal{0.0f, 1.0f, 0.0f};
+};
+
+Support support(std::uint8_t* world, V3 feet, float below) {
+    Support s;
+    const V3 offsets[5] = {{0.0f, 0.0f, 0.0f}, {kFoot, 0.0f, kFoot}, {-kFoot, 0.0f, kFoot}, {kFoot, 0.0f, -kFoot}, {-kFoot, 0.0f, -kFoot}};
+    constexpr float kProbe = 0.02f;
+    const float drop = kRadius + below;
+    for (int k = 0; k < 5; ++k) {
+        float f = 1.0f;
+        V3 n;
+        const V3 from = feet + offsets[k] + V3{0.0f, kRadius, 0.0f};
+        float f2 = 1.0f;
+        V3 n2;
+        const bool h1 = sphere_cast(world, from, V3{0.0f, -drop, 0.0f}, kProbe, f, n, g_body_filter) && f > 0.0f;
+        const bool h2 = sphere_cast(world, from, V3{0.0f, -drop, 0.0f}, kProbe, f2, n2, kFloorFilter) && f2 > 0.0f &&
+                        n2.y >= kMinWalkNormal;
+        if (h2 && (!h1 || f2 < f)) {
+            f = f2;
+            n = n2;
+        } else if (!h1) {
+            continue;
+        }
+        if (n.y < (k == 0 ? kMinWalkNormal : 0.9f)) continue;
+        const float y = from.y - drop * f - kProbe;
+        if (!s.found || y > s.y) {
+            s.found = true;
+            s.y = y;
+            s.normal = n;
+        }
+        // Standing on it through the middle: a corner's higher top is a
+        // step's edge, the steps' to climb.
+        if (k == 0 && s.found && s.y >= feet.y - 0.02f) break;
+    }
+    return s;
+}
+
+// The feet put back on top of what they stand in - a floor the last move
+// sank them into, a lift rising under them - and, for a body that was
+// standing and is not on its way up, onto a floor at most `snap` below: a
+// lift going down, a ramp's crest. Up to kRadius; a step's height when the
+// view should ease it.
+void settle(std::uint8_t* world, float snap) {
+    const Support s = support(world, pm.origin, snap);
+    if (!s.found) return;
+    const float gap = pm.origin.y - s.y;
+    if (gap < 0.0f) {
+        // Room for the head where it is lifted to.
+        float f = 1.0f;
+        V3 n;
+        const float h = body_height() * kUnit;
+        if (sphere_cast(world, pm.origin + V3{0.0f, h - kRadius, 0.0f}, V3{0.0f, -gap + kSkin, 0.0f}, kRadius, f, n, g_body_filter) &&
+            n.y < 0.0f && f > 0.0f)
+            return;
+        pm.origin.y = s.y + kSkin * 0.5f;
+        if (pm.velocity.y < 0.0f) pm.velocity.y = 0.0f;
+        if (-gap / kUnit > 2.0f && pm.on_ground) pm.stepped += std::min(16.0f, std::ceil(-gap / kUnit / 4.0f) * 4.0f);
+    } else if (gap > kSkin && pm.on_ground && pm.velocity.y <= 0.0f && gap <= snap) {
+        const Trace down = body_trace(world, pm.origin, V3{pm.origin.x, s.y + kSkin * 0.5f, pm.origin.z}, body_height());
+        if (!down.startsolid) pm.origin = down.end;
+    }
+}
+
+// Whether the body stands inside something: a top over the feet within the
+// body's lower half, straight above them.
+bool inside(std::uint8_t* world, V3 feet) {
+    float f = 1.0f;
+    V3 n;
+    const float top = 2.0f * kRadius;
+    return sphere_cast(world, feet + V3{0.0f, top, 0.0f}, V3{0.0f, -(top - 0.1f), 0.0f}, 0.02f, f, n, g_body_filter) && f > 0.0f &&
+           n.y > 0.0f;
+}
+
 // PM_GroundTrace: on the ground when a short trace down meets a surface that
-// is walkable.
+// is walkable - or when the body's flat bottom rests on one (support).
 void ground_trace(std::uint8_t* world, float previous_vy) {
-    const Trace tr = body_trace(world, pm.origin, pm.origin - V3{0.0f, 0.25f * kUnit + kSkin, 0.0f}, body_height());
+    Trace tr = body_trace(world, pm.origin, pm.origin - V3{0.0f, 0.25f * kUnit + kSkin, 0.0f}, body_height());
+    if ((!tr.hit || tr.normal.y < kMinWalkNormal)) {
+        const Support s = support(world, pm.origin, 0.25f * kUnit + kSkin);
+        if (s.found && pm.origin.y - s.y <= 0.25f * kUnit + kSkin) {
+            tr.hit = true;
+            tr.normal = s.normal;
+        }
+    }
     if (!tr.hit) {
         pm.on_ground = pm.ground_plane = pm.walking = false;
         return;
@@ -918,7 +1049,9 @@ void footsteps(const Cmd& cmd, float dt) {
 void pmove_step(std::uint8_t* world, const Cmd& cmd, float yaw, float dt) {
     if (!cmd.jump) pm.jump_held = false;
     const float previous_vy = pm.velocity.y;
+    const V3 start = pm.origin;
     check_duck(world, cmd);
+    settle(world, kSnap);
     ground_trace(world, previous_vy);
     if (pm.knock_time > 0.0) pm.knock_time = std::max(0.0, pm.knock_time - dt);  // PM_DropTimers
 
@@ -965,6 +1098,13 @@ void pmove_step(std::uint8_t* world, const Cmd& cmd, float yaw, float dt) {
         // A ground too steep to stand on is slid along.
         if (pm.ground_plane) clip_velocity(pm.velocity, pm.ground_normal, kOverclip);
         step_slide_move(world, true, dt);
+    }
+    settle(world, kSnap);
+    if (inside(world, pm.origin) && !inside(world, start)) {
+        // Into something the casts missed (one the sphere already overlapped
+        // at the start, which they pass through): the move is undone.
+        pm.origin = start;
+        pm.velocity.x = pm.velocity.z = 0.0f;
     }
     ground_trace(world, previous_vy);
     footsteps(cmd, dt);
@@ -1143,8 +1283,10 @@ constexpr std::uint32_t kGuns[] = {15000000, 35000000, 36000000, 6000000, 330000
 // (correctMagic, 100 on the Blunderbuss) x1.287. The gem's third effect, WPN
 // durability DOWN -65.3, does nothing to a gun and is left out.
 constexpr std::uint32_t kShotgunGun = 6000000;
+constexpr std::uint32_t kGrenadeGun = 15000000, kRocketGun = 35000000;  // the Cannon, the Church Cannon
 constexpr float kGemRate = 1.287f, kGemAdd = 7.3f;
 constexpr float kGrenadeSpeed = 700.0f;  // units a second
+constexpr std::uint16_t kLauncherAtkPct = 185;  // the grenade's and the rocket's attack correction (guns_apply)
 constexpr float kRocket = 900.0f * kUnit, kGrenade = kGrenadeSpeed * kUnit;
 struct BulletRule {
     std::uint32_t id;
@@ -1207,12 +1349,16 @@ void guns_apply() {
     }
     int weapons = 0, bullets = 0;
     for (const std::uint32_t base : kGuns) {
-        const auto* top_row = g.param<bb::params::EquipParamWeapon>(base + 1000);
+        // The rocket launcher hits as the grenade launcher does (Quake 3's
+        // are alike): the Church Cannon takes the Cannon's attack and
+        // scaling, so the two stay equal at any stats and any NG cycle.
+        const auto* top_row = g.param<bb::params::EquipParamWeapon>((base == kRocketGun ? kGrenadeGun : base) + 1000);
         if (!top_row) continue;
         const bb::EQUIP_PARAM_WEAPON_ST top_copy = *top_row;
         const auto* top = &top_copy;
-        // Up to +10 itself: the shotgun's gem goes on the row the shot names too.
-        for (std::uint32_t level = 0; level <= (base == kShotgunGun ? 10u : 9u); ++level) {
+        // Up to +10 itself where it changes: the shotgun's gem and the rocket's
+        // attack go on the row the shot names too.
+        for (std::uint32_t level = 0; level <= (base == kShotgunGun || base == kRocketGun ? 10u : 9u); ++level) {
             auto* w = g.param<bb::params::EquipParamWeapon>(base + level * 100);
             if (!w) continue;
             g_saved_weapons.emplace_back(base + level * 100, *w);
@@ -1237,6 +1383,18 @@ void guns_apply() {
                 w->correctFaith = top->correctFaith * kGemRate;
             }
             ++weapons;
+        }
+    }
+    // Any hunter can fire them as they hit: a stat under a gun's requirement
+    // (the Church Cannon's 16 bloodtinge and 27 strength, the Piercing Rifle's
+    // 9 and 10 skill) cuts its damage to a fraction - the rocket hit for 76
+    // where the grenade hit for 497, the plasma for 3.
+    for (const std::uint32_t base : kGuns) {
+        if (auto* w = g.param<bb::params::EquipParamWeapon>(base + 1000)) {
+            if (base != kShotgunGun && base != kRocketGun) g_saved_weapons.emplace_back(base + 1000, *w);  // theirs are saved above
+            for (std::uint32_t level = 0; level <= 10; ++level)
+                if (auto* lw = g.param<bb::params::EquipParamWeapon>(base + level * 100))
+                    lw->properStrength = lw->properAgility = lw->properMagic = lw->properFaith = 0;
         }
     }
     for (const BulletRule& r : kBulletRules) {
@@ -1308,10 +1466,9 @@ void guns_apply() {
         b->atkId_Bullet = -1;
         ++bullets;
     }
-    // The cannons fire each other's shell, but each hits as its own shot: the
-    // Church Cannon's shell is 170% of its gun's attack (620, burst 621), the
-    // Cannon's 100% (600, 601). Left with the shell, the rocket was the Church
-    // Cannon's 480 at 100% - the weakest of the two pairings.
+    // The cannons fire each other's shell, but each hits by its own gun's
+    // attack rows (620, burst 621; 600, 601) - their correction set alike
+    // below.
     constexpr std::pair<std::uint32_t, std::int32_t> kShellAtks[] = {{700, 620}, {701, 621}, {720, 600}, {722, 601}};
     for (const auto& [id, atk] : kShellAtks)
         if (auto* b = g.param<bb::params::Bullet>(id)) b->atkId_Bullet = atk;  // saved with kBulletRules
@@ -1337,6 +1494,29 @@ void guns_apply() {
             a->atkObj = rocket->atkObj;
         }
     }
+    // The grenade and the rocket hit alike, as Quake 3's do (100 each, with
+    // 100 of splash): one attack (the Cannon's, above), one correction for
+    // the grenade's hit (600 on a character, its burst 601 at the fuse) and
+    // the rocket's (620 its direct hit, 621 its burst), and one hit on the
+    // enemy a shell strikes - the rocket's burst shares its direct hit's list
+    // (the grenade's already did), where it hit the same enemy again. About
+    // 1000 a shot on an NG+7 enemy.
+    const auto correct = [](std::uint32_t id, std::uint16_t pct, bool saved) {
+        auto* a = g.param<bb::params::AtkParam_Pc>(id);
+        if (!a) return;
+        if (!saved) g_saved_atks.emplace_back(id, *a);
+        a->atkPhysCorrection = a->atkMagCorrection = a->atkFireCorrection = a->atkThunCorrection = pct;
+    };
+    const auto pct = [](const char* env, int fallback) {
+        const char* e = std::getenv(env);  // QUAKE_LAUNCHER_PCT (a test): tuning
+        return static_cast<std::uint16_t>(e ? std::atoi(e) : fallback);
+    };
+    const std::uint16_t launcher = pct("QUAKE_LAUNCHER_PCT", kLauncherAtkPct);
+    correct(600, launcher, false);
+    correct(601, launcher, false);
+    correct(620, launcher, false);
+    correct(621, launcher, true);  // saved with its object power
+    if (auto* b = g.param<bb::params::Bullet>(700)) b->isUseSharedHitList = 1;  // saved with kBulletRules
     g_guns_table = probe;
     g_guns_quake = true;
     g.log("quake: the guns at +10 whatever their level (%d rows), %d bullets flying as Quake 3's", weapons, bullets);
@@ -1779,9 +1959,27 @@ void flashes_frame(double ms, bool all) {
     }
 }
 
+// A playing sound's handle (sub_17e0290's out: its id first) and its stop
+// (sub_2be23f0, which the game calls on a handle before it reuses it; an
+// ended or empty handle is passed over).
+struct SoundHandle {
+    alignas(16) std::uint64_t h[2] = {};
+    bool live = false;
+};
+constexpr std::uint64_t kSoundStop = 0x2be23f0;
+
+void sound_stop(SoundHandle& sh) {
+    if (!sh.live) return;
+    sh.live = false;
+    BbCallRegs r{};
+    r.arg[0] = reinterpret_cast<std::uint64_t>(sh.h);
+    g.api->call_guest(kSoundStop, &r);
+}
+
 // The TAE's sound at a point: a type-1 sound ('c', the character's own bank)
-// becomes a 'g' for the kinds of character the TAE makes them so.
-void sound_at(std::uint8_t* chr, V3 where, std::int32_t type, std::int32_t id) {
+// becomes a 'g' for the kinds of character the TAE makes them so. `keep`
+// takes its handle, to stop it later.
+void sound_at(std::uint8_t* chr, V3 where, std::int32_t type, std::int32_t id, SoundHandle* keep = nullptr) {
     if (!chr || type < 0 || id <= 0) return;
     // The TAE's floor (8) and attire (9) sounds are the character's own 'c'
     // sounds: the event names the hundred and the character's material module
@@ -1811,7 +2009,11 @@ void sound_at(std::uint8_t* chr, V3 where, std::int32_t type, std::int32_t id) {
     r.arg[1] = reinterpret_cast<std::uint64_t>(point);
     r.arg[2] = static_cast<std::uint32_t>(type);
     r.arg[3] = static_cast<std::uint32_t>(id);
-    g.api->call_guest(kSoundAt, &r);
+    if (g.api->call_guest(kSoundAt, &r) == 0 && keep) {
+        keep->h[0] = handle[0];
+        keep->h[1] = handle[1];
+        keep->live = true;
+    }
 }
 
 // A sound by its name, at a point: what sub_17e0290 does once it has spelled
@@ -1882,6 +2084,7 @@ struct Spin {
     double last_ms = -1e9, loop_ms = -1e9;
     double start_ms = -1e9, stop_ms = -1e9;  // the burst's, for the barrels' animations
     std::uint64_t fx = 0;
+    SoundHandle fire;  // the barrels' firing, which their flash (6602) plays: alone with the flash off
     V3 muzzle;
 } spin;
 
@@ -1889,6 +2092,7 @@ void spin_shot(std::uint8_t* chr, V3 muzzle, double ms) {
     if (!spin.on) {
         sound_at(chr, muzzle, kGunFx[0].sound_type, kGunFx[0].sound);
         spin.fx = flash_on(chr, kGunFx[0].dummy, kGunFx[0].effect);
+        if (!s.muzzle_flash) sound_at(chr, muzzle, 5, kGunFx[0].effect, &spin.fire);
         spin.on = true;
         spin.loop_ms = ms;
         spin.start_ms = ms;
@@ -1902,6 +2106,7 @@ void spin_frame(std::uint8_t* chr, double ms, bool stop) {
     if (stop || ms - spin.last_ms > kWeapons[0].refire_ms + 150.0) {
         if (spin.fx) flash_end(spin.fx);
         spin.fx = 0;
+        sound_stop(spin.fire);
         spin.on = false;
         spin.stop_ms = ms;
         if (chr) {
@@ -1954,7 +2159,16 @@ void fire(std::uint8_t* chr, V3 eye, float yaw, float pitch, float game_yaw) {
     } else {
         const GunFx& fx = kGunFx[arms.current];
         flash(chr, fx.dummy, fx.effect, fx.hold_ms, view.ms);
-        sound_at(chr, muzzle, fx.sound_type, fx.sound);
+        // The plasma gun's ten shots a second: each its own sound cut the one
+        // before short, as Quake 3's weapon channel does - left to overlap,
+        // the game's limit on one sound's voices dropped every shot after five.
+        static SoundHandle plasma;
+        if (arms.current == 4) {
+            sound_stop(plasma);
+            sound_at(chr, muzzle, fx.sound_type, fx.sound, &plasma);
+        } else {
+            sound_at(chr, muzzle, fx.sound_type, fx.sound);
+        }
     }
     if (g_log || g_shots <= 3)
         g.log("quake: %s shot %llu: emitter %d (%s)", w.name, static_cast<unsigned long long>(g_shots),
@@ -2222,6 +2436,52 @@ void request_dump(double at) {
     g.log("quake: test dump at %.2f s", at);
 }
 
+// QUAKE_TEST's aim: the view turned on the nearest living enemy's chest.
+void aim_nearest() {
+    BbChr chrs[256];
+    std::size_t n = 0;
+    if (g.api->chr_list(chrs, 256, &n) != 0) return;
+    n = std::min<std::size_t>(n, 256);
+    const V3 eye = pm.origin + V3{0.0f, static_cast<float>(pm.eye) * kUnit, 0.0f};
+    float best = 40.0f;
+    V3 to;
+    for (std::size_t i = 0; i < n; ++i) {
+        const BbChr& c = chrs[i];
+        if (c.is_player || c.hp <= 0 || c.npc_param <= 0) continue;
+        const V3 d = V3{c.pos[0], c.pos[1] + 1.0f, c.pos[2]} - eye;
+        if (length(d) < best) best = length(d), to = d;
+    }
+    if (best >= 40.0f) return;
+    static int said = 0;
+    if (said++ == 0) {
+        for (std::size_t i = 0; i < n; ++i)
+            if (!chrs[i].is_player && chrs[i].hp > 0)
+                g.log("quake: chr npc %d hp %d at %.2f %.2f %.2f, %.1f m", chrs[i].npc_param, chrs[i].hp, static_cast<double>(chrs[i].pos[0]),
+                      static_cast<double>(chrs[i].pos[1]), static_cast<double>(chrs[i].pos[2]),
+                      static_cast<double>(length(V3{chrs[i].pos[0], chrs[i].pos[1], chrs[i].pos[2]} - eye)));
+    }
+    view.yaw = std::atan2(to.x, to.z);
+    view.pitch = std::asin(std::clamp(to.y / length(to), -1.0f, 1.0f));
+}
+
+// QUAKE_DMG=1 (a test): every character's HP that falls, logged with the gun up.
+void damage_log() {
+    static std::unordered_map<std::uint32_t, std::int32_t> was;
+    BbChr chrs[256];
+    std::size_t n = 0;
+    if (g.api->chr_list(chrs, 256, &n) != 0) return;
+    n = std::min<std::size_t>(n, 256);
+    for (std::size_t i = 0; i < n; ++i) {
+        const BbChr& c = chrs[i];
+        if (c.is_player) continue;
+        auto it = was.find(c.handle);
+        if (it != was.end() && c.hp < it->second)
+            g.log("quake: dmg npc %d (%d/%d) took %d - %s up", c.npc_param, c.hp, c.max_hp, it->second - c.hp,
+                  kWeapons[arms.current].name);
+        was[c.handle] = c.hp;
+    }
+}
+
 Frame read_input() {
     Frame f;
     BbInput in{};
@@ -2260,6 +2520,7 @@ Frame read_input() {
             else if (step.what == "jump") f.cmd.jump = true;
             else if (step.what == "crouch") f.cmd.crouch = true;
             else if (step.what == "fire") f.cmd.fire = true;
+            else if (step.what == "aim") aim_nearest();
             else if (step.what == "yaw") view.yaw += step.arg * kDeg / 60.0f;
             else if (step.what == "face") view.yaw = step.arg * kDeg;
             else if (step.what == "pitch") view.pitch += step.arg * kDeg / 60.0f;
@@ -2669,6 +2930,123 @@ void begin(std::uint8_t* phys, const BbCamera& cam) {
     }
     g_written = pm.origin;
     g_written_valid = true;
+    if (const char* e = std::getenv("QUAKE_GRID")) {
+        // QUAKE_GRID=a,b[,half,step]: down casts over a square round the player with
+        // two filters, logging where they disagree.
+        unsigned fa = 0, fb = 0;
+        float half = 30.0f, step = 0.5f;
+        std::sscanf(e, "%x,%x,%f,%f", &fa, &fb, &half, &step);
+        std::uint8_t* world = collision_world();
+        int n = 0, diff = 0, onlya = 0, onlyb = 0;
+        for (float dx = -half; dx <= half; dx += step) {
+            for (float dz = -half; dz <= half; dz += step) {
+                const V3 from = pm.origin + V3{dx, 8.0f, dz};
+                const V3 d{0.0f, -20.0f, 0.0f};
+                float f1 = 1.0f, f2 = 1.0f;
+                V3 n1, n2;
+                const bool h1 = sphere_cast(world, from, d, 0.05f, f1, n1, fa);
+                const bool h2 = sphere_cast(world, from, d, 0.05f, f2, n2, fb);
+                ++n;
+                const float y1 = h1 ? from.y - 20.0f * f1 : -999.0f, y2 = h2 ? from.y - 20.0f * f2 : -999.0f;
+                if (std::fabs(y1 - y2) > 0.05f) {
+                    ++diff;
+                    if (y1 > y2) ++onlya;
+                    else ++onlyb;
+                    if (diff <= 200)
+                        g.log("quake: grid %.2f %.2f: %x %.2f (n.y %.2f) %x %.2f (n.y %.2f)", static_cast<double>(from.x),
+                              static_cast<double>(from.z), fa, static_cast<double>(y1), static_cast<double>(n1.y), fb,
+                              static_cast<double>(y2), static_cast<double>(n2.y));
+                }
+            }
+        }
+        g.log("quake: grid %x vs %x: %d casts, %d differ (%d higher with %x, %d with %x)", fa, fb, n, diff, onlya, fa, onlyb, fb);
+    }
+    if (const char* e = std::getenv("QUAKE_PTS")) {
+        // QUAKE_PTS="x,y,z;...": a down cast from 3 m over each point with every filter 0x20-0x3f.
+        std::uint8_t* world = collision_world();
+        for (const char* p = e; p && *p;) {
+            V3 q;
+            if (std::sscanf(p, "%f,%f,%f", &q.x, &q.y, &q.z) != 3) break;
+            char line[1200];
+            int n = std::snprintf(line, sizeof line, "quake: pt %.2f %.2f %.2f:", static_cast<double>(q.x), static_cast<double>(q.y),
+                                  static_cast<double>(q.z));
+            for (unsigned f = 0x20; f < 0x40; ++f) {
+                float fr = 1.0f;
+                V3 nn;
+                const V3 from = q + V3{0.0f, 3.0f, 0.0f};
+                const bool h = sphere_cast(world, from, V3{0.0f, -8.0f, 0.0f}, 0.05f, fr, nn, f);
+                n += std::snprintf(line + n, sizeof line - static_cast<std::size_t>(n), " %x:%.2f", f,
+                                   h ? static_cast<double>(from.y - 8.0f * fr) : -999.0);
+            }
+            g.log("%s", line);
+            p = std::strchr(p, ';');
+            if (p) ++p;
+        }
+    }
+    if (const char* e = std::getenv("QUAKE_FUZZ")) {
+        // QUAKE_FUZZ=half,step[,seconds]: from each floor point of a grid, the body run forward
+        // at eight headings; a run whose feet end up under a surface (one between 0.1 and
+        // 0.6 m over them) fell into the map.
+        float half = 20.0f, step = 2.0f, secs = 0.6f, cx = pm.origin.x, cz = pm.origin.z;
+        int only = -1, verbose = 0;
+        std::sscanf(e, "%f,%f,%f,%f,%f,%d,%d", &half, &step, &secs, &cx, &cz, &only, &verbose);
+        std::uint8_t* world = collision_world();
+        const Pm saved = pm;
+        const V3 centre{cx, pm.origin.y, cz};
+        int runs = 0, bad = 0;
+        double travelled = 0.0;
+        auto floor_at = [&](V3 p, float above, float& y) {
+            float f = 1.0f;
+            V3 n;
+            const V3 from = p + V3{0.0f, above, 0.0f};
+            if (!sphere_cast(world, from, V3{0.0f, -(above + 3.0f), 0.0f}, 0.02f, f, n, g_body_filter) || f <= 0.0f || n.y < 0.5f) return false;
+            y = from.y - (above + 3.0f) * f;
+            return true;
+        };
+        for (float dx = -half; dx <= half; dx += step) {
+            for (float dz = -half; dz <= half; dz += step) {
+                float fy;
+                if (!floor_at(centre + V3{dx, 0.0f, dz}, 3.0f, fy)) continue;
+                for (int k = 0; k < 8; ++k) {
+                    if (only >= 0 && k != only) continue;
+                    pm = Pm{};
+                    pm.origin = pm.last_ground = V3{centre.x + dx, fy + 0.02f, centre.z + dz};
+                    pm.jump_held = false;
+                    Cmd cmd;
+                    cmd.forward = 1.0f;
+                    const float yaw = static_cast<float>(k) * kPi / 4.0f;
+                    ++runs;
+                    float worst = 0.0f;
+                    V3 where;
+                    for (int i = 0; i < static_cast<int>(secs * 125.0f); ++i) {
+                        pmove_step(world, cmd, yaw, static_cast<float>(kMaxStep));
+                        if (verbose)
+                            g.log("quake: fuzz step %d at %.3f %.3f %.3f v %.0f %.0f %.0f %s n %.2f %.2f %.2f", i,
+                                  static_cast<double>(pm.origin.x), static_cast<double>(pm.origin.y), static_cast<double>(pm.origin.z),
+                                  static_cast<double>(pm.velocity.x), static_cast<double>(pm.velocity.y), static_cast<double>(pm.velocity.z),
+                                  pm.on_ground ? "ground" : "air", static_cast<double>(pm.ground_normal.x),
+                                  static_cast<double>(pm.ground_normal.y), static_cast<double>(pm.ground_normal.z));
+                        float over;
+                        if (floor_at(pm.origin, 0.6f, over) && over > pm.origin.y + 0.1f && over - pm.origin.y > worst) {
+                            worst = over - pm.origin.y;
+                            where = pm.origin;
+                        }
+                    }
+                    travelled += std::hypot(pm.origin.x - (centre.x + dx), pm.origin.z - (centre.z + dz));
+                    if (worst > 0.0f) {
+                        ++bad;
+                        if (bad <= 60)
+                            g.log("quake: fuzz from %.2f %.2f %.2f heading %d: feet %.2f m under a surface at %.2f %.2f %.2f",
+                                  static_cast<double>(centre.x + dx), static_cast<double>(fy), static_cast<double>(centre.z + dz),
+                                  k * 45, static_cast<double>(worst), static_cast<double>(where.x), static_cast<double>(where.y),
+                                  static_cast<double>(where.z));
+                    }
+                }
+            }
+        }
+        g.log("quake: fuzz %d runs, %d into the map, %.2f m on average", runs, bad, runs ? travelled / runs : 0.0);
+        pm = saved;
+    }
     if (const char* e = std::getenv("QUAKE_FILTER")) g_body_filter = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 16));
 }
 
@@ -2907,8 +3285,16 @@ void camera(BbCamera& cam) {
     const bool ladder = rungs >= 0 || climbing_off;
     if (ladder != g_on_ladder) {
         g_on_ladder = ladder;
-        take_input(true, !ladder);
         g.log("quake: %s a ladder", ladder ? "on" : "off");
+    }
+    // The movement keys are the game's on the rungs alone: its climb over the
+    // top plays without them, and W held through it walked the hunter off by
+    // the game's own camera (not Quake's view) - somewhere at random - and
+    // kept them moving, so Quake never took them back.
+    static bool keys_given = false;
+    if ((rungs >= 0) != keys_given) {
+        keys_given = rungs >= 0;
+        take_input(true, !keys_given);
     }
     // The body hidden part by part, the gun kept (vm_frame); with no gun
     // drawn, the whole character by its draw switch.
@@ -2926,6 +3312,8 @@ void camera(BbCamera& cam) {
     }
     const Frame in = read_input();
     weapons_frame(in, view.ms);
+    static const bool dmg_log = std::getenv("QUAKE_DMG") != nullptr;
+    if (dmg_log) damage_log();
     // A gun on its way down takes its flashes with it.
     if (arms.pending >= 0) {
         spin_frame(chr, view.ms, true);
