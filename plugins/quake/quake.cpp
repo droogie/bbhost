@@ -85,7 +85,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.17",
+    "0.3.18",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -205,6 +205,7 @@ constexpr float kStandHeight = 56.0f, kCrouchHeight = 40.0f;  // feet to the top
 constexpr int kStandEye = 50, kCrouchEye = 36;                // feet to the eye: Quake 3's view heights over its origin
 constexpr float kRadius = 0.3f;                               // the body's, metres (Quake 3's box is 0.47 m across)
 constexpr float kSkin = 0.01f;                                // what a move stops short of a surface by, metres
+constexpr float kSnap = 0.15f;                                // how far down a standing body follows its floor (a lift going down), metres
 constexpr double kMaxStep = 1.0 / 125.0;                      // the longest physics step
 constexpr double kMaxFrame = 0.05;                            // a hitch is not a run-up
 constexpr double kDoubleJumpSeconds = 0.4;                    // CPM's window
@@ -495,6 +496,14 @@ bool body_cast(std::uint8_t* world, V3 from, V3 delta, float radius, float& frac
     float f = 1.0f;
     V3 n;
     if (!sphere_cast(world, from, delta, radius, f, n, g_body_filter)) return false;
+    // The cast reports the nearest hit alone, and a surface the sphere
+    // already touches is nearest: a wall slid along hid the floor behind it,
+    // and the body fell through the floor beside the wall. A touch the move
+    // leaves (below) is cast past again from a hair out along its normal.
+    for (int k = 0; sphere >= 0 && k < 3 && f <= 0.0f && dot(n, dir) > -0.1f; ++k) {
+        from = from + n * (0.01f * static_cast<float>(k + 1));
+        if (!sphere_cast(world, from, delta, radius, f, n, g_body_filter)) return false;
+    }
     // Quake 3's body is a box, and only its bottom stands on anything: what
     // the waist's and the head's spheres meet under their middles - the top
     // edge of a chest-high wall, a lip beside the body - is the box's side
@@ -563,7 +572,12 @@ Trace body_trace(std::uint8_t* world, V3 from, V3 to, float height) {
         V3 flat{t.normal.x, 0.0f, t.normal.z};
         if (normalize(flat) > 1e-3f) t.normal = flat;
     }
-    const float made = std::max(0.0f, t.fraction * len - kSkin);
+    // kSkin off the surface along its normal, as Quake 3's traces stop
+    // SURFACE_CLIP_EPSILON off the plane: kSkin along a move that grazes a
+    // surface left the sphere a hair from it, and the next cast, starting
+    // inside, saw nothing there.
+    const float into = std::max(-dot(dir, t.normal), 0.2f);
+    const float made = std::max(0.0f, t.fraction * len - kSkin / into);
     t.fraction = made / len;
     t.end = from + delta * t.fraction;
     return t;
@@ -833,10 +847,90 @@ void crash_land(float previous_vy) {
     pm.bob_cycle = 0.0f;
 }
 
+// What the body's flat bottom stands on, as Quake 3's box finds it: thin
+// casts down through its middle and four corners, from kRadius over the feet
+// to `below` under them, the highest walkable surface met. The corners take
+// only flat tops (a beam, a rafter, a step's edge the sphere would roll off);
+// the middle any slope the body walks. A cast that starts inside something
+// is no support.
+constexpr float kFoot = 0.2f;  // the corners' offset, inside the sphere's own radius
+struct Support {
+    bool found = false;
+    float y = 0.0f;  // the surface's height
+    V3 normal{0.0f, 1.0f, 0.0f};
+};
+
+Support support(std::uint8_t* world, V3 feet, float below) {
+    Support s;
+    const V3 offsets[5] = {{0.0f, 0.0f, 0.0f}, {kFoot, 0.0f, kFoot}, {-kFoot, 0.0f, kFoot}, {kFoot, 0.0f, -kFoot}, {-kFoot, 0.0f, -kFoot}};
+    constexpr float kProbe = 0.02f;
+    const float drop = kRadius + below;
+    for (int k = 0; k < 5; ++k) {
+        float f = 1.0f;
+        V3 n;
+        const V3 from = feet + offsets[k] + V3{0.0f, kRadius, 0.0f};
+        if (!sphere_cast(world, from, V3{0.0f, -drop, 0.0f}, kProbe, f, n, g_body_filter) || f <= 0.0f) continue;
+        if (n.y < (k == 0 ? kMinWalkNormal : 0.9f)) continue;
+        const float y = from.y - drop * f - kProbe;
+        if (!s.found || y > s.y) {
+            s.found = true;
+            s.y = y;
+            s.normal = n;
+        }
+        // Standing on it through the middle: a corner's higher top is a
+        // step's edge, the steps' to climb.
+        if (k == 0 && s.found && s.y >= feet.y - 0.02f) break;
+    }
+    return s;
+}
+
+// The feet put back on top of what they stand in - a floor the last move
+// sank them into, a lift rising under them - and, for a body that was
+// standing and is not on its way up, onto a floor at most `snap` below: a
+// lift going down, a ramp's crest. Up to kRadius; a step's height when the
+// view should ease it.
+void settle(std::uint8_t* world, float snap) {
+    const Support s = support(world, pm.origin, snap);
+    if (!s.found) return;
+    const float gap = pm.origin.y - s.y;
+    if (gap < 0.0f) {
+        // Room for the head where it is lifted to.
+        float f = 1.0f;
+        V3 n;
+        const float h = body_height() * kUnit;
+        if (sphere_cast(world, pm.origin + V3{0.0f, h - kRadius, 0.0f}, V3{0.0f, -gap + kSkin, 0.0f}, kRadius, f, n, g_body_filter) &&
+            n.y < 0.0f && f > 0.0f)
+            return;
+        pm.origin.y = s.y + kSkin * 0.5f;
+        if (pm.velocity.y < 0.0f) pm.velocity.y = 0.0f;
+        if (-gap / kUnit > 2.0f && pm.on_ground) pm.stepped += std::min(16.0f, std::ceil(-gap / kUnit / 4.0f) * 4.0f);
+    } else if (gap > kSkin && pm.on_ground && pm.velocity.y <= 0.0f && gap <= snap) {
+        const Trace down = body_trace(world, pm.origin, V3{pm.origin.x, s.y + kSkin * 0.5f, pm.origin.z}, body_height());
+        if (!down.startsolid) pm.origin = down.end;
+    }
+}
+
+// Whether the body stands inside something: a top over the feet within the
+// body's lower half, straight above them.
+bool inside(std::uint8_t* world, V3 feet) {
+    float f = 1.0f;
+    V3 n;
+    const float top = 2.0f * kRadius;
+    return sphere_cast(world, feet + V3{0.0f, top, 0.0f}, V3{0.0f, -(top - 0.1f), 0.0f}, 0.02f, f, n, g_body_filter) && f > 0.0f &&
+           n.y > 0.0f;
+}
+
 // PM_GroundTrace: on the ground when a short trace down meets a surface that
-// is walkable.
+// is walkable - or when the body's flat bottom rests on one (support).
 void ground_trace(std::uint8_t* world, float previous_vy) {
-    const Trace tr = body_trace(world, pm.origin, pm.origin - V3{0.0f, 0.25f * kUnit + kSkin, 0.0f}, body_height());
+    Trace tr = body_trace(world, pm.origin, pm.origin - V3{0.0f, 0.25f * kUnit + kSkin, 0.0f}, body_height());
+    if ((!tr.hit || tr.normal.y < kMinWalkNormal)) {
+        const Support s = support(world, pm.origin, 0.25f * kUnit + kSkin);
+        if (s.found && pm.origin.y - s.y <= 0.25f * kUnit + kSkin) {
+            tr.hit = true;
+            tr.normal = s.normal;
+        }
+    }
     if (!tr.hit) {
         pm.on_ground = pm.ground_plane = pm.walking = false;
         return;
@@ -918,7 +1012,9 @@ void footsteps(const Cmd& cmd, float dt) {
 void pmove_step(std::uint8_t* world, const Cmd& cmd, float yaw, float dt) {
     if (!cmd.jump) pm.jump_held = false;
     const float previous_vy = pm.velocity.y;
+    const V3 start = pm.origin;
     check_duck(world, cmd);
+    settle(world, kSnap);
     ground_trace(world, previous_vy);
     if (pm.knock_time > 0.0) pm.knock_time = std::max(0.0, pm.knock_time - dt);  // PM_DropTimers
 
@@ -965,6 +1061,13 @@ void pmove_step(std::uint8_t* world, const Cmd& cmd, float yaw, float dt) {
         // A ground too steep to stand on is slid along.
         if (pm.ground_plane) clip_velocity(pm.velocity, pm.ground_normal, kOverclip);
         step_slide_move(world, true, dt);
+    }
+    settle(world, kSnap);
+    if (inside(world, pm.origin) && !inside(world, start)) {
+        // Into something the casts missed (one the sphere already overlapped
+        // at the start, which they pass through): the move is undone.
+        pm.origin = start;
+        pm.velocity.x = pm.velocity.z = 0.0f;
     }
     ground_trace(world, previous_vy);
     footsteps(cmd, dt);
@@ -2669,6 +2772,123 @@ void begin(std::uint8_t* phys, const BbCamera& cam) {
     }
     g_written = pm.origin;
     g_written_valid = true;
+    if (const char* e = std::getenv("QUAKE_GRID")) {
+        // QUAKE_GRID=a,b[,half,step]: down casts over a square round the player with
+        // two filters, logging where they disagree.
+        unsigned fa = 0, fb = 0;
+        float half = 30.0f, step = 0.5f;
+        std::sscanf(e, "%x,%x,%f,%f", &fa, &fb, &half, &step);
+        std::uint8_t* world = collision_world();
+        int n = 0, diff = 0, onlya = 0, onlyb = 0;
+        for (float dx = -half; dx <= half; dx += step) {
+            for (float dz = -half; dz <= half; dz += step) {
+                const V3 from = pm.origin + V3{dx, 8.0f, dz};
+                const V3 d{0.0f, -20.0f, 0.0f};
+                float f1 = 1.0f, f2 = 1.0f;
+                V3 n1, n2;
+                const bool h1 = sphere_cast(world, from, d, 0.05f, f1, n1, fa);
+                const bool h2 = sphere_cast(world, from, d, 0.05f, f2, n2, fb);
+                ++n;
+                const float y1 = h1 ? from.y - 20.0f * f1 : -999.0f, y2 = h2 ? from.y - 20.0f * f2 : -999.0f;
+                if (std::fabs(y1 - y2) > 0.05f) {
+                    ++diff;
+                    if (y1 > y2) ++onlya;
+                    else ++onlyb;
+                    if (diff <= 200)
+                        g.log("quake: grid %.2f %.2f: %x %.2f (n.y %.2f) %x %.2f (n.y %.2f)", static_cast<double>(from.x),
+                              static_cast<double>(from.z), fa, static_cast<double>(y1), static_cast<double>(n1.y), fb,
+                              static_cast<double>(y2), static_cast<double>(n2.y));
+                }
+            }
+        }
+        g.log("quake: grid %x vs %x: %d casts, %d differ (%d higher with %x, %d with %x)", fa, fb, n, diff, onlya, fa, onlyb, fb);
+    }
+    if (const char* e = std::getenv("QUAKE_PTS")) {
+        // QUAKE_PTS="x,y,z;...": a down cast from 3 m over each point with every filter 0x20-0x3f.
+        std::uint8_t* world = collision_world();
+        for (const char* p = e; p && *p;) {
+            V3 q;
+            if (std::sscanf(p, "%f,%f,%f", &q.x, &q.y, &q.z) != 3) break;
+            char line[1200];
+            int n = std::snprintf(line, sizeof line, "quake: pt %.2f %.2f %.2f:", static_cast<double>(q.x), static_cast<double>(q.y),
+                                  static_cast<double>(q.z));
+            for (unsigned f = 0x20; f < 0x40; ++f) {
+                float fr = 1.0f;
+                V3 nn;
+                const V3 from = q + V3{0.0f, 3.0f, 0.0f};
+                const bool h = sphere_cast(world, from, V3{0.0f, -8.0f, 0.0f}, 0.05f, fr, nn, f);
+                n += std::snprintf(line + n, sizeof line - static_cast<std::size_t>(n), " %x:%.2f", f,
+                                   h ? static_cast<double>(from.y - 8.0f * fr) : -999.0);
+            }
+            g.log("%s", line);
+            p = std::strchr(p, ';');
+            if (p) ++p;
+        }
+    }
+    if (const char* e = std::getenv("QUAKE_FUZZ")) {
+        // QUAKE_FUZZ=half,step[,seconds]: from each floor point of a grid, the body run forward
+        // at eight headings; a run whose feet end up under a surface (one between 0.1 and
+        // 0.6 m over them) fell into the map.
+        float half = 20.0f, step = 2.0f, secs = 0.6f, cx = pm.origin.x, cz = pm.origin.z;
+        int only = -1, verbose = 0;
+        std::sscanf(e, "%f,%f,%f,%f,%f,%d,%d", &half, &step, &secs, &cx, &cz, &only, &verbose);
+        std::uint8_t* world = collision_world();
+        const Pm saved = pm;
+        const V3 centre{cx, pm.origin.y, cz};
+        int runs = 0, bad = 0;
+        double travelled = 0.0;
+        auto floor_at = [&](V3 p, float above, float& y) {
+            float f = 1.0f;
+            V3 n;
+            const V3 from = p + V3{0.0f, above, 0.0f};
+            if (!sphere_cast(world, from, V3{0.0f, -(above + 3.0f), 0.0f}, 0.02f, f, n, g_body_filter) || f <= 0.0f || n.y < 0.5f) return false;
+            y = from.y - (above + 3.0f) * f;
+            return true;
+        };
+        for (float dx = -half; dx <= half; dx += step) {
+            for (float dz = -half; dz <= half; dz += step) {
+                float fy;
+                if (!floor_at(centre + V3{dx, 0.0f, dz}, 3.0f, fy)) continue;
+                for (int k = 0; k < 8; ++k) {
+                    if (only >= 0 && k != only) continue;
+                    pm = Pm{};
+                    pm.origin = pm.last_ground = V3{centre.x + dx, fy + 0.02f, centre.z + dz};
+                    pm.jump_held = false;
+                    Cmd cmd;
+                    cmd.forward = 1.0f;
+                    const float yaw = static_cast<float>(k) * kPi / 4.0f;
+                    ++runs;
+                    float worst = 0.0f;
+                    V3 where;
+                    for (int i = 0; i < static_cast<int>(secs * 125.0f); ++i) {
+                        pmove_step(world, cmd, yaw, static_cast<float>(kMaxStep));
+                        if (verbose)
+                            g.log("quake: fuzz step %d at %.3f %.3f %.3f v %.0f %.0f %.0f %s n %.2f %.2f %.2f", i,
+                                  static_cast<double>(pm.origin.x), static_cast<double>(pm.origin.y), static_cast<double>(pm.origin.z),
+                                  static_cast<double>(pm.velocity.x), static_cast<double>(pm.velocity.y), static_cast<double>(pm.velocity.z),
+                                  pm.on_ground ? "ground" : "air", static_cast<double>(pm.ground_normal.x),
+                                  static_cast<double>(pm.ground_normal.y), static_cast<double>(pm.ground_normal.z));
+                        float over;
+                        if (floor_at(pm.origin, 0.6f, over) && over > pm.origin.y + 0.1f && over - pm.origin.y > worst) {
+                            worst = over - pm.origin.y;
+                            where = pm.origin;
+                        }
+                    }
+                    travelled += std::hypot(pm.origin.x - (centre.x + dx), pm.origin.z - (centre.z + dz));
+                    if (worst > 0.0f) {
+                        ++bad;
+                        if (bad <= 60)
+                            g.log("quake: fuzz from %.2f %.2f %.2f heading %d: feet %.2f m under a surface at %.2f %.2f %.2f",
+                                  static_cast<double>(centre.x + dx), static_cast<double>(fy), static_cast<double>(centre.z + dz),
+                                  k * 45, static_cast<double>(worst), static_cast<double>(where.x), static_cast<double>(where.y),
+                                  static_cast<double>(where.z));
+                    }
+                }
+            }
+        }
+        g.log("quake: fuzz %d runs, %d into the map, %.2f m on average", runs, bad, runs ? travelled / runs : 0.0);
+        pm = saved;
+    }
     if (const char* e = std::getenv("QUAKE_FILTER")) g_body_filter = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 16));
 }
 
@@ -2907,8 +3127,16 @@ void camera(BbCamera& cam) {
     const bool ladder = rungs >= 0 || climbing_off;
     if (ladder != g_on_ladder) {
         g_on_ladder = ladder;
-        take_input(true, !ladder);
         g.log("quake: %s a ladder", ladder ? "on" : "off");
+    }
+    // The movement keys are the game's on the rungs alone: its climb over the
+    // top plays without them, and W held through it walked the hunter off by
+    // the game's own camera (not Quake's view) - somewhere at random - and
+    // kept them moving, so Quake never took them back.
+    static bool keys_given = false;
+    if ((rungs >= 0) != keys_given) {
+        keys_given = rungs >= 0;
+        take_input(true, !keys_given);
     }
     // The body hidden part by part, the gun kept (vm_frame); with no gun
     // drawn, the whole character by its draw switch.
