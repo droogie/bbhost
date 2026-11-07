@@ -2517,7 +2517,11 @@ bool host_window_pump() {
                 dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
                 dh = g_display_h ? static_cast<float>(g_display_h) : 1080.0f;
             }
-            const float scale = 1.25f, w = host_overlay_text_width(scale, text.c_str());
+            // A line wider than the display (a long one at a low resolution,
+            // 960x600 on the Steam Deck) is drawn smaller, to fit.
+            const float room = dw - 64.0f, full = host_overlay_text_width(1.25f, text.c_str());
+            const float scale = full > room && full > 0.0f ? std::max(0.5f, 1.25f * room / full) : 1.25f;
+            const float w = host_overlay_text_width(scale, text.c_str());
             const float x = (dw - w) * 0.5f, y = dh * 0.22f;
             const auto a = [&](std::uint32_t rgba) {
                 return (rgba & 0xffffff00u) | static_cast<std::uint32_t>(static_cast<float>(rgba & 0xffu) * alpha);

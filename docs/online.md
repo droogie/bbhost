@@ -36,7 +36,9 @@ the sign-in still holds, without making the window wait, and says what it
 found on the Game page's Online card and under Play: signed in,
 expired (or this PC was signed out elsewhere: log in with Discord again, or
 recover an account kept on this PC), or not checked when the server did not
-answer (with a Retry).
+answer (with a Retry). A sign-in the server refuses keeps the game offline
+instead of asking again all session; one refused while the game runs is said
+once over the game, and F10's Game page has the way back in.
 
 ## How a session connects
 

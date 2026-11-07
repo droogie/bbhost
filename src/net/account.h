@@ -24,8 +24,10 @@ void account_clear();
 // sign-in check below): the token expired or was revoked, or, with no token,
 // the online id is an account's name. Kept until the next account_set /
 // account_clear or a check the server answers yes; the event poller slows
-// down while it holds and the F10 Account section says what to do.
-// account_mark_refused logs the reason once per sign-in.
+// down while it holds, the game stays signed out where the server requires an
+// account (hle/system.cpp), and F10's account section (the Game page) says what to do.
+// account_mark_refused logs the reason once per sign-in and, while the game's
+// window is up, says once over the game what to do about it.
 bool account_refused();
 void account_mark_refused(const std::string& reason);
 

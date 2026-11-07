@@ -469,8 +469,11 @@ GUEST_ABI int hle_np_get_state(int, int* state) {
     }();
     // online.require_account: signed out until the F10 screen has logged an
     // account in, so the game plays offline rather than as a name
-    // taken from a file.
-    *state = (forced == 2 && config().online_require_account && !net::account_logged_in()) ? 1 : forced;
+    // taken from a file - and while the server refuses the sign-in it has
+    // (net::account_refused: the setup window's check, or a 401), rather
+    // than asking again all session for answers it refuses.
+    const bool signed_in = net::account_logged_in() && !net::account_refused();
+    *state = (forced == 2 && config().online_require_account && !signed_in) ? 1 : forced;
     return 0;
 }
 std::string g_online_id = "Player";

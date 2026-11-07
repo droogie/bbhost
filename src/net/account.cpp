@@ -1,9 +1,11 @@
 #include "net/account.h"
 
+#include "host/window.h"
 #include "log.h"
 #include "net/http.h"
 #include "net/sign_in_check.h"
 
+#include <cctype>
 #include <cstdlib>
 #include <ctime>
 #include <mutex>
@@ -26,11 +28,26 @@ AccountCheck g_check;
 unsigned g_check_serial = 0;
 unsigned g_signin = 0;
 
-// A refusal newly marked: said once in the log.
+// What the player is told over the game when the server refuses the sign-in
+// while it runs: a token it no longer knows needs a new sign-in; a refusal for
+// another reason (a ban) is the server's own words.
+std::string refused_banner(const std::string& reason, bool had_token) {
+    if (reason.find("banned") != std::string::npos) {
+        std::string s = reason;
+        s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+        return s;
+    }
+    return had_token ? "Sign-in expired: sign in again in F10 > Game, or at the next start"
+                     : "Online play needs a sign-in: F10 > Game";
+}
+
+// A refusal newly marked: said once in the log and, while the game's window
+// is up, once over the game.
 void said_refused(const std::string& name, const std::string& reason) {
     host_log("account: the server refused this PC's sign-in%s%s (%s): until it is signed in again (F10's Game page, or "
              "the setup window) nobody can summon or invite this player",
              name.empty() ? "" : " as ", name.c_str(), reason.c_str());
+    if (host_window_active()) host_message_show(refused_banner(reason, !name.empty()).c_str(), 15.0f);
 }
 
 // POST to the account server and read the reply whatever the status: a limit
