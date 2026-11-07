@@ -23,6 +23,12 @@
 
 #include <string>
 
+// System > PC Settings' slots (engine/option_menu.cpp's g_toggles and its
+// Texture Quality and Frame Rate lists): the movie's PCSetting section has
+// this many rows, the Defaults label below them (build_option_movie) - one
+// more than the donor's six, as PC Graphics has, for Stay Borderless.
+constexpr int kPcSettingSlots = 7;
+
 // Makes the assets if they are missing or stale and registers the directory
 // with the FS. False, with the reason logged, when the dump lacks a source.
 bool menu_assets_ensure();

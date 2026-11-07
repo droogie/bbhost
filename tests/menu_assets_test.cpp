@@ -80,8 +80,9 @@ int main() {
     }
     const std::set<std::string> gfx = section_rows(movie, "PCGraphics");
     CHECK(gfx == items(8));  // seven widget rows and the Defaults label
-    // PC Settings and PC Effects keep six rows and the label.
-    CHECK(section_rows(movie, "PCSetting") == items(7));
+    // PC Settings has seven rows (one added, as PC Graphics' seventh) and the
+    // label; PC Effects keeps six rows and the label.
+    CHECK(section_rows(movie, "PCSetting") == items(kPcSettingSlots + 1));
     CHECK(section_rows(movie, "PCEffects") == items(7));
     // PC Enhancements: a row for each of its toggles (engine/option_menu.cpp's
     // g_enhance) and the Defaults label.
@@ -95,6 +96,7 @@ int main() {
     const auto rows = read_messages();
     CHECK(rows.count(117009) && rows.at(117009).text == "HLSL Shaders" && rows.at(117009).help.find("restart") != std::string::npos);
     CHECK(rows.count(116008) && rows.at(116008).text == "Texture Quality");
+    CHECK(rows.count(116009) && rows.at(116009).text == "Stay Borderless");
     CHECK(rows.count(116045) && rows.count(116042) && rows.count(116043) && rows.count(116044) && rows.at(116044).text == "High");
     CHECK(rows.count(124005) && rows.at(124005).text == "Full Phantom HP" && rows.at(124005).help.find("restart") != std::string::npos);
     CHECK(rows.count(124006) && rows.at(124006).text == "Auto-Replenish Items" &&

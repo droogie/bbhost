@@ -511,10 +511,14 @@ struct Toggle {
     bool invert = false;
 };
 // PC Settings. The two pointer rows it had moved to PC Controls, beside the
-// rest of the mouse.
+// rest of the mouse. Five toggles and the Texture Quality and frame rate pick
+// lists fill the section's seven slots (kPcSettingSlots).
 Toggle g_toggles[] = {
     {"vsync", 116000, 1, 0xff},
     {"window_mode", 116001, 0, 0xff},
+    // Stay Borderless: Borderless never made exclusive by the driver (Windows;
+    // host/window.cpp).
+    {"stay_borderless", 116009, 0, 0xff},
     {"skip_logos", 116004, 0, 0xff},
     // The frames per second the presenter counts (host/window.cpp).
     {"fps_counter", 116007, 0, 0xff},
@@ -849,11 +853,14 @@ constexpr int kSectionSlots = 6, kKeysSlots = 8;
 // PC Graphics has one slot more (its seventh row, HLSL Shaders): the generator
 // adds it as it adds Key Bindings' two, and moves the Defaults label below it.
 constexpr int kGraphicsSlots = 7;
+// PC Settings has one more too (Stay Borderless's, after Texture Quality's
+// list took the sixth): engine/menu_assets.h's kPcSettingSlots, which the
+// generator makes.
 
 // The port's rows: its toggles plus the Texture Quality and frame-cap pick
 // lists, and in the graphics section its toggles plus the resolution list.
 constexpr int kRowCount = kToggleCount + 2;
-static_assert(kRowCount <= kSectionSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
+static_assert(kRowCount <= kPcSettingSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
                   kCameraRows <= kSectionSlots && kDeckRows <= kSectionSlots && kEnhanceRows <= kSectionSlots &&
                   kEffectsRows <= kSectionSlots && kUpscaleRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
               "more rows than the section sprite has slots: the extra ones have nowhere to draw. "
@@ -924,7 +931,7 @@ GUEST_ABI void pc_section_handler(void* dialog, void* params) {
                  std::max(0, host_opt_default_index("texture_quality")));
     add_list_row(dialog, &g_frame_cap, kRowFrameCap, kFrameCaps,
                  static_cast<int>(sizeof(kFrameCaps) / sizeof(kFrameCaps[0])), host_opt_default_frame_cap());
-    log_rows("PCSetting", dialog, kRowCount, kRowCount);
+    log_rows("PCSetting", dialog, kRowCount, kPcSettingSlots);
 }
 
 // The graphics section's handler. Same shape as the one above: a scratch
