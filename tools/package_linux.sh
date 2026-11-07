@@ -41,6 +41,36 @@ cp bbhost.example.toml "$dir/bbhost.example.toml"
 # The HLSL path's compiler beside the binary, where bbhost looks first.
 tools/fetch_dxc.sh linux "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)
+# The upscalers beside the binary, where bbhost looks for them
+# (host/upscaler.cpp, host/framegen.cpp): what tools/linux_portable_build.sh
+# put in build/upscalers (tools/build_upscaler_bridge_linux.sh), with their
+# licences. Without it DLSS, FSR and frame generation are off; TAA runs.
+upscalers=$(dirname "$bin")/upscalers
+upscaler_note="This build carries no upscaler files: Graphics > Upscaling offers TAA
+(bbhost's own) only, and frame generation is off."
+if [ -f "$upscalers/upscaler_bridge.so" ]; then
+    cp "$upscalers"/upscaler_bridge.so "$upscalers"/libnvidia-ngx-dlss.so.* "$dir/"
+    [ -f "$upscalers/libamd_fidelityfx_vk.so" ] && cp "$upscalers/libamd_fidelityfx_vk.so" "$dir/"
+    mkdir -p "$dir/licenses"
+    cp -r "$upscalers"/licenses/* "$dir/licenses/"
+    upscaler_note="upscaler_bridge.so is the Upscaler Bridge by Numity1504 (MIT licence, in
+licenses/upscaler_bridge), which bbhost calls DLSS and FSR through; it has
+NVIDIA's NGX library built in. libnvidia-ngx-dlss.so.* is NVIDIA DLSS,
+Copyright (C) NVIDIA Corporation, from NVIDIA's DLSS repository, unmodified,
+for use with bbhost only; licence in licenses/dlss. bbhost is not sponsored
+or endorsed by NVIDIA. DLSS needs an RTX card and NVIDIA's proprietary driver."
+    if [ -f "$upscalers/libamd_fidelityfx_vk.so" ]; then
+        upscaler_note="$upscaler_note
+libamd_fidelityfx_vk.so is AMD FidelityFX (FSR 3 upscaling and frame
+generation), built from the FidelityFX SDK's source under AMD's MIT licence
+(licenses/fidelityfx). FSR 4 is AMD's Windows files only and is not offered
+on Linux."
+    else
+        upscaler_note="$upscaler_note
+No FidelityFX library is in this build: FSR and frame generation are off on
+Linux; DLSS and TAA are offered."
+    fi
+fi
 # The pipeline list beside the binary, where bbhost reads it at each start and
 # builds every pipeline it names (render.cpp pipeline_manifest_load): the
 # pinned release asset (tools/fetch_pipeline_list.sh), or the local list
@@ -122,6 +152,9 @@ screens are up), and the translator's own are drawn until then; the setup
 window's Shaders tab compiles them all at once (Compile shaders now), and its
 Shaders setting picks Lifted to keep the translator's own. Without it that
 path keeps every shader as it was; nothing else uses it.
+
+Upscalers
+$upscaler_note
 
 Setup
   Untar this folder somewhere of its own, for example ~/Games/bbhost, and run

@@ -5,7 +5,11 @@
 // build. The bridge holds the calls into NVIDIA's and AMD's code; the files
 // those come in (nvngx_dlss.dll, amd_fidelityfx_loader_vk.dll,
 // amd_fidelityfx_upscaler_vk.dll) sit beside it, and a missing one only turns
-// its method off. Windows only; elsewhere every call is a no-op and nothing is
+// its method off. On Linux the same through upscaler_bridge.so (the bridge's
+// source in third_party/upscaler_bridge/src, built by
+// tools/build_upscaler_bridge_linux.sh), with libnvidia-ngx-dlss.so.<version>
+// for DLSS and libamd_fidelityfx_vk.so (FSR 3 from AMD's MIT source; FSR 4 is
+// Windows only) beside it. Elsewhere every call is a no-op and nothing is
 // available.
 //
 // The order (host/gpu.cpp init_locked, for the real instance and device only -

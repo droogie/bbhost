@@ -18,6 +18,8 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#elif defined(__linux__)
+#include <dlfcn.h>
 #endif
 
 namespace {
@@ -87,6 +89,34 @@ bool load() {
         g_dispatch = reinterpret_cast<PfnFfxDispatch>(get("ffxDispatch"));
         if (!g_create || !g_destroy || !g_configure || !g_query || !g_dispatch) {
             host_log("framegen: %s lacks the FidelityFX API", dll.string().c_str());
+            return false;
+        }
+        host_log("framegen: AMD FidelityFX frame generation loaded");
+        return true;
+#elif defined(__linux__)
+        // AMD ships its signed files for Windows only: on Linux the loader and
+        // its providers are one library built from the FidelityFX SDK's MIT
+        // source (tools/build_ffx_linux.sh), the same API.
+        const std::filesystem::path so = std::filesystem::path(config_exe_dir()) / "libamd_fidelityfx_vk.so";
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(so, ec)) {
+            host_log("framegen: no libamd_fidelityfx_vk.so beside bbhost: frame generation is not available");
+            return false;
+        }
+        void* h = dlopen(so.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h) {
+            const char* e = dlerror();
+            host_log("framegen: %s did not load (%s)", so.c_str(), e ? e : "dlopen failed");
+            return false;
+        }
+        const auto get = [h](const char* name) { return dlsym(h, name); };
+        g_create = reinterpret_cast<PfnFfxCreateContext>(get("ffxCreateContext"));
+        g_destroy = reinterpret_cast<PfnFfxDestroyContext>(get("ffxDestroyContext"));
+        g_configure = reinterpret_cast<PfnFfxConfigure>(get("ffxConfigure"));
+        g_query = reinterpret_cast<PfnFfxQuery>(get("ffxQuery"));
+        g_dispatch = reinterpret_cast<PfnFfxDispatch>(get("ffxDispatch"));
+        if (!g_create || !g_destroy || !g_configure || !g_query || !g_dispatch) {
+            host_log("framegen: %s lacks the FidelityFX API", so.c_str());
             return false;
         }
         host_log("framegen: AMD FidelityFX frame generation loaded");

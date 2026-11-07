@@ -1,0 +1,51 @@
+THIRD PARTY NOTICES -- upscaler_bridge
+
+The bridge's own code is MIT, Copyright (c) 2026 Numity1504 (LICENSE.txt).
+Made by Numity1504 (BBsuite), using Claude by Anthropic as assistant.
+This package also holds or uses the parts below. The full texts are in
+third_party\licenses\.
+
+
+NVIDIA DLSS SDK 310.9.16
+------------------------
+This software contains source code provided by NVIDIA Corporation.
+
+bin\upscaler_bridge.dll has NVIDIA's static library nvsdk_ngx_s.lib built in,
+in object form, with the inline helpers of the SDK's headers. It exists to be
+built into an application with functions of its own, such as a game host. Do
+not hand the dll out on its own and do not offer it as a product of its own:
+the SDK's terms (sections 1c, 2a and 4b) allow it only inside an application.
+Copies stay under terms at least as protective as NVIDIA's (section 2c).
+Text: third_party\licenses\NVIDIA_RTX_SDK_LICENSE.txt
+
+NOT in this package: nvngx_dlss.dll, the SDK's headers and its library. Get
+them from NVIDIA, under NVIDIA's licence: https://github.com/NVIDIA/DLSS
+Use the release file from lib\Windows_x86_64\rel, never the dev one, and do not
+change it: NGX refuses a file whose NVIDIA signature is gone.
+An application that ships nvngx_dlss.dll must also show the third party notices
+of section 9.5 of the DLSS Programming Guide (section 4.2.3 of the guide).
+
+NVIDIA, DLSS and RTX are trademarks of NVIDIA Corporation. This project is not
+sponsored or endorsed by NVIDIA.
+
+
+AMD FidelityFX SDK 2.4.0 (bin\amd_fidelityfx_loader_vk.dll,
+bin\amd_fidelityfx_upscaler_vk.dll)
+-----------------------------------------------------------
+Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+Binary form only, unchanged and signed by AMD. No reverse engineering,
+decompilation or disassembly. AMD's copyright notice, permission notice,
+disclaimers and notices, with the notices of the parts inside AMD's files:
+third_party\licenses\FidelityFX_SDK_2.4.0_license.md
+
+
+AMD FidelityFX SDK 1.1.4 headers (third_party\ffx\ffx_api)
+----------------------------------------------------------
+Copyright (C) 2024 Advanced Micro Devices, Inc. MIT licence. Its header stays
+in each file. Text: third_party\licenses\FidelityFX_SDK_1.1.4_LICENSE.txt
+
+
+Vulkan headers (third_party\vulkan)
+-----------------------------------
+Copyright 2015-2026 The Khronos Group Inc. Apache-2.0 and MIT.
+Text: third_party\licenses\Vulkan-Headers_LICENSE.md, Apache-2.0.txt, MIT.txt

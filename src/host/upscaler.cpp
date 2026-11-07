@@ -45,8 +45,12 @@ constexpr float kTaaMipBias = 0.0f;
 
 }  // namespace
 
+#if defined(_WIN32) || defined(__linux__)
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include "upscaler_bridge.h"
 
@@ -62,6 +66,36 @@ constexpr float kTaaMipBias = 0.0f;
 #include <vector>
 
 namespace {
+
+#if defined(_WIN32)
+constexpr const char* kBridgeFile = "upscaler_bridge.dll";
+#else
+constexpr const char* kBridgeFile = "upscaler_bridge.so";
+#endif
+
+// The bridge's ub_get_api, from the file at `path`; null (and why in `why`)
+// when it does not load.
+PFN_ub_get_api load_bridge(const std::filesystem::path& path, std::string* why) {
+#if defined(_WIN32)
+    // Its own folder first for what it loads (the vendors' files beside it).
+    HMODULE h = LoadLibraryExW(path.wstring().c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!h) {
+        *why = "error " + std::to_string(GetLastError());
+        return nullptr;
+    }
+    return reinterpret_cast<PFN_ub_get_api>(reinterpret_cast<void*>(GetProcAddress(h, "ub_get_api")));
+#else
+    // By its full path; it finds NVIDIA's and AMD's files in its own folder
+    // (the vendor folder it is given) by their full paths too.
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) {
+        const char* e = dlerror();
+        *why = e ? e : "dlopen failed";
+        return nullptr;
+    }
+    return reinterpret_cast<PFN_ub_get_api>(dlsym(h, "ub_get_api"));
+#endif
+}
 
 const ub_api* g_ub = nullptr;
 ub_context* g_ctx = nullptr;
@@ -84,19 +118,18 @@ bool upscaler_open() {
         host_log("upscaler: off (BBHOST_UPSCALER=0)");
         return false;
     }
-    const std::filesystem::path dll = std::filesystem::path(config_exe_dir()) / "upscaler_bridge.dll";
+    const std::filesystem::path dll = std::filesystem::path(config_exe_dir()) / kBridgeFile;
     std::error_code ec;
     if (!std::filesystem::is_regular_file(dll, ec)) {
-        host_log("upscaler: no upscaler_bridge.dll beside bbhost.exe: DLSS and FSR 3/4 are not available");
+        host_log("upscaler: no %s beside bbhost: DLSS and FSR are not available", kBridgeFile);
         return false;
     }
-    // Its own folder first for what it loads (the vendors' files beside it).
-    HMODULE h = LoadLibraryExW(dll.wstring().c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!h) {
-        host_log("upscaler: %s did not load (error %lu)", dll.string().c_str(), GetLastError());
+    std::string why;
+    const PFN_ub_get_api get_api = load_bridge(dll, &why);
+    if (!get_api && !why.empty()) {
+        host_log("upscaler: %s did not load (%s)", dll.string().c_str(), why.c_str());
         return false;
     }
-    auto get_api = reinterpret_cast<PFN_ub_get_api>(reinterpret_cast<void*>(GetProcAddress(h, "ub_get_api")));
     const ub_api* api = get_api ? get_api(UB_API_VERSION) : nullptr;
     if (!api) {
         host_log("upscaler: %s is not a bridge of API %u", dll.string().c_str(), UB_API_VERSION);
@@ -191,7 +224,11 @@ std::atomic<bool> g_failed{false};  // an evaluate failed: the plain picture fro
 // ProductName does not start with "Vulkan": not the loader). It runs its own
 // TAA and jitter, so ours stays off with it - the bridge's UB_ERR_BLOCKED for
 // TAA, which has no bridge to ask (Numity1504's step 9, "Only one AA").
+// BBsuite is Windows only.
 bool bbsuite_layer_present() {
+#if !defined(_WIN32)
+    return false;
+#else
     static const bool present = [] {
         wchar_t exe[MAX_PATH];
         const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -222,6 +259,7 @@ bool bbsuite_layer_present() {
         return other;
     }();
     return present;
+#endif
 }
 
 int upscaler_method() {
@@ -315,7 +353,7 @@ bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c) {
     return false;
 }
 
-#else  // no bridge outside Windows
+#else  // no bridge outside Windows and Linux
 
 bool upscaler_open() { return false; }
 const VkInstanceCreateInfo* upscaler_prepare_instance(const VkInstanceCreateInfo* in) { return in; }

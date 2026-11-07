@@ -8,7 +8,9 @@
 // first draw) and put back over every frame shown, real or generated.
 //
 // The runtime is AMD's: amd_fidelityfx_loader_vk.dll and
-// amd_fidelityfx_framegeneration_vk.dll beside bbhost.exe. Without them, the
+// amd_fidelityfx_framegeneration_vk.dll beside bbhost.exe; on Linux,
+// libamd_fidelityfx_vk.so beside bbhost (built from the same SDK's MIT
+// source, the same API: AMD ships no Linux files). Without them, the
 // device's three spare queues (host/gpu.h fg_queues) or the setting, the
 // presenter keeps a swapchain of its own and nothing here runs.
 //
