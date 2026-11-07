@@ -91,6 +91,12 @@ namespace {
 
 using stream::Op;
 
+// The recorder's driver calls and its waits for the submission thread, for
+// the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kBeginSite{slow_calls::kBeginCommands, "the recorder's"};
+constexpr slow_calls::Site kEndSite{slow_calls::kEndCommands, "the recorder's"};
+constexpr slow_calls::Site kSubmittedSite{slow_calls::kSubmitted, "a submission"};
+
 inline void cpu_relax() {
 #if defined(__x86_64__)
     _mm_pause();
@@ -551,16 +557,16 @@ void replay_block(const Block& b) {
             VkCommandBufferBeginInfo bi{};
             bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            const std::uint64_t t0 = host_clock_monotonic_ns();
+            slow_calls::Scope timed(kBeginSite, 0, true);  // its clock reads the figure's too
             vkBeginCommandBuffer(r->cmd, &bi);
-            add_relaxed(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+            add_relaxed(g_stream_stats.endbegin_ns, timed.end());
             break;
         }
         case Op::kEndSubmit: {
             const auto* r = reinterpret_cast<const stream::EndSubmit*>(p);
-            const std::uint64_t t0 = host_clock_monotonic_ns();
+            slow_calls::Scope timed(kEndSite, 0, true);  // its clock reads the figure's too
             vkEndCommandBuffer(r->cmds[r->ncmds - 1]);
-            add_relaxed(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+            add_relaxed(g_stream_stats.endbegin_ns, timed.end());
             add_relaxed(g_stream_stats.endbegin_n, 1);
             // R4: this core's commands are in memory before another thread
             // submits them (enqueue's mutex would also drain them).
@@ -1182,7 +1188,7 @@ void stream_wait_submitted(std::uint64_t serial) {
     // validation layer reports and AMD's driver answered once with a
     // 10-second timeout in the self-test.
     ++g_counts.submitted_waits;
-    const std::uint64_t t0 = host_clock_monotonic_ns();
+    slow_calls::Scope timed(kSubmittedSite, 0, true);  // a slow call's, its clock reads the count's too
     for (std::uint64_t spins = 0; stream_submitted_serial() <= serial; ++spins) {
         if ((spins & 1023) == 0 && g_mode == kModeThread && g_sleeping.load(std::memory_order_seq_cst)) published_wake();
         if (spins < 4096) {
@@ -1193,7 +1199,7 @@ void stream_wait_submitted(std::uint64_t serial) {
             host_sleep_us(20);
         }
     }
-    g_counts.submitted_wait_ns += host_clock_monotonic_ns() - t0;
+    g_counts.submitted_wait_ns += timed.end();
 }
 
 std::string stream_last_op() {

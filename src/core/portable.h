@@ -40,6 +40,12 @@ std::uint32_t host_thread_id();
 // (comm, 15 characters) on Linux; on Windows winpthreads' copy and
 // SetThreadDescription, which the sampler and debuggers read.
 void host_thread_set_name(const char* name);
+// The calling thread's name as host_thread_set_name last gave it (whole: a
+// longer one than Linux keeps too); else, on Linux, its comm - what it took
+// from the thread that made it. False when it has none. Kept here because
+// winpthreads keeps no name for a detached thread (its pthread_setname_np
+// refuses one whose handle is closed), and most of ours are.
+bool host_thread_name(char* out, std::size_t n);
 // Puts the calling thread at the lowest priority there is (idle on Windows,
 // nice 19 on Linux), for good: work that must never take a core the game wants.
 void host_thread_background();
