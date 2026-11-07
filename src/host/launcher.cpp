@@ -351,7 +351,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     std::chrono::steady_clock::time_point cache_state_at{};
     bool cache_state_devices = false, compile_was_running = false;
     // The PC enhancements, through the same calls: each is read when the
-    // game starts (main.cpp, config_set_enhancements). The same four the
+    // game starts (main.cpp, config_set_enhancements). The same ones the
     // game's System > PC Enhancements and F10 > PC ENHANCEMENTS have.
     struct Enhancement {
         const char* key;
@@ -373,6 +373,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
          false},
         {"skill_issue", "SKILL ISSUE", "The death message says SKILL ISSUE.",
          "When the hunter dies, the screen says SKILL ISSUE instead of YOU DIED, in every language.", false},
+        {"full_phantom_hp", "Full Phantom HP", "Your full HP when you are summoned into another hunter's world.",
+         "Summoned into another hunter's world as a cooperator or an invader, the game gives a hunter 70% of their HP. "
+         "With this on, yours stays whole. It is each visitor's own setting: a host's changes nothing for the hunters in "
+         "its world, and every game in the session shows a visitor's HP as the visitor's own game has it.",
+         false},
     };
     for (Enhancement& e : enhancements) e.on = host_opt_get(e.key);
     // The Patches page: every manifest the loader would read
