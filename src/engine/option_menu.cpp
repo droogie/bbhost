@@ -153,8 +153,8 @@ const char kOurCameraName[] = "PCCamera";
 // The Steam Deck's frame rate and model detail - on a Deck only (host_steam_deck).
 const char kOurDeckName[] = "PCDeck";
 // The PC enhancements: the port's additions to the game itself - the mirror,
-// the rebirth, five players, SKILL ISSUE, Full Phantom HP. Each is read once at
-// start, which its line help says.
+// the rebirth, five players, SKILL ISSUE, Full Phantom HP, Auto-Replenish
+// Items. Each is read once at start, which its line help says.
 const char kOurEnhanceName[] = "PCEnhance";
 
 // The overlay asset that has to supply that sprite. Opening a section whose
@@ -220,10 +220,10 @@ constexpr std::uint32_t kSystemEffectsRowId = 110010;
 constexpr std::uint32_t kSystemCameraRowId = 110011;
 constexpr std::uint32_t kSystemDeckRowId = 110012;
 constexpr std::uint32_t kSystemEnhanceRowId = 110013;
-// PC Enhancements, 124000: five toggles, each for the next start (124000
+// PC Enhancements, 124000: six toggles, each for the next start (124000
 // was The Old Hunters, a patch of its own since: the setup window's Patches tab).
 constexpr std::uint32_t kEnhMirror = 124001, kEnhRebirth = 124002, kEnhFivePlayers = 124003, kEnhSkillIssue = 124004;
-constexpr std::uint32_t kEnhFullPhantomHp = 124005;
+constexpr std::uint32_t kEnhFullPhantomHp = 124005, kEnhAutoReplenish = 124006;
 // Steam Deck, 123000: its frame rate - the two configurations,
 // host_set_deck_profile - and the model detail.
 constexpr std::uint32_t kDeckFrameRate = 123000, kDeckModelDetail = 123001;
@@ -628,14 +628,16 @@ std::uint64_t g_deck_vtable = 0;
 std::atomic<bool> g_deck_redraw{false};  // the model detail row shows a value the frame rate set
 constexpr int kDeckRows = 2;
 
-// PC Enhancements: five toggles, read at the next start (main.cpp,
-// config_set_enhancements), so a change here shows at once and applies then.
+// PC Enhancements: six toggles, as many as the section has slots, read at the
+// next start (main.cpp, config_set_enhancements), so a change here shows at
+// once and applies then.
 Toggle g_enhance[] = {
     {"change_appearance", kEnhMirror, 1, 0xff},
     {"rebirth", kEnhRebirth, 1, 0xff},
     {"five_players", kEnhFivePlayers, 1, 0xff},
     {"skill_issue", kEnhSkillIssue, 1, 0xff},
     {"full_phantom_hp", kEnhFullPhantomHp, 1, 0xff},
+    {"auto_replenish", kEnhAutoReplenish, 1, 0xff},
 };
 constexpr int kEnhanceRows = static_cast<int>(sizeof(g_enhance) / sizeof(g_enhance[0]));
 

@@ -218,6 +218,10 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
         auto it = kv.find("world.full_phantom_hp");
         if (it != kv.end()) c->full_phantom_hp = it->second == "true" || it->second == "1";
     }
+    {
+        auto it = kv.find("world.auto_replenish");
+        if (it != kv.end()) c->auto_replenish = it->second == "true" || it->second == "1";
+    }
     // Every [keys] entry, whatever it is called: the action names live in
     // window.cpp beside the defaults, and an unknown one is reported there
     // rather than silently dropped here.
@@ -818,6 +822,10 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
         if (std::strcmp(e, "1") == 0) c.full_phantom_hp = true;
         else if (std::strcmp(e, "0") == 0) c.full_phantom_hp = false;
     }
+    if (const char* e = std::getenv("BBHOST_AUTO_REPLENISH")) {
+        if (std::strcmp(e, "1") == 0) c.auto_replenish = true;
+        else if (std::strcmp(e, "0") == 0) c.auto_replenish = false;
+    }
     if (const char* e = std::getenv("BBHOST_SETUP_WINDOW")) {
         if (std::strcmp(e, "1") == 0) c.setup_always = true;
         else if (std::strcmp(e, "0") == 0) c.setup_always = false;
@@ -926,7 +934,8 @@ std::string config_eboot_help(const HostConfig& c, const std::string& sha256, co
 
 void config_set_skip_intro(bool on) { g_cfg.skip_intro = on; }
 
-void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue, bool full_phantom_hp) {
+void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue, bool full_phantom_hp,
+                             bool auto_replenish) {
     const auto set = [](bool* field, bool on, const char* env) {
         const char* e = std::getenv(env);
         if (e && (std::strcmp(e, "0") == 0 || std::strcmp(e, "1") == 0)) return;  // the environment's, kept
@@ -937,6 +946,7 @@ void config_set_enhancements(bool change_appearance, bool rebirth, bool five_pla
     set(&g_cfg.five_players, five_players, "BBHOST_FIVE_PLAYERS");
     set(&g_cfg.skill_issue, skill_issue, "BBHOST_SKILL_ISSUE");
     set(&g_cfg.full_phantom_hp, full_phantom_hp, "BBHOST_FULL_PHANTOM_HP");
+    set(&g_cfg.auto_replenish, auto_replenish, "BBHOST_AUTO_REPLENISH");
 }
 
 void config_set_online(const std::string& host, const std::string& scheme, bool verify_tls, bool require_account,

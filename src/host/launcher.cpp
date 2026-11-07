@@ -378,6 +378,12 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
          "With this on, yours stays whole. It is each visitor's own setting: a host's changes nothing for the hunters in "
          "its world, and every game in the session shows a visitor's HP as the visitor's own game has it.",
          false},
+        {"auto_replenish", "Auto-Replenish Items",
+         "Molotovs, knives and more refill from storage on a death in your world or in the Hunter's Dream.",
+         "Twenty more consumables refill from storage the way Blood Vials and Quicksilver Bullets do - after a death "
+         "in your own world and on arriving in the Hunter's Dream: Molotovs, knives, pebbles, papers, elixirs, "
+         "pellets, Bone Marrow Ash and more.",
+         false},
     };
     for (Enhancement& e : enhancements) e.on = host_opt_get(e.key);
     // The Patches page: every manifest the loader would read

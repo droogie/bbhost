@@ -123,6 +123,7 @@ add_executable(bbhost
   src/engine/chara_id.cpp
   src/engine/five_players.cpp
   src/engine/phantom_hp.cpp
+  src/engine/auto_replenish.cpp
   src/engine/maiden_events.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp

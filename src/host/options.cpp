@@ -104,6 +104,7 @@ enum SettingId {
     kFivePlayers,
     kSkillIssue,
     kFullPhantomHp,
+    kAutoReplenish,
     kMenuTextSize,
     kMenuHue,
     kMenuVibrance,
@@ -332,6 +333,9 @@ Setting g_set[kSettingCount] = {
      true},
     {"full_phantom_hp", "Full Phantom HP", {"On", "Off"}, 0,
      "Requires a restart. Your full HP when summoned to another world; each visitor's own setting decides.", true},
+    {"auto_replenish", "Auto-Replenish Items", {"On", "Off"}, 0,
+     "Requires a restart. Molotovs, knives and more refill from storage on a death in your world or in the Dream.",
+     true},
     // bbhost's own menus - the setup window, F9 and F10 - and everything in
     // them grow with it (launcher_ui set_scale). 100% is their usual size: the
     // in-game menus' follows the game's resolution (height / 900), the setup
@@ -400,6 +404,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFivePlayers},
     {Row::Option, nullptr, kSkillIssue},
     {Row::Option, nullptr, kFullPhantomHp},
+    {Row::Option, nullptr, kAutoReplenish},
     {Row::Header, "STARTUP"},
     {Row::Option, nullptr, kSkipLogos},
     {Row::Option, nullptr, kPerformanceMode},
@@ -746,6 +751,7 @@ void apply(int id) {
         case kFivePlayers:
         case kSkillIssue:
         case kFullPhantomHp:
+        case kAutoReplenish:
             break;  // read by the loader before any of this exists
         case kMenuTextSize:
         case kMenuHue:
@@ -892,6 +898,7 @@ void rebuild_settings() {
     h.five_players = on_of(kFivePlayers);
     h.skill_issue = on_of(kSkillIssue);
     h.full_phantom_hp = on_of(kFullPhantomHp);
+    h.auto_replenish = on_of(kAutoReplenish);
     settings_store().publish(h);
 }
 
@@ -964,6 +971,7 @@ void host_options_load() {
     g_set[kFivePlayers].index = config().five_players ? 0 : 1;
     g_set[kSkillIssue].index = config().skill_issue ? 0 : 1;
     g_set[kFullPhantomHp].index = config().full_phantom_hp ? 0 : 1;
+    g_set[kAutoReplenish].index = config().auto_replenish ? 0 : 1;
     // video.fps_cap is the frame rate's default: one of the setting's rates or
     // 0 (Display-Limited); another number takes the nearest rate below it.
     {
@@ -1001,7 +1009,7 @@ void host_options_load() {
                          static_cast<int>(kEffectTiming), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
                          static_cast<int>(kModelDetail), static_cast<int>(kShaders), static_cast<int>(kChangeAppearance),
                          static_cast<int>(kRebirth), static_cast<int>(kFivePlayers), static_cast<int>(kSkillIssue),
-                         static_cast<int>(kFullPhantomHp)})
+                         static_cast<int>(kFullPhantomHp), static_cast<int>(kAutoReplenish)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
     FILE* f = std::fopen(path.c_str(), "r");

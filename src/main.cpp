@@ -1064,11 +1064,13 @@ int main(int argc, char** argv) {
     // next start.
     {
         const HostSettings h = host_settings();
-        config_set_enhancements(h.change_appearance, h.rebirth, h.five_players, h.skill_issue, h.full_phantom_hp);
+        config_set_enhancements(h.change_appearance, h.rebirth, h.five_players, h.skill_issue, h.full_phantom_hp,
+                                h.auto_replenish);
         const HostConfig& c = config();
-        host_log("pc enhancements: mirror %s, rebirth %s, five players %s, skill issue %s, Full Phantom HP %s",
+        host_log("pc enhancements: mirror %s, rebirth %s, five players %s, skill issue %s, Full Phantom HP %s, "
+                 "Auto-Replenish Items %s",
                  c.change_appearance ? "on" : "off", c.rebirth ? "on" : "off", c.five_players ? "on" : "off",
-                 c.skill_issue ? "on" : "off", c.full_phantom_hp ? "on" : "off");
+                 c.skill_issue ? "on" : "off", c.full_phantom_hp ? "on" : "off", c.auto_replenish ? "on" : "off");
         // The debug menu was a PC Settings switch before the Debug Menu plugin
         // took its place: a player who had it on gets the plugin turned on,
         // once, and the old switch goes off.
