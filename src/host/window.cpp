@@ -112,6 +112,9 @@ std::atomic<bool> g_want_vsync{true};
 // phase the flip clock steers towards.
 std::atomic<std::uint64_t> g_present_last_ns{0}, g_present_serial{0};
 std::atomic<bool> g_swap_dirty{false};
+// The presenting thread's id (host_thread_id), for the focus lines to ask the
+// slow-call registry what it is in (presenter_in_call); 0 before it runs.
+std::atomic<std::uint32_t> g_present_tid{0};
 
 // Text entry state (host_text_entry_*). SDL text input is toggled from the
 // pump (main thread) when `want` changes.
@@ -861,6 +864,26 @@ constexpr slow_calls::Site kOwnCopySite{slow_calls::kQueueSubmit, "the copy, on 
 constexpr slow_calls::Site kCopySite{slow_calls::kQueueSubmit, "the copy"};
 constexpr slow_calls::Site kCopyGpuSite{slow_calls::kWaitFences, "the copy on the GPU"};
 constexpr slow_calls::Site kPresentSite{slow_calls::kQueuePresent, "present"};
+
+// What the presenting thread is in, for the window's focus lines: " (the
+// presenter 2.71 s into vkWaitForFences, the acquired image)" once it has been
+// in one timed call for 100 ms or more, else nothing. A display that stops
+// handing the swapchain's images back keeps the presenter seconds in its wait
+// for one; whether a focus change came while it waited - and may have ended
+// the wait - or after it was over is then in the log.
+std::string presenter_in_call() {
+    slow_calls::ThreadCall c;
+    if (!slow_calls::thread_in_call(g_present_tid.load(std::memory_order_relaxed), 100'000'000ull, &c)) return {};
+    char buf[192];
+    if (c.ns >= 1'000'000'000ull) {
+        std::snprintf(buf, sizeof(buf), " (the presenter %.2f s into %s, %s)", static_cast<double>(c.ns) / 1e9,
+                      slow_calls::call_name(c.call), c.where);
+    } else {
+        std::snprintf(buf, sizeof(buf), " (the presenter %.0f ms into %s, %s)", static_cast<double>(c.ns) / 1e6,
+                      slow_calls::call_name(c.call), c.where);
+    }
+    return buf;
+}
 
 // Which step of a present this thread is on, for the hang watchdog: a present
 // that never comes back stops the flips, and everything behind them.
@@ -2265,10 +2288,13 @@ bool host_window_pump() {
             // Keyboard focus decides whether SDL delivers input at all: no
             // keys without it, and the controller's events are dropped too
             // (SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS is off), so a game
-            // that ignores every input may be a window that lost focus.
+            // that ignores every input may be a window that lost focus. And
+            // what the presenter is in, when it has been in one call 100 ms
+            // or more (presenter_in_call).
             case SDL_EVENT_WINDOW_FOCUS_GAINED:
             case SDL_EVENT_WINDOW_FOCUS_LOST: {
-                host_log("window: keyboard focus %s", e.type == SDL_EVENT_WINDOW_FOCUS_GAINED ? "gained" : "lost");
+                host_log("window: keyboard focus %s%s", e.type == SDL_EVENT_WINDOW_FOCUS_GAINED ? "gained" : "lost",
+                         presenter_in_call().c_str());
                 // SDL restarted text input with the focus, and the IME with it.
                 std::lock_guard<std::mutex> lock(g_text_mu);
                 if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED && g_text_on) ime_off_for_ascii_locked();
@@ -2793,6 +2819,7 @@ std::thread g_present_thread;
 void present_thread_main() {
     host_thread_set_name("bb-present");
     host_thread_set_class(HostThreadClass::GpuFeed, "bb-present");  // core/host_clock.h
+    g_present_tid.store(host_thread_id(), std::memory_order_relaxed);
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(g_present_mu);
