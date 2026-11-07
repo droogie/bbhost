@@ -51,3 +51,15 @@ std::uint64_t live_resolution_current(unsigned* w, unsigned* h);
 // The display buffers' size, made at the start for the largest size a live
 // change may reach; false before it is known or without live changes.
 bool live_resolution_display_size(unsigned* w, unsigned* h);
+
+// Shadow resolution while the game runs: the shadow maps made again at the
+// sizes the settings now ask for (engine/patch_manifest.h
+// shadow_resolution_sizes), at the next quiet point; any thread. The sun's
+// at the frame after, the lamps' and torches' there. Refused, with a log
+// line, when the render-target heap lacks the room: it applies at the next
+// start.
+void live_shadows_request();
+// Whether Shadow resolution's entry `tier` can be made while the game runs:
+// the render-target heap was grown for it at the start (up to Ultra, or the
+// starting entry when larger).
+bool live_shadows_can(int tier);

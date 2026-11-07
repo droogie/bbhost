@@ -352,14 +352,16 @@ Setting g_set[kSettingCount] = {
     // The shadow maps' sizes (engine/patch_manifest.cpp
     // shadow_resolution_manifest): the sun's at 4096 whatever the area's
     // ShadowParam asks, the dynamic lights' spot maps and cube faces larger
-    // than the game's 512 and 256. Made as the game starts, from a
-    // render-target heap grown by what they take (engine/live_resolution.cpp).
+    // than the game's 512 and 256. Made again while the game runs
+    // (live_shadows_request) from a render-target heap grown at the start for
+    // up to Ultra (engine/live_resolution.cpp); Giga past that waits for the
+    // next start (live_shadows_can: the pill).
     {"shadow_resolution", "Shadow resolution", {"Lowest", "Low", "Default", "High", "Ultra", "Giga"}, 2,
-     "Requires a restart. The sharpness of every shadow: the sun's, the lamps' and the torches'. Default is the game's own "
+     "The sharpness of every shadow: the sun's, the lamps' and the torches'. Default is the game's own "
      "(the sun 2048 or 4096 as each area asks, lamps 512, torches 256). Lowest 512, 128, 64; Low 1024, 256, 128; High 4096, "
      "1024, 512; Ultra 4096, 2048, 1024 (about 500 MB more memory); Giga 4096 everywhere (about 1.8 GB more memory and as "
-     "much video memory again; much slower where lights cast shadows). Performance mode sets 1024, 256, 128 while this is "
-     "Default; any other size wins over it.",
+     "much video memory again; much slower where lights cast shadows). Changes at once up to Ultra; Giga needs a restart "
+     "unless the game started at Giga. Performance mode sets 1024, 256, 128 while this is Default; any other size wins over it.",
      true},
     // Two more of the area's numbers, scaled: 5 is the area's own, 0 none, 10
     // twice it.
@@ -564,9 +566,9 @@ Setting g_set[kSettingCount] = {
     // runs (apply), SSAO, anti-aliasing, motion blur, chromatic aberration and
     // the dynamic lights' shadows through their settings' own switches
     // (engine/graphics_patch.cpp). Its shadow map sizes (Shadow resolution
-    // Default's place) are made as the game starts.
+    // Default's place) are made again with it (live_shadows_request).
     {"performance_mode", "Performance mode", {"Off", "On"}, 0,
-     "Every post-effect and YEBIS pass off for frame rate: SSAO, motion blur, anti-aliasing, depth of field, chromatic aberration, bloom, and the dynamic lights' shadows (lamps, torches, the lantern; the sun's and the moon's stay). The map's fog stays. Changes at once; with Shadow resolution at Default, its smaller shadow maps take a restart.", false},
+     "Every post-effect and YEBIS pass off for frame rate: SSAO, motion blur, anti-aliasing, depth of field, chromatic aberration, bloom, and the dynamic lights' shadows (lamps, torches, the lantern; the sun's and the moon's stay). The map's fog stays. Changes at once, with Shadow resolution at Default its smaller shadow maps too.", false},
     // The old switch for the developers' debug menu, which the Debug Menu
     // plugin replaced (engine/debug_menu.h): no row shows it, and an "On" an
     // older bbhost saved turns the plugin on once (main.cpp).
@@ -1264,7 +1266,19 @@ void apply(int id) {
                 const bool ok = patch_manifest_refresh_live("performance-mode", reads_on(s, s.index), &changed, &why);
                 host_log("graphics: Performance mode %s while the game runs%s", reads_on(s, s.index) ? "on" : "off",
                          ok ? "" : " (its YEBIS passes at the next start)");
+                // Its shadow sizes stand in for Default's.
+                live_shadows_request();
             }
+            was = s.index;
+            break;
+        }
+        case kShadowResolution: {
+            // The maps made again at the next quiet point
+            // (engine/live_resolution.cpp); the start's manifest takes the
+            // setting, so only once the game runs. An entry past what the
+            // heap was grown for logs that it waits for the next start.
+            static int was = -1;
+            if (was >= 0 && was != s.index && live_resolution_available()) live_shadows_request();
             was = s.index;
             break;
         }
@@ -2050,7 +2064,8 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
     const int custom = id == kFrameCap ? shown_index(kFrameCapCustom) : 0;
     const int custom_fps = id == kFrameCap ? shown_index(kFrameCapCustomFps) : 0;
     const bool restart = s.restart && !g_setup_page && !(id == kResolution && res_live(cur)) &&
-                         !(id == kFrameCap && frame_rate_live(frame_rate_of(cur, custom, custom_fps)));
+                         !(id == kFrameCap && frame_rate_live(frame_rate_of(cur, custom, custom_fps))) &&
+                         !(id == kShadowResolution && live_shadows_can(cur));
     ImGui::PushID(id);
     int on_i = -1, off_i = -1;
     for (int v = 0; v < n; ++v) {

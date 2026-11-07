@@ -626,8 +626,9 @@ Manifest render_scale_manifest() {
 // starts, which the stock heap does not hold at the larger sizes - at all
 // 4096, the first area's meshes were not made and the game read through the
 // null - so the heap grows by shadow_resolution_heap_mib
-// (engine/live_resolution.cpp). Measured at all 4096 (Radeon 8060S, 1080p, an
-// indoor room with lamps): the heap's free 1663 MiB less, 69 -> 45 fps.
+// (engine/live_resolution.cpp), and for up to Ultra's sizes so a change while
+// the game runs fits. Measured at all 4096 (Radeon 8060S, 1080p, an indoor
+// room with lamps): the heap's free 1663 MiB less, 69 -> 45 fps.
 constexpr std::uint64_t kShadowSunSite = 0x012ac231, kShadowSpotSite = 0x0261b0f3, kShadowCubeSizeSite = 0x0261b116;
 struct ShadowSizes {
     std::uint32_t sun, spot, cube;  // 0: the game's own
@@ -664,7 +665,10 @@ Manifest shadow_resolution_manifest() {
                     (shadow_performance_sizes() ? " (Performance mode)" : "");
     m.option = "graphics.shadow_resolution";
     m.order = 9050;
-    m.live = false;
+    // Made again while the game runs (engine/live_resolution.cpp
+    // apply_shadow_sizes): the sun follows its site at the next frame, the
+    // lights' manager is made again there.
+    m.live = true;
     auto imm = [](std::vector<std::uint8_t> op, std::uint32_t v) {
         for (int k = 0; k < 4; ++k) op.push_back(static_cast<std::uint8_t>(v >> (8 * k)));
         return op;
@@ -879,13 +883,23 @@ std::vector<std::string> patch_manifests_gameplay() {
 
 bool patch_manifests_done() { return g_manifests_done.load(std::memory_order_acquire); }
 
-std::uint64_t shadow_resolution_heap_mib() {
-    {
-        std::lock_guard<std::mutex> lk(g_live_mu);
-        const auto it = g_written.lower_bound(kShadowSunSite);
-        if (it == g_written.end() || it->first >= kShadowSunSite + 12) return 0;  // not applied (off, or refused)
-    }
-    const ShadowSizes z = shadow_sizes();
+namespace {
+// The setting's entry `tier` (-1: the setting's now): Performance mode's in
+// Default's place, as shadow_sizes.
+ShadowSizes shadow_sizes_of(int tier) {
+    if (tier < 0) return shadow_sizes();
+    if (tier == kShadowDefaultTier && host_settings().performance_mode) return kShadowPerformanceMode;
+    return kShadowTiers[std::clamp(tier, 0, 5)];
+}
+}  // namespace
+
+ShadowMapSizes shadow_resolution_sizes(int tier) {
+    const ShadowSizes z = shadow_sizes_of(tier);
+    return ShadowMapSizes{z.sun, z.spot ? z.spot : 512u, z.cube ? z.cube : 256u};
+}
+
+std::uint64_t shadow_resolution_more_mib(int tier) {
+    const ShadowSizes z = shadow_sizes_of(tier);
     // Each LOD's maps and the one target they share, 4 bytes a texel.
     const auto lods = [](std::uint64_t size, const int* count, int faces) {
         std::uint64_t b = 0;
@@ -901,6 +915,7 @@ std::uint64_t shadow_resolution_heap_mib() {
     const std::uint64_t mib = (more >> 20) + 128;  // and a margin
     return (mib + 63) / 64 * 64;
 }
+
 
 void patch_manifests_apply(ElfImage* image) {
     struct Done {
@@ -1332,4 +1347,11 @@ bool patch_manifest_refresh_live(const std::string& name, bool on, bool* changed
     if (!ok) host_log("patch: %s: made again %s at the next start - %s", name.c_str(), on ? "on" : "off", w.c_str());
     if (why) *why = w;
     return ok;
+}
+
+bool shadow_resolution_known(bool* applied) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    const auto it = g_written.lower_bound(kShadowSunSite);
+    if (applied) *applied = it != g_written.end() && it->first < kShadowSunSite + 12;  // not applied: off, or refused
+    return find_locked("shadow-resolution") != nullptr;
 }

@@ -102,10 +102,21 @@ const char* patch_manifest_owner(std::uint64_t address, std::size_t n);
 std::vector<std::string> patch_manifests_gameplay();
 // Whether patch_manifests_apply has run: the list above is final after it.
 bool patch_manifests_done();
-// What the Shadow resolution setting's larger shadow maps take from the
-// render-target heap, in MiB (a multiple of 64), when its built-in patch was
-// applied; 0 when not (engine/live_resolution.cpp grows the heap by it).
-std::uint64_t shadow_resolution_heap_mib();
+// The Shadow resolution setting's entry `tier` (-1: the setting's now), with
+// Performance mode's sizes in Default's place: the sun's (0: the size each
+// area's ShadowParam asks), the lamps' spot maps and the torches' cube faces
+// (the game's 512 and 256 filled in).
+struct ShadowMapSizes {
+    std::uint32_t sun, spot, cube;
+};
+ShadowMapSizes shadow_resolution_sizes(int tier = -1);
+// What that entry's larger shadow maps take from the render-target heap past
+// the game's own, in MiB (a multiple of 64, with a margin); 0 when none is
+// larger (engine/live_resolution.cpp grows the heap by it).
+std::uint64_t shadow_resolution_more_mib(int tier = -1);
+// Whether bbhost's built-in patch was read for this eboot (and so can be
+// written while the game runs); *applied: whether the start applied it.
+bool shadow_resolution_known(bool* applied = nullptr);
 
 // A manifest while the game runs, for the patch menu (host/ingame_menu.cpp).
 struct PatchLiveState {
