@@ -495,6 +495,19 @@ struct Hold {
     bool auto_turn = false;      // the auto turn's step of the yaw (P11, 0x183c870)
     bool return_weight = false;  // the pitch return's weight ramping down (P12, 0x183c984)
     bool wall_turn = false;      // the turn away from a wall (P17, 0x183dde6)
+    bool stick_pitch = false;    // the pitch read back as the stick turns (P13, 0x183cb56)
+    bool stick_yaw = false;      // the yaw read back as the stick turns (P13, 0x183cb97)
+};
+
+// Two more stores a plugin may make no-ops (plugins/iso): as the stick turns
+// the camera, its pitch and yaw are read back from where it stands against
+// the point it looks at (P13). Trailing a character that runs sideways, that
+// adds the trail's angle to the stick's turn - faster one way, slower the
+// other, at any deflection short of the fast turn's. Mirrored as the
+// community patch's nops are, and masked in the body check the same way.
+constexpr mouse_camera::HoldSite kStickReadBack[2] = {
+    {0x183cb56, {0xc4, 0xc1, 0x7a, 0x11, 0x85, 0x40, 0x01, 0x00, 0x00}},  // vmovss [r13+0x140], xmm0
+    {0x183cb97, {0xc4, 0xc1, 0x7a, 0x11, 0x85, 0x44, 0x01, 0x00, 0x00}},  // vmovss [r13+0x144], xmm0
 };
 
 Hold held_turns() {
@@ -508,6 +521,8 @@ Hold held_turns() {
     h.auto_turn = held(1);  // R3's recentre: held only by the patch's own nop
     h.return_weight = held(2);
     h.wall_turn = held(3);
+    h.stick_pitch = load<u8>(game_address(kStickReadBack[0].bn)) == 0x90;
+    h.stick_yaw = load<u8>(game_address(kStickReadBack[1].bn)) == 0x90;
     return h;
 }
 
@@ -1104,8 +1119,8 @@ void steer_by_stick(FollowCam& cam, const Step& step, bool auto_turning) {
     if (auto_turning) return;
     if (step.stick_turns) {
         const Vec to_focus = cam.focus - cam.point;
-        cam.pitch = pitch_along(to_focus, cam.pitch);
-        cam.yaw = yaw_along(to_focus, cam.yaw);
+        if (!step.hold.stick_pitch) cam.pitch = pitch_along(to_focus, cam.pitch);
+        if (!step.hold.stick_yaw) cam.yaw = yaw_along(to_focus, cam.yaw);
     }
     const float ramp = fast_turn_ramp(cam, step.stick, step.dt);
     mouse_camera::free_camera_ran();
@@ -1627,8 +1642,9 @@ namespace {
 // The body ours mirrors, hashed (FNV-1a) with the run-time sites masked; each
 // site must hold the game's bytes or the known patch's - the three below, and
 // the four stores holding auto-rotation removes (mouse_camera::kHoldSites),
-// which ours mirrors as nops whoever wrote them.
-constexpr u64 kBodyHash = 0xc106b99ce56d67baull;
+// which ours mirrors as nops whoever wrote them, and the stick's two read-backs
+// (kStickReadBack) likewise.
+constexpr u64 kBodyHash = 0xefb8732784b76962ull;
 constexpr struct Site {
     u64 at;
     unsigned n;
@@ -1655,6 +1671,8 @@ bool masked(u64 a) {
         if (a >= s.at && a < s.at + s.n) return true;
     for (const mouse_camera::HoldSite& s : mouse_camera::kHoldSites)
         if (a >= s.bn && a < s.bn + sizeof s.game) return true;
+    for (const mouse_camera::HoldSite& s : kStickReadBack)
+        if (a >= s.bn && a < s.bn + sizeof s.game) return true;
     return false;
 }
 
@@ -1671,6 +1689,11 @@ bool follow_camera_body_ok(const std::uint8_t* entry) {
         if (v != s.game && v != s.patched) return false;
     }
     for (const mouse_camera::HoldSite& s : mouse_camera::kHoldSites) {
+        const u8* at = entry + (s.bn - kUpdate);
+        if (std::memcmp(at, s.game, sizeof s.game) != 0 && std::memcmp(at, mouse_camera::kNop9, sizeof s.game) != 0)
+            return false;
+    }
+    for (const mouse_camera::HoldSite& s : kStickReadBack) {
         const u8* at = entry + (s.bn - kUpdate);
         if (std::memcmp(at, s.game, sizeof s.game) != 0 && std::memcmp(at, mouse_camera::kNop9, sizeof s.game) != 0)
             return false;

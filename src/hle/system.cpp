@@ -1898,7 +1898,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             if (now >= it->from) {
                 // A stick name (lup .. rright, bits above the pad's) deflects that stick fully
                 // for the hold, as BBHOST_AUTOPRESS's do: a test request's walk.
-                if (it->button & 0x1ef0000u) {
+                if (it->button & 0x3ef0000u) {
                     if (it->button & 0x10000u) p.ly = 0;
                     if (it->button & 0x20000u) p.ly = 255;
                     if (it->button & 0x40000u) p.lx = 0;
@@ -1907,6 +1907,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
                     if (it->button & 0x400000u) p.ry = 255;
                     if (it->button & 0x800000u) p.rx = 0;
                     if (it->button & 0x1000000u) p.rx = 255;
+                    if (it->button & 0x2000000u) p.rx = 192;  // half way right: a partial turn
                 } else {
                     p.buttons |= it->button;
                 }
@@ -2272,6 +2273,7 @@ std::uint32_t hle_pad_button_named(const std::string& name) {
         std::uint32_t bit;
     } names[] = {{"lup", 0x10000u}, {"ldown", 0x20000u}, {"lleft", 0x40000u}, {"lright", 0x80000u},  // left stick, full
                  {"rup", 0x200000u}, {"rdown", 0x400000u}, {"rleft", 0x800000u}, {"rright", 0x1000000u},  // right stick, full
+                 {"rright_half", 0x2000000u},  // right stick, half way
                  {"cross", 0x4000u}, {"circle", 0x2000u}, {"square", 0x8000u}, {"triangle", 0x1000u},
                  {"options", 0x8u}, {"up", 0x10u},        {"down", 0x40u},     {"left", 0x80u},
                  {"right", 0x20u},  {"l1", 0x400u},       {"r1", 0x800u},      {"l2", 0x100u},
