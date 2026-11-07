@@ -8,10 +8,12 @@
 #include "log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -31,37 +33,62 @@ constexpr std::uint64_t kLinesInFull = 50;
 
 struct CallNames {
     const char* name;
+    const char* key;  // BBHOST_TEST_SLOW_CALL's
 };
 constexpr CallNames kNames[kCallCount] = {
-    {"vkQueueSubmit"},
-    {"vkQueuePresentKHR"},
-    {"vkAcquireNextImageKHR"},
-    {"vkQueueBindSparse"},
-    {"vkWaitForFences"},
-    {"vkWaitSemaphores"},
-    {"vkGetSemaphoreCounterValue"},
-    {"vkDeviceWaitIdle"},
-    {"vkQueueWaitIdle"},
-    {"vkAllocateMemory"},
-    {"vkMapMemory"},
-    {"vkFreeMemory"},
-    {"vkBeginCommandBuffer"},
-    {"vkEndCommandBuffer"},
-    {"queue-lock"},
-    {"submitted-wait"},
+    {"vkQueueSubmit", "submit"},
+    {"vkQueuePresentKHR", "present"},
+    {"vkAcquireNextImageKHR", "acquire"},
+    {"vkQueueBindSparse", "bind-sparse"},
+    {"vkWaitForFences", "wait-fences"},
+    {"vkWaitSemaphores", "wait-semaphores"},
+    {"vkGetSemaphoreCounterValue", "semaphore-value"},
+    {"vkDeviceWaitIdle", "device-idle"},
+    {"vkQueueWaitIdle", "queue-idle"},
+    {"vkAllocateMemory", "allocate"},
+    {"vkMapMemory", "map"},
+    {"vkFreeMemory", "free"},
+    {"vkBeginCommandBuffer", "begin"},
+    {"vkEndCommandBuffer", "end"},
+    {"queue-lock", "queue-lock"},
+    {"submitted-wait", "submitted-wait"},
 };
 
 struct Config {
     std::uint64_t threshold = 50 * kMs;  // 0: off
+    Call test_call = kCallCount;         // kCallCount: no test delay
+    std::uint64_t test_ns = 0, test_every = 1;
+    bool test_lock = false;
 };
 
-Config parse(const char* ms) {
+// BBHOST_SLOW_CALL_MS, and BBHOST_TEST_SLOW_CALL's <call>:<ms>[:<every>[:lock]].
+Config parse(const char* ms, const char* test) {
     Config c;
     if (ms && *ms) c.threshold = std::strtoull(ms, nullptr, 10) * kMs;
+    if (test && *test) {
+        const char* colon = std::strchr(test, ':');
+        const std::size_t len = colon ? static_cast<std::size_t>(colon - test) : std::strlen(test);
+        for (int k = 0; k < kCallCount; ++k) {
+            if ((std::strlen(kNames[k].key) == len && std::strncmp(kNames[k].key, test, len) == 0) ||
+                (std::strlen(kNames[k].name) == len && std::strncmp(kNames[k].name, test, len) == 0)) {
+                c.test_call = static_cast<Call>(k);
+            }
+        }
+        if (c.test_call != kCallCount && colon) {
+            char* end = nullptr;
+            c.test_ns = std::strtoull(colon + 1, &end, 10) * kMs;
+            if (end && *end == ':') {
+                const unsigned long long every = std::strtoull(end + 1, &end, 10);
+                c.test_every = every ? every : 1;
+            }
+            if (end && *end == ':' && std::strcmp(end + 1, "lock") == 0) c.test_lock = true;
+        }
+        if (!c.test_ns) c.test_call = kCallCount;
+    }
     return c;
 }
 
-Config g_cfg = parse(std::getenv("BBHOST_SLOW_CALL_MS"));
+Config g_cfg = parse(std::getenv("BBHOST_SLOW_CALL_MS"), std::getenv("BBHOST_TEST_SLOW_CALL"));
 std::uint64_t slow_entry_ns() { return std::min(kBuckets[0], g_cfg.threshold); }
 
 }  // namespace
@@ -91,6 +118,9 @@ std::atomic<std::uint64_t> g_max_ns[kCallCount] = {}, g_win_max_ns[kCallCount] =
 std::uint64_t g_over_last[kCallCount][3] = {};  // under g_mu: the last window report's
 std::atomic<std::uint64_t> g_logged{0}, g_unlogged{0};
 std::atomic<bool> g_said{false};
+// BBHOST_TEST_SLOW_CALL.
+std::atomic<std::uint64_t> g_test_seen{0}, g_test_delays{0};
+std::mutex g_test_mu;
 std::mutex g_last_mu;
 char g_last_line[1000];  // under g_last_mu (test_last_line); no destructor, for a line made as the process ends
 
@@ -132,6 +162,16 @@ void say_config() {
     host_log("slow calls: the driver calls a frame can wait on are timed on every thread; one of %llu ms or more is logged with the "
              "calls the other threads were in then, the first %llu in full (BBHOST_SLOW_CALL_MS; 0: off)",
              static_cast<unsigned long long>(g_cfg.threshold / kMs), static_cast<unsigned long long>(kLinesInFull));
+    if (g_cfg.test_call != kCallCount) {
+        const unsigned long long every = g_cfg.test_every;
+        char nth[32] = "";
+        if (every > 1) {
+            const char* suffix = every % 100 / 10 == 1 ? "th" : every % 10 == 1 ? "st" : every % 10 == 2 ? "nd" : every % 10 == 3 ? "rd" : "th";
+            std::snprintf(nth, sizeof(nth), "%llu%s ", every, suffix);
+        }
+        host_log("slow calls: test: %llu ms more in every %s%s%s (BBHOST_TEST_SLOW_CALL)", static_cast<unsigned long long>(g_cfg.test_ns / kMs), nth,
+                 kNames[g_cfg.test_call].name, g_cfg.test_lock ? ", holding a lock every other thread's timed driver call takes as it starts" : "");
+    }
 }
 
 // Gives the thread's slot back as it exits: its counts go to the totals.
@@ -271,6 +311,25 @@ __attribute__((noinline)) void slow(const Site& site, std::uint64_t d, std::uint
     std::memcpy(g_last_line, buf, len + 1);
 }
 
+// BBHOST_TEST_SLOW_CALL: the delay in the call it names, inside its scope;
+// with `lock`, the other driver calls wait for a delayed one to end.
+void test_hook(const Site& site) {
+    const Config& c = g_cfg;
+    if (site.call == c.test_call && (g_test_seen.fetch_add(1, std::memory_order_relaxed) + 1) % c.test_every == 0) {
+        g_test_delays.fetch_add(1, std::memory_order_relaxed);
+        if (c.test_lock) {
+            std::lock_guard<std::mutex> lk(g_test_mu);
+            std::this_thread::sleep_for(std::chrono::nanoseconds(c.test_ns));
+        } else {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(c.test_ns));
+        }
+        return;
+    }
+    if (c.test_lock && is_driver_call(site.call)) {
+        std::lock_guard<std::mutex> lk(g_test_mu);  // behind a delayed call, as behind a driver's lock
+    }
+}
+
 // Calls of kind c since the start (`time`: their nanoseconds), every thread's.
 std::uint64_t total(Call c, bool time) {
     std::uint64_t v = (time ? g_out_ns : g_out_calls)[c].load(std::memory_order_relaxed);
@@ -297,6 +356,7 @@ void Scope::begin(bool measure) noexcept {
         s->site.store(site_, std::memory_order_release);
         slot_ = s;
     }
+    if (g_cfg.test_call != kCallCount) test_hook(*site_);
 }
 
 std::uint64_t Scope::end() noexcept {
@@ -347,6 +407,7 @@ void Scope::next(const Site& next) noexcept {
         s->site.store(site_, std::memory_order_release);
         slot_ = s;
     }
+    if (g_cfg.test_call != kCallCount) test_hook(*site_);
 }
 
 CpPhase::CpPhase() noexcept {
@@ -399,8 +460,10 @@ std::string window_report() {
 void final_report() {
     if (!on()) return;
     const std::uint64_t logged = std::min(g_logged.load(std::memory_order_relaxed), kLinesInFull);
-    host_log("slow calls (BBHOST_SLOW_CALL_MS=%llu): %llu lines logged, %llu more counted only", static_cast<unsigned long long>(g_cfg.threshold / kMs),
-             static_cast<unsigned long long>(logged), static_cast<unsigned long long>(g_unlogged.load(std::memory_order_relaxed)));
+    host_log("slow calls (BBHOST_SLOW_CALL_MS=%llu): %llu lines logged, %llu more counted only; %llu test delays (BBHOST_TEST_SLOW_CALL)",
+             static_cast<unsigned long long>(g_cfg.threshold / kMs), static_cast<unsigned long long>(logged),
+             static_cast<unsigned long long>(g_unlogged.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(g_test_delays.load(std::memory_order_relaxed)));
     std::lock_guard<std::mutex> lk(g_mu);
     for (int k = 0; k < kCallCount; ++k) {
         const Call c = static_cast<Call>(k);
@@ -431,8 +494,8 @@ std::string in_calls_now() {
     return buf[0] == ' ' ? std::string(buf + 1) : std::string(buf);
 }
 
-void test_configure(const char* slow_call_ms) {
-    g_cfg = parse(slow_call_ms);
+void test_configure(const char* slow_call_ms, const char* test_slow_call) {
+    g_cfg = parse(slow_call_ms, test_slow_call);
     std::lock_guard<std::mutex> lk(g_mu);
     for (int k = 0; k < kCallCount; ++k) {
         g_out_calls[k].store(0);
@@ -450,6 +513,8 @@ void test_configure(const char* slow_call_ms) {
     }
     g_logged.store(0);
     g_unlogged.store(0);
+    g_test_seen.store(0);
+    g_test_delays.store(0);
     g_said.store(false);
 }
 
@@ -461,6 +526,7 @@ TestCounts test_counts(Call c) {
     for (int i = 0; i < 3; ++i) t.over[i] = g_over[c][i].load();
     t.logged = std::min(g_logged.load(), kLinesInFull);
     t.unlogged = g_unlogged.load();
+    t.delays = g_test_delays.load();
     return t;
 }
 

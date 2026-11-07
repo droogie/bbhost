@@ -1,8 +1,9 @@
 // The slow-call registry without the game (host/slow_calls.h): a call over the
 // threshold is logged on one line with what the other threads were calling
 // then; its counts by call; the first lines in full and the rest counted; a
-// poll step's slack; the command processor's driver phase; off, nothing
-// timed. Then the cost of a timed call against an untimed one.
+// poll step's slack; the command processor's driver phase; the test hook's
+// delays, and with `lock` the calls that queue behind a delayed one; off,
+// nothing timed. Then the cost of a timed call against an untimed one.
 #include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/slow_calls.h"
@@ -181,8 +182,56 @@ void test_cp_phase() {
     CHECK(ns >= 5'000'000ull && ns < 35'000'000ull);
 }
 
+void test_hook_delays() {
+    slow_calls::test_configure("50", "wait-fences:30:3");
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 6; ++i) Scope timed(kFence);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const slow_calls::TestCounts f = slow_calls::test_counts(slow_calls::kWaitFences);
+    CHECK(f.delays == 2 && f.calls == 6 && f.over[0] == 2 && f.logged == 0);
+    CHECK(ms >= 60.0);
+    // Another call's kind is not delayed; an unknown kind or no delay arms nothing.
+    {
+        const auto t1 = std::chrono::steady_clock::now();
+        Scope timed(kSubmit);
+        timed.end();
+        CHECK(std::chrono::steady_clock::now() - t1 < std::chrono::milliseconds(20));
+    }
+    slow_calls::test_configure("50", "nothing:30:1");
+    for (int i = 0; i < 3; ++i) Scope timed(kFence);
+    CHECK(slow_calls::test_counts(slow_calls::kWaitFences).delays == 0);
+}
+
+void test_hook_lock() {
+    // The present delayed 150 ms holding the test lock: a submit that starts
+    // 30 ms in waits for it, as behind a driver's own lock, and the present's
+    // line names it; the queue-lock wait (ours, no driver call) does not wait.
+    slow_calls::test_configure("50", "present:150:1:lock");
+    std::thread p = call_on("t-present", kPresent, 0);
+    std::thread s([] {
+        name_thread("t-submit");
+        sleep_ms(30);
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            Scope ours(kLock);
+            ours.end();
+            CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50));
+        }
+        Scope timed(kSubmit);
+        sleep_ms(30);  // still in it when the present's line is made
+    });
+    p.join();
+    const std::string line = slow_calls::test_last_line();
+    std::fprintf(stderr, "line: %s\n", line.c_str());
+    CHECK(has(line, "slow call: vkQueuePresentKHR 1"));
+    CHECK(has(line, " t-submit:") && has(line, " vkQueueSubmit "));
+    s.join();
+    const slow_calls::TestCounts sub = slow_calls::test_counts(slow_calls::kQueueSubmit);
+    CHECK(sub.calls == 1 && sub.over[1] == 1);  // ~120 ms behind the present
+}
+
 void test_off() {
-    slow_calls::test_configure("0");
+    slow_calls::test_configure("0", "present:100:1");
     {
         Scope timed(kPresent);
         CHECK(timed.start_ns() == 0);
@@ -194,7 +243,7 @@ void test_off() {
         CHECK(measured.end() >= 2'000'000ull);
     }
     const slow_calls::TestCounts p = slow_calls::test_counts(slow_calls::kQueuePresent);
-    CHECK(p.calls == 0);
+    CHECK(p.calls == 0 && p.delays == 0);
     CHECK(slow_calls::window_report().empty() && slow_calls::in_calls_now().empty());
 }
 
@@ -237,6 +286,8 @@ int main() {
     test_poll_slack();
     test_lock_and_next();
     test_cp_phase();
+    test_hook_delays();
+    test_hook_lock();
     test_off();
     test_in_calls_now();
     cost();
