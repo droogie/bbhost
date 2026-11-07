@@ -1,0 +1,5 @@
+/* The NGX bridge exports its one function (upscaler_bridge.h): NVIDIA's NGX SDK, linked into it, stays inside. */
+{
+    global: ub_get_api;
+    local: *;
+};

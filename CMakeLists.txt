@@ -441,6 +441,51 @@ else()
   message(STATUS "bbhost: SDL3/Vulkan not found; headless only")
 endif()
 
+# NVIDIA DLSS on Linux: bbhost's NGX bridge (src/ngx_bridge, MIT, not GPL: it
+# links NVIDIA's NGX SDK), libbbhost_ngx_bridge.so beside bbhost, which bbhost
+# loads at run time (host/upscaler.cpp) as the Windows build loads
+# Numity1504's upscaler_bridge.dll - bbhost itself never links NVIDIA's code.
+# NVIDIA's headers and static library come from its DLSS repository at a
+# pinned tag, each checked by SHA-256 (tools/fetch_ngx.sh, kept in NGX_CACHE,
+# build/ngx by default); never in the repository. BBHOST_NGX=OFF, or the files
+# not fetched (offline): no bridge, and DLSS stays off on Linux. The DLSS
+# runtime it needs at run time (libnvidia-ngx-dlss.so.<version>) the package
+# fetches; for a build here, tools/fetch_ngx.sh runtime build.
+if(UNIX AND NOT APPLE AND Vulkan_FOUND)
+  option(BBHOST_NGX "build the NGX bridge (DLSS on Linux) with NVIDIA's NGX SDK, fetched pinned by tools/fetch_ngx.sh" ON)
+  if(BBHOST_NGX)
+    set(BBHOST_NGX_SDK ${CMAKE_BINARY_DIR}/ngx-sdk)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_ngx.sh sdk ${BBHOST_NGX_SDK}
+      RESULT_VARIABLE ngx_rc OUTPUT_VARIABLE ngx_out ERROR_VARIABLE ngx_err TIMEOUT 600)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_ngx.sh --tag OUTPUT_VARIABLE ngx_tag OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(ngx_rc EQUAL 0 AND EXISTS ${BBHOST_NGX_SDK}/lib/libnvsdk_ngx.a)
+      find_package(Threads REQUIRED)
+      add_library(bbhost_ngx_bridge MODULE src/ngx_bridge/ngx_bridge.cpp src/ngx_bridge/bridge_core.cpp)
+      target_include_directories(bbhost_ngx_bridge PRIVATE third_party/upscaler_bridge ${BBHOST_NGX_SDK}/include)
+      string(REGEX REPLACE "^v" "" ngx_version "${ngx_tag}")
+      target_compile_definitions(bbhost_ngx_bridge PRIVATE NGX_BRIDGE_SDK="${ngx_version}")
+      target_compile_features(bbhost_ngx_bridge PRIVATE cxx_std_17)
+      # NVIDIA's headers' own initialisers.
+      target_compile_options(bbhost_ngx_bridge PRIVATE -Wno-missing-field-initializers -Wno-missing-braces)
+      target_link_libraries(bbhost_ngx_bridge PRIVATE Vulkan::Headers ${BBHOST_NGX_SDK}/lib/libnvsdk_ngx.a ${CMAKE_DL_LIBS} Threads::Threads m)
+      # One symbol out (ub_get_api), NVIDIA's library's kept in, and nothing left unresolved.
+      target_link_options(bbhost_ngx_bridge PRIVATE -Wl,--exclude-libs,ALL
+        -Wl,--version-script=${CMAKE_SOURCE_DIR}/src/ngx_bridge/exports.map -Wl,-z,defs)
+      set_target_properties(bbhost_ngx_bridge PROPERTIES OUTPUT_NAME bbhost_ngx_bridge PREFIX lib
+        CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+        LINK_DEPENDS ${CMAKE_SOURCE_DIR}/src/ngx_bridge/exports.map)
+      add_dependencies(bbhost bbhost_ngx_bridge)
+      message(STATUS "bbhost: NVIDIA's NGX SDK ${ngx_version}; building the NGX bridge (DLSS on Linux), ${CMAKE_BINARY_DIR}/libbbhost_ngx_bridge.so")
+    else()
+      string(STRIP "${ngx_err}" ngx_err)
+      string(REPLACE "\n" "; " ngx_err "${ngx_err}")
+      message(STATUS "bbhost: NVIDIA's NGX SDK not fetched (${ngx_err}); no NGX bridge: DLSS stays off on Linux")
+    endif()
+  else()
+    message(STATUS "bbhost: BBHOST_NGX=OFF; no NGX bridge: DLSS stays off on Linux")
+  endif()
+endif()
+
 # The game's functions as ours (src/decomp, docs/decomp.md), one folder per
 # engine area. A leaf runs on the game's thread state, where FS may be the
 # game's, so no decomp file reads the stack protector's canary through it; and
@@ -589,6 +634,21 @@ if(UNIX)
   target_link_libraries(ps1_plugin_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(ps1_plugin_test bb_plugin_ps1)
   add_test(NAME ps1_plugin_test COMMAND ps1_plugin_test $<TARGET_FILE:bb_plugin_ps1>)
+  # The NGX bridge (src/ngx_bridge): its parts without NVIDIA's code always;
+  # with the bridge built, the library itself through bbhost's call order. A
+  # pretend Vulkan (tests/fake_vulkan.h) stands in for the loader, so no driver
+  # or GPU is touched.
+  if(Vulkan_FOUND)
+    add_executable(ngx_bridge_test tests/ngx_bridge_test.cpp src/ngx_bridge/bridge_core.cpp)
+    target_include_directories(ngx_bridge_test PRIVATE src third_party/upscaler_bridge)
+    target_link_libraries(ngx_bridge_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    if(TARGET bbhost_ngx_bridge)
+      add_dependencies(ngx_bridge_test bbhost_ngx_bridge)
+      add_test(NAME ngx_bridge_test COMMAND ngx_bridge_test $<TARGET_FILE:bbhost_ngx_bridge>)
+    else()
+      add_test(NAME ngx_bridge_test COMMAND ngx_bridge_test)
+    endif()
+  endif()
   add_executable(thunk_args tests/thunk_args.cpp src/core/thunk.cpp src/core/tls_rewrite.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   target_include_directories(thunk_args PRIVATE src)
   target_link_libraries(thunk_args PRIVATE pthread)
