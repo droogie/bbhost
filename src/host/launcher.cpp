@@ -2,6 +2,7 @@
 #include "host/launcher.h"
 
 #include "bbhost_version.h"
+#include "core/config_move.h"
 #include "core/sha256.h"
 #include "engine/addr.h"
 #include "engine/patch_manifest.h"
@@ -432,6 +433,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     App0Version app0_ver;
     PluginUi plugin_ui;
     bool plugin_seen = false;
+    // The settings folder's move (core/config_move.h): told at the top of
+    // every page until it is dismissed.
+    std::vector<ConfigMove> moves = config_moves_to_show();
     std::string saved_note;
     bool saved_ok = true;
     double saved_at = -100.0;
@@ -937,6 +941,55 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         auto card_h = [&](float rows) {
             return 2 * 14 * scale + 11.5f * scale + 4 * scale + st.ItemSpacing.y + rows * ImGui::GetFrameHeightWithSpacing() - st.ItemSpacing.y;
         };
+
+        // The settings moved to their new folder: what moved, from where to
+        // where, what stayed or went beside what was there, until Dismiss.
+        if (!moves.empty()) {
+            ui::card_begin("##moved", ImVec2(ImGui::GetContentRegionAvail().x, 0), "SETTINGS FOLDER");
+            const float fh = ImGui::GetFrameHeight();
+            for (std::size_t i = 0; i < moves.size(); ++i) {
+                const ConfigMove& m = moves[i];
+                if (i) ImGui::Dummy(ImVec2(0, 6 * scale));
+                const ImVec2 at = ImGui::GetCursorScreenPos();
+                ImGui::Dummy(ImVec2(fh * 0.8f, fh));
+                const bool failed = !m.failed.empty();
+                ui::draw_icon(ImGui::GetWindowDrawList(), failed ? ui::Icon::Warning : ui::Icon::Folder, at + ImVec2(fh * 0.4f, fh * 0.5f),
+                              fh * 0.62f, failed ? ui::kWarn : ui::kIce);
+                ImGui::SameLine(0, 8 * scale);
+                ImGui::AlignTextToFramePadding();
+                ImGui::PushFont(ui::font_strong(), 0.0f);
+                ImGui::TextUnformatted(config_move_heading(m).c_str());
+                ImGui::PopFont();
+                if (moves.size() > 1) {
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextFaint);
+                    ImGui::TextUnformatted(m.when.c_str());
+                    ImGui::PopStyleColor();
+                }
+                bool first = true;
+                for (const ConfigMoveLine& l : config_move_lines(m)) {
+                    dim_text(l.text, l.warn ? ui::kWarn : first ? ui::kText : ui::kTextDim, false);
+                    first = false;
+                }
+            }
+            ImGui::Dummy(ImVec2(0, 2 * scale));
+            // The folder in use, and Dismiss, at the right.
+            const std::string folder = moves.back().failed.empty() ? moves.back().to : moves.back().from;
+            const char* open_label = "Open the folder";
+            const float dw = ImGui::CalcTextSize("Dismiss").x + st.FramePadding.x * 3,
+                        ow = ImGui::CalcTextSize(open_label).x + st.FramePadding.x * 2;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, ImGui::GetContentRegionAvail().x - dw - ow - st.ItemSpacing.x));
+            if (ui::ghost_button(open_label)) SDL_OpenURL(("file:///" + generic(folder)).c_str());
+            ui::tooltip_for_item(nullptr, generic(folder));
+            ImGui::SameLine();
+            if (ui::primary_button("Dismiss##moved", ImVec2(dw, 0))) {
+                config_moves_dismiss();
+                moves.clear();
+            }
+            ui::tooltip_for_item(nullptr, "Hide this notice. Nothing else changes.");
+            ui::card_end();
+            ImGui::Dummy(ImVec2(0, gap - st.ItemSpacing.y));
+        }
 
         if (page == kPageGame) {
             const float w = ImGui::GetContentRegionAvail().x;

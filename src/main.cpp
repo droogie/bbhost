@@ -3,6 +3,7 @@
 #include "decomp/decomp.h"
 #include "engine/mouse_camera.h"
 #include "core/config.h"
+#include "core/config_move.h"
 #include "core/host_clock.h"
 #include "core/portable.h"
 #include "core/thunk.h"
@@ -1037,7 +1038,14 @@ int main(int argc, char** argv) {
         // seen yet (or plugins.show_settings): it opens on the Plugins tab.
         const std::string help = config_setup_help(cfg);
         const bool plugins_tab = !cfg.headless && help.empty() && !cfg.setup_requested && plugin_ui_wants_attention();
-        if (!compile_session && !cfg.headless && !cfg.setup_skip && (cfg.setup_requested || cfg.setup_always || !help.empty() || plugins_tab)) {
+        // The settings moved to their new folder (core/config_move.h): the
+        // window opens to say so until it is dismissed - not for a harness,
+        // which keeps it shut (BBHOST_SETUP_WINDOW=0), nor for the game the
+        // window starts while it stays open (--no-setup).
+        const char* setup_env = std::getenv("BBHOST_SETUP_WINDOW");
+        const bool moved = !(setup_env && std::strcmp(setup_env, "0") == 0) && !config_moves_to_show().empty();
+        if (!compile_session && !cfg.headless && !cfg.setup_skip &&
+            (cfg.setup_requested || cfg.setup_always || !help.empty() || plugins_tab || moved)) {
             std::string reason = help.substr(0, help.find('\n'));
             if (reason.rfind("bbhost: ", 0) == 0) reason = reason.substr(8);
             if (launcher_run(cfg, reason, plugins_tab) == LauncherResult::Quit) return help.empty() ? 0 : 2;
