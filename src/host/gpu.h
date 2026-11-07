@@ -704,7 +704,7 @@ std::string host_gpu_clear_view_report();
 struct GpuStats {
     std::uint64_t draws, dispatches, flushes, gpu_us, pipelines, transfers, transfer_batches;
     // CP-thread wall time by phase, nanoseconds (see kPhaseNames).
-    std::uint64_t phase_ns[8];
+    std::uint64_t phase_ns[9];
     // host_gpu_draw calls, failures, and calls that had nothing to draw.
     std::uint64_t draw_calls, draw_failures, draws_empty;
     // The draws by how their pixel shader ran (DrawPs), and the failures by
@@ -761,8 +761,16 @@ enum DrawVsWhy {
 const char* host_gpu_vs_why_name(int why);
 // A draw failure reason's name ("pixel shader"), or null past the last.
 const char* host_gpu_draw_fail_name(int reason);
-enum GpuPhase { kPhaseDraw, kPhaseDispatch, kPhasePrefetch, kPhasePipeline, kPhaseBind, kPhaseExec, kPhaseWait, kPhaseLock, kPhaseCount };
-static const char* const kPhaseNames[8] = {"draw", "dispatch", "prefetch", "pipeline", "bind", "exec", "label-wait", "lock-wait"};
+// kPhaseDriver: a command-processor thread inside a timed driver call
+// (host/slow_calls.h) - or a wait for the queue's lock or for a submission the
+// submission thread has still to hand over - in a command buffer's packets,
+// which `exec` includes, or after the job, outside it (its submission and the
+// slot it retires); a wait for the GPU's fence or timeline holds the GPU's
+// own time too. Last, so the line's fields before it keep their places for
+// the tools that read them.
+enum GpuPhase { kPhaseDraw, kPhaseDispatch, kPhasePrefetch, kPhasePipeline, kPhaseBind, kPhaseExec, kPhaseWait, kPhaseLock, kPhaseDriver, kPhaseCount };
+static const char* const kPhaseNames[kPhaseCount] = {"draw", "dispatch", "prefetch", "pipeline", "bind", "exec", "label-wait", "lock-wait", "driver"};
+static_assert(sizeof(GpuStats::phase_ns) / sizeof(GpuStats::phase_ns[0]) == kPhaseCount, "a phase for each name");
 void host_gpu_phase_add(int phase, std::uint64_t ns);
 // Scoped wall-clock accumulator for a phase. `weight` books each reading that
 // many times over, so a caller can time one call in n; 0 reads no clock.

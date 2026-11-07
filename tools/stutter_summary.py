@@ -13,8 +13,10 @@ Per log:
                since C11), 0x1d17ecd / 0x1d18285 the character jobs
   CP stalls    `stall:` lines by cause: shader/pipeline (translations and
                pipeline creation on the command processor), texture work,
-               lock waits, the command processor busy with draws, or idle
-               (the main loop or the game was the slow one)
+               lock waits, driver calls (the command processor in a timed
+               driver call, or waiting for the queue: host/slow_calls.h), the
+               command processor busy with draws, or idle (the main loop or
+               the game was the slow one)
   slow calls   `slow call:` lines by call, and the longest
   settle       with BBHOST_GX_RATE=1: seconds from each warp until GX
                resources stop being made (20 or more a second) - how long
@@ -79,6 +81,8 @@ def summary(path):
             c.append('texture')
         if d.get('lock-wait', 0) >= 10:
             c.append('lock-wait')
+        if d.get('driver', 0) >= 10:
+            c.append('driver')
         if not c:
             c.append('cp-busy' if d.get('exec', 0) >= d['gap'] * 0.6 else 'cp-idle')
         causes.update(c)

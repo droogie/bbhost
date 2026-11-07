@@ -1,9 +1,10 @@
 // The slow-call registry without the game (host/slow_calls.h): a call over the
 // threshold is logged on one line with what the other threads were calling
 // then; its counts by call; the first lines in full and the rest counted; a
-// poll step's slack; off, nothing timed. Then the cost of a timed call
-// against an untimed one.
+// poll step's slack; the command processor's driver phase; off, nothing
+// timed. Then the cost of a timed call against an untimed one.
 #include "hle/modules.h"
+#include "host/gpu.h"
 #include "host/slow_calls.h"
 #include "log.h"
 
@@ -19,6 +20,10 @@
 // What slow_calls.cpp asks the rest of bbhost.
 std::uint64_t hle_gnm_flip_calls() { return 4242; }
 bool host_thread_name(char* out, std::size_t n) { return pthread_getname_np(pthread_self(), out, n) == 0 && out[0]; }
+std::atomic<std::uint64_t> g_driver_phase_ns{0};
+void host_gpu_phase_add(int phase, std::uint64_t ns) {
+    if (phase == kPhaseDriver) g_driver_phase_ns.fetch_add(ns);
+}
 
 namespace {
 
@@ -160,6 +165,22 @@ void test_lock_and_next() {
     CHECK(has(slow_calls::test_last_line(), "slow call: queue-lock "));
 }
 
+void test_cp_phase() {
+    slow_calls::test_configure("50");
+    g_driver_phase_ns.store(0);
+    std::thread([] {
+        {
+            Scope outside(kFence);  // not in a command buffer's packets: no phase
+            sleep_ms(40);
+        }
+        slow_calls::CpPhase phase;
+        Scope inside(kFence);
+        sleep_ms(5);
+    }).join();
+    const std::uint64_t ns = g_driver_phase_ns.load();
+    CHECK(ns >= 5'000'000ull && ns < 35'000'000ull);
+}
+
 void test_off() {
     slow_calls::test_configure("0");
     {
@@ -215,6 +236,7 @@ int main() {
     test_first_lines_in_full();
     test_poll_slack();
     test_lock_and_next();
+    test_cp_phase();
     test_off();
     test_in_calls_now();
     cost();

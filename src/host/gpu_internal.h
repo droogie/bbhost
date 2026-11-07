@@ -685,7 +685,7 @@ struct Gpu {
     // The GPU busy meter (gpu_busy.cpp) is on: the slots and the presenter
     // have their timestamp pairs.
     bool busy = false;
-    std::atomic<std::uint64_t> phase_ns[8] = {};
+    std::atomic<std::uint64_t> phase_ns[kPhaseCount] = {};
 };
 extern Gpu g;
 

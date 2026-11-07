@@ -9570,7 +9570,7 @@ bool host_gpu_available() {
 GpuStats host_gpu_stats() {
     GpuStats st{g.draws.load(),      g.dispatches.load(),        g.flushes, g.gpu_us.load(),
                 g.gfx_pipelines.load(), g.transfers.load(), g.transfer_batches.load(), {}};
-    for (int i = 0; i < 8; ++i) st.phase_ns[i] = g.phase_ns[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kPhaseCount; ++i) st.phase_ns[i] = g.phase_ns[i].load(std::memory_order_relaxed);
     st.draw_calls = g.draw_calls.load();
     st.draw_failures = g.draw_failures.load();
     st.draws_empty = g.draws_empty.load();
@@ -9634,7 +9634,9 @@ const char* host_gpu_vs_why_name(int why) {
                                                     "a short stride",      "data outside one buffer"};
     return why >= 0 && why < kVsWhyCount ? names[why] : nullptr;
 }
-void host_gpu_phase_add(int phase, std::uint64_t ns) { g.phase_ns[phase & 7].fetch_add(ns, std::memory_order_relaxed); }
+void host_gpu_phase_add(int phase, std::uint64_t ns) {
+    if (phase >= 0 && phase < kPhaseCount) g.phase_ns[phase].fetch_add(ns, std::memory_order_relaxed);
+}
 
 GpuHandles host_gpu_handles() {
     GpuHandles h;
