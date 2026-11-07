@@ -68,8 +68,8 @@ tells you which paths to fill in.
 is read in layers, each overriding only the keys it sets:
 
 1. the per-user `bbhost.toml`: `%APPDATA%\bbhost` on Windows,
-   `$XDG_CONFIG_HOME/bbhost` or `~/.config/bbhost` on Linux
-   (`BBHOST_CONFIG_DIR` replaces the folder);
+   `$XDG_DATA_HOME/bbhost` or `~/.local/share/bbhost` on Linux, beside the
+   data folder (`BBHOST_CONFIG_DIR` replaces the folder);
 2. `bbhost.toml` next to the executable, or in the working directory;
 3. `--config <file>`;
 4. the command line: `--app0 <dir>`, `--data <dir>`, `--eboot <file>`, or the
@@ -88,6 +88,17 @@ The in-game settings (F10, or the PC Settings, PC Graphics and Key Bindings
 entries the game's own System menu gains) are saved beside the per-user config
 in `bbhost-options.toml` - or in one next to the executable, when there is
 one there.
+
+Older versions kept the Linux settings in `$XDG_CONFIG_HOME/bbhost` or
+`~/.config/bbhost`. At each start bbhost moves what it keeps there -
+`bbhost.toml`, the `bbhost-options*.toml` files, `plugins` and `patches` - to
+the new folder, and the setup window says what moved until you dismiss it.
+Nothing is overwritten: a file the new folder already has stays in use, and
+the old one goes beside it as `<name>.from-config-<date>`. Anything else in
+the old folder is yours and stays there, so a path in `bbhost.toml` that
+points into it keeps working (a relative one is written out in full). A
+linked or read-only old folder is copied rather than emptied, and a start
+that cannot move it uses the old folder as it is.
 
 ## Saves
 

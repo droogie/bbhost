@@ -204,8 +204,8 @@ later file replacing an earlier one with the same name:
 1. `<exe dir>/patches` (the release package)
 2. `<exe dir>/../patches` (a build tree: `build/bbhost` reads the repository's `patches/`)
 3. `patches` in the per-user folder (`%APPDATA%\bbhost\patches`,
-   `~/.config/bbhost/patches`): your own, which no release carries and every
-   copy of bbhost reads
+   `~/.local/share/bbhost/patches`): your own, which no release carries and
+   every copy of bbhost reads
 4. `<mods>/patches` (a mod's own)
 
 ```toml

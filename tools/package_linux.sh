@@ -63,7 +63,7 @@ glibcxx=$(objdump -T "$bin" | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1)
 cat > "$dir/run-bbhost.sh" <<'EOF'
 #!/bin/bash
 # Starts bbhost and keeps its log in logs/ (the newest ten are kept).
-#   ./run-bbhost.sh                       the per-user config (~/.config/bbhost/bbhost.toml)
+#   ./run-bbhost.sh                       the per-user config (~/.local/share/bbhost/bbhost.toml)
 #   BBHOST_CONFIG=other.toml ./run-bbhost.sh   that file on top of it
 cd "$(dirname "$0")" || exit 1
 cfg=${BBHOST_CONFIG:-bbhost.toml}
@@ -130,10 +130,12 @@ Setup
   (each turns green when it is right), then Play. ./run-bbhost.sh --setup
   opens it again.
 
-  The settings are kept in ~/.config/bbhost/bbhost.toml, which every copy of
-  bbhost reads, so a new download or an update needs nothing set again. The
-  F10 settings and your account sign-in are kept beside it, saves and caches
-  in ~/.local/share/bbhost/data.
+  The settings are kept in ~/.local/share/bbhost/bbhost.toml, which every
+  copy of bbhost reads, so a new download or an update needs nothing set
+  again. The F10 settings and your account sign-in are kept beside it, saves
+  and caches in ~/.local/share/bbhost/data. (Older versions kept the settings
+  in ~/.config/bbhost; bbhost moves them as it starts, and the setup window
+  says what moved.)
   bbhost.example.toml lists every setting.
 
 Run
@@ -166,7 +168,7 @@ Online
   Other players reach you on UDP port 9307: a firewall on this PC must let it
   in. If summons keep failing with one person, forwarding that port to this
   PC on your router often fixes it. Two PCs in one house: set p2p_addr under
-  [online] in ~/.config/bbhost/bbhost.toml to each PC's local address.
+  [online] in ~/.local/share/bbhost/bbhost.toml to each PC's local address.
 
 Steam Deck
   The release's bbhost-steamdeck tarball is this package with the Deck's
