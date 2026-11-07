@@ -85,7 +85,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.21",
+    "0.3.22",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -1283,9 +1283,10 @@ constexpr std::uint32_t kGuns[] = {15000000, 35000000, 36000000, 6000000, 330000
 // (correctMagic, 100 on the Blunderbuss) x1.287. The gem's third effect, WPN
 // durability DOWN -65.3, does nothing to a gun and is left out.
 constexpr std::uint32_t kShotgunGun = 6000000;
+constexpr std::uint32_t kGrenadeGun = 15000000, kRocketGun = 35000000;  // the Cannon, the Church Cannon
 constexpr float kGemRate = 1.287f, kGemAdd = 7.3f;
 constexpr float kGrenadeSpeed = 700.0f;  // units a second
-constexpr std::uint16_t kGrenadeAtkPct = 185, kRocketAtkPct = 126;  // the shells' attack corrections (guns_apply)
+constexpr std::uint16_t kLauncherAtkPct = 185;  // the grenade's and the rocket's attack correction (guns_apply)
 constexpr float kRocket = 900.0f * kUnit, kGrenade = kGrenadeSpeed * kUnit;
 struct BulletRule {
     std::uint32_t id;
@@ -1348,12 +1349,16 @@ void guns_apply() {
     }
     int weapons = 0, bullets = 0;
     for (const std::uint32_t base : kGuns) {
-        const auto* top_row = g.param<bb::params::EquipParamWeapon>(base + 1000);
+        // The rocket launcher hits as the grenade launcher does (Quake 3's
+        // are alike): the Church Cannon takes the Cannon's attack and
+        // scaling, so the two stay equal at any stats and any NG cycle.
+        const auto* top_row = g.param<bb::params::EquipParamWeapon>((base == kRocketGun ? kGrenadeGun : base) + 1000);
         if (!top_row) continue;
         const bb::EQUIP_PARAM_WEAPON_ST top_copy = *top_row;
         const auto* top = &top_copy;
-        // Up to +10 itself: the shotgun's gem goes on the row the shot names too.
-        for (std::uint32_t level = 0; level <= (base == kShotgunGun ? 10u : 9u); ++level) {
+        // Up to +10 itself where it changes: the shotgun's gem and the rocket's
+        // attack go on the row the shot names too.
+        for (std::uint32_t level = 0; level <= (base == kShotgunGun || base == kRocketGun ? 10u : 9u); ++level) {
             auto* w = g.param<bb::params::EquipParamWeapon>(base + level * 100);
             if (!w) continue;
             g_saved_weapons.emplace_back(base + level * 100, *w);
@@ -1386,7 +1391,7 @@ void guns_apply() {
     // where the grenade hit for 497, the plasma for 3.
     for (const std::uint32_t base : kGuns) {
         if (auto* w = g.param<bb::params::EquipParamWeapon>(base + 1000)) {
-            if (base != kShotgunGun) g_saved_weapons.emplace_back(base + 1000, *w);  // the shotgun's +10 is saved above
+            if (base != kShotgunGun && base != kRocketGun) g_saved_weapons.emplace_back(base + 1000, *w);  // theirs are saved above
             for (std::uint32_t level = 0; level <= 10; ++level)
                 if (auto* lw = g.param<bb::params::EquipParamWeapon>(base + level * 100))
                     lw->properStrength = lw->properAgility = lw->properMagic = lw->properFaith = 0;
@@ -1461,10 +1466,9 @@ void guns_apply() {
         b->atkId_Bullet = -1;
         ++bullets;
     }
-    // The cannons fire each other's shell, but each hits as its own shot: the
-    // Church Cannon's shell is 170% of its gun's attack (620, burst 621), the
-    // Cannon's 100% (600, 601). Left with the shell, the rocket was the Church
-    // Cannon's 480 at 100% - the weakest of the two pairings.
+    // The cannons fire each other's shell, but each hits by its own gun's
+    // attack rows (620, burst 621; 600, 601) - their correction set alike
+    // below.
     constexpr std::pair<std::uint32_t, std::int32_t> kShellAtks[] = {{700, 620}, {701, 621}, {720, 600}, {722, 601}};
     for (const auto& [id, atk] : kShellAtks)
         if (auto* b = g.param<bb::params::Bullet>(id)) b->atkId_Bullet = atk;  // saved with kBulletRules
@@ -1491,10 +1495,12 @@ void guns_apply() {
         }
     }
     // The grenade and the rocket hit alike, as Quake 3's do (100 each, with
-    // 100 of splash): the grenade's one hit (600 on a character, its burst
-    // 601 at the fuse, on the Cannon's 600) and the rocket's direct hit and
-    // splash together (620, 621, on the Church Cannon's 480) each about 1000
-    // on an NG+7 enemy (1012, 504 twice).
+    // 100 of splash): one attack (the Cannon's, above), one correction for
+    // the grenade's hit (600 on a character, its burst 601 at the fuse) and
+    // the rocket's (620 its direct hit, 621 its burst), and one hit on the
+    // enemy a shell strikes - the rocket's burst shares its direct hit's list
+    // (the grenade's already did), where it hit the same enemy again. About
+    // 1000 a shot on an NG+7 enemy.
     const auto correct = [](std::uint32_t id, std::uint16_t pct, bool saved) {
         auto* a = g.param<bb::params::AtkParam_Pc>(id);
         if (!a) return;
@@ -1502,13 +1508,15 @@ void guns_apply() {
         a->atkPhysCorrection = a->atkMagCorrection = a->atkFireCorrection = a->atkThunCorrection = pct;
     };
     const auto pct = [](const char* env, int fallback) {
-        const char* e = std::getenv(env);  // QUAKE_GL_PCT / QUAKE_RL_PCT (a test): tuning
+        const char* e = std::getenv(env);  // QUAKE_LAUNCHER_PCT (a test): tuning
         return static_cast<std::uint16_t>(e ? std::atoi(e) : fallback);
     };
-    correct(600, pct("QUAKE_GL_PCT", kGrenadeAtkPct), false);  // a grenade that hits a character
-    correct(601, pct("QUAKE_GL_PCT", kGrenadeAtkPct), false);
-    correct(620, pct("QUAKE_RL_PCT", kRocketAtkPct), false);
-    correct(621, pct("QUAKE_RL_PCT", kRocketAtkPct), true);  // saved with its object power
+    const std::uint16_t launcher = pct("QUAKE_LAUNCHER_PCT", kLauncherAtkPct);
+    correct(600, launcher, false);
+    correct(601, launcher, false);
+    correct(620, launcher, false);
+    correct(621, launcher, true);  // saved with its object power
+    if (auto* b = g.param<bb::params::Bullet>(700)) b->isUseSharedHitList = 1;  // saved with kBulletRules
     g_guns_table = probe;
     g_guns_quake = true;
     g.log("quake: the guns at +10 whatever their level (%d rows), %d bullets flying as Quake 3's", weapons, bullets);
