@@ -40,6 +40,11 @@ std::vector<std::string> g_args;  // the arguments the setup window's child is s
 std::string g_exe_name;          // this executable's file name (argv[0]'s)
 std::string g_run;               // the child's: the run id it was started with (--compile-shaders=<id>), for its record
 
+// The pretend compile (BBHOST_TEST_COMPILE) and what the self-test expects of it.
+constexpr std::uint64_t kPretendStages = 12, kPretendFailed = 1, kPretendHlsl = 10, kPretendKept = 1, kPretendPipelines = 3;
+constexpr const char* kPretendFailure = "pretend failure x1";
+constexpr const char* kPretendLift = "pretend lift x1";
+
 std::string data_dir(const std::string& data) {
     return (data.empty() ? config_default_data_dir() : data) + "/bbhost";
 }
@@ -112,20 +117,39 @@ int shader_compile_session() {
         ::close(fd);
     }
 #endif
+    // BBHOST_TEST_COMPILE (bbhost --compile-selftest): a pretend compile, no
+    // GPU - its lines, its record and its last line as a compile has them,
+    // in a moment. "lost": its stdout lost after the device line, as when a
+    // console took it over; "nonl": the last line without its newline;
+    // "quiet": nothing at all, not even a record.
+    const char* te = std::getenv("BBHOST_TEST_COMPILE");
+    const std::string test = te && *te && std::strcmp(te, "0") != 0 ? te : "";
+    if (test == "quiet") std::_Exit(0);
     host_log("compile-shaders: bbhost %s, every shader into the caches in %s", BBHOST_VERSION, dir.c_str());
+    if (!test.empty()) host_log("compile-shaders: a pretend compile (BBHOST_TEST_COMPILE=%s), no GPU", test.c_str());
     const auto say = [](const std::string& line) {
         std::fputs(("compile-shaders: " + line + "\n").c_str(), stdout);
         std::fflush(stdout);
     };
-    host_gpu_set_compile_session(true);
-    say("phase starting the GPU");
-    if (!host_gpu_init(nullptr, 0, false)) {
-        say("error no Vulkan device could be started (see " + log_path + ")");
-        std::fflush(stderr);
-        std::_Exit(3);
+    std::string device = "pretend device";
+    if (test.empty()) {
+        host_gpu_set_compile_session(true);
+        say("phase starting the GPU");
+        if (!host_gpu_init(nullptr, 0, false)) {
+            say("error no Vulkan device could be started (see " + log_path + ")");
+            std::fflush(stderr);
+            std::_Exit(3);
+        }
+        device = host_gpu_device_identity();
     }
-    const std::string device = host_gpu_device_identity();
     say("device " + device);
+    if (test == "lost") {
+#if defined(_WIN32)
+        std::freopen("NUL", "w", stdout);
+#else
+        std::freopen("/dev/null", "w", stdout);
+#endif
+    }
     // "cancel" on stdin ends it early: what has not begun is dropped, what
     // has is written. Stdin closing does not (a run from a script with no
     // input goes to its end; the setup window sends "cancel" when it closes).
@@ -144,25 +168,46 @@ int shader_compile_session() {
     const auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
     say("phase compiling");
     HostShaderCompileProgress p;
-    for (;;) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        p = host_gpu_compile_progress();
-        std::uint64_t taken = 0, compiled = 0, kept = 0;
-        std::string reasons;
-        gpu::hlsl_counts(taken, compiled, kept, reasons);
+    const auto progress = [&](std::uint64_t taken, std::uint64_t kept) {
         char b[240];
         std::snprintf(b, sizeof(b), "progress %llu %llu %llu %llu %llu %.1f %llu %llu", static_cast<unsigned long long>(p.done),
                       static_cast<unsigned long long>(p.total), static_cast<unsigned long long>(p.failed),
                       static_cast<unsigned long long>(taken), static_cast<unsigned long long>(kept), seconds(),
                       static_cast<unsigned long long>(p.recipes_done), static_cast<unsigned long long>(p.recipes_total));
         say(b);
-        if (p.finished && (p.listed || cancelled.load())) break;
-    }
-    say("phase writing the caches");
-    host_gpu_save_pipeline_cache_at_exit();
+    };
     std::uint64_t taken = 0, compiled = 0, kept = 0;
     std::string hlsl_reasons;
-    gpu::hlsl_counts(taken, compiled, kept, hlsl_reasons);
+    if (test.empty()) {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            p = host_gpu_compile_progress();
+            std::string reasons;
+            gpu::hlsl_counts(taken, compiled, kept, reasons);
+            progress(taken, kept);
+            if (p.finished && (p.listed || cancelled.load())) break;
+        }
+        say("phase writing the caches");
+        host_gpu_save_pipeline_cache_at_exit();
+        gpu::hlsl_counts(taken, compiled, kept, hlsl_reasons);
+    } else {
+        p.total = kPretendStages;
+        p.recipes_total = kPretendPipelines;
+        while (p.done < p.total && !cancelled.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            ++p.done;
+            progress(p.done * kPretendHlsl / kPretendStages, 0);
+        }
+        p.failed = kPretendFailed;
+        p.recipes_done = kPretendPipelines;
+        p.reasons = std::string(kPretendFailure) + "\n";
+        p.listed = p.finished = true;
+        say("phase writing the caches");
+        taken = kPretendHlsl;
+        compiled = kPretendHlsl - 1;
+        kept = kPretendKept;
+        hlsl_reasons = std::string(kPretendLift) + "\n";
+    }
     const bool hlsl = gpu::hlsl_on();
     // One answer for the record, the last line and the exit code, whenever
     // a "cancel" comes in.
@@ -200,7 +245,8 @@ int shader_compile_session() {
                   static_cast<unsigned long long>(p.done), static_cast<unsigned long long>(p.total), static_cast<unsigned long long>(p.failed),
                   static_cast<unsigned long long>(taken), static_cast<unsigned long long>(kept), seconds(),
                   static_cast<unsigned long long>(p.recipes_done), static_cast<unsigned long long>(p.recipes_total));
-    say(b);
+    if (test == "nonl") std::fputs((std::string("compile-shaders: ") + b).c_str(), stdout);
+    else say(b);
     host_log("compile-shaders: %s", b);
     // Not fflush(nullptr): the stdin reader holds stdin's lock in getline.
     std::fflush(stdout);
@@ -428,4 +474,87 @@ void ShaderCompileJob::reader() {
                  v_.finished ? "done" : "cancelled", record_.c_str(), run_.c_str());
     else if (need_record && (code == 0 || code == 1))
         host_log("setup: compile-shaders: no last line, and %s holds no record of run %s", record_.c_str(), run_.c_str());
+}
+
+// ---- The self-test -------------------------------------------------------------------
+
+std::string shader_compile_selftest_dir(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--compile-selftest") == 0 && i + 1 < argc) return argv[i + 1];
+        if (std::strncmp(argv[i], "--compile-selftest=", 19) == 0) return argv[i] + 19;
+    }
+    return {};
+}
+
+int shader_compile_selftest(const std::string& dir_arg) {
+    std::error_code ec;
+    const fs::path dir = fs::absolute(fs::path(dir_arg), ec);
+    const fs::path app0 = dir / "app0", data = dir / "data", cfg = dir / "cfg";
+    fs::create_directories(app0 / "dvdroot_ps4", ec);
+    fs::create_directories(data, ec);
+    fs::create_directories(cfg, ec);
+    // Only there to be found: a pretend compile reads no game.
+    { std::ofstream eboot(dir / "eboot.bin", std::ios::binary | std::ios::app); }
+    const std::string toml = (dir / "bbhost.toml").generic_string();
+    {
+        std::ofstream t(toml, std::ios::trunc);
+        // No server of anyone's: a compile goes nowhere, and its configuration names none.
+        t << "[paths]\napp0 = \"" << app0.generic_string() << "\"\neboot = \"" << (dir / "eboot.bin").generic_string()
+          << "\"\ndata = \"" << data.generic_string() << "\"\n\n[online]\nhost = \"127.0.0.1\"\n\n[debug]\ntooling = true\n";
+    }
+    std::ofstream report(dir / "selftest.txt", std::ios::trunc);
+    const auto say = [&report](const std::string& s) {
+        std::printf("%s\n", s.c_str());
+        std::fflush(stdout);
+        report << s << "\n";
+        report.flush();
+    };
+    // The children's environment: SDL's copy of this process's, which they
+    // are started with. Their own configuration folder, never the player's.
+    SDL_Environment* env = SDL_GetEnvironment();
+    SDL_SetEnvironmentVariable(env, "BBHOST_CONFIG_DIR", cfg.generic_string().c_str(), true);
+    g_args = {"--config", toml};
+    const std::vector<std::string> reasons{kPretendFailure, std::string("the lift kept: ") + kPretendLift};
+    struct Round {
+        const char* mode;
+        const char* what;
+        bool finished, from_record;
+        const char* error;
+    };
+    static const Round kRounds[] = {
+        {"1", "its lines arrive", true, false, ""},
+        {"nonl", "its last line has no newline", true, false, ""},
+        {"lost", "its stdout is lost after the device line", true, true, ""},
+        {"quiet", "it says nothing and writes no record (the last round's is there)", false, false, "the compile ended early (exit 0)"},
+    };
+    int failures = 0;
+    for (const Round& r : kRounds) {
+        SDL_SetEnvironmentVariable(env, "BBHOST_TEST_COMPILE", r.mode, true);
+        ShaderCompileJob job;
+        std::string err;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool started = job.start(data.generic_string(), err);
+        while (started && job.running() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(60))
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const ShaderCompileView v = job.view();
+        char got[320];
+        std::snprintf(got, sizeof(got), "%s%s, %llu of %llu, %llu failed, %llu HLSL, %llu kept the lift, pipelines %llu of %llu, %zu reasons%s%s",
+                      v.finished ? "done" : v.cancelled ? "cancelled" : "not done", v.from_record ? " (its record's)" : "",
+                      static_cast<unsigned long long>(v.done), static_cast<unsigned long long>(v.total),
+                      static_cast<unsigned long long>(v.failed), static_cast<unsigned long long>(v.hlsl),
+                      static_cast<unsigned long long>(v.lift), static_cast<unsigned long long>(v.recipes_done),
+                      static_cast<unsigned long long>(v.recipes_total), v.reasons.size(), v.error.empty() ? "" : "; ", v.error.c_str());
+        std::string wrong;
+        if (!started) wrong = "not started: " + err;
+        else if (v.running) wrong = "still running after 60 s";
+        else if (v.finished != r.finished || v.from_record != r.from_record || v.error != r.error) wrong = "a different end";
+        else if (r.finished && (v.done != kPretendStages || v.total != kPretendStages || v.failed != kPretendFailed ||
+                                v.hlsl != kPretendHlsl || v.lift != kPretendKept || v.recipes_done != kPretendPipelines ||
+                                v.recipes_total != kPretendPipelines || v.reasons != reasons))
+            wrong = "other counts or reasons";
+        say(std::string(wrong.empty() ? "ok   " : "FAIL ") + r.mode + ": " + r.what + " -> " + got + (wrong.empty() ? "" : " (" + wrong + ")"));
+        if (!wrong.empty()) ++failures;
+    }
+    say(failures ? "compile selftest: " + std::to_string(failures) + " of 4 rounds failed" : "compile selftest: ok");
+    return failures ? 1 : 0;
 }

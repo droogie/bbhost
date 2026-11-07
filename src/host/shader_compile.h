@@ -41,7 +41,17 @@ void shader_compile_set_args(int argc, char** argv);
 // or null with `error` set.
 void* host_start_again(const char* flag, bool pipe_stdio, std::string& error);
 // The child's run, once the game's folders are known; its exit code.
+// BBHOST_TEST_COMPILE pretends the compile (no GPU) for the self-test below.
 int shader_compile_session();
+// `bbhost --compile-selftest DIR` (the shader_compile_e2e test): the setup
+// window's side end to end - this executable started again as the window
+// starts it, its stdout read, its record taken - with children that pretend
+// the compile (BBHOST_TEST_COMPILE), in DIR (a game folder, eboot and
+// configuration of their own). The exit code says; the lines are also kept
+// in DIR/selftest.txt. "" when the arguments do not ask for it.
+std::string shader_compile_selftest_dir(int argc, char** argv);
+int shader_compile_selftest(const std::string& dir);
+
 // What the setup window shows before anything runs.
 struct ShaderCacheState {
     std::string dir;                // <data>/bbhost

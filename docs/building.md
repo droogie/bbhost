@@ -129,6 +129,15 @@ The Windows build has the same target under wine (`build-win`, target
 `build/gcn2spv --check <dvdroot_ps4>/shader/*.dcx` translates and validates
 every shader in the game's shader bundles.
 
+`bbhost --compile-selftest DIR` (ctest's `shader_compile_e2e`) runs the setup
+window's **Compile shaders now** end to end: bbhost started again as the
+window starts it, with children that pretend the compile (no GPU, no game
+files; the folder, eboot and configuration they use are made in `DIR`), whose
+lines arrive, end without a newline, are lost after the first ones, or never
+come. The Windows build runs it under wine the same way; started with no
+file or pipe for its output, it opens a console as a double-clicked
+`bbhost.exe` does.
+
 ## Packages
 
 | Target or script | Produces |
