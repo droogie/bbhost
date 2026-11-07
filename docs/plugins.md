@@ -252,6 +252,14 @@ gives the Binary Ninja address.
   every frame: each new set makes the map's pipelines again. NULL or radius 0
   turns it off. The Isometric plugin's Cutaway; it costs a third of a
   millisecond of GPU time a frame at 1080p.
+- `view_cutaway_objects(float start)` (v24): `view_cutaway2`'s cone for the
+  draws the stencil marks 8 and 12 too, its tip `start` of the way from the
+  point looked at toward the camera (0.5 halfway). Those marks hold the
+  characters and the map's objects alike - neither the stencil, the vertex
+  shader nor what moves tells them apart - so a character high between the
+  view and the point looked at is cut with the objects; nothing standing near
+  that point is. Below 0, the default, they are never cut. The Isometric
+  plugin's Cut objects; no GPU time to measure beyond the map's cut.
 - `scene_dither(bits)` (v25): the finished picture - the 3D and its post
   effects, before the HUD and the menus are drawn over it - rounded to `bits`
   a channel through the PS1 GPU's 4x4 ordered dither, a cell of the pattern a

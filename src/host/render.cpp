@@ -23670,18 +23670,24 @@ static bool draw_impl(const GpuDraw& d) {
     // The cutaway per pixel: the camera draws' pixel stages, with the draw's
     // viewport to take each pixel back to view space.
     s.pixel_cut_on = false;
-    // The G-buffer's stencil marks what a draw is: the map's own pieces 9, the
-    // characters (players, enemies, their parts) and the objects 8 and 12 - a
-    // draw that writes those is never cut. (What moves is no test: the map's
-    // pieces are in the velocity pass's index buffers too.)
+    // The G-buffer's stencil marks what a draw is: the map's own pieces 9;
+    // the characters (players, enemies, their parts) and the map's objects
+    // (furniture, crates, lamps) alike 8, and a few of either 12 - neither
+    // the stencil, the vertex shader nor what moves tells a character from an
+    // object (the map's pieces are in the velocity pass's index buffers too).
+    // Those are cut only when a plugin asks (scene_look_object_cut), by the
+    // same cone with its tip that share of the way toward the camera - out of
+    // reach of anything standing near the point looked at.
     const std::uint32_t mark = s.stencil_ref & 0xffu;
     const bool chr_or_obj = (s.depth_control & 1u) && (mark == 8u || mark == 12u);
+    const float object_start = chr_or_obj ? scene_look_object_cut() : -1.0f;
     // Only what writes depth: the G-buffer's surfaces and their depth pass -
     // never a pass drawn over them (the lighting's full-screen passes, the
     // light volumes), whose pixels are what the cut surfaces leave to see.
     const bool writes_depth = (s.depth_control & 6u) == 6u;
     float view_tan[2], view_depth[2];
-    if (scene_look_pixel_cut(nullptr) && look_camera_draw(s) && writes_depth && !chr_or_obj && s.vport[0] != 0.0f &&
+    if (scene_look_pixel_cut(nullptr) && look_camera_draw(s) && writes_depth && (!chr_or_obj || object_start >= 0.0f) &&
+        s.vport[0] != 0.0f &&
         s.vport[2] != 0.0f && upscale_view_terms(&view_tan[0], &view_tan[1], &view_depth[0], &view_depth[1]) &&
         scene_look_pixel_cut(&s.pixel_cut)) {
         // The view's own field of view and depth decode, rounded (to 1/1024 and
@@ -23699,6 +23705,7 @@ static bool draw_impl(const GpuDraw& d) {
         s.pixel_cut.tan_y = std::round(view_tan[1] * 1024.0f) / 1024.0f;
         s.pixel_cut.depth_z = bits12(view_depth[0]);
         s.pixel_cut.depth_w = bits12(view_depth[1]);
+        if (chr_or_obj) s.pixel_cut.distance = std::round(s.pixel_cut.distance * (1.0f - object_start) * 4.0f) / 4.0f;
         s.pixel_cut_on = true;
         key = fnv1a(&s.pixel_cut, sizeof(s.pixel_cut), key ^ kPixelCutSalt);
         static std::atomic<int> said{0};
