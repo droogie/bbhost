@@ -635,16 +635,26 @@ if(UNIX)
   add_dependencies(ps1_plugin_test bb_plugin_ps1)
   add_test(NAME ps1_plugin_test COMMAND ps1_plugin_test $<TARGET_FILE:bb_plugin_ps1>)
   # The NGX bridge (src/ngx_bridge): its parts without NVIDIA's code always;
-  # with the bridge built, the library itself through bbhost's call order. A
-  # pretend Vulkan (tests/fake_vulkan.h) stands in for the loader, so no driver
-  # or GPU is touched.
+  # with the bridge built, the library itself through bbhost's call order, and
+  # host/upscaler.cpp's Linux loader with it, under Numity1504's name, under
+  # all three names (the first found loads) and with none. A pretend Vulkan (tests/fake_vulkan.h) stands in for the loader, so no
+  # driver or GPU is touched.
   if(Vulkan_FOUND)
     add_executable(ngx_bridge_test tests/ngx_bridge_test.cpp src/ngx_bridge/bridge_core.cpp)
     target_include_directories(ngx_bridge_test PRIVATE src third_party/upscaler_bridge)
     target_link_libraries(ngx_bridge_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    add_executable(upscaler_load_test tests/upscaler_load_test.cpp src/host/upscaler.cpp)
+    target_include_directories(upscaler_load_test PRIVATE src third_party/upscaler_bridge ${CMAKE_BINARY_DIR}/gen)
+    target_link_libraries(upscaler_load_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    add_dependencies(upscaler_load_test bbhost_version)
+    add_test(NAME upscaler_load_none COMMAND upscaler_load_test none)
     if(TARGET bbhost_ngx_bridge)
       add_dependencies(ngx_bridge_test bbhost_ngx_bridge)
+      add_dependencies(upscaler_load_test bbhost_ngx_bridge)
       add_test(NAME ngx_bridge_test COMMAND ngx_bridge_test $<TARGET_FILE:bbhost_ngx_bridge>)
+      add_test(NAME upscaler_load_bridge COMMAND upscaler_load_test bridge $<TARGET_FILE:bbhost_ngx_bridge>)
+      add_test(NAME upscaler_load_numity COMMAND upscaler_load_test numity $<TARGET_FILE:bbhost_ngx_bridge>)
+      add_test(NAME upscaler_load_order COMMAND upscaler_load_test order $<TARGET_FILE:bbhost_ngx_bridge>)
     else()
       add_test(NAME ngx_bridge_test COMMAND ngx_bridge_test)
     endif()
