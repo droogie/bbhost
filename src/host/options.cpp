@@ -2563,7 +2563,11 @@ void output_for(int* w, int* h) {
     if (g_set[kWindowMode].index == 0) {
         ww = config().width;
         wh = config().height;
-    } else if (!host_desktop_max_size(&ww, &wh)) {
+    } else if (!host_desktop_primary_size(&ww, &wh)) {
+        // The screen the window fills - not the largest width and height of
+        // all displays: with a second display of another shape (a portrait
+        // one beside a 2560x1440, 2560x1920) the game was made that shape and
+        // shown with bars at the sides, its UI shrunk.
         return;
     }
     if (ww <= 0 || wh <= 0) return;

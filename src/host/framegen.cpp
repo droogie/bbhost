@@ -398,8 +398,17 @@ void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D ds
             if (s.display_va == display_va) h = s;
         }
     }
+    // Why frames go without generation, every 600 presents (the log's "frames shown" line).
+    static std::uint64_t calls = 0, none = 0, again = 0;
+    if (++calls % 600 == 0 && (none || again)) {
+        host_log("framegen: of the last 600 frames %llu had no HUD-less copy, %llu were shown before (last prepared %llu, presented %llu)",
+                 static_cast<unsigned long long>(none), static_cast<unsigned long long>(again), static_cast<unsigned long long>(h.id),
+                 static_cast<unsigned long long>(g_present_id));
+        none = again = 0;
+    }
     // A frame seen before (the same buffer shown again) is not one to generate after.
     if (!h.image || h.id <= g_present_id) {
+        ++(h.image ? again : none);
         static std::atomic<int> told{0};
         if (told.fetch_add(1) < 3)
             host_log("framegen: no HUD-less copy to present display buffer 0x%llx with (%s)", static_cast<unsigned long long>(display_va),
