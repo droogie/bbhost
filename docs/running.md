@@ -717,7 +717,7 @@ anti-aliasing:
 
 | Choice | Where it runs |
 |---|---|
-| TAA | bbhost's own temporal anti-aliasing: any GPU, Windows and Linux, the 3D at the Resolution |
+| TAA | bbhost's own temporal anti-aliasing: any GPU, Windows and Linux, the 3D at the Resolution - one below the window keeps the game and its HUD at the window's size, as DLSS and FSR do |
 | DLSS | NVIDIA RTX cards, on Windows and on Linux: DLAA, Quality, Balanced or Performance (the 3D at the full Resolution, two thirds, about 59% or half each way) and its model (DLSS preset K, J, L or M) |
 | FSR 3, FSR 4 | AMD FidelityFX, on Windows: FSR 4 where the GPU and driver run it, FSR 3 on any GPU |
 
