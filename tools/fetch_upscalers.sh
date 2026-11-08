@@ -18,9 +18,11 @@
 set -eu
 cd "$(dirname "$0")/.."
 FFX_TAG=v2.4.0
-FFX_URL=https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/raw/$FFX_TAG/Kits/FidelityFX/signedbin
+FFX_REPO=GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+FFX_DIR=Kits/FidelityFX/signedbin
 DLSS_TAG=v310.9.16
-DLSS_URL=https://github.com/NVIDIA/DLSS/raw/$DLSS_TAG/lib/Windows_x86_64/rel
+DLSS_REPO=NVIDIA/DLSS
+DLSS_DIR=lib/Windows_x86_64/rel
 BRIDGE=third_party/upscaler_bridge/bin/upscaler_bridge.dll
 
 files="amd_fidelityfx_loader_vk.dll amd_fidelityfx_upscaler_vk.dll amd_fidelityfx_framegeneration_vk.dll nvngx_dlss.dll upscaler_bridge.dll"
@@ -47,6 +49,19 @@ fi
 dest=${1:-}
 [ -n "$dest" ] || fail "usage: tools/fetch_upscalers.sh DIR"
 sha() { sha256sum "$1" | cut -d' ' -f1; }
+# One file of a repository at a tag: from raw.githubusercontent.com, where
+# github.com's /raw/ address redirects, then from github.com itself (on
+# 2026-11-08 github.com answered 504 for these files while
+# raw.githubusercontent.com served them). The pin checks either.
+download() {  # REPO TAG PATH OUT
+    local url
+    for url in "https://raw.githubusercontent.com/$1/$2/$3" "https://github.com/$1/raw/$2/$3"; do
+        echo "fetch_upscalers: $url"
+        curl -sSL --fail --retry 3 -m 600 -o "$4" "$url" && return 0
+    done
+    rm -f "$4"
+    return 1
+}
 
 cache=${UPSCALERS_CACHE:-build/upscalers}
 mkdir -p "$cache" "$dest/licenses/fidelityfx" "$dest/licenses/dlss" "$dest/licenses/upscaler_bridge"
@@ -57,12 +72,14 @@ for f in $files; do
         cp "$BRIDGE" "$dest/$f"
         continue
     fi
-    case "$f" in nvngx_*) url=$DLSS_URL/$f ;; *) url=$FFX_URL/$f ;; esac
+    case "$f" in
+        nvngx_*) repo=$DLSS_REPO tag=$DLSS_TAG path=$DLSS_DIR/$f ;;
+        *) repo=$FFX_REPO tag=$FFX_TAG path=$FFX_DIR/$f ;;
+    esac
     kept=$cache/$f
     if [ ! -f "$kept" ] || [ "$(sha "$kept")" != "$want" ]; then
         rm -f "$kept"
-        echo "fetch_upscalers: $url"
-        curl -sSL --fail --retry 3 -m 600 -o "$kept.part" "$url" || { rm -f "$kept.part"; fail "download failed: $url"; }
+        download "$repo" "$tag" "$path" "$kept.part" || fail "download failed: $repo $tag $path"
         got=$(sha "$kept.part")
         if [ "$got" != "$want" ]; then
             rm -f "$kept.part"
