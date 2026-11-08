@@ -227,6 +227,11 @@ bool host_window_pixels(int* w, int* h);
 // own, unchanged by Fullscreen's exclusive mode while it is up - for the game's
 // size with an upscaler (host/options.cpp). False before the window is made.
 bool host_window_desktop_size(int* w, int* h);
+// The same, as the window's thread last saw it - updated when the window is
+// made, moves to another display, or a display's mode changes - for any
+// thread (the game's frame end: engine/live_resolution.cpp). False before the
+// window is made, and with no window (headless).
+bool host_window_display_now(int* w, int* h);
 // `fn` is told the window's pixel size now (if there is a window) and each
 // time it changes - a resize, a fullscreen toggle, a display change - on the
 // window's thread. One listener (the light grid, engine/graphics_patch.cpp).
@@ -235,6 +240,12 @@ void host_window_on_pixels(void (*fn)(int, int));
 // when there is no window (headless) or the display does not say. The flip
 // clock runs at this rate instead of assuming 59.94 Hz.
 float host_window_refresh_hz();
+// The refresh rate of the display the game is on: the window's
+// (host_window_refresh_hz) once there is one, before that the primary
+// display's, where the window opens (host_desktop_refresh_hz) - Display-Limited
+// and frame generation's limit take it, so a window on a 144 Hz second screen
+// beside a 60 Hz primary runs at 144, not 60.
+float host_display_refresh_hz();
 // The steady-clock time, in nanoseconds, at which the presenting thread last
 // finished a present, and a counter of finished presents. With V-Sync on the
 // present returns on the display's own vblank, which is the phase the flip

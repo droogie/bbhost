@@ -57,6 +57,7 @@
 static std::atomic<std::uint64_t> g_window_pixels{0};
 // Told the window's pixel size when it changes (host_window_on_pixels).
 static std::atomic<void (*)(int, int)> g_on_pixels{nullptr};
+void note_window_display();  // the window's display's size, for any thread (host_window_display_now)
 
 namespace {
 
@@ -2065,6 +2066,11 @@ void host_window_set_stay_borderless(bool on) {
 #endif
 }
 
+float host_display_refresh_hz() {
+    const float hz = host_window_refresh_hz();
+    return hz > 0.0f ? hz : host_desktop_refresh_hz();
+}
+
 float host_window_refresh_hz() {
 #if defined(BBHOST_HAVE_SDL3)
     if (!g_active.load() || !g_window) return 0.0f;
@@ -2198,6 +2204,7 @@ bool window_start_impl(int width, int height, const char* title) {
         return false;
     }
     g_window_made.store(true);
+    note_window_display();
     // BBHOST_NO_GAMEPAD=1: ignore controllers, so a test run on a virtual
     // display takes input only from its own script and not from a controller
     // plugged into the machine it runs on (pads_ignored).
@@ -2350,6 +2357,15 @@ bool host_window_pump() {
                 // resize - a tiling window manager's, its fullscreen toggle -
                 // rebuilds it here rather than waiting to be told.
                 g_swap_dirty.store(true);
+                note_window_display();
+                break;
+            // Moved onto another display, or a display's mode changed: the
+            // game's back buffer follows the window's display
+            // (engine/live_resolution.cpp, at its next quiet point).
+            case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            case SDL_EVENT_DISPLAY_DESKTOP_MODE_CHANGED:
+                note_window_display();
                 break;
             case SDL_EVENT_MOUSE_MOTION: {
                 // A mouse that is touched, not one that twitches by a pixel.
@@ -3254,6 +3270,28 @@ void host_window_on_pixels(void (*fn)(int, int)) {
     g_on_pixels.store(fn, std::memory_order_release);
     int w = 0, h = 0;
     if (fn && host_window_pixels(&w, &h)) fn(w, h);
+}
+
+// The size of the display the window is on, as the window's thread last saw
+// it (note_window_display): w << 32 | h, 0 before the window is made. Read
+// from any thread (host_window_display_now) - the game's frame end polls it
+// for the display buffers (engine/live_resolution.cpp).
+std::atomic<std::uint64_t> g_window_display{0};
+void note_window_display() {
+    int w = 0, h = 0;
+    if (!host_window_desktop_size(&w, &h)) return;
+    const std::uint64_t v = static_cast<std::uint64_t>(w) << 32 | static_cast<std::uint32_t>(h);
+    const std::uint64_t was = g_window_display.exchange(v, std::memory_order_relaxed);
+    if (was != v && was) host_log("window: on a %dx%d display now (was %llux%llu)", w, h, static_cast<unsigned long long>(was >> 32),
+                                  static_cast<unsigned long long>(was & 0xffffffffu));
+}
+
+bool host_window_display_now(int* w, int* h) {
+    const std::uint64_t v = g_window_display.load(std::memory_order_relaxed);
+    if (!v) return false;
+    *w = static_cast<int>(v >> 32);
+    *h = static_cast<int>(v & 0xffffffffu);
+    return true;
 }
 
 bool host_window_desktop_size(int* w, int* h) {

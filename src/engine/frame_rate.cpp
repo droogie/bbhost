@@ -1877,7 +1877,7 @@ void retime_effects(int fps) {
 // values follow the frame's time already.
 void retarget(int want) {
     int fps = want;
-    if (fps == 0) fps = uncapped_limit::rate_fps(g_uncapped_forced, g_uncapped_forced ? 0.0f : host_desktop_refresh_hz());
+    if (fps == 0) fps = uncapped_limit::rate_fps(g_uncapped_forced, g_uncapped_forced ? 0.0f : host_display_refresh_hz());
     g_uncapped = want == 0;
     if (fps == g_game_fps) return;
     if (fps != 60 && !g_cloth_applied) {
@@ -2596,7 +2596,7 @@ void converted_start(int got) {
 // stays converted (retarget), a 30 like the Custom limit's 10 to 29.
 void convert_live(int want) {
     int fps = want;
-    if (fps == 0) fps = uncapped_limit::rate_fps(g_uncapped_forced, g_uncapped_forced ? 0.0f : host_desktop_refresh_hz());
+    if (fps == 0) fps = uncapped_limit::rate_fps(g_uncapped_forced, g_uncapped_forced ? 0.0f : host_display_refresh_hz());
     if (fps == 30) return;  // the game's own already
     g_uncapped = want == 0;
     const int got = apply_rate(g_image, fps);
@@ -2705,7 +2705,7 @@ void frame_rate_install(ElfImage* image) {
     // (engine/uncapped_limit.h). A display changed while the game runs applies
     // on the next run, as every rate does.
     if (want == 0) {
-        const float hz = g_uncapped_forced ? 0.0f : host_desktop_refresh_hz();
+        const float hz = g_uncapped_forced ? 0.0f : host_display_refresh_hz();
         want = uncapped_limit::rate_fps(g_uncapped_forced, hz);
         g_uncapped = true;
         if (g_uncapped_forced) {

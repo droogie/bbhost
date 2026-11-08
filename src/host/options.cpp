@@ -1096,12 +1096,15 @@ void targets_follow_settings(const char* what, bool ssr_on) {
     host_log("graphics: %s changed: %s", what, rebuild ? "the scene's targets made again" : "no target changes");
 }
 
-// The primary display's refresh rate, the one frame generation's limit is
-// half of (engine/frame_rate.cpp fg_cap_target reads host_desktop_refresh_hz:
-// the same display). host_desktop_refresh_hz brings SDL's video up and down,
-// which the presenter's thread must not, so on Windows the display's settings
-// are asked directly, at most every 2 s; elsewhere SDL's answer once.
+// The refresh rate of the display the window is on, the one frame
+// generation's limit is half of (engine/frame_rate.cpp fg_cap_target reads
+// host_window_refresh_hz: the same display). Before there is a window, the
+// primary display's, where it opens: host_desktop_refresh_hz brings SDL's
+// video up and down, which the presenter's thread must not, so on Windows the
+// display's settings are asked directly, at most every 2 s; elsewhere SDL's
+// answer once.
 float refresh_hz_now() {
+    if (const float w = host_window_refresh_hz(); w > 0.0f) return w;
 #if defined(_WIN32)
     static std::atomic<float> hz{0.0f};
     static std::atomic<std::int64_t> asked{0};
