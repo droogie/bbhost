@@ -525,11 +525,11 @@ unless you need it - it may do the same
 way each swapchain was made: `exclusive fullscreen disallowed (Stay
 borderless)`, or `the driver decides on exclusive fullscreen`.
 
-The frame rate is the game's own speed, chosen when it starts (a change
-applies on the next run): 30 is the game as it shipped; 60, 90, 120, 150, 180,
-240, 360, 480 and 960 run its logic at that rate; Display-Limited is the
-display's refresh rate when the game starts, to the nearest whole frame a
-second (59.94 Hz runs 60), run as that rate - its target, its steps, its code
+The frame rate is the game's own speed, and a change applies at once, while
+the game runs: 30 is the game as it shipped; 60, 90, 120, 150, 180, 240, 360,
+480 and 960 run its logic at that rate; Display-Limited is the display's
+refresh rate when the game starts or when it is chosen, to the nearest whole
+frame a second (59.94 Hz runs 60), run as that rate - its target, its steps, its code
 immediates and frame counts, 1/180 s each on a 180 Hz display, V-Sync on or
 off - and 60 when no display says a rate (headless). What counts frames cannot
 follow the frame's time, so a rate that moved with it (the Uncapped of earlier
