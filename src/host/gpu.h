@@ -620,6 +620,14 @@ bool host_gpu_copy_image_region(const GpuImageCopy& c);
 // unmapped: its surfaces are retired once the command processor has retired
 // everything submitted up to `after_submitted` (hle_gnm_submitted_total()).
 void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+// A resolution or render-size change's rebuild at the quiet point (engine/
+// live_resolution.cpp resize): between on and off the game lets go of its
+// targets and makes them at the new size. The targets and snapshots of the
+// resources that died meanwhile go at off - the command processor has run
+// everything before them - unless the resource made next at the same address
+// takes them, rather than after the reuse idle time an area load's are kept
+// for; their memory is back in the image heap before the next frame.
+void host_gpu_targets_rebuild(bool on);
 // GX mapped the texture whose memory is [base, base + bytes) for the CPU to
 // write: its surfaces upload it again at their next use.
 void host_gpu_texture_written(std::uint64_t base, std::size_t bytes);

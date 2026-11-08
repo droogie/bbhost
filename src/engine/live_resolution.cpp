@@ -1042,6 +1042,10 @@ bool resize(std::uint32_t w, std::uint32_t h) {
     const std::uint64_t failed = gx_resources_create_failures();
     RenderScale rs_was, rs_now;
     const bool scaled = render_scale_retarget(w, h, g_display[0], g_display[1], hle_video_flip_count(), &rs_was, &rs_now);
+    // The resources that die from here to the end of the broadcasts are the
+    // old size's: their targets go at the end (host_gpu_targets_rebuild),
+    // before the next frame makes the new size's.
+    host_gpu_targets_rebuild(true);
     int ctxs = scaled ? broadcast_size(dev, gm, was_w, was_h, w, h, &rs_was, &rs_now) : broadcast_size(dev, gm, was_w, was_h, w, h);
     bool fitted = true;
     const std::uint64_t unfit = unfit_scene_ctx();
@@ -1059,6 +1063,7 @@ bool resize(std::uint32_t w, std::uint32_t h) {
         h = was_h;
         fitted = false;
     }
+    host_gpu_targets_rebuild(false);
     // The window size SprjInitStuff derives from the res words at the start
     // (0x59404d8/dc), which sub_212c630 divides the res words by; the Sprj
     // listener sets only the res words and the UI scale. Booted at this size

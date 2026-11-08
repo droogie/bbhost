@@ -2429,7 +2429,13 @@ bool res_identity_on();
 // A target something wrote in a submission made after `after_submitted` (the
 // count when the resource died) has a newer owner: it stays, and takes the
 // generation of the resource that now holds its memory.
-void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted);
+// `rebuild`: the resource died in a resolution or render-size change's
+// rebuild (host_gpu_targets_rebuild), which makes the new size's targets in
+// the same call: an image that neither the resource made next at its own
+// address nor the dead one made again whole takes is the old size's alone,
+// and goes now rather than after the idle time.
+void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted,
+                                     bool rebuild = false);
 struct ResolveKind {
     const char* prev;
     explicit ResolveKind(const char* kind) : prev(t_resolve_kind) { t_resolve_kind = kind; }
@@ -2736,6 +2742,9 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c);
 bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, std::uint32_t height, std::size_t bytes_per_pixel,
                                        VkImage target);
 void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+// While on, the resources that die are a size change's old ones
+// (host_gpu_targets_rebuild): their retirements say so.
+void textures_rebuild_window(bool on);
 // Every texture image made from [lo, hi) dropped now (host_gpu_forget_region);
 // how many.
 std::uint64_t textures_forget_region_locked(std::uint64_t lo, std::uint64_t hi);
