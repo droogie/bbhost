@@ -47,15 +47,29 @@ case "$target" in
 esac
 [ "$(cat third_party/dxc/VERSION)" = "$DXC_TAG" ] || fail "third_party/dxc holds the licences of $(cat third_party/dxc/VERSION), not $DXC_TAG"
 sha() { sha256sum "$1" | cut -d' ' -f1; }
+# The release asset from its download address, then through GitHub's API (the
+# release by its tag, the asset's API address from it, that address asked for
+# the file itself): on 2026-11-08 github.com's download addresses answered 504
+# for minutes on end while the API served the releases.
+download() {  # OUT
+    local url at
+    url=https://github.com/microsoft/DirectXShaderCompiler/releases/download/$DXC_TAG/$asset
+    echo "fetch_dxc: $url"
+    curl -sSL --fail --retry 3 -m 600 -o "$1" "$url" && return 0
+    at=$(curl -sSL --fail --retry 3 -m 60 "https://api.github.com/repos/microsoft/DirectXShaderCompiler/releases/tags/$DXC_TAG" |
+        python3 -I -c 'import json, sys; d = json.loads(sys.stdin.read() or "{}"); print(next((a["url"] for a in d.get("assets", []) if a["name"] == sys.argv[1]), ""))' "$asset") && [ -n "$at" ] &&
+        echo "fetch_dxc: $at" &&
+        curl -sSL --fail --retry 3 -m 600 -H 'Accept: application/octet-stream' -o "$1" "$at" && return 0
+    rm -f "$1"
+    return 1
+}
 
 cache=${DXC_CACHE:-build/dxc}
 mkdir -p "$cache"
 archive=$cache/$DXC_TAG-$asset
 if [ ! -f "$archive" ] || [ "$(sha "$archive")" != "$asset_sha" ]; then
     rm -f "$archive"
-    url=https://github.com/microsoft/DirectXShaderCompiler/releases/download/$DXC_TAG/$asset
-    echo "fetch_dxc: $url"
-    curl -sSL --fail --retry 3 -m 600 -o "$archive.part" "$url" || { rm -f "$archive.part"; fail "download failed: $url"; }
+    download "$archive.part" || fail "download failed: DXC $DXC_TAG $asset"
     got=$(sha "$archive.part")
     if [ "$got" != "$asset_sha" ]; then
         rm -f "$archive.part"
