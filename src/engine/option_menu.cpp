@@ -2111,7 +2111,7 @@ void option_menu_poll() {
     if (g_frame_cap != g_last_frame_cap) {
         g_last_frame_cap = g_frame_cap;
         host_opt_set_frame_cap(g_frame_cap);
-        host_log("pc-options: frame rate %d from the System menu (0 is uncapped; applies on the next run)", g_frame_cap);
+        host_log("pc-options: frame rate %d from the System menu (0 is Display-Limited)", g_frame_cap);
     }
     if (g_keys_save.exchange(false)) {
         host_options_save_now();
