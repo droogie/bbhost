@@ -33,6 +33,7 @@ mkdir -p "$dir/data" "$dir/logs" "$dir/plugins" "$dir/build"
 cp -r patches "$dir/patches"
 cp include/bbhost_plugin.h "$dir/plugins/"
 cp LICENSE "$dir/LICENSE"
+cp LICENSE-EXCEPTION "$dir/LICENSE-EXCEPTION"
 tools/package_plugins.sh "$(dirname "$bin")/plugins" "$dir/plugins"
 objcopy --strip-debug "$bin" "$dir/bbhost" 2>/dev/null || llvm-objcopy --strip-debug "$bin" "$dir/bbhost"
 chmod +x "$dir/bbhost"
@@ -85,8 +86,10 @@ bbhost for Linux, build $name
 
 bbhost runs Bloodborne on PC: the game's own 1.09 executable, its calls into
 the PS4's system libraries answered by bbhost and its graphics recompiled for
-Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE); the
-source is at https://github.com/droogie/bbhost.
+Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE), with
+an additional permission to combine it with GPU vendors' upscaling and frame
+generation runtimes (LICENSE-EXCEPTION); the source is at
+https://github.com/droogie/bbhost.
 
 You need
   - x86-64 Linux with glibc ${glibc#GLIBC_} or newer (Ubuntu 24.04, Linux Mint 22, Debian 13,

@@ -1,0 +1,35 @@
+bbhost: additional permission under GNU GPL version 3 section 7
+
+bbhost is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. The license is in the file LICENSE.
+
+Additional permission under GNU GPL version 3 section 7
+
+If you modify bbhost, or any covered work, by linking or combining it with a
+Vendor Upscaling Runtime (or a modified version of that runtime), containing
+parts covered by the terms of that runtime's own license, the licensors of
+bbhost grant you additional permission to convey the resulting work.
+Corresponding Source for a non-source form of such a combination need not
+include the source code of the Vendor Upscaling Runtime.
+
+A "Vendor Upscaling Runtime" is software published by a graphics hardware
+vendor for upscaling, anti-aliasing, frame generation or related image
+reconstruction on a GPU, together with the loader, interface and development
+kit libraries the vendor publishes for using it. At the time of writing these
+include NVIDIA DLSS (the NGX libraries and the DLSS runtime), AMD FidelityFX
+(its loader, upscaler and frame generation libraries) and Intel XeSS
+(libxess). A library whose own source is available under terms compatible
+with the GNU GPL, and whose purpose is to call a Vendor Upscaling Runtime (for
+example an upscaler bridge), may be combined and conveyed with bbhost under
+this permission together with the runtime it calls, including when that
+runtime's libraries are linked into it.
+
+This permission covers only Vendor Upscaling Runtimes and the libraries
+described above that call them. It grants nothing for any other code, and it
+does not change the terms under which any other part of bbhost is licensed.
+
+If you modify bbhost, you may extend this permission to your version, but you
+are not obliged to do so. If you do not wish to do so, delete this permission
+from your version.

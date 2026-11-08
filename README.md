@@ -192,10 +192,13 @@ third_party/     LibAtrac9, Dear ImGui, Monocypher, and the licences of the DXC 
 ## License
 
 bbhost is free software, licensed under the GNU General Public License,
-version 3 or later (see [LICENSE](LICENSE)). The third-party code in
-`third_party/` and `src/host/shaders/fsr1/` keeps its own licenses. The debug
-menu's glyphs (`plugins/debug_menu/font14.bin`) come from the X11 fonts k14
-and 7x14, which are in the public domain.
+version 3 or later (see [LICENSE](LICENSE)). It carries an additional
+permission under the license's section 7 to combine it with GPU vendors'
+upscaling and frame generation runtimes, such as NVIDIA DLSS, AMD FidelityFX
+and Intel XeSS (see [LICENSE-EXCEPTION](LICENSE-EXCEPTION)). The third-party
+code in `third_party/` and `src/host/shaders/fsr1/` keeps its own licenses.
+The debug menu's glyphs (`plugins/debug_menu/font14.bin`) come from the X11
+fonts k14 and 7x14, which are in the public domain.
 
 Bloodborne is a trademark of Sony Interactive Entertainment. bbhost is not
 affiliated with or endorsed by Sony or FromSoftware, and contains none of the

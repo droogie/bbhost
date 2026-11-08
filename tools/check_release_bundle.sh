@@ -4,8 +4,9 @@
 # config showing the live server's settings, launchers that pass no config,
 # and the binaries' own first-start template naming the live server over
 # https. Each bundle carries the pinned DXC library beside its executable
-# with DXC's licences, and no DXIL validator (tools/fetch_dxc.sh). The
-# publish job runs it on what it is about to sign.
+# with DXC's licences, and no DXIL validator (tools/fetch_dxc.sh), and
+# bbhost's licence's additional permission (LICENSE-EXCEPTION). The publish
+# job runs it on what it is about to sign.
 #   tools/check_release_bundle.sh DIR     (dist/release)
 set -eu
 d=${1:?usage: tools/check_release_bundle.sh DIR}
@@ -53,6 +54,16 @@ while IFS= read -r exe; do
     done
 done < <(find "$work" -mindepth 3 -maxdepth 3 -type f \( -name bbhost.exe -o -name bbhost \))
 if find "$work" -iname 'dxil.dll' -o -iname 'libdxil.so*' | grep .; then fail "a bundle carries DXC's DXIL validator"; fi
+# bbhost's licence's additional permission (LICENSE-EXCEPTION: combining bbhost
+# with GPU vendors' upscaling and frame generation runtimes) beside each
+# executable, as the repository has it: LICENSE-EXCEPTION.txt on Windows.
+exception=$(dirname "$0")/../LICENSE-EXCEPTION
+while IFS= read -r exe; do
+    b=$(dirname "$exe")
+    case "$exe" in *.exe) f=$b/LICENSE-EXCEPTION.txt ;; *) f=$b/LICENSE-EXCEPTION ;; esac
+    [ -f "$f" ] || fail "${b#"$work"/}: no $(basename "$f") beside the executable"
+    cmp -s "$f" "$exception" || fail "${f#"$work"/}: not the repository's LICENSE-EXCEPTION"
+done < <(find "$work" -mindepth 3 -maxdepth 3 -type f \( -name bbhost.exe -o -name bbhost \))
 # The upscalers' runtime beside each Windows executable, the pinned files with
 # their licences (tools/fetch_upscalers.sh): without them a release has no FSR,
 # DLSS or frame generation.
