@@ -965,6 +965,7 @@ int main(int argc, char** argv) {
         }
     }
 #else
+    hle_kernel_reserve_guest_windows();  // before anything else can take those addresses (Vulkan's drivers, NGX)
     host_log("bbhost %s (%s, Linux x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
     log_cpu();
     std::signal(SIGTERM, on_term);

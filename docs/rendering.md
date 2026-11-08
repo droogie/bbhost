@@ -854,8 +854,8 @@ second row, pinned 4.95 GB). Where the rule does not hold - an integrated GPU,
 fewer threads, 60 fps and below, a card under 6,144 MiB free - the run commit
 stays on by Windows' default, as before. The homes are made as
 their buffers are, so the choice is made once, with the device at start: a
-frame rate changed in play (it changes at once between the rates above 30)
-leaves the choice as it was until the next start. Off, one line says why (`gxvk homes: off by
+frame rate changed in play (it changes at once, 30 included) leaves the
+choice as it was until the next start. Off, one line says why (`gxvk homes: off by
 default here (...)`); on, the homes' line says what decided it, and on
 Windows the run commit's line (`list-resolve: run commit ...`) says whether
 it gave way. `BBHOST_GXVK_HOMES=1` turns the homes on anywhere they can be

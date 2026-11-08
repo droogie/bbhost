@@ -496,8 +496,11 @@ Player* ensure_buffers(std::unique_lock<std::mutex>& lk, std::uintptr_t h, Playe
     }
     p->video_buffers = std::move(video);
     p->audio_buffers = std::move(audio);
-    host_log("avplayer: %ux%u pitch %u, %u fps, %u Hz audio, %zu video buffers from the game's allocator", p->width, p->height,
-             p->pitch, p->framerate, p->audio_rate, p->video_buffers.size());
+    // Without audio buffers no audio is delivered, the audio queue fills and
+    // the decoder stops: the picture freezes. Said here, by the movie.
+    host_log("avplayer: %ux%u pitch %u, %u fps, %u Hz audio, %zu video and %zu of 4 audio buffers from the game's allocator%s",
+             p->width, p->height, p->pitch, p->framerate, p->audio_rate, p->video_buffers.size(), p->audio_buffers.size(),
+             p->audio_buffers.empty() && p->audio_sel >= 0 ? " - no audio buffer: the movie stops when its audio queue is full" : "");
 #else
     (void)lk;
     (void)h;

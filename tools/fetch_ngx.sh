@@ -24,7 +24,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 TAG=v310.9.16
-URL=https://github.com/NVIDIA/DLSS/raw/$TAG
+REPO=NVIDIA/DLSS
 RUNTIME=libnvidia-ngx-dlss.so.310.9.16
 
 headers="nvsdk_ngx_defs.h nvsdk_ngx_defs_vk.h nvsdk_ngx_params.h nvsdk_ngx_vk.h nvsdk_ngx_helpers_vk.h"
@@ -63,16 +63,27 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 
 cache=${NGX_CACHE:-build/ngx}
 mkdir -p "$cache"
+# One file of NVIDIA's repository: from raw.githubusercontent.com, where
+# github.com's /raw/ address redirects, then from github.com itself (on
+# 2026-11-08 github.com answered 504 for these files while
+# raw.githubusercontent.com served them). The pin checks either.
+download() {  # PATH OUT
+    local url
+    for url in "https://raw.githubusercontent.com/$REPO/$TAG/$1" "https://github.com/$REPO/raw/$TAG/$1"; do
+        echo "fetch_ngx: $url"
+        curl -sSL --fail --retry 2 --connect-timeout 15 -m 900 -o "$2" "$url" && return 0
+    done
+    rm -f "$2"
+    return 1
+}
 # One file into the cache, checked against its pin (a kept one too).
 get() {
-    local f=$1 want kept url got
+    local f=$1 want kept got
     want=$(pin "$f")
     kept=$cache/$f
     if [ -f "$kept" ] && [ "$(sha "$kept")" = "$want" ]; then return 0; fi
     rm -f "$kept"
-    url=$URL/$(where "$f")
-    echo "fetch_ngx: $url"
-    curl -sSL --fail --retry 2 --connect-timeout 15 -m 900 -o "$kept.part" "$url" || { rm -f "$kept.part"; fail "download failed: $url"; }
+    download "$(where "$f")" "$kept.part" || fail "download failed: $REPO $TAG $(where "$f")"
     got=$(sha "$kept.part")
     if [ "$got" != "$want" ]; then
         rm -f "$kept.part"

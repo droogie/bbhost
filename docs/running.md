@@ -525,11 +525,11 @@ unless you need it - it may do the same
 way each swapchain was made: `exclusive fullscreen disallowed (Stay
 borderless)`, or `the driver decides on exclusive fullscreen`.
 
-The frame rate is the game's own speed, chosen when it starts (a change
-applies on the next run): 30 is the game as it shipped; 60, 90, 120, 150, 180,
-240, 360, 480 and 960 run its logic at that rate; Display-Limited is the
-display's refresh rate when the game starts, to the nearest whole frame a
-second (59.94 Hz runs 60), run as that rate - its target, its steps, its code
+The frame rate is the game's own speed, and a change applies at once, while
+the game runs: 30 is the game as it shipped; 60, 90, 120, 150, 180, 240, 360,
+480 and 960 run its logic at that rate; Display-Limited is the display's
+refresh rate when the game starts or when it is chosen, to the nearest whole
+frame a second (59.94 Hz runs 60), run as that rate - its target, its steps, its code
 immediates and frame counts, 1/180 s each on a 180 Hz display, V-Sync on or
 off - and 60 when no display says a rate (headless). What counts frames cannot
 follow the frame's time, so a rate that moved with it (the Uncapped of earlier
@@ -717,7 +717,7 @@ anti-aliasing:
 
 | Choice | Where it runs |
 |---|---|
-| TAA | bbhost's own temporal anti-aliasing: any GPU, Windows and Linux, the 3D at the Resolution |
+| TAA | bbhost's own temporal anti-aliasing: any GPU, Windows and Linux, the 3D at the Resolution - one below the window keeps the game and its HUD at the window's size, as DLSS and FSR do |
 | DLSS | NVIDIA RTX cards, on Windows and on Linux: DLAA, Quality, Balanced or Performance (the 3D at the full Resolution, two thirds, about 59% or half each way) and its model (DLSS preset K, J, L or M) |
 | FSR 3, FSR 4 | AMD FidelityFX, on Windows: FSR 4 where the GPU and driver run it, FSR 3 on any GPU |
 

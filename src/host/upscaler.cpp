@@ -57,6 +57,7 @@ constexpr float kTaaMipBias = 0.0f;
 
 #include <algorithm>
 #include <cmath>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
