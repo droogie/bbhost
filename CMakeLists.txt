@@ -847,6 +847,10 @@ if(UNIX)
   add_executable(memory_policy_test tests/memory_policy_test.cpp)
   target_include_directories(memory_policy_test PRIVATE src)
   add_test(NAME memory_policy_test COMMAND memory_policy_test)
+  # Where a direct mapping goes when the kernel chooses its address: the view's blocks, the offset kept, the alignment.
+  add_executable(dmem_place_test tests/dmem_place_test.cpp)
+  target_include_directories(dmem_place_test PRIVATE src)
+  add_test(NAME dmem_place_test COMMAND dmem_place_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)
