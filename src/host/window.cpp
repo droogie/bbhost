@@ -1588,8 +1588,9 @@ void update_pad() {
         // The sixteen buttons, the triggers past a quarter of their travel, each
         // giving in play the press it is bound to (host/bindings.h host_pad_*):
         // a rebound one's play press goes to play_buttons, which a menu takes
-        // out again, and its own to menu_buttons, which a menu puts in, so in
-        // a menu every button is itself.
+        // out again, and its menu press to menu_buttons, which a menu puts in,
+        // so in a menu every button is itself - but for the menu's OK and
+        // Back, which follow Interact and Dodge (host_pad_menu_bit).
         bool held[kPadInputs] = {};
         for (int i = 0; i < kPadInputs; ++i) {
             const SDL_GamepadButton b = pad_sdl_button(i);
@@ -1615,11 +1616,11 @@ void update_pad() {
         held[kPadR2] = rt > 8000;
         for (int i = 0; i < kPadInputs; ++i) {
             if (!held[i]) continue;
-            const std::uint32_t play = host_pad_play_bit(i), own = host_pad_input_bit(i);
+            const std::uint32_t play = host_pad_play_bit(i), menu = host_pad_menu_bit(i);
             p.buttons |= play;
-            if (play != own) {
+            if (play != menu) {
                 p.play_buttons |= play;
-                p.menu_buttons |= own;
+                p.menu_buttons |= menu;
             }
             // A button bound to L2 or R2 pulls that trigger all the way.
             if (play == kL2 && i != kPadL2) p.l2 = 255;
@@ -2243,12 +2244,13 @@ bool host_window_pump() {
                 // deciding which button is which: a player with only a
                 // controller in hand is never left in a box that only a
                 // keyboard can close. A press, so the button that opened the
-                // box - still held when it appears - does not close it.
+                // box - still held when it appears - does not close it. The
+                // buttons are the menu's, which follow Interact and Dodge
+                // (host_pad_menu_bit).
                 std::lock_guard<std::mutex> lock(g_text_mu);
                 if (!g_text_on || ingame_menu_open()) break;
-                const std::uint32_t bit = e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH  ? kCross
-                                          : e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST ? kCircle
-                                                                                         : 0u;
+                const int input = host_pad_input_of_event(e);
+                const std::uint32_t bit = input >= 0 ? host_pad_menu_bit(input) : 0u;
                 if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START || (bit && bit == menu_confirm_button())) {
                     g_text_result = 1;
                 } else if (bit && bit == menu_back_button()) {
@@ -2587,6 +2589,18 @@ bool host_window_pump() {
             if (host_input_device() == InputDevice::Pad) {
                 help = menu_confirm_button() == kCross ? "Cross / A accepts    Circle / B cancels    Type on a keyboard"
                                                        : "Circle / B accepts    Cross / A cancels    Type on a keyboard";
+                // Interact or Dodge moved: the buttons they are on now.
+                int ok = -1, back = -1;
+                for (int i = 0; i < kPadInputs; ++i) {
+                    if (host_pad_menu_bit(i) == menu_confirm_button()) ok = i;
+                    if (host_pad_menu_bit(i) == menu_back_button()) back = i;
+                }
+                if (host_pad_input_bit(ok) != menu_confirm_button() || host_pad_input_bit(back) != menu_back_button()) {
+                    static char moved[96];
+                    std::snprintf(moved, sizeof moved, "%s accepts    %s cancels    Type on a keyboard",
+                                  host_pad_input_name(ok), host_pad_input_name(back));
+                    help = moved;
+                }
             }
             host_overlay_text(bx + 20.0f, by + bh - 30.0f, 0.62f, 0x9a9a9aff, help);
         }
