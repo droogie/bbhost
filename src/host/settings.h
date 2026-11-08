@@ -60,6 +60,8 @@ struct HostSettings {
     // plugged in, 1 always the bound key, 2 always the pad's glyph
     // (engine/key_prompts.h).
     int button_prompts = 0;
+    // 0 Auto, 1 Xbox, 2 the game's own; read at start (engine/prompt_glyphs.h).
+    int controller_prompts = 0;
     // The controller sticks' deadzones, left then right (host/window.cpp
     // stick_deadzone): inside `inner` of the full travel the stick is at
     // rest, from `outer` out it is pushed all the way.
