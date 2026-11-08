@@ -140,10 +140,11 @@ int main() {
     // 3. Every PC row's line help fits the help line, which shows one line
     // and cuts it off past the dialog (about 130 characters of its font; the
     // Resolution row's 198 and Frame Rate's 175 were cut): 96 at most. The
-    // System list's rows (110006..110013) and the port's sections (116000 on).
+    // System list's rows (110006..110013) and the port's sections (116000 to
+    // PC Upscaling's 125999).
     int helps = 0;
     for (const auto& [id, row] : rows) {
-        const bool pc_row = (id >= 110006 && id <= 110013) || (id >= 116000 && id < 125000);
+        const bool pc_row = (id >= 110006 && id <= 110013) || (id >= 116000 && id < 126000);
         if (!pc_row || row.help.empty()) continue;
         ++helps;
         if (row.help.size() > 96) {
