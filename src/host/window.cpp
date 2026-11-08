@@ -3253,6 +3253,23 @@ void host_window_on_pixels(void (*fn)(int, int)) {
     if (fn && host_window_pixels(&w, &h)) fn(w, h);
 }
 
+bool host_window_desktop_size(int* w, int* h) {
+#if defined(BBHOST_HAVE_SDL3)
+    if (!g_window_made.load() || !g_window) return false;
+    const SDL_DisplayID d = SDL_GetDisplayForWindow(g_window);
+    const SDL_DisplayMode* m = d ? SDL_GetDesktopDisplayMode(d) : nullptr;
+    if (!m || m->w <= 0 || m->h <= 0) return false;
+    const float k = m->pixel_density > 0.0f ? m->pixel_density : 1.0f;
+    *w = static_cast<int>(static_cast<float>(m->w) * k + 0.5f);
+    *h = static_cast<int>(static_cast<float>(m->h) * k + 0.5f);
+    return true;
+#else
+    (void)w;
+    (void)h;
+    return false;
+#endif
+}
+
 bool host_window_pixels(int* w, int* h) {
     const std::uint64_t v = g_window_pixels.load(std::memory_order_relaxed);
     if (!v) return false;

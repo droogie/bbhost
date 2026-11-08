@@ -1230,6 +1230,14 @@ void apply(int id) {
             }
             if (was[id] >= 0 && was[id] != s.index && live_resolution_available()) targets_follow_settings(s.label, id == kSsr && s.index == 1);
             was[id] = s.index;
+            // An upscaler chosen or not moves the game's size (the window's
+            // with one and a smaller Resolution): Fullscreen's display mode
+            // follows it, as it follows the Resolution - chosen in the setup
+            // window, it stayed the Resolution's.
+            if (id == kUpscaler && g_set[kWindowMode].index == 2) {
+                unsigned w = 0, h = 0;
+                if (output_of(&w, &h)) host_window_set_mode(2, static_cast<int>(w), static_cast<int>(h));
+            }
             break;
         }
         case kFrameCap:
@@ -1821,6 +1829,11 @@ void host_options_load() {
     if (const char* e = std::getenv("BBHOST_MOUSE_CURSOR"); e && e[0]) {
         g_set[kDrawCursor].index = e[0] == '0' ? 0 : 1;
     }
+    // Published before they are applied: the applies read them (Window mode's
+    // the upscaler's, through the game's size - read from the defaults it gave
+    // Fullscreen the Resolution's display mode while the game was the screen's
+    // size).
+    rebuild_settings();
     host_options_apply();
     rebuild_settings();
 }
@@ -2620,11 +2633,14 @@ void output_for(int* w, int* h) {
     if (g_set[kWindowMode].index == 0) {
         ww = config().width;
         wh = config().height;
-    } else if (!host_desktop_primary_size(&ww, &wh)) {
-        // The screen the window fills - not the largest width and height of
-        // all displays: with a second display of another shape (a portrait
-        // one beside a 2560x1440, 2560x1920) the game was made that shape and
-        // shown with bars at the sides, its UI shrunk.
+    } else if (!host_window_desktop_size(&ww, &wh) && !host_desktop_primary_size(&ww, &wh)) {
+        // The screen the window fills: once the window is made, its display's
+        // desktop mode (not Fullscreen's exclusive mode while it is up);
+        // before that the primary display's, where the window opens. Not the
+        // largest width and height of all displays: with a second display of
+        // another shape (a portrait one beside a 2560x1440, 2560x1920) the
+        // game was made that shape and shown with bars at the sides, its UI
+        // shrunk.
         return;
     }
     if (ww <= 0 || wh <= 0) return;

@@ -223,6 +223,10 @@ void host_window_set_vsync(bool on);
 // The presented image's size in pixels (the swapchain: the window, or the
 // display in fullscreen); false before there is one (headless). Any thread.
 bool host_window_pixels(int* w, int* h);
+// The desktop mode of the display the window is on, in pixels - the desktop's
+// own, unchanged by Fullscreen's exclusive mode while it is up - for the game's
+// size with an upscaler (host/options.cpp). False before the window is made.
+bool host_window_desktop_size(int* w, int* h);
 // `fn` is told the window's pixel size now (if there is a window) and each
 // time it changes - a resize, a fullscreen toggle, a display change - on the
 // window's thread. One listener (the light grid, engine/graphics_patch.cpp).
