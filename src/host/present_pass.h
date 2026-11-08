@@ -11,7 +11,8 @@
 // the whole image when there are bars, the blit, and - with anything on the
 // overlay - a second layout change and a second rendering that loaded the
 // image the blit had just stored. Now: one layout change in, one rendering,
-// one out. A magnified picture (FSR 1, host/fsr.cpp) keeps its compute passes.
+// one out. A magnified picture keeps the blit (or FSR 1's compute passes, host/fsr.cpp, when
+// BBHOST_UPSCALE=fsr1 asks for them).
 
 #include <vulkan/vulkan.h>
 

@@ -392,8 +392,8 @@ path at all:
   mapping): every stage's resources and constants are built by bbhost.
 - Scaleform, the menu renderer: its draws are taken from its hardware
   abstraction layer.
-- Depth snapshots, the on-screen overlay and FSR 1 upscaling are bbhost's
-  own.
+- Depth snapshots, the on-screen overlay and FSR 1 upscaling (only with
+  BBHOST_UPSCALE=fsr1) are bbhost's own.
 
 ## Native or emulated
 

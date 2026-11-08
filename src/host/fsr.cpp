@@ -1,13 +1,15 @@
-// The presenter's upscale when the game renders smaller than the window: AMD
-// FidelityFX Super Resolution 1 (shaders/fsr1/, MIT) - EASU, an
-// edge-adaptive upsampling of the display buffer's rendered area, then RCAS,
-// a contrast-adaptive sharpening of the result - in place of a bilinear blit.
-// A Steam Deck holds 60 fps rendering at 960x600 (the GPU is pixel-bound at
-// 1280x800, ~45 fps), and stretched bilinearly that looks soft on its own
-// screen. Two compute passes, the second into the swapchain image itself when
-// it takes storage writes (window.cpp asks for that where the surface allows),
-// else into an image of the output size and a 1:1 blit from it (BBHOST_FSR_DIRECT=0
-// always does that). BBHOST_UPSCALE=linear keeps the bilinear blit.
+// The presenter's upscale when the game renders smaller than the window, on
+// request only (BBHOST_UPSCALE=fsr1): AMD FidelityFX Super Resolution 1
+// (shaders/fsr1/, MIT) - EASU, an edge-adaptive upsampling of the display
+// buffer's rendered area, then RCAS, a contrast-adaptive sharpening of the
+// result - in place of a bilinear blit. It was on for every such picture (a
+// Resolution below the window with Upscaling off, the Steam Deck's 960x600, a
+// plugin's smaller 3D), sharpening what the player had not asked to change;
+// Upscaling (TAA, FSR 3/4, DLSS) is the setting for that now, and the picture
+// is stretched as it is. Two compute passes, the second into the swapchain
+// image itself when it takes storage writes (window.cpp asks for that where
+// the surface allows), else into an image of the output size and a 1:1 blit
+// from it (BBHOST_FSR_DIRECT=0 always does that).
 #include "host/gpu_internal.h"
 #include "host/shaders/fsr_easu.spv.h"
 #include "host/shaders/fsr_easu_h.spv.h"
@@ -73,7 +75,7 @@ struct Fsr {
 
 const bool g_wanted = [] {
     const char* e = std::getenv("BBHOST_UPSCALE");
-    return !(e && std::strcmp(e, "linear") == 0);
+    return e && std::strcmp(e, "fsr1") == 0;
 }();
 
 VkPipeline make_pipeline(const std::uint32_t* code, std::size_t bytes) {

@@ -536,7 +536,7 @@ Setting g_set[kSettingCount] = {
     // a taller one), the HUD at 16:9 in the middle, the plates and the lock-on
     // where the camera puts them. 960x600 and 1024x640 are the Deck's screen at
     // 75% and 80%: it holds 60 fps there (pixel-bound at 1280x800, ~45), and
-    // the presenter upscales by FSR 1. The largest want a GPU to match - or
+    // the presenter stretches the picture to the screen. The largest want a GPU to match - or
     // Upscaling below Native AA, which draws the 3D at a fraction of them.
     {"resolution", "Resolution", {"640x360", "960x540", "1280x720", "1366x768", "1440x810", "1600x900", "1920x1080", "2560x1440",
                                   "2880x1620", "3200x1800", "3840x2160", "5120x2880", "7680x4320", "960x600", "1024x640",

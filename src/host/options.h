@@ -148,7 +148,7 @@ void host_options_save_now();
 // so instead.
 bool host_steam_deck();
 // Its two configurations as one choice: 0 is 30 fps at the screen's own
-// 1280x800, 1 is 60 fps rendering at 960x600 (upscaled by FSR 1) with Model
+// 1280x800, 1 is 60 fps rendering at 960x600 (stretched to the screen) with Model
 // detail Low, which holds the heaviest views at 60. Read from the frame cap:
 // 60 or more, or none, is 1. Setting one
 // sets the frame cap, the resolution and the model detail together - the
