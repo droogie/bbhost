@@ -26502,13 +26502,16 @@ static bool draw_impl(const GpuDraw& d) {
     // drawn into the display buffer: a rect pass copies a target of the same
     // size into it (89cda9e4+38d65b32, with a table), and the HUD is drawn
     // into that target first. So the target is learned from that pass, copied
-    // before its first triangle-list draw (the HUD's) once the post chain's
-    // last passes have written it, and the copy handed over with the display
-    // buffer the pass then writes. A plugin's dither (scene_dither) goes over
-    // the target at the same point, before the copy.
+    // before its first triangle-list draw (the HUD's) once the frame's picture
+    // is in it, and the copy handed over with the display buffer the pass then
+    // writes. A plugin's dither (scene_dither) goes over the target at the
+    // same point, before the copy.
     const std::uint32_t dither = scene_look_dither();
     if ((upscale_pass_hudless_due_locked() || dither) && s.color[0]) {
         static std::uint64_t hud_target = 0;
+        // The target's last write (RtImage::last_write) as the display
+        // buffer's pass read it: a write since is the next frame's.
+        static std::uint64_t shown_write = 0;
         static bool target_written = false, hud_begun = false;
         const std::uint64_t dst = s.color[0]->base;
         if (hle_video_is_display_buffer(dst)) {
@@ -26519,6 +26522,7 @@ static bool draw_impl(const GpuDraw& d) {
                     if (t && t->width == s.color[0]->width && t->height == s.color[0]->height) {
                         if (hud_target != t->base) host_log("framegen: the HUD's target is 0x%llx", static_cast<unsigned long long>(t->base));
                         hud_target = t->base;
+                        shown_write = t->last_write;
                         break;
                     }
                 }
@@ -26527,11 +26531,17 @@ static bool draw_impl(const GpuDraw& d) {
             target_written = false;
             hud_begun = false;
         } else if (dst == hud_target) {
-            // The post chain's last passes write it as strips (prim 6) or
-            // rects; the HUD's first draw is a triangle list (prim 4).
-            if (s.prim != 4) {
-                target_written = true;
-            } else if (target_written && !hud_begun) {
+            // At the display buffers' size the post chain's last passes write
+            // it, as strips (prim 6) or rects; the HUD's first draw is a
+            // triangle list (prim 4). At another size - a Resolution other
+            // than the screen's with Upscaling off or TAA, the scene in a
+            // target of its own (engine/live_resolution.cpp) - the post chain
+            // ends in that target and the picture comes into this one by a
+            // copy, which no draw here sees: only the HUD's triangles were,
+            // so no HUD-less picture was ever taken and frame generation never
+            // generated. So any write since the display buffer's pass counts.
+            if (s.prim != 4 || s.color[0]->last_write != shown_write) target_written = true;
+            if (s.prim == 4 && target_written && !hud_begun) {
                 if (part) {
                     run_part_stop(kRunStopOrder);
                     return false;
