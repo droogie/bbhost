@@ -749,11 +749,17 @@ const Choice kUpscalers[] = {{0, 125032}, {1, 125040}, {2, 125033}, {3, 125034},
 const Choice kUpscaleQualities[] = {{0, 125036}, {1, 125037}, {2, 125038}, {3, 125039}};  // Performance .. Native AA
 std::int32_t g_up_scaler = 0, g_up_scaler_last = -1;
 std::int32_t g_up_quality = 2, g_up_quality_last = -1;
+// The rows pc_upscale_handler builds: as many as the section's slots
+// (engine/menu_assets.h kPcUpscaleSlots), which the generator makes.
 #if defined(_WIN32)
 constexpr int kUpscaleRows = 6;
 #else
-constexpr int kUpscaleRows = 5;  // no Frame generation: the five rows the section's movie has (engine/menu_assets.cpp)
+constexpr int kUpscaleRows = 5;  // no Frame generation
 #endif
+// Six rows in five slots (Windows, until the section had six) drew Upscaling
+// Quality in the Defaults label's place, with no value and no list to open,
+// and left the Defaults row out.
+static_assert(kUpscaleRows == kPcUpscaleSlots, "PC Upscaling's rows and the PCUpscale section's slots differ (engine/menu_assets.h)");
 
 
 void seed_camera_tuning() {
@@ -1021,7 +1027,7 @@ GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
     add_list_row(dialog, &g_up_quality, kUpQuality, kUpscaleQualities,
                  static_cast<int>(sizeof(kUpscaleQualities) / sizeof(kUpscaleQualities[0])),
                  std::max(0, host_opt_default_index("upscale_quality")));
-    log_rows("PCUpscale", dialog, kUpscaleRows, kUpscaleRows);
+    log_rows("PCUpscale", dialog, kUpscaleRows, kPcUpscaleSlots);
 }
 
 // PC Controls: the mouse camera, how fast it turns and which way, and the

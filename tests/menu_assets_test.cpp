@@ -85,6 +85,9 @@ int main() {
     // the label.
     CHECK(section_rows(movie, "PCSetting") == items(kPcSettingSlots + 1));
     CHECK(section_rows(movie, "PCEffects") == items(7));
+    // PC Upscaling: a slot for each of its rows - six on Windows, five
+    // elsewhere (no Frame generation) - and the label.
+    CHECK(section_rows(movie, "PCUpscale") == items(kPcUpscaleSlots + 1));
     // PC Enhancements: a row for each of its toggles (engine/option_menu.cpp's
     // g_enhance) and the Defaults label.
     CHECK(section_rows(movie, "PCEnhance") == items(7));
