@@ -173,7 +173,14 @@ std::uint32_t value_of(Value v, const RenderScale& rs) {
     }
 }
 
+// TAA chosen (BBHOST_UPSCALE=taa, else Upscaling's 4): no quality of its own.
+bool taa_asked() {
+    if (const char* e = std::getenv("BBHOST_UPSCALE"); e && *e) return std::strcmp(e, "taa") == 0;
+    return host_settings_ref().upscaler == 4;
+}
+
 int quality_asked() {
+    if (taa_asked()) return 0;  // its 3D is the Resolution's size
     if (const char* e = std::getenv("BBHOST_UPSCALE_QUALITY"); e && *e) {
         const std::string v = e;
         if (v == "native") return 0;
@@ -187,10 +194,9 @@ int quality_asked() {
 
 bool upscaler_asked() {
     if (const char* e = std::getenv("BBHOST_UPSCALE"); e && *e)
-        return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0;
-    // (TAA, 4, keeps the 3D at the Resolution.)
-    const int u = host_settings_ref().upscaler;
-    return u != 0 && u != 4;
+        return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0 || std::strcmp(e, "taa") == 0;
+    // (TAA, 4, at the Resolution's size below the window: quality_asked.)
+    return host_settings_ref().upscaler != 0;
 }
 
 ElfImage* g_image = nullptr;
@@ -468,9 +474,14 @@ void settings_changed(const HostSettings& s) {
         runs = upscaler_method_scales(upscaler_method());
     } else {
         const UpscalerCaps caps = upscaler_caps();
-        runs = s.upscaler == 1 ? caps.dlss : s.upscaler == 2 || s.upscaler == 3 ? caps.fsr : false;  // (4, TAA: the Resolution's size)
+        runs = s.upscaler == 1   ? caps.dlss
+               : s.upscaler == 2 || s.upscaler == 3 ? caps.fsr
+               : s.upscaler == 4 ? upscaler_method() == kUpscaleTaa  // (no BBsuite beside it)
+                                 : false;
     }
-    const int quality = std::getenv("BBHOST_UPSCALE_QUALITY") ? now.quality : std::clamp(s.upscale_quality, 0, 3);
+    const int quality = s.upscaler == 4                     ? 0  // TAA: the Resolution's size
+                        : std::getenv("BBHOST_UPSCALE_QUALITY") ? now.quality
+                                                            : std::clamp(s.upscale_quality, 0, 3);
     // The upscaler on or off moves the game's own size too (host_opt_output_size:
     // the window's with one and a smaller Resolution, the Resolution without).
     int ow = 0, oh = 0;
