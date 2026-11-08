@@ -2,7 +2,7 @@
 # game's own 30 fps.
 #
 # Leave this file as it is. The game's paths are not set here: they live in
-# your per-user config (~/.config/bbhost/bbhost.toml), which the first start
+# your per-user config (~/.local/share/bbhost/bbhost.toml), which the first start
 # writes (the setup window asks for them) and every copy of bbhost reads - see
 # STEAMDECK.md. This file only sets what suits the Deck. The F10 screen and
 # the game's PC Graphics menu still change any of it; those changes (and the

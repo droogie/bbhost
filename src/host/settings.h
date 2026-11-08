@@ -21,6 +21,9 @@ struct HostSettings {
 
     // Display
     bool fullscreen = false;
+    // Stay borderless (Windows): Borderless is never made exclusive by the
+    // driver (host/window.cpp); elsewhere it does nothing.
+    bool stay_borderless = false;
     bool vsync = true;
     int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 10 to 960; 0 is Display-Limited (the display's rate)
     // The Native frame clock (experimental, off): read once as the game starts
@@ -135,6 +138,8 @@ struct HostSettings {
     bool rebirth = true;
     bool five_players = true;
     bool skill_issue = false;
+    bool full_phantom_hp = true;
+    bool auto_replenish = true;
 };
 
 // A copy of the current settings (no lock: the snapshot published last).

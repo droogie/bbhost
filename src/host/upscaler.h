@@ -5,12 +5,13 @@
 // build. The bridge holds the calls into NVIDIA's and AMD's code; the files
 // those come in (nvngx_dlss.dll, amd_fidelityfx_loader_vk.dll,
 // amd_fidelityfx_upscaler_vk.dll) sit beside it, and a missing one only turns
-// its method off. On Linux the same through upscaler_bridge.so (the bridge's
-// source in third_party/upscaler_bridge/src, built by
-// tools/build_upscaler_bridge_linux.sh), with libnvidia-ngx-dlss.so.<version>
-// for DLSS and libamd_fidelityfx_vk.so (FSR 3 from AMD's MIT source; FSR 4 is
-// Windows only) beside it. Elsewhere every call is a no-op and nothing is
-// available.
+// its method off. On Linux the same calls go to bbhost's NGX bridge
+// (src/ngx_bridge, MIT: the same C API, DLSS through NVIDIA's NGX, FSR not
+// there), libbbhost_ngx_bridge.so beside the executable, with NVIDIA's
+// libnvidia-ngx-dlss.so.<version> beside it - or to the upscaler bridge's own
+// source built for Linux, upscaler_bridge.so, or Numity1504's own Linux bridge,
+// libupscaler_bridge.so, should one be put there (either wins over the NGX
+// bridge). Elsewhere every call is a no-op and nothing is available.
 //
 // The order (host/gpu.cpp init_locked, for the real instance and device only -
 // never the throwaway probe instances): upscaler_open before Vulkan, then
@@ -56,6 +57,13 @@ UpscalerCaps upscaler_caps();
 // host/upscale_pass.cpp, any GPU, no bridge) - and only one that can run here.
 int upscaler_method();
 constexpr int kUpscaleTaa = 3;
+// Whether the Upscaling list offers a choice, by the menu's order (0 Off,
+// 1 TAA, 2 FSR 3, 3 FSR 4, 4 DLSS): on Windows each of them (one this machine
+// cannot run says why when chosen); on Linux Off, TAA and DLSS where it can run
+// - the device's answer, or before the device (the setup window) a bridge
+// beside bbhost - and never FSR. The menus show the choice a setting holds
+// whatever this says.
+bool upscaler_offered(int index);
 // Whether a method draws the 3D smaller and brings it back (DLSS, FSR, TAA):
 // with one, the game and its HUD are the window's size and the 3D the
 // Resolution's below it. TAA has no quality of its own - its 3D is the

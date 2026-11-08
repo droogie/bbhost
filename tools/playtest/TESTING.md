@@ -39,8 +39,9 @@ point.
 3. That's it. To change these later, start bbhost with `--setup` (Windows:
    `run-bbhost.bat --setup`), or turn on *Show this window at every start*
    (its Settings page). The settings are kept in your **per-user config**
-   (`%APPDATA%\bbhost\bbhost.toml` on Windows, `~/.config/bbhost/bbhost.toml`
-   on Linux), which you can also edit by hand.
+   (`%APPDATA%\bbhost\bbhost.toml` on Windows,
+   `~/.local/share/bbhost/bbhost.toml` on Linux), which you can also edit by
+   hand.
 
 You do this **once**: every copy of bbhost reads that file, so a new kit or a
 new download needs nothing set again. Your F10 settings

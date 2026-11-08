@@ -15,6 +15,7 @@
 #include "hle/modules.h"
 #include "host/bindings.h"
 #include "host/options.h"
+#include "host/upscaler.h"
 #include "log.h"
 
 #include <algorithm>
@@ -153,9 +154,9 @@ const char kOurEffectsName[] = "PCEffects";
 const char kOurCameraName[] = "PCCamera";
 // The Steam Deck's frame rate and model detail - on a Deck only (host_steam_deck).
 const char kOurDeckName[] = "PCDeck";
-// The PC enhancements: the port's additions to the game itself - The Old
-// Hunters, the mirror, the rebirth, five players. Each is read once at start,
-// which its line help says.
+// The PC enhancements: the port's additions to the game itself - the mirror,
+// the rebirth, five players, SKILL ISSUE, Full Phantom HP, Auto-Replenish
+// Items. Each is read once at start, which its line help says.
 const char kOurEnhanceName[] = "PCEnhance";
 // The upscaler and what goes with it - Upscaling, its quality, Sharpness, Frame
 // generation, Reflection quality: the launcher's and F10's Graphics rows that
@@ -232,9 +233,10 @@ constexpr std::uint32_t kSystemUpscaleRowId = 110014;
 // (125036..125039).
 constexpr std::uint32_t kUpFrameGen = 125000, kUpSharpness = 125001, kUpReflection = 125002, kUpScaler = 125003,
                         kUpQuality = 125004, kUpTaaStrength = 125005;
-// PC Enhancements, 124000: four toggles, each for the next start (124000
+// PC Enhancements, 124000: six toggles, each for the next start (124000
 // was The Old Hunters, part of bbhost since: engine/patch_manifest.cpp).
 constexpr std::uint32_t kEnhMirror = 124001, kEnhRebirth = 124002, kEnhFivePlayers = 124003, kEnhSkillIssue = 124004;
+constexpr std::uint32_t kEnhFullPhantomHp = 124005, kEnhAutoReplenish = 124006;
 // Steam Deck, 123000: its frame rate - the two configurations,
 // host_set_deck_profile - and the model detail.
 constexpr std::uint32_t kDeckFrameRate = 123000, kDeckModelDetail = 123001;
@@ -510,10 +512,18 @@ struct Toggle {
     bool invert = false;
 };
 // PC Settings. The two pointer rows it had moved to PC Controls, beside the
-// rest of the mouse.
+// rest of the mouse. On Windows five toggles and the Texture Quality and frame
+// rate pick lists fill the section's seven slots, elsewhere four and the lists
+// its six (engine/menu_assets.h kPcSettingSlots).
 Toggle g_toggles[] = {
     {"vsync", 116000, 1, 0xff},
     {"window_mode", 116001, 0, 0xff},
+#if defined(_WIN32)
+    // Stay Borderless: Borderless never made exclusive by the driver
+    // (host/window.cpp). It does nothing elsewhere, so it has a row on Windows
+    // alone.
+    {"stay_borderless", 116009, 0, 0xff},
+#endif
     {"skip_logos", 116004, 0, 0xff},
     // The frames per second the presenter counts (host/window.cpp).
     {"fps_counter", 116007, 0, 0xff},
@@ -707,21 +717,25 @@ std::uint64_t g_deck_vtable = 0;
 std::atomic<bool> g_deck_redraw{false};  // the model detail row shows a value the frame rate set
 constexpr int kDeckRows = 2;
 
-// PC Enhancements: four toggles, read at the next start (main.cpp,
-// config_set_enhancements), so a change here shows at once and applies then.
+// PC Enhancements: six toggles, as many as the section has slots, read at the
+// next start (main.cpp, config_set_enhancements), so a change here shows at
+// once and applies then.
 Toggle g_enhance[] = {
     {"change_appearance", kEnhMirror, 1, 0xff},
     {"rebirth", kEnhRebirth, 1, 0xff},
     {"five_players", kEnhFivePlayers, 1, 0xff},
     {"skill_issue", kEnhSkillIssue, 1, 0xff},
+    {"full_phantom_hp", kEnhFullPhantomHp, 1, 0xff},
+    {"auto_replenish", kEnhAutoReplenish, 1, 0xff},
 };
 constexpr int kEnhanceRows = static_cast<int>(sizeof(g_enhance) / sizeof(g_enhance[0]));
 
 // PC Upscaling: the settings by their index, as F10 and the setup window keep
 // them (host/options.cpp) - one setting, one order, three front ends. Frame
-// generation a toggle, Sharpness a slider (its 0-100% in tenths), Reflection
-// quality a left/right pair, and the two lists last: a pick list opens over
-// the rows under it (as PC Settings' two do).
+// generation a toggle (on Windows alone: AMD's FidelityFX, no row elsewhere),
+// Sharpness a slider (its 0-100% in tenths), Reflection quality a left/right
+// pair, and the two lists last: a pick list opens over the rows under it (as
+// PC Settings' two do).
 Toggle g_up_frame_gen{"frame_generation", kUpFrameGen, 0, 0xff};
 Slider g_up_sharpness{"sharpness", kUpSharpness, 0, 0xff};
 // TAA strength beside Sharpness: the section's lists have to come last, and it
@@ -735,7 +749,17 @@ const Choice kUpscalers[] = {{0, 125032}, {1, 125040}, {2, 125033}, {3, 125034},
 const Choice kUpscaleQualities[] = {{0, 125036}, {1, 125037}, {2, 125038}, {3, 125039}};  // Performance .. Native AA
 std::int32_t g_up_scaler = 0, g_up_scaler_last = -1;
 std::int32_t g_up_quality = 2, g_up_quality_last = -1;
+// The rows pc_upscale_handler builds: as many as the section's slots
+// (engine/menu_assets.h kPcUpscaleSlots), which the generator makes.
+#if defined(_WIN32)
 constexpr int kUpscaleRows = 6;
+#else
+constexpr int kUpscaleRows = 5;  // no Frame generation
+#endif
+// Six rows in five slots (Windows, until the section had six) drew Upscaling
+// Quality in the Defaults label's place, with no value and no list to open,
+// and left the Defaults row out.
+static_assert(kUpscaleRows == kPcUpscaleSlots, "PC Upscaling's rows and the PCUpscale section's slots differ (engine/menu_assets.h)");
 
 
 void seed_camera_tuning() {
@@ -799,7 +823,9 @@ void seed_upscale() {
 // PC Upscaling's rows that are not toggles or sliders: a change here goes to
 // the setting; a change made in F10 is taken up so the row shows it next time.
 void push_upscale() {
+#if defined(_WIN32)
     push(g_up_frame_gen);
+#endif
     push(g_up_sharpness);
     push(g_up_taa_strength);
     const auto pick = [](const char* key, std::int32_t& value, std::int32_t& last) {
@@ -845,11 +871,14 @@ constexpr int kSectionSlots = 6, kKeysSlots = 8;
 // PC Graphics has one slot more (its seventh row, HLSL Shaders): the generator
 // adds it as it adds Key Bindings' two, and moves the Defaults label below it.
 constexpr int kGraphicsSlots = 7;
+// PC Settings has one more too on Windows (Stay Borderless's, after
+// Texture Quality's list took the sixth): engine/menu_assets.h's
+// kPcSettingSlots, which the generator makes.
 
 // The port's rows: its toggles plus the Texture Quality and frame-cap pick
 // lists, and in the graphics section its toggles plus the resolution list.
 constexpr int kRowCount = kToggleCount + 2;
-static_assert(kRowCount <= kSectionSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
+static_assert(kRowCount <= kPcSettingSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
                   kCameraRows <= kSectionSlots && kDeckRows <= kSectionSlots && kEnhanceRows <= kSectionSlots &&
                   kEffectsRows <= kSectionSlots && kUpscaleRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
               "more rows than the section sprite has slots: the extra ones have nowhere to draw. "
@@ -920,7 +949,7 @@ GUEST_ABI void pc_section_handler(void* dialog, void* params) {
                  std::max(0, host_opt_default_index("texture_quality")));
     add_list_row(dialog, &g_frame_cap, kRowFrameCap, kFrameCaps,
                  static_cast<int>(sizeof(kFrameCaps) / sizeof(kFrameCaps[0])), host_opt_default_frame_cap());
-    log_rows("PCSetting", dialog, kRowCount, kRowCount);
+    log_rows("PCSetting", dialog, kRowCount, kPcSettingSlots);
 }
 
 // The graphics section's handler. Same shape as the one above: a scratch
@@ -973,25 +1002,32 @@ GUEST_ABI void pc_effects_handler(void* dialog, void* params) {
     log_rows("PCEffects", dialog, kEffectsRows, kEffectsRows);
 }
 
-// PC Upscaling: a toggle, two sliders and a pair, then Upscaling and its quality
-// as the two pick lists last (the quality's list opens over the Defaults
-// caption, Upscaling's over the quality's row - as PC Settings' two).
+// PC Upscaling: a toggle (Windows: Frame generation), two sliders and a pair,
+// then Upscaling and its quality as the two pick lists last (the quality's
+// list opens over the Defaults caption, Upscaling's over the quality's row -
+// as PC Settings' two).
 GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
     host_log("pc-options: PCUpscale opened, dialog=%p params=%p", dialog, params);
     alignas(16) std::uint8_t scratch[0x100]{};
     hle_call_guest<std::int64_t>(guest_fn(kScratchInit), &scratch);
     seed_upscale();
+#if defined(_WIN32)
     add_toggle_row(dialog, &g_up_frame_gen.value, g_up_frame_gen.id, default_of(g_up_frame_gen));
+#endif
     add_slider_row(dialog, &g_up_sharpness.value, g_up_sharpness.id, default_of(g_up_sharpness));
     add_slider_row(dialog, &g_up_taa_strength.value, g_up_taa_strength.id, default_of(g_up_taa_strength));
     add_pair_row(dialog, &g_up_reflection, kUpReflection, kReflectionQualities,
                  static_cast<std::uint8_t>(std::max(0, host_opt_default_index("ssr_quality")) == 1 ? 1 : 0));
-    add_list_row(dialog, &g_up_scaler, kUpScaler, kUpscalers, static_cast<int>(sizeof(kUpscalers) / sizeof(kUpscalers[0])),
-                 std::max(0, host_opt_default_index("upscaler")));
+    // The upscalers this platform offers, and the one chosen (host/upscaler.h upscaler_offered).
+    Choice upscalers[sizeof(kUpscalers) / sizeof(kUpscalers[0])];
+    int n_upscalers = 0;
+    for (const Choice& ch : kUpscalers)
+        if (ch.value == g_up_scaler || upscaler_offered(ch.value)) upscalers[n_upscalers++] = ch;
+    add_list_row(dialog, &g_up_scaler, kUpScaler, upscalers, n_upscalers, std::max(0, host_opt_default_index("upscaler")));
     add_list_row(dialog, &g_up_quality, kUpQuality, kUpscaleQualities,
                  static_cast<int>(sizeof(kUpscaleQualities) / sizeof(kUpscaleQualities[0])),
                  std::max(0, host_opt_default_index("upscale_quality")));
-    log_rows("PCUpscale", dialog, kUpscaleRows, kUpscaleRows);
+    log_rows("PCUpscale", dialog, kUpscaleRows, kPcUpscaleSlots);
 }
 
 // PC Controls: the mouse camera, how fast it turns and which way, and the
@@ -1027,7 +1063,7 @@ GUEST_ABI void pc_camera_handler(void* dialog, void* params) {
     log_rows("PCCamera", dialog, kCameraRows, kCameraRows);
 }
 
-// PC Enhancements: four toggles, nothing that opens over the rows.
+// PC Enhancements: its toggles, nothing that opens over the rows.
 GUEST_ABI void pc_enhance_handler(void* dialog, void* params) {
     host_log("pc-options: PCEnhance opened, dialog=%p params=%p", dialog, params);
     alignas(16) std::uint8_t scratch[0x100]{};

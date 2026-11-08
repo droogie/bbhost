@@ -68,8 +68,8 @@ tells you which paths to fill in.
 is read in layers, each overriding only the keys it sets:
 
 1. the per-user `bbhost.toml`: `%APPDATA%\bbhost` on Windows,
-   `$XDG_CONFIG_HOME/bbhost` or `~/.config/bbhost` on Linux
-   (`BBHOST_CONFIG_DIR` replaces the folder);
+   `$XDG_DATA_HOME/bbhost` or `~/.local/share/bbhost` on Linux, beside the
+   data folder (`BBHOST_CONFIG_DIR` replaces the folder);
 2. `bbhost.toml` next to the executable, or in the working directory;
 3. `--config <file>`;
 4. the command line: `--app0 <dir>`, `--data <dir>`, `--eboot <file>`, or the
@@ -88,6 +88,17 @@ The in-game settings (F10, or the PC Settings, PC Graphics and Key Bindings
 entries the game's own System menu gains) are saved beside the per-user config
 in `bbhost-options.toml` - or in one next to the executable, when there is
 one there.
+
+Older versions kept the Linux settings in `$XDG_CONFIG_HOME/bbhost` or
+`~/.config/bbhost`. At each start bbhost moves what it keeps there -
+`bbhost.toml`, the `bbhost-options*.toml` files, `plugins` and `patches` - to
+the new folder, and the setup window says what moved until you dismiss it.
+Nothing is overwritten: a file the new folder already has stays in use, and
+the old one goes beside it as `<name>.from-config-<date>`. Anything else in
+the old folder is yours and stays there, so a path in `bbhost.toml` that
+points into it keeps working (a relative one is written out in full). A
+linked or read-only old folder is copied rather than emptied, and a start
+that cannot move it uses the old folder as it is.
 
 ## Saves
 
@@ -448,14 +459,28 @@ fixes it:
 KERNEL=="udmabuf", TAG+="uaccess"
 ```
 
-**AMD on Windows, slower in a window.** Play in fullscreen (Fullscreen in PC
-Settings, or Window mode in F10). In a window the desktop composites the
-picture, and AMD's driver then never completes the game's occlusion queries -
-the same as when the window is not focused - so the game, getting no answers,
-stops culling hidden geometry. On a Radeon 8060S at 1920x1080 that is 112 fps
-uncapped in a window against 161 in fullscreen, and at 60 fps the GPU 55% busy
-against 37%. The log's `occlusion:` line, every 300 flips, then says `0 dumps`
-or `left not ready (N queries unavailable)`.
+**The picture stops for seconds in fullscreen on Windows.** The game goes on
+behind it, but the display stops handing the window its images back; the log's
+`slow call: vkWaitForFences ... (the acquired image)` lines say for how long.
+The graphics driver can take Borderless, a window that covers the screen, as
+exclusive fullscreen and switch into and out of it on its own: try
+[Stay borderless](#display-and-frame-rate), which keeps the window a window. A
+`window: keyboard focus` line logged while the picture is stopped says how
+long the presenter had been waiting by then (`the presenter 2.71 s into
+vkWaitForFences, the acquired image`), so the log shows whether switching away
+from the game and back ended the stop or came after it.
+
+<a id="amd-on-windows-slower-in-a-window"></a>
+**AMD on Windows, slower in a window.** Play in Borderless with Stay
+borderless off, or in Fullscreen (Window mode in F10 or the setup window;
+Fullscreen in PC Settings). In a window the desktop composites the picture,
+and AMD's driver then never completes the game's occlusion queries - the same
+as when the window is not focused - so the game, getting no answers, stops
+culling hidden geometry. Stay borderless keeps the game a window for
+the driver, and may be as slow. On a Radeon 8060S at 1920x1080 that is 112
+fps uncapped in a window against 161 in fullscreen, and at 60 fps the GPU 55%
+busy against 37%. The log's `occlusion:` line, every 300 flips, then says
+`0 dumps` or `left not ready (N queries unavailable)`.
 
 **Steam Deck.** Start bbhost from Steam (as a non-Steam game), in Game Mode or
 Desktop Mode; otherwise Steam's desktop controls send keys alongside the pad
@@ -472,6 +497,33 @@ The picture keeps its aspect ratio. The settings offer 16:9 sizes from
 32:9), and the resolution can be changed while playing.
 bbhost paces the game to the refresh rate of the display its window is on;
 `[video] vblank_hz` overrides a display that reports the wrong rate.
+
+Window mode is one of three (the Game page of F10 or of the setup window;
+Fullscreen in the game's PC Settings fills the screen):
+- Windowed is a window you can move and resize.
+- Borderless covers the screen at the desktop's resolution and never changes
+  the display's mode, so switching away is instant. On Windows the graphics
+  driver may still take it as exclusive fullscreen, switching into and out of
+  it on its own.
+- Fullscreen takes the display over at the mode nearest the Resolution, which
+  can change the screen's resolution.
+
+Stay borderless (the row under Window mode in F10 and the setup window while
+Borderless is chosen, Stay Borderless in PC Settings; off by default) keeps
+Borderless a window that the driver never makes exclusive fullscreen, frame
+generation's swapchain too, and applies at once: try it if the picture freezes
+for a few seconds while the game keeps running. Linux and the Steam Deck have
+no such setting: there is no exclusive fullscreen to disallow.
+
+AMD cards on Windows run slower in a window, where the game has to draw hidden
+objects too: use Borderless or Fullscreen, and leave Stay borderless off
+unless you need it - it may do the same
+([AMD on Windows, slower in a window](#amd-on-windows-slower-in-a-window)).
+
+`[video] window_mode` in bbhost.toml is the default: `"Windowed"`,
+`"Borderless"` or `"Fullscreen"`. The log's `present: mode` line says which
+way each swapchain was made: `exclusive fullscreen disallowed (Stay
+borderless)`, or `the driver decides on exclusive fullscreen`.
 
 The frame rate is the game's own speed, chosen when it starts (a change
 applies on the next run): 30 is the game as it shipped; 60, 90, 120, 150, 180,
@@ -656,6 +708,39 @@ flips`). `BBHOST_FLIP_AFTER_GPU=0` completes a flip once the frame is recorded,
 as before: the game could then run several frames ahead of the GPU after a
 loading screen and overwrite what it had not read yet, which could hold the
 GPU for minutes.
+
+## Upscaling
+
+Graphics > Upscaling (F10, the setup window's Graphics page, or System > PC
+Upscaling in the game) runs one of these in place of the game's own
+anti-aliasing:
+
+| Choice | Where it runs |
+|---|---|
+| TAA | bbhost's own temporal anti-aliasing: any GPU, Windows and Linux, the 3D at the Resolution |
+| DLSS | NVIDIA RTX cards, on Windows and on Linux: DLAA, Quality, Balanced or Performance (the 3D at the full Resolution, two thirds, about 59% or half each way) and its model (DLSS preset K, J, L or M) |
+| FSR 3, FSR 4 | AMD FidelityFX, on Windows: FSR 4 where the GPU and driver run it, FSR 3 on any GPU |
+
+Frame generation (AMD FidelityFX) also runs on Windows only. Sharpness
+sharpens what TAA, FSR or DLSS gives.
+
+On Windows the package carries the upscalers' files beside `bbhost.exe`:
+Numity1504's Upscaler Bridge (`upscaler_bridge.dll`), which bbhost calls them
+through, NVIDIA's `nvngx_dlss.dll` and AMD's FidelityFX DLLs.
+
+On Linux, DLSS needs an NVIDIA RTX card with NVIDIA's own driver, a recent
+one (the driver brings NVIDIA's NGX, which runs DLSS; Nouveau and NVK cannot).
+The Linux package carries `libbbhost_ngx_bridge.so`, bbhost's NGX bridge (the
+Upscaler Bridge's API over NVIDIA's NGX, MIT), and NVIDIA's DLSS runtime,
+`libnvidia-ngx-dlss.so.310.9.16`, beside the binary; bbhost loads the bridge
+from its own folder at start. On any other GPU the Upscaling list offers Off
+and TAA, and the log's `upscaler:` lines say why DLSS is not available. The
+Steam Deck kit carries neither file (the Deck's GPU is AMD's).
+
+`BBHOST_UPSCALE=dlss|taa|fsr|fsr3` picks the method for a run over the
+setting, and `BBHOST_UPSCALER=0` loads no bridge at all. On Linux,
+`BBHOST_NGX_LOG=1` (2: verbose) has NVIDIA's NGX log into bbhost's log, and
+into its own files in `ngx/` in the settings folder.
 
 ## Online
 

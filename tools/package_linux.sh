@@ -3,7 +3,9 @@
 # counterpart of tools/win_package.sh: the binary without its DWARF, the patch
 # manifests it applies (patches/, looked for next to the binary), the plugin
 # header, the example config, DXC's release library for the HLSL shader path
-# with its licences (tools/fetch_dxc.sh), a README with what the machine must
+# with its licences (tools/fetch_dxc.sh), DLSS - the NGX bridge built beside the
+# binary and NVIDIA's DLSS runtime (tools/fetch_ngx.sh), each with its licence -
+# a README with what the machine must
 # have, a launcher that keeps a log file, and the empty data/, logs/ and
 # build/ (frame dumps) the run writes into: the release's Linux bundle. Nothing in it picks
 # a server: bbhost's defaults are the live server's (https://thehuntersdream.com).
@@ -33,6 +35,7 @@ mkdir -p "$dir/data" "$dir/logs" "$dir/plugins" "$dir/build"
 cp -r patches "$dir/patches"
 cp include/bbhost_plugin.h "$dir/plugins/"
 cp LICENSE "$dir/LICENSE"
+cp LICENSE-EXCEPTION "$dir/LICENSE-EXCEPTION"
 tools/package_plugins.sh "$(dirname "$bin")/plugins" "$dir/plugins"
 objcopy --strip-debug "$bin" "$dir/bbhost" 2>/dev/null || llvm-objcopy --strip-debug "$bin" "$dir/bbhost"
 chmod +x "$dir/bbhost"
@@ -41,36 +44,25 @@ cp bbhost.example.toml "$dir/bbhost.example.toml"
 # The HLSL path's compiler beside the binary, where bbhost looks first.
 tools/fetch_dxc.sh linux "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)
-# The upscalers beside the binary, where bbhost looks for them
-# (host/upscaler.cpp, host/framegen.cpp): what tools/linux_portable_build.sh
-# put in build/upscalers (tools/build_upscaler_bridge_linux.sh), with their
-# licences. Without it DLSS, FSR and frame generation are off; TAA runs.
-upscalers=$(dirname "$bin")/upscalers
-upscaler_note="This build carries no upscaler files: Graphics > Upscaling offers TAA
-(bbhost's own) only, and frame generation is off."
-if [ -f "$upscalers/upscaler_bridge.so" ]; then
-    cp "$upscalers"/upscaler_bridge.so "$upscalers"/libnvidia-ngx-dlss.so.* "$dir/"
-    [ -f "$upscalers/libamd_fidelityfx_vk.so" ] && cp "$upscalers/libamd_fidelityfx_vk.so" "$dir/"
-    mkdir -p "$dir/licenses"
-    cp -r "$upscalers"/licenses/* "$dir/licenses/"
-    upscaler_note="upscaler_bridge.so is the Upscaler Bridge by Numity1504 (MIT licence, in
-licenses/upscaler_bridge), which bbhost calls DLSS and FSR through; it has
-NVIDIA's NGX library built in. libnvidia-ngx-dlss.so.* is NVIDIA DLSS,
-Copyright (C) NVIDIA Corporation, from NVIDIA's DLSS repository, unmodified,
-for use with bbhost only; licence in licenses/dlss. bbhost is not sponsored
-or endorsed by NVIDIA. DLSS needs an RTX card and NVIDIA's proprietary driver."
-    if [ -f "$upscalers/libamd_fidelityfx_vk.so" ]; then
-        upscaler_note="$upscaler_note
-libamd_fidelityfx_vk.so is AMD FidelityFX (FSR 3 upscaling and frame
-generation), built from the FidelityFX SDK's source under AMD's MIT licence
-(licenses/fidelityfx). FSR 4 is AMD's Windows files only and is not offered
-on Linux."
-    else
-        upscaler_note="$upscaler_note
-No FidelityFX library is in this build: FSR and frame generation are off on
-Linux; DLSS and TAA are offered."
-    fi
+# DLSS on an NVIDIA RTX card: bbhost's NGX bridge (MIT; it holds NVIDIA's NGX
+# SDK library), which bbhost loads from beside itself (host/upscaler.cpp), and
+# NVIDIA's DLSS runtime, pinned and unmodified (tools/fetch_ngx.sh), each with
+# its licence - never bbhost's GPL. A build without the bridge (BBHOST_NGX=OFF,
+# or NVIDIA's SDK not fetched) packs neither; BBHOST_PACKAGE_DLSS=0 leaves them
+# out of one that has it. tools/check_release_bundle.sh fails a release without
+# them, and tools/package_steamdeck.sh takes them out of the Steam Deck's kit
+# (an AMD GPU).
+bridge=$(dirname "$bin")/libbbhost_ngx_bridge.so
+dlss=0
+if [ "${BBHOST_PACKAGE_DLSS:-1}" != 0 ] && [ -f "$bridge" ]; then
+    cp "$bridge" "$dir/libbbhost_ngx_bridge.so"
+    mkdir -p "$dir/licenses/ngx_bridge" "$dir/licenses/upscaler_bridge"
+    cp src/ngx_bridge/LICENSE "$dir/licenses/ngx_bridge/LICENSE"
+    cp third_party/upscaler_bridge/LICENSE.txt "$dir/licenses/upscaler_bridge/LICENSE.txt"
+    tools/fetch_ngx.sh runtime "$dir"
+    dlss=1
 fi
+dlss_runtime=$(tools/fetch_ngx.sh --files)
 # The pipeline list beside the binary, where bbhost reads it at each start and
 # builds every pipeline it names (render.cpp pipeline_manifest_load): the
 # pinned release asset (tools/fetch_pipeline_list.sh), or the local list
@@ -93,7 +85,7 @@ glibcxx=$(objdump -T "$bin" | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1)
 cat > "$dir/run-bbhost.sh" <<'EOF'
 #!/bin/bash
 # Starts bbhost and keeps its log in logs/ (the newest ten are kept).
-#   ./run-bbhost.sh                       the per-user config (~/.config/bbhost/bbhost.toml)
+#   ./run-bbhost.sh                       the per-user config (~/.local/share/bbhost/bbhost.toml)
 #   BBHOST_CONFIG=other.toml ./run-bbhost.sh   that file on top of it
 cd "$(dirname "$0")" || exit 1
 cfg=${BBHOST_CONFIG:-bbhost.toml}
@@ -109,14 +101,40 @@ exit "${PIPESTATUS[0]}"
 EOF
 chmod +x "$dir/run-bbhost.sh"
 
+# The README's Upscaling section, where the package has DLSS.
+dlss_text=
+if [ "$dlss" = 1 ]; then
+    dlss_text="Upscaling
+  Graphics > Upscaling offers TAA, bbhost's own (any GPU), and on an NVIDIA
+  RTX card with NVIDIA's own driver, a recent one, DLSS: its quality from
+  Performance to DLAA, and its model (K, J, L or M). DLSS runs through these
+  files beside bbhost, each under its own licence; bbhost's licence permits
+  combining bbhost with them (LICENSE-EXCEPTION):
+    - $dlss_runtime:
+      NVIDIA DLSS, Copyright (C) NVIDIA Corporation, from the DLSS SDK
+      (https://github.com/NVIDIA/DLSS), unmodified, for NVIDIA RTX graphics
+      cards only; licence in licenses/dlss. bbhost is not sponsored or
+      endorsed by NVIDIA.
+    - libbbhost_ngx_bridge.so: bbhost's NGX bridge (MIT licence, in
+      licenses/ngx_bridge), which bbhost calls DLSS through; it contains
+      NVIDIA's NGX SDK library, under NVIDIA's licence too. It implements the
+      Upscaler Bridge API by Numity1504 (MIT, licenses/upscaler_bridge).
+  On another GPU DLSS is not offered, and the log says why. FSR 3, FSR 4 and
+  frame generation run on Windows only.
+
+"
+fi
+
 cat > "$dir/README-linux.txt" <<EOF
 bbhost for Linux, build $name
 ==================================
 
 bbhost runs Bloodborne on PC: the game's own 1.09 executable, its calls into
 the PS4's system libraries answered by bbhost and its graphics recompiled for
-Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE); the
-source is at https://github.com/droogie/bbhost.
+Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE), with
+an additional permission to combine it with GPU vendors' upscaling and frame
+generation runtimes (LICENSE-EXCEPTION); the source is at
+https://github.com/droogie/bbhost.
 
 You need
   - x86-64 Linux with glibc ${glibc#GLIBC_} or newer (Ubuntu 24.04, Linux Mint 22, Debian 13,
@@ -153,20 +171,19 @@ window's Shaders tab compiles them all at once (Compile shaders now), and its
 Shaders setting picks Lifted to keep the translator's own. Without it that
 path keeps every shader as it was; nothing else uses it.
 
-Upscalers
-$upscaler_note
-
-Setup
+${dlss_text}Setup
   Untar this folder somewhere of its own, for example ~/Games/bbhost, and run
   ./run-bbhost.sh from a terminal there. The first time, the setup window
   opens: pick the game folder and the decrypted eboot with the Browse buttons
   (each turns green when it is right), then Play. ./run-bbhost.sh --setup
   opens it again.
 
-  The settings are kept in ~/.config/bbhost/bbhost.toml, which every copy of
-  bbhost reads, so a new download or an update needs nothing set again. The
-  F10 settings and your account sign-in are kept beside it, saves and caches
-  in ~/.local/share/bbhost/data.
+  The settings are kept in ~/.local/share/bbhost/bbhost.toml, which every
+  copy of bbhost reads, so a new download or an update needs nothing set
+  again. The F10 settings and your account sign-in are kept beside it, saves
+  and caches in ~/.local/share/bbhost/data. (Older versions kept the settings
+  in ~/.config/bbhost; bbhost moves them as it starts, and the setup window
+  says what moved.)
   bbhost.example.toml lists every setting.
 
 Run
@@ -199,7 +216,7 @@ Online
   Other players reach you on UDP port 9307: a firewall on this PC must let it
   in. If summons keep failing with one person, forwarding that port to this
   PC on your router often fixes it. Two PCs in one house: set p2p_addr under
-  [online] in ~/.config/bbhost/bbhost.toml to each PC's local address.
+  [online] in ~/.local/share/bbhost/bbhost.toml to each PC's local address.
 
 Steam Deck
   The release's bbhost-steamdeck tarball is this package with the Deck's
@@ -250,6 +267,7 @@ stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
 cp -r "$dir" "$stage/"
 find "$stage" -type d -exec chmod 755 {} + && find "$stage" -type f -exec chmod 644 {} +
 chmod 755 "$stage/$name/bbhost" "$stage/$name/run-bbhost.sh"
+[ "$dlss" = 0 ] || chmod 755 "$stage/$name/libbbhost_ngx_bridge.so" "$stage/$name/$dlss_runtime"
 rm -f "$out/$name.tar.gz"
 tar czf "$out/$name.tar.gz" -C "$stage" --owner=0 --group=0 "$name"
 echo "package: $out/$name.tar.gz ($(( $(stat -c %s "$out/$name.tar.gz") / 1048576 )) MB); symbols: $out/$name.debug"

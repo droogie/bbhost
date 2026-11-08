@@ -20,13 +20,6 @@
 #   tools/linux_portable_build.sh            -> build-linux-portable/build/bbhost
 #                                               (and plugins/, the official ones
 #                                               tools/package_linux.sh packs)
-#   UPSCALERS=0 tools/linux_portable_build.sh
-#                                            no upscaler bridge (DLSS) beside it:
-#                                            by default NVIDIA's DLSS files for Linux
-#                                            are fetched at their pins and the bridge
-#                                            is built into build/upscalers
-#                                            (tools/build_upscaler_bridge_linux.sh),
-#                                            which tools/package_linux.sh packs
 #   PORTABLE_TARGETS="gcn2hlsl" tools/linux_portable_build.sh
 #                                            more targets built the same way:
 #                                            gcn2hlsl, the HLSL sweep a Steam
@@ -68,10 +61,6 @@ if [ "${1:-}" != --inside ]; then
     }
     fetch sdl3 "https://github.com/libsdl-org/SDL/archive/refs/tags/$SDL_TAG.tar.gz" 'SDL-*'
     fetch ffmpeg "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VER.tar.xz" 'ffmpeg-*'
-    # NVIDIA's DLSS files for the upscaler bridge, at their pins.
-    if [ "${UPSCALERS:-1}" != 0 ]; then
-        UPSCALERS_LINUX_CACHE=$W/upscalers-cache tools/build_upscaler_bridge_linux.sh --fetch
-    fi
     # The Vulkan headers of this machine (Ubuntu 24.04's are 1.3.275, older than
     # the renderer's), copied: the chroot cannot follow a symlink out of itself.
     rm -rf "$W/prefix/include/vulkan" "$W/prefix/include/vk_video"
@@ -90,7 +79,7 @@ if [ "${1:-}" != --inside ]; then
         mount --rbind /sys "$R/sys"
         mkdir -p "$R/src" && mount --bind "$SRC" "$R/src"
         exec chroot "$R" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            HOME=/root DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 BBHOST_GIT_REV="$BBHOST_GIT_REV" PORTABLE_TARGETS="${PORTABLE_TARGETS:-}"             UPSCALERS="${UPSCALERS:-1}" FFX_LINUX_SO="${FFX_LINUX_SO:-}" \
+            HOME=/root DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 BBHOST_GIT_REV="$BBHOST_GIT_REV" PORTABLE_TARGETS="${PORTABLE_TARGETS:-}" \
             bash /src/tools/linux_portable_build.sh --inside
     ' sh "$ROOTFS" "$SRC"
 fi
@@ -151,11 +140,4 @@ cmake -S /src -B "$W/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
 grep -E "^-- bbhost" "$W/bbhost-configure.log" || true
 cmake --build "$W/build" --target bbhost bb_plugin_hello bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_debug_menu ${PORTABLE_TARGETS:-} -j"$(nproc)" > "$W/bbhost-build.log" 2>&1 \
     || { grep -E "error|undefined" "$W/bbhost-build.log" | head -30; exit 1; }
-# The upscaler bridge (DLSS; FSR 3 and frame generation with FFX_LINUX_SO, a
-# path under /src) beside it, from the files fetched above.
-rm -rf "$W/build/upscalers"
-if [ "${UPSCALERS:-1}" != 0 ]; then
-    UPSCALERS_LINUX_CACHE=$W/upscalers-cache tools/build_upscaler_bridge_linux.sh "$W/build/upscalers" > "$W/upscalers-build.log" 2>&1         || { tail -30 "$W/upscalers-build.log"; exit 1; }
-    tail -1 "$W/upscalers-build.log"
-fi
 echo "portable build: $W/build/bbhost"

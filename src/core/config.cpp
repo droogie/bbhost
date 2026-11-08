@@ -1,4 +1,5 @@
 #include "core/config.h"
+#include "core/config_move.h"
 #include "core/sfo.h"
 #include "log.h"
 #include "bbhost_version.h"
@@ -219,6 +220,14 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
         auto it = kv.find("world.skill_issue");
         if (it != kv.end()) c->skill_issue = it->second == "true" || it->second == "1";
     }
+    {
+        auto it = kv.find("world.full_phantom_hp");
+        if (it != kv.end()) c->full_phantom_hp = it->second == "true" || it->second == "1";
+    }
+    {
+        auto it = kv.find("world.auto_replenish");
+        if (it != kv.end()) c->auto_replenish = it->second == "true" || it->second == "1";
+    }
     // Every [keys] entry, whatever it is called: the action names live in
     // window.cpp beside the defaults, and an unknown one is reported there
     // rather than silently dropped here.
@@ -293,17 +302,31 @@ std::string env_dir(const char* name) {
     return p;
 }
 
+#if !defined(_WIN32)
+// Where bbhost kept the per-user settings on Linux before they moved beside
+// the data folder.
+std::string old_user_config_dir() {
+    if (std::string d = env_dir("XDG_CONFIG_HOME"); !d.empty()) return d + "/bbhost";
+    if (std::string d = env_dir("HOME"); !d.empty()) return d + "/.config/bbhost";
+    return {};
+}
+#endif
+
 // The per-user folders (config_user_dir): what a player sets once and every
 // download or update of bbhost then finds - the game's paths, the F10
 // settings, the account. BBHOST_CONFIG_DIR replaces the config one (tests,
-// a portable setup).
+// a portable setup). On Linux the settings are beside the data folder; an
+// older bbhost's folder (old_user_config_dir) is moved there at start
+// (core/config_move.h), or used as it is for a start that cannot move it.
 std::string user_config_dir() {
     if (std::string d = env_dir("BBHOST_CONFIG_DIR"); !d.empty()) return d;
 #if defined(_WIN32)
     if (std::string d = env_dir("APPDATA"); !d.empty()) return d + "/bbhost";
 #else
-    if (std::string d = env_dir("XDG_CONFIG_HOME"); !d.empty()) return d + "/bbhost";
-    if (std::string d = env_dir("HOME"); !d.empty()) return d + "/.config/bbhost";
+    if (std::string d = config_move_fallback(); !d.empty()) return d;
+    if (std::string d = env_dir("XDG_DATA_HOME"); !d.empty()) return d + "/bbhost";
+    if (std::string d = env_dir("HOME"); !d.empty()) return d + "/.local/share/bbhost";
+    if (std::string d = old_user_config_dir(); !d.empty()) return d;  // no home for them: where they were
 #endif
     return exe_dir();
 }
@@ -635,6 +658,12 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     //   config that does not exist yet is imported from the second when that
     //   names the game, and one that does is given the keys bbhost has since
     //   come to expect.
+#if !defined(_WIN32)
+    // What an older bbhost kept in ~/.config/bbhost moves beside the data
+    // folder first, before anything reads it (core/config_move.h). Not for a
+    // folder of its own (BBHOST_CONFIG_DIR).
+    if (env_dir("BBHOST_CONFIG_DIR").empty()) config_move_at_start(old_user_config_dir(), user_config_dir());
+#endif
     const std::string user_cfg = user_config_dir() + "/bbhost.toml";
     make_dirs(user_config_dir());  // where the F10 settings are saved, whatever else exists
     std::string local_cfg;
@@ -817,6 +846,14 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
         if (std::strcmp(e, "1") == 0) c.skill_issue = true;
         else if (std::strcmp(e, "0") == 0) c.skill_issue = false;
     }
+    if (const char* e = std::getenv("BBHOST_FULL_PHANTOM_HP")) {
+        if (std::strcmp(e, "1") == 0) c.full_phantom_hp = true;
+        else if (std::strcmp(e, "0") == 0) c.full_phantom_hp = false;
+    }
+    if (const char* e = std::getenv("BBHOST_AUTO_REPLENISH")) {
+        if (std::strcmp(e, "1") == 0) c.auto_replenish = true;
+        else if (std::strcmp(e, "0") == 0) c.auto_replenish = false;
+    }
     if (const char* e = std::getenv("BBHOST_SETUP_WINDOW")) {
         if (std::strcmp(e, "1") == 0) c.setup_always = true;
         else if (std::strcmp(e, "0") == 0) c.setup_always = false;
@@ -925,7 +962,8 @@ std::string config_eboot_help(const HostConfig& c, const std::string& sha256, co
 
 void config_set_skip_intro(bool on) { g_cfg.skip_intro = on; }
 
-void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue) {
+void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue, bool full_phantom_hp,
+                             bool auto_replenish) {
     const auto set = [](bool* field, bool on, const char* env) {
         const char* e = std::getenv(env);
         if (e && (std::strcmp(e, "0") == 0 || std::strcmp(e, "1") == 0)) return;  // the environment's, kept
@@ -935,6 +973,8 @@ void config_set_enhancements(bool change_appearance, bool rebirth, bool five_pla
     set(&g_cfg.rebirth, rebirth, "BBHOST_REBIRTH");
     set(&g_cfg.five_players, five_players, "BBHOST_FIVE_PLAYERS");
     set(&g_cfg.skill_issue, skill_issue, "BBHOST_SKILL_ISSUE");
+    set(&g_cfg.full_phantom_hp, full_phantom_hp, "BBHOST_FULL_PHANTOM_HP");
+    set(&g_cfg.auto_replenish, auto_replenish, "BBHOST_AUTO_REPLENISH");
 }
 
 void config_set_online(const std::string& host, const std::string& scheme, bool verify_tls, bool require_account,
@@ -994,8 +1034,8 @@ bool config_write_template(const std::string& path) {
     out << "# bbhost configuration. Set the two paths under [paths], then run bbhost.\n"
            "# On Windows write them either way: \"C:\\Games\\Bloodborne\" or \"C:/Games/Bloodborne\".\n"
            "# A relative path is taken from the folder this file is in.\n"
-           "# This file is the per-user one (%APPDATA%\\bbhost on Windows, ~/.config/bbhost on\n"
-           "# Linux): every copy of bbhost reads it, so a new download or an update keeps it.\n"
+           "# This file is the per-user one (%APPDATA%\\bbhost on Windows, ~/.local/share/bbhost\n"
+           "# on Linux): every copy of bbhost reads it, so a new download or an update keeps it.\n"
            "[paths]\n"
            "# The folder that contains dvdroot_ps4 (the decrypted game dump). An update\n"
            "# kept beside it in a folder of its own (CUSA00900-UPDATE or CUSA00900-patch,\n"

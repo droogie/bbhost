@@ -20,6 +20,7 @@
 #include "host/audio.h"
 #include "host/foreign_hooks.h"
 #include "host/gpu.h"
+#include "host/slow_calls.h"
 #include "log.h"
 #if !defined(_WIN32)
 #include <pthread.h>
@@ -43,6 +44,13 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <vulkan/vulkan.h>
+#if defined(_WIN32)
+// VK_EXT_full_screen_exclusive's structure and query (exclusive_policy) are
+// Windows' own, in the header that takes <windows.h>'s types.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <vulkan/vulkan_win32.h>
+#endif
 #endif
 
 // The swapchain's extent (width << 32 | height) for host_window_pixels; 0 before one.
@@ -98,19 +106,24 @@ std::uint32_t g_plugin_pressed = 0;                                   // under g
 // BBHOST_IME_TEST: opens the text box once at startup and again on F11.
 std::atomic<bool> g_ime_test_reopen{true};
 
-// The options screen's two display settings (host/options.h). Both can be set
+// The options screen's display settings (host/options.h). All can be set
 // before the presenter exists, so they are wishes the swapchain reads, not
 // calls into it.
 // Window mode (host_window_set_mode): 0 windowed, 1 borderless, 2 fullscreen,
 // and the size Fullscreen's display mode is to be nearest.
 std::atomic<int> g_want_mode{0};
 std::atomic<int> g_mode_w{0}, g_mode_h{0};
+// Stay borderless: Borderless never made exclusive (exclusive_policy).
+std::atomic<bool> g_want_stay_borderless{false};
 std::atomic<bool> g_want_vsync{true};
 // When the presenting thread last finished a present, and how many it has
 // finished: with V-Sync on that instant is a display vblank, which is the
 // phase the flip clock steers towards.
 std::atomic<std::uint64_t> g_present_last_ns{0}, g_present_serial{0};
 std::atomic<bool> g_swap_dirty{false};
+// The presenting thread's id (host_thread_id), for the focus lines to ask the
+// slow-call registry what it is in (presenter_in_call); 0 before it runs.
+std::atomic<std::uint32_t> g_present_tid{0};
 
 // Text entry state (host_text_entry_*). SDL text input is toggled from the
 // pump (main thread) when `want` changes.
@@ -323,6 +336,13 @@ struct Presenter {
     VkFence acquire_fence = VK_NULL_HANDLE;
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     bool latest_ready = false;  // the device has FIFO_LATEST_READY enabled (gpu.cpp)
+    // The device has VK_EXT_full_screen_exclusive on (gpu.cpp, Windows): the
+    // swapchain can say whether the driver may make the window exclusive
+    // fullscreen (exclusive_policy).
+    bool full_screen_exclusive = false;
+#if defined(_WIN32)
+    PFN_vkGetPhysicalDeviceSurfacePresentModes2EXT present_modes2 = nullptr;  // that extension's mode query
+#endif
     bool gpu_wait = false;      // sleep on the frame's fence before presenting (present_gpu_wait_default)
     std::uint64_t present_value = 0;  // the last own-queue copy's value on host_gpu_present_timeline()
     std::mutex mu;
@@ -439,6 +459,84 @@ const char* present_mode_name(VkPresentModeKHR m) {
     }
 }
 
+// Whether the driver may take the window as exclusive fullscreen, said as the
+// swapchain is made (Windows, VK_EXT_full_screen_exclusive). Borderless (the
+// window mode) is a window at the desktop's size (SDL's fullscreen with no
+// display mode of its own), and a swapchain that says nothing gets the
+// driver's DEFAULT, which on Windows lets NVIDIA's and AMD's drivers take a
+// window that covers the screen as exclusive fullscreen - with the switches
+// into and out of it that come with that. Stay borderless (the setting)
+// says DISALLOWED there: the window stays a window. Everything else says
+// nothing, as before the setting - Fullscreen, which sets the display's own
+// mode, among it. Off Windows there is no such extension and nothing to say.
+// On NVIDIA's driver (610.60, an RTX 3070 Ti laptop over Remote Desktop,
+// 2026-11-07) the first swapchain that disallows it loads d3d12.dll inside
+// vkCreateSwapchainKHR - the driver presents through DXGI from then on (the
+// `present: Windows' graphics modules` line) - where a start with the default
+// kept the driver's own path: presents returned in 0.3 ms against 5.5 ms.
+struct ExclusivePolicy {
+#if defined(_WIN32)
+    VkSurfaceFullScreenExclusiveInfoEXT info{VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT};
+#endif
+    bool chained = false;   // `info` goes on the swapchain and on its present modes' query
+    const char* text = "";  // for the `present: mode` line
+};
+ExclusivePolicy exclusive_policy() {
+    ExclusivePolicy p;
+#if defined(_WIN32)
+    const bool stay = g_want_mode.load() == 1 && g_want_stay_borderless.load();
+    if (stay && g_vk.full_screen_exclusive) {
+        p.info.fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+        p.chained = true;
+        p.text = ", exclusive fullscreen disallowed (Stay borderless)";
+    } else if (g_vk.full_screen_exclusive) {
+        p.text = ", the driver decides on exclusive fullscreen";
+    } else {
+        p.text = stay ? ", the driver decides on exclusive fullscreen (no VK_EXT_full_screen_exclusive: Stay borderless "
+                        "cannot disallow it)"
+                      : ", the driver decides on exclusive fullscreen (no VK_EXT_full_screen_exclusive)";
+    }
+#endif
+    return p;
+}
+
+// The present modes the surface offers a swapchain with `policy`: with it
+// chained, VK_EXT_full_screen_exclusive's own query, since a driver may offer
+// other modes to a window it may not make exclusive; else the plain one.
+std::vector<VkPresentModeKHR> surface_present_modes(const ExclusivePolicy& policy) {
+    std::vector<VkPresentModeKHR> modes;
+    std::uint32_t n = 0;
+#if defined(_WIN32)
+    if (policy.chained && g_vk.present_modes2) {
+        VkPhysicalDeviceSurfaceInfo2KHR si{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR};
+        si.pNext = &policy.info;
+        si.surface = g_vk.surface;
+        VkResult r = g_vk.present_modes2(g_vk.phys, &si, &n, nullptr);
+        if (r == VK_SUCCESS && n) {
+            modes.resize(n);
+            r = g_vk.present_modes2(g_vk.phys, &si, &n, modes.data());
+            if (r == VK_SUCCESS || r == VK_INCOMPLETE) {
+                modes.resize(n);
+                return modes;
+            }
+        }
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 4)
+            host_log("present: vkGetPhysicalDeviceSurfacePresentModes2EXT gave %d (%u modes); the surface's modes are asked without the policy",
+                     static_cast<int>(r), n);
+        modes.clear();
+        n = 0;
+    }
+#else
+    (void)policy;
+#endif
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, nullptr);
+    modes.resize(n);
+    if (n) vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, modes.data());
+    modes.resize(n);
+    return modes;
+}
+
 // The present mode for the V-Sync setting, from what the surface offers.
 // V-Sync on: MAILBOX (the newest finished frame goes up at the next refresh, no
 // tearing, no queue of frames behind the display), else FIFO_LATEST_READY (the
@@ -448,12 +546,9 @@ const char* present_mode_name(VkPresentModeKHR m) {
 // FIFO is the only mode a surface must support, so it is what is left.
 // BBHOST_PRESENT_MODE=fifo|mailbox|latest|immediate|relaxed asks for one
 // (FIFO when the surface lacks it); =old is the choice before this one (FIFO
-// with V-Sync; MAILBOX, else IMMEDIATE, without).
-VkPresentModeKHR choose_present_mode(bool vsync, std::string& why) {
-    std::uint32_t nmodes = 0;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
-    std::vector<VkPresentModeKHR> modes(nmodes);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
+// with V-Sync; MAILBOX, else IMMEDIATE, without). `modes` are the surface's
+// (surface_present_modes).
+VkPresentModeKHR choose_present_mode(bool vsync, const std::vector<VkPresentModeKHR>& modes, std::string& why) {
     const auto offered = [&](VkPresentModeKHR m) {
 #if defined(VK_KHR_present_mode_fifo_latest_ready)
         if (m == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR && !g_vk.latest_ready) return false;  // the device's extension is off
@@ -602,9 +697,16 @@ bool vk_create_swapchain() {
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     std::string why;
     const bool vsync = g_want_vsync.load();
-    sci.presentMode = choose_present_mode(vsync, why);
+    // Stay borderless's say on exclusive fullscreen, and the modes the
+    // surface offers with it.
+    const ExclusivePolicy policy = exclusive_policy();
+    const std::vector<VkPresentModeKHR> modes = surface_present_modes(policy);
+    sci.presentMode = choose_present_mode(vsync, modes, why);
     sci.clipped = VK_TRUE;
     sci.oldSwapchain = old;
+#if defined(_WIN32)
+    if (policy.chained) sci.pNext = &policy.info;
+#endif
     // Windows' graphics modules before and after: a driver that presents
     // through DXGI (a D3D12 queue of its own copying our images into a DXGI
     // swapchain) loads d3d12.dll inside vkCreateSwapchainKHR, as happened in
@@ -620,16 +722,24 @@ bool vk_create_swapchain() {
     } else if (old && framegen_wanted()) {
         // Frame generation switched on: AMD's swapchain takes no old one, and
         // the surface holds one at a time - ours goes first, its last present done.
-        vkQueueWaitIdle(g_vk.present_queue ? g_vk.present_queue : g_vk.queue);
+        {
+            static constexpr slow_calls::Site kFgSwitchIdleSite{slow_calls::kQueueIdle, "our swapchain going for frame generation's"};
+            slow_calls::Scope timed(kFgSwitchIdleSite);
+            vkQueueWaitIdle(g_vk.present_queue ? g_vk.present_queue : g_vk.queue);
+        }
         vkDestroySwapchainKHR(g_vk.device, old, nullptr);
         old = VK_NULL_HANDLE;
         sci.oldSwapchain = VK_NULL_HANDLE;
     }
+    // AMD's swapchain is made from this create info too: framegen_create_swapchain
+    // copies it whole into AMD's ffxCreateContextDescFrameGenerationSwapChainVK
+    // (its createInfo), pNext and all, so Stay borderless's word on
+    // exclusive fullscreen (chained above) goes to the swapchain AMD makes.
     const bool fg = framegen_wanted() &&
                     framegen_create_swapchain(g_vk.phys, g_vk.device, sci, g_vk.present_queue ? g_vk.present_queue : g_vk.queue,
                                               g_vk.family, g_vk.fg_queues, &g_vk.swapchain);
     if (!fg && vkCreateSwapchainKHR(g_vk.device, &sci, nullptr, &g_vk.swapchain) != VK_SUCCESS) {
-        host_log("vulkan: swapchain creation failed");
+        host_log("vulkan: swapchain creation failed%s", policy.text);
         return false;
     }
     [[maybe_unused]] const std::string modules_after = host_graphics_modules();
@@ -652,16 +762,13 @@ bool vk_create_swapchain() {
                 default: return "other";
             }
         };
-        std::uint32_t nmodes = 0;
-        vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
-        std::vector<VkPresentModeKHR> modes(nmodes);
-        if (nmodes) vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
         std::string have;
         for (VkPresentModeKHR m : modes) have += std::string(have.empty() ? "" : " ") + mode_name(m);
         const std::string chosen = why.empty() ? std::string() : " (" + why + ")";
-        host_log("present: mode %s%s (the surface has: %s), %s, %s, %u images, usage 0x%x%s", mode_name(sci.presentMode),
+        host_log("present: mode %s%s (the surface has: %s), %s%s%s, %s, %u images, usage 0x%x%s", mode_name(sci.presentMode),
                  chosen.c_str(), have.c_str(),
-                 g_want_mode.load() == 2 ? "fullscreen" : g_want_mode.load() == 1 ? "borderless" : "windowed",
+                 g_want_mode.load() == 2 ? "fullscreen" : g_want_mode.load() == 1 ? "borderless" : "windowed", policy.text,
+                 fg && policy.chained ? " - in AMD's frame generation swapchain's create info" : "",
                  sci.imageFormat == VK_FORMAT_R8G8B8A8_UNORM   ? "R8G8B8A8"
                  : sci.imageFormat == VK_FORMAT_B8G8R8A8_UNORM ? "B8G8R8A8"
                                                                : "another format",
@@ -731,6 +838,13 @@ bool vk_start() {
     for (int i = 0; i < 3; ++i) g_vk.fg_queues[i] = h.fg_queues[i];
     g_vk.family = h.family;
     g_vk.latest_ready = h.fifo_latest_ready;
+    g_vk.full_screen_exclusive = h.full_screen_exclusive;
+#if defined(_WIN32)
+    if (g_vk.full_screen_exclusive) {
+        g_vk.present_modes2 = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModes2EXT>(
+            vkGetInstanceProcAddr(g_vk.instance, "vkGetPhysicalDeviceSurfacePresentModes2EXT"));
+    }
+#endif
     if (!SDL_Vulkan_CreateSurface(g_window, g_vk.instance, nullptr, &g_vk.surface)) {
         host_log("vulkan: surface creation failed: %s", SDL_GetError());
         return false;
@@ -846,6 +960,37 @@ void host_fps_frame_start() {
 
 namespace {
 
+// The presenter's driver calls, for the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kLastCopySite{slow_calls::kWaitFences, "the last copy"};
+constexpr slow_calls::Site kRebuildIdleSite{slow_calls::kDeviceIdle, "a swapchain rebuild"};
+constexpr slow_calls::Site kAcquireSite{slow_calls::kAcquireImage, "the presenter"};
+constexpr slow_calls::Site kAcquireAgainSite{slow_calls::kAcquireImage, "after a rebuild"};
+constexpr slow_calls::Site kAcquiredSite{slow_calls::kWaitFences, "the acquired image"};
+constexpr slow_calls::Site kOwnCopySite{slow_calls::kQueueSubmit, "the copy, on the presenter's queue"};
+constexpr slow_calls::Site kCopySite{slow_calls::kQueueSubmit, "the copy"};
+constexpr slow_calls::Site kCopyGpuSite{slow_calls::kWaitFences, "the copy on the GPU"};
+constexpr slow_calls::Site kPresentSite{slow_calls::kQueuePresent, "present"};
+
+// What the presenting thread is in, for the window's focus lines: " (the
+// presenter 2.71 s into vkWaitForFences, the acquired image)" once it has been
+// in one timed call for 100 ms or more, else nothing. A display that stops
+// handing the swapchain's images back keeps the presenter seconds in its wait
+// for one; whether a focus change came while it waited - and may have ended
+// the wait - or after it was over is then in the log.
+std::string presenter_in_call() {
+    slow_calls::ThreadCall c;
+    if (!slow_calls::thread_in_call(g_present_tid.load(std::memory_order_relaxed), 100'000'000ull, &c)) return {};
+    char buf[192];
+    if (c.ns >= 1'000'000'000ull) {
+        std::snprintf(buf, sizeof(buf), " (the presenter %.2f s into %s, %s)", static_cast<double>(c.ns) / 1e9,
+                      slow_calls::call_name(c.call), c.where);
+    } else {
+        std::snprintf(buf, sizeof(buf), " (the presenter %.0f ms into %s, %s)", static_cast<double>(c.ns) / 1e6,
+                      slow_calls::call_name(c.call), c.where);
+    }
+    return buf;
+}
+
 // Which step of a present this thread is on, for the hang watchdog: a present
 // that never comes back stops the flips, and everything behind them.
 std::atomic<const char*> g_present_step{"idle"};
@@ -899,7 +1044,10 @@ bool vk_present() {
     // next vblank, and holding the GPU lock across that stalls the command
     // processor - the game's own thread - for most of a frame.
     present_step("waiting for the last present");
-    vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    {
+        slow_calls::Scope timed(kLastCopySite);
+        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    }
     host_gpu_busy_present_done();  // the last blit's two timestamps, before this one rewrites them
     // While the window is minimized nothing is acquired or presented (the
     // game's flips do not wait for this thread), and once it is back the
@@ -915,12 +1063,16 @@ bool vk_present() {
         host_log("present: the window is back; the swapchain is made again");
         g_swap_dirty.store(true);
     }
-    // A V-Sync change has no surface event behind it, so the options screen
-    // asks for the rebuild the acquire would otherwise never be told to do.
+    // A V-Sync change has no surface event behind it, nor has Stay
+    // borderless's, so the options screen asks for the rebuild the acquire
+    // would otherwise never be told to do.
     if (g_swap_dirty.exchange(false)) {
         host_gpu_lock();
         host_gpu_queue_lock();
-        vkDeviceWaitIdle(g_vk.device);
+        {
+            slow_calls::Scope timed(kRebuildIdleSite);
+            vkDeviceWaitIdle(g_vk.device);
+        }
         host_gpu_queue_unlock();
         vk_create_swapchain();
         host_gpu_unlock();
@@ -942,7 +1094,11 @@ bool vk_present() {
     // waiting on its flips (two runs frozen 20 s into the title, "acquiring an
     // image (43.4 s)"). Past 100 ms this frame is not presented; the game goes
     // on and the next frame tries again.
-    VkResult r = acquire(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
+    VkResult r;
+    {
+        slow_calls::Scope timed(kAcquireSite);
+        r = acquire(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
+    }
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4) host_log("present: no swapchain image within 100 ms (the window is not being shown?); frame not presented");
@@ -960,7 +1116,10 @@ bool vk_present() {
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         host_gpu_lock();
         host_gpu_queue_lock();
-        vkDeviceWaitIdle(g_vk.device);
+        {
+            slow_calls::Scope timed(kRebuildIdleSite);
+            vkDeviceWaitIdle(g_vk.device);
+        }
         host_gpu_queue_unlock();
         const bool remade = vk_create_swapchain();
         host_gpu_unlock();
@@ -968,6 +1127,7 @@ bool vk_present() {
             return false;
         }
         if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
+        slow_calls::Scope timed(kAcquireAgainSite);
         r = (framegen_active() ? framegen_acquire : vkAcquireNextImageKHR)(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem,
                                                                                acquire_fence, &idx);
         if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;  // ours all the same: not presenting it would keep it for ever
@@ -980,9 +1140,9 @@ bool vk_present() {
         // that is a vblank away; this thread sleeps through it, and the
         // renderer's queue never waits for the display.
         present_step("waiting for the acquired image");
-        const auto t0 = std::chrono::steady_clock::now();
+        slow_calls::Scope timed(kAcquiredSite, 0, true);  // its clock reads the figure's too
         vkWaitForFences(g_vk.device, 1, &g_vk.acquire_fence, VK_TRUE, UINT64_MAX);
-        g_pstats.acquire_wait_us += us(t0, std::chrono::steady_clock::now());
+        g_pstats.acquire_wait_us += timed.end() / 1000;
     }
     // The frame: the newest the game has flipped, taken now - after the waits
     // above, which last a GPU frame when the GPU is behind - not before them.
@@ -1109,7 +1269,7 @@ bool vk_present() {
                 present_pass_end(g_vk.cmd, g_vk.images[idx]);
                 if (have && framegen_active())
                     framegen_frame(g_vk.cmd, display_va, shown.offset, shown.extent, static_cast<std::int32_t>(src.x),
-                                   static_cast<std::int32_t>(src.y), src.w, src.h);
+                                   static_cast<std::int32_t>(src.y), src.w, src.h, false);
                 recorded = true;
                 wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
                 ++g_pstats.one_pass;
@@ -1155,8 +1315,10 @@ bool vk_present() {
         // Blit the game's display buffer; dark red (cycling with the buffer
         // index) when the renderer has not produced it yet.
         void* const storage_view = g_vk.storage && idx < g_vk.views.size() ? static_cast<void*>(g_vk.views[idx]) : nullptr;
+        bool by_fsr = false;  // a picture smaller than its rectangle, upscaled by FSR 1 (host/fsr.cpp)
         if (!display_va || !host_gpu_blit_display(g_vk.cmd, display_va, g_vk.images[idx], shown.offset.x, shown.offset.y,
-                                                  shown.extent.width, shown.extent.height, src_w, src_h, src_x, src_y, storage_view)) {
+                                                  shown.extent.width, shown.extent.height, src_w, src_h, src_x, src_y, storage_view,
+                                                  &by_fsr)) {
             VkClearColorValue color{{0.06f + 0.04f * (buffer_index % 3), 0.0f, 0.02f, 1.0f}};
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdClearColorImage(g_vk.cmd, g_vk.images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
@@ -1165,7 +1327,7 @@ bool vk_present() {
             ++g_pstats.blits;
             if (framegen_active())
                 framegen_frame(g_vk.cmd, display_va, shown.offset, shown.extent, static_cast<std::int32_t>(src_x),
-                               static_cast<std::int32_t>(src_y), src_w, src_h);
+                               static_cast<std::int32_t>(src_y), src_w, src_h, by_fsr);
         }
         // The host overlay goes over the game's frame: the pointer now, the text
         // box and the options screen later. Drawing needs
@@ -1252,7 +1414,11 @@ bool vk_present() {
         own.pCommandBuffers = &g_vk.cmd;
         own.signalSemaphoreCount = 2;
         own.pSignalSemaphores = signals;
-        const VkResult sr = vkQueueSubmit(g_vk.present_queue, 1, &own, g_vk.fence);
+        VkResult sr;
+        {
+            slow_calls::Scope timed(kOwnCopySite);
+            sr = vkQueueSubmit(g_vk.present_queue, 1, &own, g_vk.fence);
+        }
         if (sr != VK_SUCCESS) {
             // Nothing waits for a copy that never went in (present_reads_wait).
             VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
@@ -1274,7 +1440,10 @@ bool vk_present() {
         host_gpu_wait_submitted(ticket);
     } else {
         host_gpu_queue_lock();
-        vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
+        {
+            slow_calls::Scope timed(kCopySite);
+            vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
+        }
         host_gpu_queue_unlock();
         host_gpu_unlock();
         locked = false;
@@ -1284,6 +1453,7 @@ bool vk_present() {
     // (BBHOST_PRESENT_GPU_WAIT). Bounded: a lost device signals nothing.
     if (g_vk.gpu_wait) {
         present_step("waiting for the frame on the GPU");
+        slow_calls::Scope timed(kCopyGpuSite);
         vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, 1000000000ull);
     }
     const auto t_gpu_done = std::chrono::steady_clock::now();
@@ -1311,7 +1481,11 @@ bool vk_present() {
     pi.pSwapchains = &g_vk.swapchain;
     pi.pImageIndices = &idx;
     present_step("presenting");
-    const VkResult pr = (framegen_active() ? framegen_present : vkQueuePresentKHR)(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
+    VkResult pr;
+    {
+        slow_calls::Scope timed(kPresentSite);
+        pr = (framegen_active() ? framegen_present : vkQueuePresentKHR)(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
+    }
     if (queue_held) host_gpu_queue_unlock();
     if (locked) {
         host_gpu_unlock();
@@ -1851,14 +2025,43 @@ void host_window_set_mode(int mode, int width, int height) {
         resized = g_mode_w.exchange(width) != width;
         resized = (g_mode_h.exchange(height) != height) || resized;
     }
-    if (g_want_mode.exchange(mode) == mode && !(mode == 2 && resized)) {
+    const int was = g_want_mode.exchange(mode);
+    if (was == mode && !(mode == 2 && resized)) {
         return;
     }
-    if (g_window) apply_window_mode(mode);
+    if (g_window) {
+        apply_window_mode(mode);
+#if defined(_WIN32)
+        // With Stay borderless on, the swapchain says something in Borderless alone
+        // (exclusive_policy): made again when the mode goes to or from it,
+        // whether or not the window's size changes with it.
+        if (g_want_stay_borderless.load() && (was == 1) != (mode == 1)) g_swap_dirty.store(true);
+#endif
+    }
 #else
     (void)mode;
     (void)width;
     (void)height;
+#endif
+}
+
+void host_window_set_stay_borderless(bool on) {
+#if defined(BBHOST_HAVE_SDL3)
+    if (g_want_stay_borderless.exchange(on) == on) {
+        return;
+    }
+    if (g_window) {
+#if defined(_WIN32)
+        // Only Borderless's swapchain changes (exclusive_policy).
+        const bool borderless = g_want_mode.load() == 1;
+        if (borderless) g_swap_dirty.store(true);
+        host_log("window: stay borderless %s%s", on ? "on" : "off", borderless ? "; the swapchain is made again" : ", for Borderless");
+#else
+        host_log("window: stay borderless %s (it applies on Windows; nothing changes here)", on ? "on" : "off");
+#endif
+    }
+#else
+    (void)on;
 #endif
 }
 
@@ -2224,10 +2427,13 @@ bool host_window_pump() {
             // Keyboard focus decides whether SDL delivers input at all: no
             // keys without it, and the controller's events are dropped too
             // (SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS is off), so a game
-            // that ignores every input may be a window that lost focus.
+            // that ignores every input may be a window that lost focus. And
+            // what the presenter is in, when it has been in one call 100 ms
+            // or more (presenter_in_call).
             case SDL_EVENT_WINDOW_FOCUS_GAINED:
             case SDL_EVENT_WINDOW_FOCUS_LOST: {
-                host_log("window: keyboard focus %s", e.type == SDL_EVENT_WINDOW_FOCUS_GAINED ? "gained" : "lost");
+                host_log("window: keyboard focus %s%s", e.type == SDL_EVENT_WINDOW_FOCUS_GAINED ? "gained" : "lost",
+                         presenter_in_call().c_str());
                 // SDL restarted text input with the focus, and the IME with it.
                 std::lock_guard<std::mutex> lock(g_text_mu);
                 if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED && g_text_on) ime_off_for_ascii_locked();
@@ -2333,6 +2539,7 @@ bool host_window_pump() {
             shown = last ? static_cast<int>(fps + 0.5) : 0;
             // With frame generation, beside it in brackets what is on screen:
             // the game's frames and the ones generated between them.
+            // (None until AMD's swapchain has been measured: framegen_shown_per_frame 0.)
             shown_total = last && framegen_active() ? static_cast<int>(fps * framegen_shown_per_frame() + 0.5) : 0;
             shown_at = now;
             const GpuBusy b = host_gpu_busy();
@@ -2477,7 +2684,11 @@ bool host_window_pump() {
                 dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
                 dh = g_display_h ? static_cast<float>(g_display_h) : 1080.0f;
             }
-            const float scale = 1.25f, w = host_overlay_text_width(scale, text.c_str());
+            // A line wider than the display (a long one at a low resolution,
+            // 960x600 on the Steam Deck) is drawn smaller, to fit.
+            const float room = dw - 64.0f, full = host_overlay_text_width(1.25f, text.c_str());
+            const float scale = full > room && full > 0.0f ? std::max(0.5f, 1.25f * room / full) : 1.25f;
+            const float w = host_overlay_text_width(scale, text.c_str());
             const float x = (dw - w) * 0.5f, y = dh * 0.22f;
             const auto a = [&](std::uint32_t rgba) {
                 return (rgba & 0xffffff00u) | static_cast<std::uint32_t>(static_cast<float>(rgba & 0xffu) * alpha);
@@ -2761,6 +2972,7 @@ std::thread g_present_thread;
 void present_thread_main() {
     host_thread_set_name("bb-present");
     host_thread_set_class(HostThreadClass::GpuFeed, "bb-present");  // core/host_clock.h
+    g_present_tid.store(host_thread_id(), std::memory_order_relaxed);
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(g_present_mu);
@@ -3042,6 +3254,23 @@ void host_window_on_pixels(void (*fn)(int, int)) {
     g_on_pixels.store(fn, std::memory_order_release);
     int w = 0, h = 0;
     if (fn && host_window_pixels(&w, &h)) fn(w, h);
+}
+
+bool host_window_desktop_size(int* w, int* h) {
+#if defined(BBHOST_HAVE_SDL3)
+    if (!g_window_made.load() || !g_window) return false;
+    const SDL_DisplayID d = SDL_GetDisplayForWindow(g_window);
+    const SDL_DisplayMode* m = d ? SDL_GetDesktopDisplayMode(d) : nullptr;
+    if (!m || m->w <= 0 || m->h <= 0) return false;
+    const float k = m->pixel_density > 0.0f ? m->pixel_density : 1.0f;
+    *w = static_cast<int>(static_cast<float>(m->w) * k + 0.5f);
+    *h = static_cast<int>(static_cast<float>(m->h) * k + 0.5f);
+    return true;
+#else
+    (void)w;
+    (void)h;
+    return false;
+#endif
 }
 
 bool host_window_pixels(int* w, int* h) {

@@ -29,6 +29,7 @@
 #include "core/memory.h"
 #include "core/host_clock.h"
 #include "host/perf_meter.h"
+#include "host/gxvk_lists.h"
 #include "core/portable.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
@@ -1948,9 +1949,11 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
         // The bottleneck meter (host/perf_meter.h): the limiter's wait and the
         // rate it held the frame to (none on a loading screen; the game's own 30).
         const std::uint64_t waited_t1 = host_clock_monotonic_ns();
-        perf_meter_limiter(waited_t1 - wait_t0, static_cast<std::uint64_t>(clock.spun_us) * 1000,
-                           g_fast_target ? 0.0f : target > 0.0f ? 1.0f / target : !converted ? 30.0f : 0.0f);
-        fg_pace_note(waited_t1, waited_t1 - wait_t0, g_fast_target ? 0.0f : fg_cap_target());
+        const std::uint64_t waited_ns = waited_t1 - wait_t0;
+        const float cap_fps = g_fast_target ? 0.0f : target > 0.0f ? 1.0f / target : !converted ? 30.0f : 0.0f;
+        perf_meter_limiter(waited_ns, static_cast<std::uint64_t>(clock.spun_us) * 1000, cap_fps);
+        fg_pace_note(waited_t1, waited_ns, g_fast_target ? 0.0f : fg_cap_target());
+        gxvk_lists::frame_paced(waited_ns, cap_fps);  // the draw pool rests while the cap holds the frame (host/gxvk_lists.h)
         g_fast_target = false;
         host_fps_frame_start();  // the FPS counter: the frame starts as the limiter lets it go (host/window.h)
         if (converted) each_frame(f);

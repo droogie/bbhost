@@ -29,6 +29,7 @@ cp -r patches "$dir/patches"
 mkdir -p "$dir/plugins"
 cp include/bbhost_plugin.h "$dir/plugins/"
 cp LICENSE "$dir/LICENSE.txt"
+cp LICENSE-EXCEPTION "$dir/LICENSE-EXCEPTION.txt"
 tools/package_plugins.sh "$(dirname "$exe")/plugins" "$dir/plugins"
 llvm-objcopy --strip-debug "$exe" "$dir/bbhost.exe"
 cp "$exe" "$out/$name.debug.exe"
@@ -60,8 +61,10 @@ bbhost for Windows, build $name
 
 bbhost runs Bloodborne on PC: the game's own 1.09 executable, its calls into
 the PS4's system libraries answered by bbhost and its graphics recompiled for
-Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE.txt); the
-source is at https://github.com/droogie/bbhost.
+Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE.txt),
+with an additional permission to combine it with GPU vendors' upscaling and
+frame generation runtimes (LICENSE-EXCEPTION.txt); the source is at
+https://github.com/droogie/bbhost.
 
 You need
   - Your own copy of Bloodborne, dumped from your own PS4 - nothing from the
@@ -148,7 +151,8 @@ The shader compiler
 Upscaling and frame generation
   Graphics > Upscaling's FSR 3, FSR 4 and DLSS and Frame generation run
   through these files beside bbhost.exe, each its maker's own, unmodified and
-  under its own licence - not the GPL, which covers bbhost alone:
+  under its own licence; bbhost's licence permits combining bbhost with them
+  (LICENSE-EXCEPTION.txt):
     - amd_fidelityfx_loader_vk.dll, amd_fidelityfx_upscaler_vk.dll and
       amd_fidelityfx_framegeneration_vk.dll: AMD FidelityFX (FSR 3, FSR 4 and
       frame generation), Copyright (C) Advanced Micro Devices, Inc., from the

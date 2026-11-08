@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "host/gpu_memtrack.h"
+#include "host/slow_calls.h"
 
 namespace {
 struct Site {
@@ -141,17 +142,18 @@ bool imported(const VkMemoryAllocateInfo* info) {
 }  // namespace
 
 VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* cb,
-                         VkDeviceMemory* out, const char* file, int line) {
+                         VkDeviceMemory* out, const char* file, int line, const slow_calls::Site& site) {
     const bool limited = g_limit_bytes && ((g_limit_types >> info->memoryTypeIndex) & 1) && !imported(info);
     if (limited) {
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_limited_bytes + info->allocationSize > g_limit_bytes) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         g_limited_bytes += info->allocationSize;  // held for it now, so two threads cannot both pass
     }
-    const auto t0 = std::chrono::steady_clock::now();
+    // Timed as a slow call (host/slow_calls.h), whose clock reads are this
+    // report's too.
+    slow_calls::Scope timed(site, 0, true);
     const VkResult r = vkAllocateMemory(device, info, cb, out);
-    const auto us = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    const std::uint64_t us = timed.end() / 1000;
     if (limited && !(r == VK_SUCCESS && out && *out != VK_NULL_HANDLE)) {
         std::lock_guard<std::mutex> lk(g_mu);
         g_limited_bytes -= info->allocationSize;
@@ -205,7 +207,13 @@ VkResult bb_alloc_memory(VkDevice device, const VkMemoryAllocateInfo* info, cons
     return r;
 }
 
-void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb) {
+VkResult bb_map_memory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags,
+                       void** data, const slow_calls::Site& site) {
+    slow_calls::Scope timed(site);
+    return vkMapMemory(device, memory, offset, size, flags, data);
+}
+
+void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* cb, const slow_calls::Site& site) {
     if (memory != VK_NULL_HANDLE) {
         std::lock_guard<std::mutex> lk(g_mu);
         auto it = g_blocks.find(reinterpret_cast<std::uint64_t>(memory));
@@ -223,6 +231,8 @@ void bb_free_memory(VkDevice device, VkDeviceMemory memory, const VkAllocationCa
             g_blocks.erase(it);
         }
     }
+    if (memory == VK_NULL_HANDLE) return;  // nothing to free: vkFreeMemory would do nothing
+    slow_calls::Scope timed(site);         // a slow call's (host/slow_calls.h)
     vkFreeMemory(device, memory, cb);
 }
 

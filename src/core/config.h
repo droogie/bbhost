@@ -73,6 +73,14 @@ struct HostConfig {
     // world.skill_issue / BBHOST_SKILL_ISSUE=0|1: the death message reads
     // SKILL ISSUE instead of YOU DIED (engine/menu_assets.h). Off by default.
     bool skill_issue = false;
+    // world.full_phantom_hp / BBHOST_FULL_PHANTOM_HP=0|1: a hunter summoned into
+    // another hunter's world, as a cooperator or an invader, keeps their full
+    // max HP there instead of 70% (engine/phantom_hp.h).
+    bool full_phantom_hp = true;
+    // world.auto_replenish / BBHOST_AUTO_REPLENISH=0|1: twenty more consumables
+    // (Molotovs, knives, pebbles, papers, elixirs...) refill from storage as
+    // Blood Vials and Quicksilver Bullets do (engine/auto_replenish.h).
+    bool auto_replenish = true;
     // [keys] from the config, action name -> SDL key name. Empty unless the
     // player has rebound something; window.cpp holds the defaults and the
     // list of action names.
@@ -159,9 +167,11 @@ struct App0Version {
 App0Version config_app0_version(const std::string& app0);
 // The PC enhancements, the same way: the options file's choices (F10, the
 // System menu's PC Enhancements, the setup window's tab) once it is read. A
-// BBHOST_CHANGE_APPEARANCE, BBHOST_REBIRTH, BBHOST_FIVE_PLAYERS or
-// BBHOST_SKILL_ISSUE of 0 or 1 still wins over the options file.
-void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue);
+// BBHOST_CHANGE_APPEARANCE, BBHOST_REBIRTH, BBHOST_FIVE_PLAYERS,
+// BBHOST_SKILL_ISSUE, BBHOST_FULL_PHANTOM_HP or BBHOST_AUTO_REPLENISH of 0 or 1
+// still wins over the options file.
+void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue, bool full_phantom_hp,
+                             bool auto_replenish);
 // The setup window's server, in memory before it is saved: its account calls
 // (net::auth_server_base) go where its dropdown says. Main thread, before
 // the game starts.
@@ -196,7 +206,9 @@ bool config_saves_locally();
 // The folder saves go to when paths.data is not set (the per-user data folder).
 std::string config_default_data_dir();
 // The per-user folder the config and the F10 settings live in: %APPDATA%/bbhost,
-// $XDG_CONFIG_HOME/bbhost or ~/.config/bbhost; BBHOST_CONFIG_DIR replaces it.
+// $XDG_DATA_HOME/bbhost or ~/.local/share/bbhost (an older bbhost's
+// ~/.config/bbhost is moved there at start: core/config_move.h);
+// BBHOST_CONFIG_DIR replaces it.
 std::string config_user_dir();
 // The directory the running executable is in ("." when unknown).
 std::string config_exe_dir();

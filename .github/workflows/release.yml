@@ -4,7 +4,10 @@
 # kit made from it, with the unstripped binaries for symbolizing crash
 # reports. Each package carries DXC's release library for the HLSL shader
 # path, its release archive checked against the SHA-256 tools/fetch_dxc.sh
-# pins. The bundles go to the live server (https://thehuntersdream.com) by
+# pins. The Linux tarball carries DLSS - the NGX bridge the build makes with
+# NVIDIA's NGX SDK and NVIDIA's DLSS runtime, both fetched pinned by
+# tools/fetch_ngx.sh into the cached prefix - and the Steam Deck kit none of
+# it. The bundles go to the live server (https://thehuntersdream.com) by
 # default, and the playtest kits for the dev server (tools/package_playtest.sh)
 # are never among them: tools/check_release_bundle.sh fails the release
 # otherwise. Both builds are ThinLTO builds (-DBBHOST_LTO=ON, docs/building.md), the Windows one
@@ -76,6 +79,7 @@ jobs:
         env:
           RELEASE_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.RELEASE_SIGNING_KEY || '' }}
           DXC_CACHE: build-ci/prefix/dxc-cache   # the archive tools/ci_build.sh fetched and checked
+          NGX_CACHE: build-ci/prefix/ngx-cache   # NVIDIA's files (tools/fetch_ngx.sh): the SDK the build took, the DLSS runtime
         run: tools/package_linux.sh build-ci/build/bbhost build/linux
       - uses: actions/upload-artifact@v4
         with:

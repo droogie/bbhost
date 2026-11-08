@@ -57,7 +57,6 @@ constexpr float kTaaMipBias = 0.0f;
 
 #include <algorithm>
 #include <cmath>
-#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
@@ -68,36 +67,6 @@ constexpr float kTaaMipBias = 0.0f;
 #include <vector>
 
 namespace {
-
-#if defined(_WIN32)
-constexpr const char* kBridgeFile = "upscaler_bridge.dll";
-#else
-constexpr const char* kBridgeFile = "upscaler_bridge.so";
-#endif
-
-// The bridge's ub_get_api, from the file at `path`; null (and why in `why`)
-// when it does not load.
-PFN_ub_get_api load_bridge(const std::filesystem::path& path, std::string* why) {
-#if defined(_WIN32)
-    // Its own folder first for what it loads (the vendors' files beside it).
-    HMODULE h = LoadLibraryExW(path.wstring().c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!h) {
-        *why = "error " + std::to_string(GetLastError());
-        return nullptr;
-    }
-    return reinterpret_cast<PFN_ub_get_api>(reinterpret_cast<void*>(GetProcAddress(h, "ub_get_api")));
-#else
-    // By its full path; it finds NVIDIA's and AMD's files in its own folder
-    // (the vendor folder it is given) by their full paths too.
-    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!h) {
-        const char* e = dlerror();
-        *why = e ? e : "dlopen failed";
-        return nullptr;
-    }
-    return reinterpret_cast<PFN_ub_get_api>(dlsym(h, "ub_get_api"));
-#endif
-}
 
 const ub_api* g_ub = nullptr;
 ub_context* g_ctx = nullptr;
@@ -113,25 +82,52 @@ void UB_CALL bridge_log(void*, int32_t level, const char* line) {
     host_log("upscaler: %s%s", level == UB_LOG_ERROR ? "error: " : level == UB_LOG_WARNING ? "warning: " : "", line);
 }
 
+// upscaler_open has run: from then on the device's caps say what can run.
+std::atomic<bool> g_tried{false};
+
+#if !defined(_WIN32)
+// The bridges bbhost loads on Linux, beside the executable, the first found:
+// the upscaler bridge's own source built for Linux under the Windows DLL's
+// name (upscaler_bridge.so), Numity1504's own under a library's name, should
+// he make one, else bbhost's NGX bridge (src/ngx_bridge: DLSS through NVIDIA's
+// NGX). The same API, so each takes the place of those after it.
+constexpr const char* kNgxBridge = "libbbhost_ngx_bridge.so";
+constexpr const char* kLinuxBridges[] = {"upscaler_bridge.so", "libupscaler_bridge.so", kNgxBridge};
+
+bool bridge_beside_exe() {
+    static const bool beside = [] {
+        for (const char* name : kLinuxBridges) {
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(std::filesystem::path(config_exe_dir()) / name, ec)) return true;
+        }
+        return false;
+    }();
+    return beside;
+}
+#endif
+
 }  // namespace
 
 bool upscaler_open() {
+    g_tried.store(true, std::memory_order_release);
     if (const char* e = std::getenv("BBHOST_UPSCALER"); e && e[0] == '0') {
         host_log("upscaler: off (BBHOST_UPSCALER=0)");
         return false;
     }
-    const std::filesystem::path dll = std::filesystem::path(config_exe_dir()) / kBridgeFile;
+#if defined(_WIN32)
+    const std::filesystem::path dll = std::filesystem::path(config_exe_dir()) / "upscaler_bridge.dll";
     std::error_code ec;
     if (!std::filesystem::is_regular_file(dll, ec)) {
-        host_log("upscaler: no %s beside bbhost: DLSS and FSR are not available", kBridgeFile);
+        host_log("upscaler: no upscaler_bridge.dll beside bbhost.exe: DLSS and FSR 3/4 are not available");
         return false;
     }
-    std::string why;
-    const PFN_ub_get_api get_api = load_bridge(dll, &why);
-    if (!get_api && !why.empty()) {
-        host_log("upscaler: %s did not load (%s)", dll.string().c_str(), why.c_str());
+    // Its own folder first for what it loads (the vendors' files beside it).
+    HMODULE h = LoadLibraryExW(dll.wstring().c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!h) {
+        host_log("upscaler: %s did not load (error %lu)", dll.string().c_str(), GetLastError());
         return false;
     }
+    auto get_api = reinterpret_cast<PFN_ub_get_api>(reinterpret_cast<void*>(GetProcAddress(h, "ub_get_api")));
     const ub_api* api = get_api ? get_api(UB_API_VERSION) : nullptr;
     if (!api) {
         host_log("upscaler: %s is not a bridge of API %u", dll.string().c_str(), UB_API_VERSION);
@@ -150,6 +146,51 @@ bool upscaler_open() {
     g_ub = api;
     host_log("upscaler: %s loaded", dll.string().c_str());
     return true;
+#else
+    // From the executable's own folder (/proc/self/exe's, never a library
+    // path), RTLD_LOCAL: nothing of the bridge's reaches anything else.
+    const std::string dir = config_exe_dir();
+    void* h = nullptr;
+    std::string path;
+    bool seen = false;
+    for (const char* name : kLinuxBridges) {
+        const std::string p = dir + "/" + name;
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(p, ec)) continue;
+        seen = true;
+        if ((h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL))) {
+            path = p;
+            break;
+        }
+        host_log("upscaler: %s did not load: %s", p.c_str(), dlerror());
+    }
+    if (!h) {
+        if (!seen) host_log("upscaler: no %s beside bbhost (%s): DLSS is not available", kNgxBridge, dir.c_str());
+        return false;
+    }
+    auto get_api = reinterpret_cast<PFN_ub_get_api>(dlsym(h, "ub_get_api"));
+    const ub_api* api = get_api ? get_api(UB_API_VERSION) : nullptr;
+    if (!api) {
+        host_log("upscaler: %s is not a bridge of API %u", path.c_str(), UB_API_VERSION);
+        return false;
+    }
+    // NGX's data folder (its logs, when it logs) under the run's own settings
+    // folder: BBHOST_CONFIG_DIR's in a test, never the player's then.
+    const std::string data = config_user_dir() + "/ngx";
+    ub_open_desc od{};
+    od.struct_size = sizeof(od);
+    od.vendor_folder = dir.c_str();
+    od.data_folder = data.c_str();
+    od.engine_version = BBHOST_VERSION;
+    od.log = &bridge_log;
+    if (api->open_context(&od, &g_ctx) != UB_OK) {
+        host_log("upscaler: the bridge did not open: %s", api->last_error(nullptr));
+        return false;
+    }
+    g_ub = api;
+    host_log("upscaler: %s loaded", path.c_str());
+    return true;
+#endif
 }
 
 const VkInstanceCreateInfo* upscaler_prepare_instance(const VkInstanceCreateInfo* in) {
@@ -211,6 +252,9 @@ void upscaler_attach(VkInstance instance, VkPhysicalDevice phys, VkDevice device
     g_caps = c;
     g_caps_dlss.store(c.dlss, std::memory_order_relaxed);
     g_caps_fsr.store(c.fsr, std::memory_order_relaxed);
+#if !defined(_WIN32)
+    host_log("upscaler: the Upscaling list offers Off, TAA%s", c.dlss ? ", DLSS" : "");
+#endif
 }
 
 UpscalerCaps upscaler_caps() {
@@ -226,11 +270,8 @@ std::atomic<bool> g_failed{false};  // an evaluate failed: the plain picture fro
 // ProductName does not start with "Vulkan": not the loader). It runs its own
 // TAA and jitter, so ours stays off with it - the bridge's UB_ERR_BLOCKED for
 // TAA, which has no bridge to ask (Numity1504's step 9, "Only one AA").
-// BBsuite is Windows only.
+#if defined(_WIN32)
 bool bbsuite_layer_present() {
-#if !defined(_WIN32)
-    return false;
-#else
     static const bool present = [] {
         wchar_t exe[MAX_PATH];
         const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -261,6 +302,19 @@ bool bbsuite_layer_present() {
         return other;
     }();
     return present;
+}
+#else
+bool bbsuite_layer_present() { return false; }  // (BBsuite is a Windows layer)
+#endif
+
+bool upscaler_offered(int index) {
+#if defined(_WIN32)
+    return index >= 0 && index <= 4;
+#else
+    if (index == 0 || index == 1) return true;  // Off, TAA
+    if (index != 4) return false;               // FSR 3, FSR 4: AMD's runtime is Windows' alone
+    // DLSS: the device's answer, or before there is one (the setup window) a bridge beside bbhost.
+    return g_tried.load(std::memory_order_acquire) ? g_caps_dlss.load(std::memory_order_relaxed) : bridge_beside_exe();
 #endif
 }
 
@@ -360,6 +414,7 @@ bool upscaler_evaluate(VkCommandBuffer cb, const UpscaleCall& c) {
 #else  // no bridge outside Windows and Linux
 
 bool upscaler_open() { return false; }
+bool upscaler_offered(int index) { return index == 0 || index == 1; }
 const VkInstanceCreateInfo* upscaler_prepare_instance(const VkInstanceCreateInfo* in) { return in; }
 void upscaler_instance_done(VkResult) {}
 bool upscaler_instance_retry(const VkInstanceCreateInfo*, const VkInstanceCreateInfo*) { return false; }

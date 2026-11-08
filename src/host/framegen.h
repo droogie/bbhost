@@ -8,9 +8,7 @@
 // first draw) and put back over every frame shown, real or generated.
 //
 // The runtime is AMD's: amd_fidelityfx_loader_vk.dll and
-// amd_fidelityfx_framegeneration_vk.dll beside bbhost.exe; on Linux,
-// libamd_fidelityfx_vk.so beside bbhost (built from the same SDK's MIT
-// source, the same API: AMD ships no Linux files). Without them, the
+// amd_fidelityfx_framegeneration_vk.dll beside bbhost.exe. Without them, the
 // device's three spare queues (host/gpu.h fg_queues) or the setting, the
 // presenter keeps a swapchain of its own and nothing here runs.
 //
@@ -77,5 +75,9 @@ void framegen_note_hudless(std::uint64_t display_va, std::uint64_t id, VkImage i
 // The presenter's side, in its command buffer after the frame's blit: the
 // HUD-less picture of the frame in `display_va` brought to the swapchain's
 // size over the same rectangles, for AMD to take the UI out of the frame with.
+// `fsr`: the frame was upscaled by FSR 1 (a picture smaller than its
+// rectangle: Upscaling Off or TAA at a Resolution below the window's), and the
+// HUD-less picture is too - stretched by a blit, it differs from the frame
+// wherever FSR 1 made an edge or sharpened, and AMD takes all of that for UI.
 void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D dst, VkExtent2D dst_size, std::int32_t src_x,
-                    std::int32_t src_y, std::uint32_t src_w, std::uint32_t src_h);
+                    std::int32_t src_y, std::uint32_t src_w, std::uint32_t src_h, bool fsr);

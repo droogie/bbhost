@@ -68,7 +68,18 @@ constexpr std::uint64_t kFeed = 1u << 15;
 extern Feed g_feed[kFeed];
 extern std::atomic<std::uint64_t> g_feed_pos;   // the recording threads' next place
 extern std::atomic<std::uint64_t> g_feed_next;  // the pool's next place
-void feed_push(std::uint64_t id, std::uint32_t kind);
+std::uint64_t feed_push(std::uint64_t id, std::uint32_t kind);  // its place
+
+// BBHOST_GXVK_LISTS_TIMES (host/gxvk_lists.h times): a stored draw's times by
+// its token slot (the id's low bits, as the commits' records): the draw's id,
+// when it was stored (rdtsc), its place in the feed, and when its list record
+// closed (FinishCommandList's leaf). Written by the recording threads, read by
+// the command processor at the token; a diagnostic, so relaxed throughout.
+struct DrawTime {
+    std::atomic<std::uint64_t> id{0}, stored{0}, feed{0}, closed{0};
+};
+constexpr std::uint64_t kTimeSlots = 16384;
+extern DrawTime g_draw_times[kTimeSlots];
 
 // ---- Stage 4b.2: the draws of a list as a context recorded them ----
 // A context's open record takes each draw the recording thread stored on it,

@@ -399,6 +399,11 @@ bool host_gpu_splice(std::uint64_t id);
 bool host_gpu_list_committed(std::uint64_t id);  // its commit is made: the pool reads its slot no more
 void host_gpu_splice_compare(std::uint64_t id);
 std::string host_gpu_splice_report(bool window = false);
+// BBHOST_GXVK_LISTS_TIMES (host/gxvk_lists.h times): the command processor
+// arrives at GX-native draw token `id`, before anything takes it; the line,
+// in three parts, with the pool's time parked (rdtsc ticks) and its parks.
+void host_gpu_lists_arrival(std::uint64_t id);
+std::string host_gpu_lists_times_report(int part, std::uint64_t parked_ticks, std::uint64_t parks);  // part 0, 1, 2
 // Stage 4b.2 (BBHOST_GXVK_LISTS=segments): at GX-native draw token `id`,
 // before its slot is taken - the members of a segment ready to splice whose
 // first member it is (null: none), their count and the segment's word; the
@@ -705,7 +710,7 @@ std::string host_gpu_clear_view_report();
 struct GpuStats {
     std::uint64_t draws, dispatches, flushes, gpu_us, pipelines, transfers, transfer_batches;
     // CP-thread wall time by phase, nanoseconds (see kPhaseNames).
-    std::uint64_t phase_ns[8];
+    std::uint64_t phase_ns[9];
     // host_gpu_draw calls, failures, and calls that had nothing to draw.
     std::uint64_t draw_calls, draw_failures, draws_empty;
     // The draws by how their pixel shader ran (DrawPs), and the failures by
@@ -762,8 +767,16 @@ enum DrawVsWhy {
 const char* host_gpu_vs_why_name(int why);
 // A draw failure reason's name ("pixel shader"), or null past the last.
 const char* host_gpu_draw_fail_name(int reason);
-enum GpuPhase { kPhaseDraw, kPhaseDispatch, kPhasePrefetch, kPhasePipeline, kPhaseBind, kPhaseExec, kPhaseWait, kPhaseLock, kPhaseCount };
-static const char* const kPhaseNames[8] = {"draw", "dispatch", "prefetch", "pipeline", "bind", "exec", "label-wait", "lock-wait"};
+// kPhaseDriver: a command-processor thread inside a timed driver call
+// (host/slow_calls.h) - or a wait for the queue's lock or for a submission the
+// submission thread has still to hand over - in a command buffer's packets,
+// which `exec` includes, or after the job, outside it (its submission and the
+// slot it retires); a wait for the GPU's fence or timeline holds the GPU's
+// own time too. Last, so the line's fields before it keep their places for
+// the tools that read them.
+enum GpuPhase { kPhaseDraw, kPhaseDispatch, kPhasePrefetch, kPhasePipeline, kPhaseBind, kPhaseExec, kPhaseWait, kPhaseLock, kPhaseDriver, kPhaseCount };
+static const char* const kPhaseNames[kPhaseCount] = {"draw", "dispatch", "prefetch", "pipeline", "bind", "exec", "label-wait", "lock-wait", "driver"};
+static_assert(sizeof(GpuStats::phase_ns) / sizeof(GpuStats::phase_ns[0]) == kPhaseCount, "a phase for each name");
 void host_gpu_phase_add(int phase, std::uint64_t ns);
 // Scoped wall-clock accumulator for a phase. `weight` books each reading that
 // many times over, so a caller can time one call in n; 0 reads no clock.
@@ -799,6 +812,10 @@ struct GpuHandles {
     void* fg_queues[3] = {};         // VkQueues for frame generation: present, image acquire, async compute; null when the family has fewer than five
     std::uint32_t family = 0;
     bool fifo_latest_ready = false;  // the device may present in VK_PRESENT_MODE_FIFO_LATEST_READY_KHR
+    // VK_EXT_full_screen_exclusive is on (Windows): a swapchain may chain
+    // VkSurfaceFullScreenExclusiveInfoEXT, and its present modes are asked with
+    // vkGetPhysicalDeviceSurfacePresentModes2EXT.
+    bool full_screen_exclusive = false;
 };
 GpuHandles host_gpu_handles();
 // The command processor wrote guest memory on the CPU (DMA, WRITE_DATA):
@@ -938,10 +955,21 @@ bool host_gpu_display_image(std::uint64_t display_va, void** image, std::uint32_
 // (a VkImage) on `cmd` (a VkCommandBuffer). Caller holds the lock. Returns
 // false when the VA is not a known render target. `dst_storage_view` (a
 // VkImageView of `dst_image` that takes storage writes, or null): an upscale
-// writes it directly instead of blitting a copy.
+// writes it directly instead of blitting a copy. `by_fsr` (or null): set to
+// whether FSR 1 upscaled it, a picture smaller than the rectangle - else a
+// blit stretched or copied it.
 bool host_gpu_blit_display(void* cmd, std::uint64_t display_va, void* dst_image, std::int32_t dst_x, std::int32_t dst_y,
                            std::uint32_t dst_w, std::uint32_t dst_h, std::uint32_t src_width, std::uint32_t src_height,
-                           std::uint32_t src_x = 0, std::uint32_t src_y = 0, void* dst_storage_view = nullptr);
+                           std::uint32_t src_x = 0, std::uint32_t src_y = 0, void* dst_storage_view = nullptr, bool* by_fsr = nullptr);
+// FSR 1 as host_gpu_blit_display upscales the display buffer, for another
+// picture in the same command buffer (frame generation's HUD-less one): the
+// sw x sh of `src_image` (a VkImage of `src_format`, src_w x src_h, in
+// GENERAL) from (src_x, src_y) into the rectangle (dst_x, dst_y, dst_w x
+// dst_h) of `dst_image` (in TRANSFER_DST_OPTIMAL). Caller holds the lock;
+// false when FSR 1 cannot run (BBHOST_UPSCALE=linear, no pipelines).
+bool host_gpu_fsr_upscale(void* cmd, void* src_image, std::uint32_t src_format, std::uint32_t src_w, std::uint32_t src_h,
+                          std::uint32_t src_x, std::uint32_t src_y, std::uint32_t sw, std::uint32_t sh, void* dst_image, std::int32_t dst_x,
+                          std::int32_t dst_y, std::uint32_t dst_w, std::uint32_t dst_h);
 // Writes the displayed render target as an image: PNG when the path ends in
 // ".png", binary PPM otherwise (headless inspection). `all_targets`: also
 // every colour RT (F12) as <stem>-rt-<base> in the same format and the draw

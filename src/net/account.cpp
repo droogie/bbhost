@@ -1,10 +1,15 @@
 #include "net/account.h"
 
+#include "host/window.h"
 #include "log.h"
 #include "net/http.h"
+#include "net/sign_in_check.h"
 
+#include <cctype>
 #include <cstdlib>
+#include <ctime>
 #include <mutex>
+#include <thread>
 
 #if !defined(_WIN32)
 #include <unistd.h>
@@ -16,6 +21,34 @@ namespace {
 std::mutex g_mu;
 std::string g_name, g_token;
 bool g_refused = false;  // the server refused this sign-in (account_refused)
+// The sign-in check (account_check_start), under g_mu: its state, which check
+// is the latest, and which sign-in it was for (account_set / account_clear
+// move g_signin on).
+AccountCheck g_check;
+unsigned g_check_serial = 0;
+unsigned g_signin = 0;
+
+// What the player is told over the game when the server refuses the sign-in
+// while it runs: a token it no longer knows needs a new sign-in; a refusal for
+// another reason (a ban) is the server's own words.
+std::string refused_banner(const std::string& reason, bool had_token) {
+    if (reason.find("banned") != std::string::npos) {
+        std::string s = reason;
+        s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+        return s;
+    }
+    return had_token ? "Sign-in expired: sign in again in F10 > Game, or at the next start"
+                     : "Online play needs a sign-in: F10 > Game";
+}
+
+// A refusal newly marked: said once in the log and, while the game's window
+// is up, once over the game.
+void said_refused(const std::string& name, const std::string& reason) {
+    host_log("account: the server refused this PC's sign-in%s%s (%s): until it is signed in again (F10's Game page, or "
+             "the setup window) nobody can summon or invite this player",
+             name.empty() ? "" : " as ", name.c_str(), reason.c_str());
+    if (host_window_active()) host_message_show(refused_banner(reason, !name.empty()).c_str(), 15.0f);
+}
 
 // POST to the account server and read the reply whatever the status: a limit
 // is a 429 with the reason in Message, which is what the player should see.
@@ -78,6 +111,8 @@ void account_set(const std::string& name, const std::string& token) {
     g_name = name;
     g_token = token;
     g_refused = false;
+    ++g_signin;
+    g_check = AccountCheck{};
 }
 
 void account_clear() {
@@ -85,6 +120,8 @@ void account_clear() {
     g_name.clear();
     g_token.clear();
     g_refused = false;
+    ++g_signin;
+    g_check = AccountCheck{};
 }
 
 bool account_refused() {
@@ -100,9 +137,74 @@ void account_mark_refused(const std::string& reason) {
         g_refused = true;
         name = g_name;
     }
-    host_log("account: the server refused this PC's sign-in%s%s (%s): until it is linked again (F10, Account) "
-             "nobody can summon or invite this player",
-             name.empty() ? "" : " as ", name.c_str(), reason.c_str());
+    said_refused(name, reason);
+}
+
+void account_check_start(int timeout_ms) {
+    std::string token, name;
+    unsigned signin = 0, mine = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_token.empty() || g_name.empty()) {
+            g_check = AccountCheck{};
+            return;
+        }
+        token = g_token;
+        name = g_name;
+        signin = g_signin;
+        mine = ++g_check_serial;
+        g_check = AccountCheck{AccountCheckState::Checking, name, "", 0};
+    }
+    // The server the caller has chosen now (the setup window's dropdown).
+    const std::string url = auth_server_base() + "/auth/whoami";
+    std::thread([url, token, name, signin, mine, timeout_ms] {
+        json::Value body = json::Value::make_object();
+        body.set("Token", token);
+        const HttpResult r = http_post_json(url, body, timeout_ms);
+        const SignInReply v = read_sign_in_reply(r.status, r.body, r.error);
+        bool newly_refused = false;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            if (signin != g_signin || mine != g_check_serial) return;  // signed in or out since, or checked again
+            g_check.why = v.why;
+            g_check.status = v.status;
+            if (v.verdict == SignInVerdict::Valid) {
+                g_check.state = AccountCheckState::Valid;
+                g_refused = false;
+            } else if (v.verdict == SignInVerdict::Refused) {
+                g_check.state = AccountCheckState::Refused;
+                newly_refused = !g_refused;
+                g_refused = true;
+            } else {
+                g_check.state = AccountCheckState::Unchecked;
+            }
+        }
+        if (v.verdict == SignInVerdict::Valid) {
+            char until[32] = "?";
+            if (v.expires_at > 0) {
+                const std::time_t t = static_cast<std::time_t>(v.expires_at);
+                std::tm tm{};
+#if defined(_WIN32)
+                const bool ok = gmtime_s(&tm, &t) == 0;
+#else
+                const bool ok = gmtime_r(&t, &tm) != nullptr;
+#endif
+                if (ok) std::strftime(until, sizeof(until), "%Y-%m-%d", &tm);
+            }
+            host_log("account: sign-in checked: the server knows this PC as %s (%s; its expiry now %s UTC)", v.name.c_str(),
+                     url.c_str(), until);
+            if (v.name != name) host_log("account: the server spells the account %s, this PC %s", v.name.c_str(), name.c_str());
+        } else if (v.verdict == SignInVerdict::Refused) {
+            if (newly_refused) said_refused(name, v.why);
+        } else {
+            host_log("account: the sign-in could not be checked at %s: %s", url.c_str(), v.why.c_str());
+        }
+    }).detach();
+}
+
+AccountCheck account_check() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_check;
 }
 
 std::string account_device_name() {

@@ -686,16 +686,25 @@ on the live save), 182.4 and 177.4 off against 182.0 and 184.5, and 200.9 on.
   command processor takes one more predictable branch a packet.
 - `BBHOST_RUN_BATCH=1|compare`: the batching above, on the census's run
   tracking (`list_resolve::run_serial`, which the per-run commit will start
-  from). On with the run commit (so by default on Windows); `=0` off.
+  from). On with the run commit (so by default on Windows, and kept on where
+  that default gives way to the constant buffers' homes); `=0` off.
 - `BBHOST_DRAW_CONTEXT=chunks|compare`: the draw's own context above, with its
   census and checks. Off by default.
 - `BBHOST_RUN_COMMIT=fork|on|compare` (`BBHOST_RUN_COMMIT_THREADS`,
   `_MIN`, `_SPIN_US`): the runs committed in parts above, in an integrated
   GPU's configuration (the lite shadow) and a discrete one's (the mirrors, GX
   buffers by handle, the particles' twins). **On by default on Windows since
-  cc9a46d1 (2026-10-29), off by default on Linux since 2026-10-31**;
-  `BBHOST_RUN_COMMIT=on` turns it on anywhere, `=0` (or `off`) commits every
-  draw in order, the draw path then taking the same branches as before. On
+  cc9a46d1 (2026-10-29), off by default on Linux since 2026-10-31**; since
+  2026-11-04 Windows' default gives way where the constant buffers' homes and the
+  pool's segments are on by their rule - a card with room or 6,144 MiB of
+  video memory free, 16 hardware threads, above 60 fps (rendering.md, "On by
+  default above 60 fps"): there they ran Old Yharnam 27-29% faster than the
+  run commit on an RTX 3070 Ti Laptop GPU, and three other places 2.2-4.0%; it stays
+  on everywhere else (an integrated GPU such as the Radeon 8060S, fewer
+  threads, 60 fps and below). `BBHOST_RUN_COMMIT=on` turns it on anywhere, `=0`
+  (or `off`) commits every draw in order, the draw path then taking the same
+  branches as before; `BBHOST_TEST_RUN_COMMIT_DEFAULT=on` takes Windows' default
+  on Linux (`=off` Linux's on Windows), to test the default and its give-way. On
   Linux it was measured to lose: an RTX 4070 with two Xeon Gold 6230 (1920x1080
   headless, uncapped, alternating runs) ran Old Yharnam at 77.8 fps with it
   against 95.1 without, the Cainhurst courtyard at 78.7 against 99.7, the
