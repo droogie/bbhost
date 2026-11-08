@@ -26214,6 +26214,19 @@ static bool draw_impl(const GpuDraw& d) {
                 for (const StageImages::Image& im : stage_images[st].images) reads |= im.resolved && image_base(im) == scene_base;
             }
             RtImage* scene = reads ? find_render_target(scene_base) : nullptr;
+            // The scene is a float target. After a rebuild of the targets (a
+            // render size back to native: FSR -> TAA) its old address can be
+            // another target's, an 8-bit one, until YEBIS's copy names the
+            // new scene: the upscaler ran on it and blitted its picture back
+            // into it - other surfaces' colours broken. Forgotten instead.
+            if (scene && scene->format != VK_FORMAT_R16G16B16A16_SFLOAT && scene->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+                scene->format != VK_FORMAT_R32G32B32A32_SFLOAT) {
+                host_log("upscaler: 0x%llx is format %d now, not the scene; waiting for YEBIS's copy to name it",
+                         static_cast<unsigned long long>(scene_base), static_cast<int>(scene->format));
+                scene_base = 0;
+                depth_base = 0;
+                scene = nullptr;
+            }
             RtImage* depth = scene ? find_render_target(depth_base) : nullptr;
             if (scene && depth && depth->depth && scene->last_write != u.done_write) {
                 if (part) {

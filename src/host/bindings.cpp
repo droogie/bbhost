@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <utility>
 
 #if defined(BBHOST_HAVE_SDL3)
 #include <SDL3/SDL.h>
@@ -809,6 +810,25 @@ std::uint32_t host_pad_play_bit(int input) {
     return input >= 0 && input < kPadInputs ? kPadBits[g_pad_gives[input].load(std::memory_order_relaxed)] : 0;
 }
 
+std::uint32_t host_pad_menu_bit(int input) {
+    if (input < 0 || input >= kPadInputs) return 0;
+    // Every button itself, then the OK's and the Back's moved in turn to the
+    // button that gives them in play, the one that had them taking that
+    // button's own: two swaps, so still a permutation.
+    int gives[kPadInputs];
+    for (int p = 0; p < kPadInputs; ++p) gives[p] = p;
+    for (const std::uint32_t bit : {menu_confirm_button(), menu_back_button()}) {
+        const int f = pad_input_of_bit(bit);
+        int from = -1, to = -1;
+        for (int p = 0; p < kPadInputs; ++p) {
+            if (g_pad_gives[p].load(std::memory_order_relaxed) == f) from = p;
+            if (gives[p] == f) to = p;
+        }
+        if (from >= 0 && to >= 0) std::swap(gives[from], gives[to]);
+    }
+    return kPadBits[gives[input]];
+}
+
 namespace {
 // The button whose press an action's is: its pad bit's, for an action that
 // works in play and has one (Gestures and Personal Effects share the
@@ -833,7 +853,10 @@ int host_pad_menu_input(int action) {
     std::uint32_t bit = kInfo[action].button;
     if (action == kBindConfirm) bit = menu_confirm_button();
     if (action == kBindBack) bit = menu_back_button();
-    return pad_input_of_bit(bit);
+    for (int p = 0; p < kPadInputs; ++p) {
+        if (host_pad_menu_bit(p) == bit) return p;
+    }
+    return -1;
 }
 
 void host_pad_capture_begin(int action) {
