@@ -520,10 +520,14 @@ Setting g_set[kSettingCount] = {
      false},
     // RCAS over the upscaler's picture (host/upscale_pass.cpp): FSR 3 and 4
     // through the bridge and DLSS do no sharpening of their own. 0% none, the
-    // default (the picture as the upscaler leaves it); 100% AMD's most.
+    // default (the picture as the upscaler leaves it); 100% AMD's most. TAA
+    // below the window is brought up by FSR 1, whose RCAS is one pass with
+    // this at the stronger of the two: FSR 1's own below 90%.
     {"sharpness", "Sharpness", signed_steps(0, 100, "%", false), 0,
-     "Sharpens the upscaled 3D (FSR or DLSS) before the post effects and the HUD, which it never touches. 0% leaves the "
-     "upscaler's picture as it is; higher brings out more detail, at 100% with some ringing on hard edges. Needs Upscaling on.",
+     "Sharpens the 3D after TAA, FSR or DLSS, before the post effects and the HUD, which it never touches. 0% leaves the "
+     "picture as it is; higher brings out more detail, at 100% with some ringing on hard edges. With TAA at a Resolution "
+     "below the window, FSR 1 brings the picture up with its own sharpening, so Sharpness changes it only above 90%. Needs "
+     "Upscaling on.",
      false},
     // AMD's frame generation (host/framegen.h): its swapchain in the
     // presenter's place; a frame it makes from the 3D between two of the
