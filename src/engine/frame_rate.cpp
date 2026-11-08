@@ -915,6 +915,11 @@ void count_was(const Counted& c, std::uint8_t* out) {
 // The game's pace: 30, or the rate it was converted to (60 to 960; Uncapped's
 // is the display's refresh rate, g_uncapped).
 std::atomic<int> g_game_fps{30};
+// Whether the game's steps are converted (apply_rate): at the start, or from
+// the game's own 30 while it runs (convert_live). A converted run taken to 30
+// stays converted - its 30 is a rate like any other - so g_game_fps alone
+// does not say it.
+std::atomic<bool> g_converted{false};
 bool g_uncapped = false;
 std::size_t g_sites_applied = 0, g_frame_time_applied = 0, g_cloth_applied = 0;
 std::atomic<std::uint64_t> g_frames{0};
@@ -1518,9 +1523,9 @@ float swing_target(float base) {
     return static_cast<float>(1.0 / fps);
 }
 
-// The converted pace's target for this frame; 0 at 30.
+// The converted pace's target for this frame; 0 at the game's own 30.
 float pace_target_of_rate() {
-    if (g_game_fps == 30) return 0.0f;
+    if (!g_converted) return 0.0f;
     if (g_game_fps == 60) return swing_target(kSixtieth);  // the eboot's own mode 2
     return swing_target(1.0f / static_cast<float>(g_game_fps));
 }
@@ -1907,6 +1912,8 @@ void retarget(int want) {
              g_cloth_va ? ", the cloth's stiffness scale above 60" : "");
 }
 
+void convert_live(int want);
+
 // rdi: the frame-time manager.
 GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* saved) {
     sound_wake_frame();  // the frame's work is done: its sound requests go to a pass now (engine/sound_wake.h)
@@ -1921,12 +1928,16 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
     world_chr_tick();   // a test warp a plugin queued this frame (BBHOST_TEST_WARP, engine/world_chr.h)
     loading_tick(hle_video_flip_count());  // the loading screens' lengths and the first in-game frame (engine/loading.h)
     auto* f = reinterpret_cast<SprjFlipper*>(static_cast<std::uintptr_t>(saved[5]));
-    const bool converted = g_game_fps != 30;
-    // A rate or an effect timing chosen in the menus since the last frame.
-    if (converted && g_source == Source::Ours) {
-        if (const int asked = g_rate_asked.exchange(-1, std::memory_order_acq_rel); asked >= 0) retarget(asked);
-        if (g_retime_asked.exchange(false, std::memory_order_acq_rel)) retime_effects(g_game_fps);
+    // A rate or an effect timing chosen in the menus since the last frame; from
+    // the game's own 30, the conversion the start would have made.
+    if (g_source == Source::Ours) {
+        if (const int asked = g_rate_asked.exchange(-1, std::memory_order_acq_rel); asked >= 0) {
+            if (g_converted) retarget(asked);
+            else convert_live(asked);
+        }
+        if (g_retime_asked.exchange(false, std::memory_order_acq_rel) && g_converted) retime_effects(g_game_fps);
     }
+    const bool converted = g_converted;
     if (g_source == Source::Ours) {
         note_main_frame_work(saved[5]);
         RealClock clock;
@@ -1938,7 +1949,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
         // rate it held the frame to (none on a loading screen; the game's own 30).
         const std::uint64_t waited_t1 = host_clock_monotonic_ns();
         perf_meter_limiter(waited_t1 - wait_t0, static_cast<std::uint64_t>(clock.spun_us) * 1000,
-                           g_fast_target ? 0.0f : target > 0.0f ? 1.0f / target : g_game_fps == 30 ? 30.0f : 0.0f);
+                           g_fast_target ? 0.0f : target > 0.0f ? 1.0f / target : !converted ? 30.0f : 0.0f);
         fg_pace_note(waited_t1, waited_t1 - wait_t0, g_fast_target ? 0.0f : fg_cap_target());
         g_fast_target = false;
         host_fps_frame_start();  // the FPS counter: the frame starts as the limiter lets it go (host/window.h)
@@ -2538,6 +2549,67 @@ int apply_rate(ElfImage* image, int want) {
     return mode;
 }
 
+// What follows a conversion at the start or while the game runs: the pace,
+// the flips, the clock's publishing and the effects' emission at `got`.
+void converted_start(int got) {
+    g_game_fps = got;
+    g_converted = true;
+    hle_video_set_game_pace(got);  // above 60: flips complete at once (hle/video.cpp)
+    // The replay ghosts and the local player's character sync count game time by
+    // default, the frame clock on or off (kHandedOver and kCountsHandedOver's
+    // by_default rows, decomp/chr/): they read the clock's 30 fps frames, which
+    // our frame-time manager then publishes every frame although nothing else
+    // of the clock is on. Each has its own switch.
+    {
+        const auto off = [](const char* k) {
+            const char* e = std::getenv(k);
+            return e && e[0] == '0';
+        };
+        const bool replay = !off("BBHOST_REPLAY_STEP"), sync = !off("BBHOST_CHR_SYNC_STEP");
+        frame_clock::set_publishing(g_source == Source::Ours && (replay || sync));
+        if (frame_clock::publishing() && !frame_clock::on())
+            host_log("frame rate: %s%s%s count game time, not the rate's frames (BBHOST_REPLAY_STEP=0, BBHOST_CHR_SYNC_STEP=0): the "
+                     "frame clock's 30 fps frames are published for them, nothing else of the clock is on (engine/frame_clock.h)",
+                     replay ? "the replay ghosts" : "", replay && sync ? " and " : "", sync ? "the character sync" : "");
+    }
+    // Above 30 the effects' whole steps set the clock's sub-steps: two in a whole 1/30 s step, one in any other (a
+    // whole 1/60 s step's one event an update is 60 a second already; a shorter step's events wait for their
+    // interval); effect timing frame stays the game's.
+    if (sfx_node::emission_clock() > 0) {
+        const int steps = effect_timing(got).steps;
+        if (steps != 30) sfx_node::set_emission_clock(1);
+        if (steps == 0) {
+            sfx_node::set_emission_clock(0);
+            host_log("frame rate: effect timing frame: the effects' emission stays the game's, one event an update");
+        }
+    }
+}
+
+// From the game's own 30 to a converted rate while the game runs (a game
+// started at 30 used to need the next start for any other): the conversion
+// the start makes for one, on the main thread between frames, as retarget's
+// rewrites are, then what the start puts in after it - the values the decomps
+// not in place take, the Bloodletter's self-hit. Taken back to 30 later it
+// stays converted (retarget), a 30 like the Custom limit's 10 to 29.
+void convert_live(int want) {
+    int fps = want;
+    if (fps == 0) fps = uncapped_limit::rate_fps(g_uncapped_forced, g_uncapped_forced ? 0.0f : host_desktop_refresh_hz());
+    if (fps == 30) return;  // the game's own already
+    g_uncapped = want == 0;
+    const int got = apply_rate(g_image, fps);
+    if (got == 30) {
+        host_log("frame rate: the game's steps could not be converted; it stays at its own 30");
+        return;
+    }
+    converted_start(got);
+    frame_rate_install_late(g_image);
+    frame_rate_atk_params_loaded();
+    host_log("frame rate: 30 -> %s%s while the game runs, converted from the game's own mode (%zu constants and %zu counts at its "
+             "values, %zu 60 FPS++, %zu frame-time and %zu cloth code sites)",
+             mode_name(got).c_str(), g_uncapped ? " (Display-Limited)" : "", g_live_constants.size(), g_live_counts.size(),
+             g_sites_applied, g_frame_time_applied, g_cloth_applied);
+}
+
 }  // namespace
 
 // As the guest's update returns (compare mode): ours on the snapshot, the
@@ -2571,9 +2643,14 @@ asm(".text\n.globl frame_ret\n" FR_TYPE_(frame_ret) "frame_ret:\n"
 
 int frame_rate_game_fps() { return g_game_fps; }
 
+// From the game's own 30 any rate converts (a refused cloth runs 60, as at the
+// start); from a converted rate, 30 included, any rate the cloth allows.
 bool frame_rate_live(int fps) {
-    return g_game_fps != 30 && fps != 30 && g_source == Source::Ours && g_image && (fps == 60 || g_cloth_applied || g_cloth_ok);
+    if (g_source != Source::Ours || !g_image) return false;
+    return !g_converted || fps == 60 || g_cloth_applied || g_cloth_ok;
 }
+
+bool frame_rate_converted() { return g_converted; }
 
 bool frame_rate_request(int fps) {
     if (!frame_rate_live(fps)) return false;
@@ -2582,7 +2659,7 @@ bool frame_rate_request(int fps) {
 }
 
 void frame_rate_retime() {
-    if (g_game_fps != 30 && g_source == Source::Ours) g_retime_asked.store(true, std::memory_order_release);
+    if (g_converted && g_source == Source::Ours) g_retime_asked.store(true, std::memory_order_release);
 }
 
 float frame_rate_limit_fps() { return static_cast<float>(g_game_fps); }
@@ -2675,6 +2752,7 @@ void frame_rate_install(ElfImage* image) {
                 g_source = Source::Guest;
             }
         }
+        g_image = image;  // a rate chosen while the game runs converts it then (convert_live)
         hle_video_set_game_pace(30);
         return;
     }
@@ -2691,36 +2769,7 @@ void frame_rate_install(ElfImage* image) {
         hle_video_set_game_pace(30);
         return;  // the hook keeps mode 2 only while g_game_fps says 60
     }
-    g_game_fps = got;
-    hle_video_set_game_pace(got);  // above 60: flips complete at once (hle/video.cpp)
-    // The replay ghosts and the local player's character sync count game time by
-    // default, the frame clock on or off (kHandedOver and kCountsHandedOver's
-    // by_default rows, decomp/chr/): they read the clock's 30 fps frames, which
-    // our frame-time manager then publishes every frame although nothing else
-    // of the clock is on. Each has its own switch.
-    {
-        const auto off = [](const char* k) {
-            const char* e = std::getenv(k);
-            return e && e[0] == '0';
-        };
-        const bool replay = !off("BBHOST_REPLAY_STEP"), sync = !off("BBHOST_CHR_SYNC_STEP");
-        frame_clock::set_publishing(g_source == Source::Ours && (replay || sync));
-        if (frame_clock::publishing() && !frame_clock::on())
-            host_log("frame rate: %s%s%s count game time, not the rate's frames (BBHOST_REPLAY_STEP=0, BBHOST_CHR_SYNC_STEP=0): the "
-                     "frame clock's 30 fps frames are published for them, nothing else of the clock is on (engine/frame_clock.h)",
-                     replay ? "the replay ghosts" : "", replay && sync ? " and " : "", sync ? "the character sync" : "");
-    }
-    // Above 30 the effects' whole steps set the clock's sub-steps: two in a whole 1/30 s step, one in any other (a
-    // whole 1/60 s step's one event an update is 60 a second already; a shorter step's events wait for their
-    // interval); effect timing frame stays the game's.
-    if (sfx_node::emission_clock() > 0) {
-        const int steps = effect_timing(got).steps;
-        if (steps != 30) sfx_node::set_emission_clock(1);
-        if (steps == 0) {
-            sfx_node::set_emission_clock(0);
-            host_log("frame rate: effect timing frame: the effects' emission stays the game's, one event an update");
-        }
-    }
+    converted_start(got);
     frame_tick_install(image);
     const std::size_t kCountsN = sizeof(kCounts) / sizeof(kCounts[0]), kBytesN = sizeof(kBytes) / sizeof(kBytes[0]);
     const std::size_t constants = sizeof(kConstants) / sizeof(kConstants[0]);
@@ -2751,7 +2800,7 @@ void frame_rate_install_late(ElfImage* image) {
 }
 
 void frame_rate_atk_params_loaded() {
-    if (g_game_fps == 30) return;
+    if (!g_converted) return;
     std::size_t bytes = 0;
     auto* row = static_cast<std::uint8_t*>(params_row("AtkParam_Pc", kBloodletterSelfHit, &bytes));
     const ParamDefinition* def = params_definition("AtkParam_Pc");
