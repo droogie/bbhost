@@ -40,6 +40,7 @@
 #include "core/win_vm.h"
 #include <pthread_time.h>  // winpthreads: clock_gettime and the POSIX clock ids
 #else
+#include "core/linux_vm.h"
 #include <fcntl.h>
 #ifndef SYS_memfd_create
 #define SYS_memfd_create 319
@@ -275,6 +276,15 @@ int host_prot(int sce_prot) {
 
 enum class Fix { None, Exact, NoReplace };
 
+#if !defined(_WIN32)
+// In the guest windows reserved at the start (hle_kernel_reserve_guest_windows,
+// core/linux_vm.h) a fixed mapping takes its part of the reservation and an
+// unmapping gives it back; elsewhere they are the plain calls.
+LinuxVmFix linux_fix(const void* hint, Fix fix) {
+    return !hint || fix == Fix::None ? LinuxVmFix::None : fix == Fix::Exact ? LinuxVmFix::Exact : LinuxVmFix::NoReplace;
+}
+#endif
+
 // Anonymous host memory. `Fix::Exact` replaces whatever is at hint (guest
 // asked for MAP_FIXED on a range it owns); `Fix::NoReplace` fails instead of
 // clobbering host memory (addresses we computed ourselves).
@@ -294,13 +304,8 @@ void* host_map_anon(void* hint, std::uint64_t len, int sce_prot, Fix fix) {
     if (sce_prot == 0) return win_vm_place(hint, round, place, kGnmVaMask);
     return win_vm_alloc(hint, round, static_cast<DWORD>(host_prot(sce_prot)), place, kGnmVaMask);
 #else
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-    if (hint && fix == Fix::Exact) {
-        flags |= MAP_FIXED;
-    } else if (hint && fix == Fix::NoReplace) {
-        flags |= MAP_FIXED_NOREPLACE;
-    }
-    void* p = mmap(hint, static_cast<std::size_t>(len), host_prot(sce_prot), flags, -1, 0);
+    void* p = linux_vm_mmap(hint, static_cast<std::size_t>(len), host_prot(sce_prot),
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0, linux_fix(hint, fix));
     if (p == MAP_FAILED) {
         return nullptr;
     }
@@ -343,14 +348,8 @@ void* host_map_dmem(void* hint, std::uint64_t len, int sce_prot, Fix fix, std::i
     return win_vm_map(g_dmem_map, hint, round, static_cast<std::uint64_t>(phys),
                       static_cast<DWORD>(host_prot(sce_prot)), place, kGnmVaMask);
 #else
-    int flags = MAP_SHARED;
-    if (hint && fix == Fix::Exact) {
-        flags |= MAP_FIXED;
-    } else if (hint && fix == Fix::NoReplace) {
-        flags |= MAP_FIXED_NOREPLACE;
-    }
-    void* p = mmap(hint, static_cast<std::size_t>(len), host_prot(sce_prot), flags, g_dmem_fd,
-                   static_cast<off_t>(phys));
+    void* p = linux_vm_mmap(hint, static_cast<std::size_t>(len), host_prot(sce_prot), MAP_SHARED, g_dmem_fd, phys,
+                            linux_fix(hint, fix));
     if (p == MAP_FAILED) {
         return nullptr;
     }
@@ -441,7 +440,7 @@ void host_unmap(std::uintptr_t p, std::uint64_t len, bool dmem) {
     win_vm_unmap(reinterpret_cast<void*>(p), (len + 0xffff) & ~std::uint64_t(0xffff));
 #else
     (void)dmem;
-    munmap(reinterpret_cast<void*>(p), static_cast<std::size_t>(len));
+    linux_vm_munmap(reinterpret_cast<void*>(p), static_cast<std::size_t>(len));  // in a guest window, the reservation again
 #endif
 }
 
@@ -834,7 +833,88 @@ bool hle_kernel_reserve_guest_windows() {
     }
     return ok;
 #else
-    return true;
+    // The same windows on Linux (core/linux_vm.h), PROT_NONE and MAP_NORESERVE
+    // - no memory, no commit - before anything else can take those addresses:
+    // NVIDIA's driver reserves 4 GiB at 8 GiB once Vulkan and NGX are up, where
+    // a heap sized for a 2560x1440 display reaches, and with the range taken
+    // the game's map of it failed and the game crashed. A guest mapping in a
+    // window takes its part of the reservation and an unmapping gives it back
+    // (host_map_anon, host_map_dmem, host_unmap). The image's fallback home
+    // needs no reservation: the image is mapped before the game's Vulkan
+    // device and the upscaler bridge come up (core/memory.cpp takes it then).
+    const char* relaunch_env = std::getenv("BBHOST_RELAUNCH");
+    const int relaunches = relaunch_env ? std::atoi(relaunch_env) : 0;
+    const bool cpu = linux_vm_reserve(kDmemVaBase, kDmemMaxSize);
+    const bool gpu = linux_vm_reserve(kGpuDmemBase, 0x100000000ull);
+    bool ok = cpu && gpu;
+    // BBHOST_TEST_RESERVE_FAIL=1: the first process pretends the reservation
+    // lost, to see the relaunch below work.
+    const char* test_fail = std::getenv("BBHOST_TEST_RESERVE_FAIL");
+    if (ok && relaunches == 0 && test_fail && test_fail[0] == '1') {
+        host_log("linux-vm: BBHOST_TEST_RESERVE_FAIL: pretending the reservation lost");
+        ok = false;
+    }
+    if (ok) {
+        char again[48] = {};
+        if (relaunches > 0) std::snprintf(again, sizeof(again), " (relaunch %d of 3)", relaunches);
+        host_log("linux-vm: guest windows [0x%llx, +0x%llx) and [0x%llx, +4 GiB) reserved: no memory until the game maps "
+                 "there%s",
+                 static_cast<unsigned long long>(kDmemVaBase), static_cast<unsigned long long>(kDmemMaxSize),
+                 static_cast<unsigned long long>(kGpuDmemBase), again);
+        return true;
+    }
+    // What has them (before main runs only the loader, the libraries it
+    // loaded and their constructors map anything).
+    const auto taken = [](std::uint64_t base, std::uint64_t len, const char* what) {
+        const std::vector<std::string> in = linux_vm_occupants(base, len);
+        for (std::size_t i = 0; i < in.size() && i < 8; ++i) host_log("linux-vm: the %s window holds %s", what, in[i].c_str());
+        if (in.size() > 8) host_log("linux-vm: ... and %zu more mappings there", in.size() - 8);
+    };
+    if (!cpu) taken(kDmemVaBase, kDmemMaxSize, "direct memory's");
+    if (!gpu) taken(kGpuDmemBase, 0x100000000ull, "GPU alias");
+    host_log("linux-vm: guest windows [0x%llx, +0x%llx) %s and [0x%llx, +4 GiB) %s",
+             static_cast<unsigned long long>(kDmemVaBase), static_cast<unsigned long long>(kDmemMaxSize),
+             cpu ? "reserved" : "NOT reserved", static_cast<unsigned long long>(kGpuDmemBase), gpu ? "reserved" : "NOT reserved");
+    if (relaunches < 3) {
+        // A fresh process is placed anew, so the run starts itself again, up
+        // to three times: in this process (execv), with the same arguments,
+        // environment and descriptors, so whatever waits for it still does.
+        char n[16];
+        std::snprintf(n, sizeof(n), "%d", relaunches + 1);
+        setenv("BBHOST_RELAUNCH", n, 1);
+        host_log("linux-vm: relaunching (%s of 3) so the guest windows are placed anew", n);
+        std::vector<std::string> args;
+        if (FILE* f = std::fopen("/proc/self/cmdline", "re")) {
+            std::string a;
+            for (int c = std::fgetc(f); c != EOF; c = std::fgetc(f)) {
+                if (c) {
+                    a += static_cast<char>(c);
+                } else {
+                    args.push_back(a);
+                    a.clear();
+                }
+            }
+            if (!a.empty()) args.push_back(a);
+            std::fclose(f);
+        }
+        std::vector<char*> argv;
+        for (std::string& a : args) argv.push_back(a.data());
+        argv.push_back(nullptr);
+        std::fflush(nullptr);
+        if (args.size()) execv("/proc/self/exe", argv.data());
+        host_log("linux-vm: relaunch failed: errno %d", errno);
+    } else {
+        host_log("linux-vm: the guest windows were taken in %d launches; giving up", relaunches + 1);
+    }
+    // Their free parts reserved still; the game's maps into the rest fail
+    // where something is, as before the windows were reserved.
+    if (!cpu)
+        host_log("linux-vm: %llu MiB of the direct memory's window reserved",
+                 static_cast<unsigned long long>(linux_vm_reserve_free(kDmemVaBase, kDmemMaxSize) >> 20));
+    if (!gpu)
+        host_log("linux-vm: %llu MiB of the GPU alias window reserved",
+                 static_cast<unsigned long long>(linux_vm_reserve_free(kGpuDmemBase, 0x100000000ull) >> 20));
+    return false;
 #endif
 }
 

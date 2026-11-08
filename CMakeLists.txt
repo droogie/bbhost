@@ -90,6 +90,7 @@ add_executable(bbhost
   src/core/host_clock.cpp
   src/core/futex.cpp
   src/core/win_vm.cpp
+  src/core/linux_vm.cpp
   src/core/win_watch.cpp
   src/host/win_crash.cpp
   src/host/plugins.cpp
@@ -931,6 +932,11 @@ if(UNIX)
   add_executable(paced_file_test tests/paced_file_test.cpp src/core/paced_file.cpp)
   target_include_directories(paced_file_test PRIVATE src)
   add_test(NAME paced_file_test COMMAND paced_file_test)
+  # The guest windows on Linux: reserved, mapped into and given back, not replaced where asked not to (core/linux_vm.h).
+  add_executable(linux_vm_test tests/linux_vm_test.cpp src/core/linux_vm.cpp)
+  target_include_directories(linux_vm_test PRIVATE src)
+  target_link_libraries(linux_vm_test PRIVATE pthread)
+  add_test(NAME linux_vm_test COMMAND linux_vm_test)
   # The decomp's tests (tests/decomp, docs/decomp.md "How one is checked"):
   # the eboot kit loads the 1.09 eboot with bbhost's own loader, every import a
   # trap, and a test runs the game's functions beside ours. They skip (77)
