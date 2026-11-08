@@ -1,0 +1,61 @@
+#version 450
+// fsr_easu_hdr.comp in half precision (FSR_EASU_H), where the device does f16
+// math (host/fsr.cpp's choice for its own EASU): the tone mapped texels are
+// 0..1, which f16 holds well. The FSR headers are AMD's (fsr1/, MIT).
+#extension GL_GOOGLE_include_directive : enable
+
+layout(push_constant) uniform Constants {
+    uvec4 con0;
+    uvec4 con1;
+    uvec4 con2;
+    uvec4 con3;
+};
+
+#define A_GPU 1
+#define A_GLSL 1
+#define A_HALF 1
+#include "fsr1/ffx_a.h"
+
+layout(set = 0, binding = 0) uniform texture2D src_image;
+layout(set = 0, binding = 1) uniform sampler src_sampler;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D dst_image;
+
+// As fsr_easu_hdr.comp: the red gather takes all three channels (in f32, the
+// picture's HDR range), tone maps them and keeps green and blue.
+AH4 g_green, g_blue;
+#define FSR_EASU_H 1
+AH4 FsrEasuRH(AF2 p) {
+    const AF4 r = max(textureGather(sampler2D(src_image, src_sampler), p, 0), AF4_(0.0));
+    const AF4 g = max(textureGather(sampler2D(src_image, src_sampler), p, 1), AF4_(0.0));
+    const AF4 b = max(textureGather(sampler2D(src_image, src_sampler), p, 2), AF4_(0.0));
+    const AF4 k = AF4_(1.0) / (max(r, max(g, b)) + AF4_(1.0));
+    g_green = AH4(g * k);
+    g_blue = AH4(b * k);
+    return AH4(r * k);
+}
+AH4 FsrEasuGH(AF2 p) { return g_green; }
+AH4 FsrEasuBH(AF2 p) { return g_blue; }
+#include "fsr1/ffx_fsr1.h"
+
+AF3 from_unit(AF3 c) { return c * ARcpF1(max(AF1_(1.0 / 32768.0), AF1_(1.0) - max(c.r, max(c.g, c.b)))); }
+
+void upscale_pixel(AU2 pos) {
+    if (pos.x >= con3.z || pos.y >= con3.w) return;
+    AH3 c;
+    FsrEasuH(c, pos, con0, con1, con2, con3);
+    const AF2 uv = (AF2(pos) * AF2_AU2(con0.xy) + AF2_AU2(con0.zw) + AF2_(0.5)) * AF2_AU2(con1.xy);
+    const AF1 a = textureLod(sampler2D(src_image, src_sampler), uv, 0.0).a;
+    imageStore(dst_image, ASU2(pos), AF4(from_unit(AF3(c)), a));
+}
+
+layout(local_size_x = 64) in;
+void main() {
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    upscale_pixel(gxy);
+    gxy.x += 8u;
+    upscale_pixel(gxy);
+    gxy.y += 8u;
+    upscale_pixel(gxy);
+    gxy.x -= 8u;
+    upscale_pixel(gxy);
+}

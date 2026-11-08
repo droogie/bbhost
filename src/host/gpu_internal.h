@@ -2761,6 +2761,11 @@ bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, V
 // takes storage writes: the last pass writes it directly. `use`: 0 the
 // display buffer, 1 frame generation's HUD-less picture - each its own sets
 // and targets, so both can be recorded in one command buffer.
+// FSR 1 in half precision on this device (f16 math, BBHOST_FSR_HALF not 0).
+bool fsr_half_locked();
+// FsrEasuCon's four constant words for EASU from the whole of an in_w x in_h
+// image to out_w x out_h (con[14], con[15] - unused by EASU - left 0).
+void fsr_easu_constants(std::uint32_t con[16], std::uint32_t in_w, std::uint32_t in_h, std::uint32_t out_w, std::uint32_t out_h);
 bool fsr_upscale_locked(VkCommandBuffer cmd, VkImage src, VkFormat src_format, std::uint32_t src_w, std::uint32_t src_h,
                         std::uint32_t src_x, std::uint32_t src_y, std::uint32_t sw, std::uint32_t sh, VkImage dst, VkRect2D area,
                         VkImageView dst_view = VK_NULL_HANDLE, unsigned use = 0);

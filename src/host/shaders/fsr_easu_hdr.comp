@@ -1,0 +1,68 @@
+#version 450
+// FSR 1 EASU (edge-adaptive spatial upsampling) of TAA's picture into the
+// output size while the 3D is smaller than it (host/upscale_pass.cpp
+// record_taa). The picture is linear HDR (RGBA16F) where EASU wants 0..1:
+// each texel goes through a reversible tone map on its largest channel,
+// c / (1 + max(c)), for EASU and back, c / (1 - max(c)), after -
+// upscale_rcas.comp's pair (FSR 2's own for its HDR history). Alpha is the
+// picture's at the pixel's place, sampled linearly, as a blit takes it.
+// con0..con3 are FsrEasuCon's; con3.zw (unused by EASU) the output's size.
+// The FSR headers are AMD's (fsr1/, MIT).
+#extension GL_GOOGLE_include_directive : enable
+
+layout(push_constant) uniform Constants {
+    uvec4 con0;
+    uvec4 con1;
+    uvec4 con2;
+    uvec4 con3;
+};
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "fsr1/ffx_a.h"
+
+layout(set = 0, binding = 0) uniform texture2D src_image;
+layout(set = 0, binding = 1) uniform sampler src_sampler;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D dst_image;
+
+// EASU gathers each of its four taps' red, green and blue in that order
+// (ffx_fsr1.h FsrEasuF): the red gather takes all three, tone maps the four
+// texels by their largest channel, and keeps green and blue for the next two.
+AF4 g_green, g_blue;
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) {
+    const AF4 r = max(textureGather(sampler2D(src_image, src_sampler), p, 0), AF4_(0.0));
+    const AF4 g = max(textureGather(sampler2D(src_image, src_sampler), p, 1), AF4_(0.0));
+    const AF4 b = max(textureGather(sampler2D(src_image, src_sampler), p, 2), AF4_(0.0));
+    const AF4 k = AF4_(1.0) / (max(r, max(g, b)) + AF4_(1.0));
+    g_green = g * k;
+    g_blue = b * k;
+    return r * k;
+}
+AF4 FsrEasuGF(AF2 p) { return g_green; }
+AF4 FsrEasuBF(AF2 p) { return g_blue; }
+#include "fsr1/ffx_fsr1.h"
+
+AF3 from_unit(AF3 c) { return c * ARcpF1(max(AF1_(1.0 / 32768.0), AF1_(1.0) - max(c.r, max(c.g, c.b)))); }
+
+void upscale_pixel(AU2 pos) {
+    if (pos.x >= con3.z || pos.y >= con3.w) return;
+    AF3 c;
+    FsrEasuF(c, pos, con0, con1, con2, con3);
+    const AF2 uv = (AF2(pos) * AF2_AU2(con0.xy) + AF2_AU2(con0.zw) + AF2_(0.5)) * AF2_AU2(con1.xy);
+    const AF1 a = textureLod(sampler2D(src_image, src_sampler), uv, 0.0).a;
+    imageStore(dst_image, ASU2(pos), AF4(from_unit(c), a));
+}
+
+layout(local_size_x = 64) in;
+void main() {
+    // Each group fills a 16x16 tile, 8x8 at a time, in AMD's swizzle.
+    AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    upscale_pixel(gxy);
+    gxy.x += 8u;
+    upscale_pixel(gxy);
+    gxy.y += 8u;
+    upscale_pixel(gxy);
+    gxy.x -= 8u;
+    upscale_pixel(gxy);
+}
