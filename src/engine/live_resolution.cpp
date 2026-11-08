@@ -1415,8 +1415,9 @@ bool live_resolution_install(ElfImage* image) {
     // display (2560x1440 and 1440x2560, 2560x2560) the buffers were a size no
     // screen has, so a picture at the screen's own size never matched them and
     // the scene took the copy path (a target of its own, copied into the HUD's
-    // target), and their memory and clears were nearly twice the screen's. The display buffers and the render-target heap are made
-    // for it at the start and cost memory pinned for the GPU for the whole
+    // target), and their memory and clears were nearly twice the screen's.
+    // The display buffers and the render-target heap are made for it at the
+    // start and cost memory pinned for the GPU for the whole
     // run whether a change ever comes or not - made at 5120x2160 they were
     // 4 x 42.5 MiB of display buffers, a 5120x2160 depth target, whole-image
     // clears of them every frame and +1,088 MiB of heap on a 1080p screen.
