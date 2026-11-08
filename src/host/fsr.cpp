@@ -120,7 +120,14 @@ bool fsr_init_locked() {
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &range;
     if (vkCreatePipelineLayout(g.device, &pli, nullptr, &g_fsr.layout) != VK_SUCCESS) return false;
-    g_fsr.half = fsr_half_locked();
+    // In half precision where the device does f16 math (gpu.cpp g.has_f16_math):
+    // RDNA packs two f16 operations into one - on a Steam Deck, 960x600 to
+    // 1280x800, 0.77 -> 0.60 ms a frame. BBHOST_FSR_HALF=0: the f32 shaders.
+    static const bool half_wanted = [] {
+        const char* e = std::getenv("BBHOST_FSR_HALF");
+        return !(e && e[0] == '0');
+    }();
+    g_fsr.half = half_wanted && g.has_f16_math;
     g_fsr.easu = g_fsr.half ? make_pipeline(k_fsr_easu_h_spv, sizeof(k_fsr_easu_h_spv)) : make_pipeline(k_fsr_easu_spv, sizeof(k_fsr_easu_spv));
     g_fsr.rcas = g_fsr.half ? make_pipeline(k_fsr_rcas_h_spv, sizeof(k_fsr_rcas_h_spv)) : make_pipeline(k_fsr_rcas_spv, sizeof(k_fsr_rcas_spv));
     if (!g_fsr.easu || !g_fsr.rcas) return false;
@@ -238,22 +245,6 @@ void image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkIma
 }
 
 }  // namespace
-
-// In half precision where the device does f16 math (gpu.cpp g.has_f16_math):
-// RDNA packs two f16 operations into one - on a Steam Deck, 960x600 to
-// 1280x800, 0.77 -> 0.60 ms a frame. BBHOST_FSR_HALF=0: the f32 shaders.
-bool fsr_half_locked() {
-    static const bool half_wanted = [] {
-        const char* e = std::getenv("BBHOST_FSR_HALF");
-        return !(e && e[0] == '0');
-    }();
-    return half_wanted && g.has_f16_math;
-}
-
-void fsr_easu_constants(std::uint32_t con[16], std::uint32_t in_w, std::uint32_t in_h, std::uint32_t out_w, std::uint32_t out_h) {
-    FsrEasuCon(con, con + 4, con + 8, con + 12, static_cast<AF1>(in_w), static_cast<AF1>(in_h), static_cast<AF1>(in_w),
-               static_cast<AF1>(in_h), static_cast<AF1>(out_w), static_cast<AF1>(out_h));
-}
 
 // Upscales [src_x, src_y, sw x sh] of the display image `src` (its whole size
 // src_w x src_h, in GENERAL) into `area` of `dst` (in TRANSFER_DST_OPTIMAL);

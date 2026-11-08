@@ -62,8 +62,6 @@
 #include "engine/render_scale.h"
 #include "host/gpu_internal.h"
 #include "host/shaders/camera_motion.spv.h"
-#include "host/shaders/fsr_easu_hdr.spv.h"
-#include "host/shaders/fsr_easu_hdr_h.spv.h"
 #include "host/shaders/capture_motion_frag.spv.h"
 #include "host/shaders/capture_motion_vert.spv.h"
 #include "host/shaders/motion_check.spv.h"
@@ -119,8 +117,6 @@ VkImageView g_picture_view = VK_NULL_HANDLE;  // this frame's final picture (ren
 OwnImage g_sharp;                   // the picture sharpened (Sharpness), the output size; made at the first use
 OwnImage g_taa_hist[2];             // TAA's two histories (record_taa): one read, one written, changing places each frame
 OwnImage g_taa_small;               // TAA's picture at the scene's size while the 3D is smaller than the output (record_taa)
-OwnImage g_taa_easu;                // ... brought up to the output by EASU, before FSR 1's RCAS (record_taa_fsr1)
-bool g_taa_sharpness_in = false;    // this frame's TAA took Sharpness into its own RCAS (record_taa_fsr1)
 int g_taa_read = 0;                 // the one this frame's TAA reads
 int g_last_method = 0;              // the last call's method, FSR 3's flag in (another one's history and LOD bias are not this one's)
 // Frame generation (host/framegen.h): the frames prepared so far - each
@@ -844,20 +840,22 @@ bool rcas_pipeline_locked() {
     return ok;
 }
 
-// FsrRcasCon's strength for the Sharpness setting (0..1, 1 the most): AMD's
-// FSR 2 maps its 0..1 sharpness to 2..0 stops below RCAS's most.
-float sharpness_scale(float sharpness) { return std::exp2(-2.0f * (1.0f - std::clamp(sharpness, 0.0f, 1.0f))); }
-
-// RCAS of `src` into `dst` (RGBA16F, w x h both; dst made) at `scale`
-// (FsrRcasCon's: 2^-stops); false when it could not run. src has been
-// written and made readable.
-bool record_rcas_into(VkCommandBuffer cb, float scale, const OwnImage& src, OwnImage& dst, std::uint32_t w, std::uint32_t h) {
+// The picture sharpened by `sharpness` (0..1, AMD's scale: 1 the most) into
+// g_sharp; false when it could not be (the picture stands as it is).
+// g_output has been written and made readable.
+bool record_rcas(VkCommandBuffer cb, float sharpness) {
     if (!rcas_pipeline_locked()) return false;
+    if (!g_sharp.image &&
+        !make(g_sharp, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+              g_ow, g_oh)) {
+        drop(g_sharp);
+        return false;
+    }
     const VkDescriptorSet set = alloc_set_locked(g_rcas_set_layout);
     if (!set) return false;
-    const VkDescriptorImageInfo src_info{VK_NULL_HANDLE, src.view, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo src_info{VK_NULL_HANDLE, g_output.view, VK_IMAGE_LAYOUT_GENERAL};
     const VkDescriptorImageInfo sampler_info{g.dummy_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-    const VkDescriptorImageInfo dst_info{VK_NULL_HANDLE, dst.view, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo dst_info{VK_NULL_HANDLE, g_sharp.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet wr[3] = {};
     for (int k = 0; k < 3; ++k) {
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -872,34 +870,24 @@ bool record_rcas_into(VkCommandBuffer cb, float scale, const OwnImage& src, OwnI
     wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     wr[2].pImageInfo = &dst_info;
     vkUpdateDescriptorSets(g.device, 3, wr, 0, nullptr);
+    // FsrRcasCon: the strength in stops below the most - AMD's FSR 2 maps its
+    // 0..1 sharpness to 2..0 stops.
+    const float stops = 2.0f * (1.0f - std::clamp(sharpness, 0.0f, 1.0f));
+    const float scale = std::exp2(-stops);
     std::uint32_t pc[8] = {};
     std::memcpy(&pc[0], &scale, 4);
-    pc[4] = w;
-    pc[5] = h;
-    barrier(cb, dst.image, VK_IMAGE_ASPECT_COLOR_BIT, dst.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+    pc[4] = g_ow;
+    pc[5] = g_oh;
+    barrier(cb, g_sharp.image, VK_IMAGE_ASPECT_COLOR_BIT, g_sharp.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-    dst.initialised = true;
+    g_sharp.initialised = true;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_rcas_pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_rcas_layout, 0, 1, &set, 0, nullptr);
     vkCmdPushConstants(cb, g_rcas_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-    vkCmdDispatch(cb, (w + 15) / 16, (h + 15) / 16, 1);
-    barrier(cb, dst.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+    vkCmdDispatch(cb, (g_ow + 15) / 16, (g_oh + 15) / 16, 1);
+    barrier(cb, g_sharp.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
     return true;
-}
-
-// The picture sharpened by `sharpness` (0..1, AMD's scale: 1 the most) into
-// g_sharp; false when it could not be (the picture stands as it is).
-// g_output has been written and made readable.
-bool record_rcas(VkCommandBuffer cb, float sharpness) {
-    if (!rcas_pipeline_locked()) return false;
-    if (!g_sharp.image &&
-        !make(g_sharp, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-              g_ow, g_oh)) {
-        drop(g_sharp);
-        return false;
-    }
-    return record_rcas_into(cb, sharpness_scale(sharpness), g_output, g_sharp, g_ow, g_oh);
 }
 
 // TAA (Graphics > Upscaling: TAA, host/upscaler.h kUpscaleTaa): Numity1504's
@@ -986,121 +974,6 @@ float taa_share() {
     return s <= 0.5f ? 0.2f * std::pow(0.5f, s * 2.0f) : 0.1f * std::pow(0.4f, (s - 0.5f) * 2.0f);
 }
 
-// TAA's picture up to the output while the 3D is smaller (record_taa): FSR 1's
-// EASU over the linear HDR picture (shaders/fsr_easu_hdr.comp, its half
-// precision twin where the device does f16 math, as host/fsr.cpp chooses).
-VkDescriptorSetLayout g_easu_set_layout = VK_NULL_HANDLE;
-VkPipelineLayout g_easu_layout = VK_NULL_HANDLE;
-VkPipeline g_easu_pipeline = VK_NULL_HANDLE;
-bool g_easu_tried = false;
-
-bool taa_easu_pipeline_locked() {
-    if (g_easu_tried) return g_easu_pipeline != VK_NULL_HANDLE;
-    g_easu_tried = true;
-    const VkDescriptorSetLayoutBinding binds[3] = {
-        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-    };
-    VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 3;
-    sli.pBindings = binds;
-    if (vkCreateDescriptorSetLayout(g.device, &sli, nullptr, &g_easu_set_layout) != VK_SUCCESS) return false;
-    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
-    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pli.setLayoutCount = 1;
-    pli.pSetLayouts = &g_easu_set_layout;
-    pli.pushConstantRangeCount = 1;
-    pli.pPushConstantRanges = &range;
-    if (vkCreatePipelineLayout(g.device, &pli, nullptr, &g_easu_layout) != VK_SUCCESS) return false;
-    const bool half = fsr_half_locked();
-    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smi.codeSize = half ? sizeof(k_fsr_easu_hdr_h_spv) : sizeof(k_fsr_easu_hdr_spv);
-    smi.pCode = half ? k_fsr_easu_hdr_h_spv : k_fsr_easu_hdr_spv;
-    VkShaderModule module = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(g.device, &smi, nullptr, &module) != VK_SUCCESS) return false;
-    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    ci.stage.module = module;
-    ci.stage.pName = "main";
-    ci.layout = g_easu_layout;
-    const bool ok = vkCreateComputePipelines(g.device, g.cache, 1, &ci, nullptr, &g_easu_pipeline) == VK_SUCCESS;
-    vkDestroyShaderModule(g.device, module, nullptr);
-    if (!ok) g_easu_pipeline = VK_NULL_HANDLE;
-    host_log("upscaler: TAA's picture brought up to the output by FSR 1 (EASU%s, then RCAS) %s", half ? " in half precision" : "",
-             ok ? "ready" : "failed to build; by a linear blit");
-    return ok;
-}
-
-// `src` (TAA's picture at the scene's size, written and made readable) into
-// `dst` (the output's size) by EASU; false when it could not run.
-bool record_taa_easu(VkCommandBuffer cb, const OwnImage& src, OwnImage& dst) {
-    if (!taa_easu_pipeline_locked() || !g_taa_sampler) return false;
-    const VkDescriptorSet set = alloc_set_locked(g_easu_set_layout);
-    if (!set) return false;
-    const VkDescriptorImageInfo src_info{VK_NULL_HANDLE, src.view, VK_IMAGE_LAYOUT_GENERAL};
-    const VkDescriptorImageInfo sampler_info{g_taa_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-    const VkDescriptorImageInfo dst_info{VK_NULL_HANDLE, dst.view, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet wr[3] = {};
-    for (int k = 0; k < 3; ++k) {
-        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[k].dstSet = set;
-        wr[k].dstBinding = static_cast<std::uint32_t>(k);
-        wr[k].descriptorCount = 1;
-    }
-    wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    wr[0].pImageInfo = &src_info;
-    wr[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    wr[1].pImageInfo = &sampler_info;
-    wr[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    wr[2].pImageInfo = &dst_info;
-    vkUpdateDescriptorSets(g.device, 3, wr, 0, nullptr);
-    std::uint32_t pc[16] = {};
-    fsr_easu_constants(pc, g_w, g_h, g_ow, g_oh);
-    pc[14] = g_ow;  // con3.zw, which EASU leaves alone: the shader's bounds
-    pc[15] = g_oh;
-    barrier(cb, dst.image, VK_IMAGE_ASPECT_COLOR_BIT, dst.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-    dst.initialised = true;
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_easu_pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_easu_layout, 0, 1, &set, 0, nullptr);
-    vkCmdPushConstants(cb, g_easu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-    vkCmdDispatch(cb, (g_ow + 15) / 16, (g_oh + 15) / 16, 1);
-    barrier(cb, dst.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
-            VK_ACCESS_SHADER_READ_BIT);
-    return true;
-}
-
-bool test_view();  // below: a test's view in the picture's place
-
-// FSR 1's own RCAS strength: 0.2 stops below its most, as AMD's samples and
-// the presenter (host/fsr.cpp kSharpness) take it.
-constexpr float kFsr1RcasStops = 0.2f;
-
-// TAA's picture (`src`, the scene's size, written by its pass) up to the
-// output as FSR 1 brings a picture up: EASU into g_taa_easu, then RCAS into
-// g_output at FSR 1's own strength, or Sharpness's when that is the stronger
-// (above 90%: one RCAS, not Sharpness's stacked on FSR 1's, which at 100%
-// over-sharpened - grain on the stones, rims on the edges). False when it
-// could not be (the caller blits from `src`).
-bool record_taa_fsr1(VkCommandBuffer cb, const OwnImage& src) {
-    g_taa_sharpness_in = false;
-    barrier(cb, src.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
-            VK_ACCESS_SHADER_READ_BIT);
-    if (!g_taa_easu.image && !make(g_taa_easu, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, g_ow, g_oh)) {
-        drop(g_taa_easu);
-        return false;
-    }
-    if (!record_taa_easu(cb, src, g_taa_easu)) return false;
-    const float sharpness = test_view() ? 0.0f : std::clamp(host_settings_ref().sharpness, 0.0f, 1.0f);
-    float scale = std::exp2(-kFsr1RcasStops);
-    if (sharpness > 0.0f) scale = std::max(scale, sharpness_scale(sharpness));
-    if (!record_rcas_into(cb, scale, g_taa_easu, g_output, g_ow, g_oh)) return false;
-    g_taa_sharpness_in = true;
-    return true;
-}
-
 // This frame's TAA into g_output and the next frame's history. The scene is
 // readable; `depth` the game's; `motion` the motion pass's constants
 // (motion_params), `velo` its velocity map (null: none) and the capture map
@@ -1119,12 +992,10 @@ bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkI
     }
     // The 3D smaller than the output (a Resolution below the window): TAA at
     // the scene's size into an image of that size, brought up to the output
-    // after it (record_taa_fsr1 into g_output), as an upscaler's picture is.
+    // after it (a linear blit into g_output), as an upscaler's picture is.
     if (g_scaled && !g_taa_small.image &&
-        !make(g_taa_small, VK_FORMAT_R16G16B16A16_SFLOAT,
-              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_w, g_h)) {
+        !make(g_taa_small, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_w, g_h)) {
         drop(g_taa_small);
-        drop(g_taa_easu);
         return false;
     }
     OwnImage& out = g_scaled ? g_taa_small : g_output;
@@ -1206,13 +1077,7 @@ bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkI
     }
     write.initialised = true;
     g_taa_read ^= 1;
-    // Up to the output by FSR 1 - EASU, then RCAS at FSR 1's own strength - as
-    // the presenter brought it up with the whole frame before TAA scaled
-    // (host/fsr.cpp). Stretched by a linear blit, the 3D was the softest of
-    // every method's. The blit when FSR 1 cannot run.
-    if (g_scaled && record_taa_fsr1(cb, out)) {
-        out.initialised = true;
-    } else if (g_scaled) {
+    if (g_scaled) {
         out.initialised = true;
         barrier(cb, out.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
                 VK_ACCESS_TRANSFER_READ_BIT);
@@ -1231,7 +1096,7 @@ bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkI
     static bool told = false;
     if (!told)
         host_log("upscaler: TAA at %ux%u (the scene's size, Numity1504's step 9)%s, the ember mask %s", g_w, g_h,
-                 g_scaled ? ", brought up to the output by FSR 1 (EASU + RCAS) after it" : "", glow ? "from the glow" : "off until a glow is found");
+                 g_scaled ? ", brought up to the output after it" : "", glow ? "from the glow" : "off until a glow is found");
     told = true;
     return true;
 }
@@ -1763,7 +1628,6 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         drop(g_taa_hist[0]);
         drop(g_taa_hist[1]);
         drop(g_taa_small);
-        drop(g_taa_easu);
         drop(g_prev_scene);
         g_prev_scene_valid = false;
         g_w = scene.width;
@@ -1793,12 +1657,9 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
             host_log("framegen: the motion at %ux%u (the scene's size, no upscaler running), scene format %d, depth format %d", g_w, g_h,
                      static_cast<int>(scene.format), static_cast<int>(depth.format));
         if (!motion_only) {
-            if (g_scaled && method == kUpscaleTaa)  // (no quality of its own: the 3D at the Resolution)
-                host_log("upscaler: TAA from %ux%u to %ux%u (the Resolution's size; FSR 1, EASU + RCAS, brings the picture up), scene format %d, depth format %d; YEBIS's copy reads the picture",
-                         g_w, g_h, g_ow, g_oh, static_cast<int>(scene.format), static_cast<int>(depth.format));
-            else if (g_scaled)
+            if (g_scaled)
                 host_log("upscaler: %s from %ux%u to %ux%u (Upscaling quality %d), scene format %d, depth format %d; YEBIS's copy reads the picture",
-                         method == 1 ? "DLSS" : "FSR", g_w, g_h, g_ow, g_oh, rs.quality, static_cast<int>(scene.format),
+                         method == 1 ? "DLSS" : method == kUpscaleTaa ? "TAA" : "FSR", g_w, g_h, g_ow, g_oh, rs.quality, static_cast<int>(scene.format),
                          static_cast<int>(depth.format));
             else
                 host_log("upscaler: %s at %ux%u (native, the scene's size), scene format %d, depth format %d",
@@ -2003,10 +1864,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     else if (const float gain = check_motion(); gain > 0.0f) record_motion_check(cb, scene, gain);
     barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
-    // Sharpness: the sharpened picture goes on in its place - scaled TAA's
-    // went into its own FSR 1 RCAS (record_taa_fsr1).
-    const bool sharpness_in = method == kUpscaleTaa && g_scaled && g_taa_sharpness_in;
-    const float sharpness = test_view() || sharpness_in ? 0.0f : sharpness_now();
+    // Sharpness: the sharpened picture goes on in its place.
+    const float sharpness = test_view() ? 0.0f : sharpness_now();
     profile_begin_locked(&g_prof_sharpen);
     const OwnImage* picture_p = sharpness > 0.0f && record_rcas(cb, sharpness) ? &g_sharp : &g_output;
     profile_end_locked();
