@@ -1269,7 +1269,7 @@ bool vk_present() {
                 present_pass_end(g_vk.cmd, g_vk.images[idx]);
                 if (have && framegen_active())
                     framegen_frame(g_vk.cmd, display_va, shown.offset, shown.extent, static_cast<std::int32_t>(src.x),
-                                   static_cast<std::int32_t>(src.y), src.w, src.h);
+                                   static_cast<std::int32_t>(src.y), src.w, src.h, false);
                 recorded = true;
                 wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
                 ++g_pstats.one_pass;
@@ -1315,8 +1315,10 @@ bool vk_present() {
         // Blit the game's display buffer; dark red (cycling with the buffer
         // index) when the renderer has not produced it yet.
         void* const storage_view = g_vk.storage && idx < g_vk.views.size() ? static_cast<void*>(g_vk.views[idx]) : nullptr;
+        bool by_fsr = false;  // a picture smaller than its rectangle, upscaled by FSR 1 (host/fsr.cpp)
         if (!display_va || !host_gpu_blit_display(g_vk.cmd, display_va, g_vk.images[idx], shown.offset.x, shown.offset.y,
-                                                  shown.extent.width, shown.extent.height, src_w, src_h, src_x, src_y, storage_view)) {
+                                                  shown.extent.width, shown.extent.height, src_w, src_h, src_x, src_y, storage_view,
+                                                  &by_fsr)) {
             VkClearColorValue color{{0.06f + 0.04f * (buffer_index % 3), 0.0f, 0.02f, 1.0f}};
             VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdClearColorImage(g_vk.cmd, g_vk.images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
@@ -1325,7 +1327,7 @@ bool vk_present() {
             ++g_pstats.blits;
             if (framegen_active())
                 framegen_frame(g_vk.cmd, display_va, shown.offset, shown.extent, static_cast<std::int32_t>(src_x),
-                               static_cast<std::int32_t>(src_y), src_w, src_h);
+                               static_cast<std::int32_t>(src_y), src_w, src_h, by_fsr);
         }
         // The host overlay goes over the game's frame: the pointer now, the text
         // box and the options screen later. Drawing needs

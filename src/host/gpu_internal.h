@@ -2752,14 +2752,18 @@ void textures_retired(int slot);                    // that submission completed
 // render.cpp
 void render_end_pass_locked();   // ends dynamic rendering if active (before dispatch/flush)
 void render_report();
+// `by_fsr`: set to whether FSR 1 upscaled it (else a blit stretched or copied it).
 bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, VkImage dst, VkRect2D area, VkExtent2D src,
-                                std::uint32_t src_x = 0, std::uint32_t src_y = 0, VkImageView dst_view = VK_NULL_HANDLE);
+                                std::uint32_t src_x = 0, std::uint32_t src_y = 0, VkImageView dst_view = VK_NULL_HANDLE,
+                                bool* by_fsr = nullptr);
 // host/fsr.cpp: FSR 1 from [src_x, src_y, sw x sh] of `src` into `area` of
 // `dst`; false when it cannot (the caller blits). `dst_view`, when `dst`
-// takes storage writes: the last pass writes it directly.
+// takes storage writes: the last pass writes it directly. `use`: 0 the
+// display buffer, 1 frame generation's HUD-less picture - each its own sets
+// and targets, so both can be recorded in one command buffer.
 bool fsr_upscale_locked(VkCommandBuffer cmd, VkImage src, VkFormat src_format, std::uint32_t src_w, std::uint32_t src_h,
                         std::uint32_t src_x, std::uint32_t src_y, std::uint32_t sw, std::uint32_t sh, VkImage dst, VkRect2D area,
-                        VkImageView dst_view = VK_NULL_HANDLE);
+                        VkImageView dst_view = VK_NULL_HANDLE, unsigned use = 0);
 // A CP DMA fill that covers a render target: clear the image instead.
 bool render_clear_by_fill_locked(std::uint64_t va, std::size_t bytes, std::uint32_t value);
 // A render target whose memory a shader fills with one value: clear the image.

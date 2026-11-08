@@ -955,10 +955,21 @@ bool host_gpu_display_image(std::uint64_t display_va, void** image, std::uint32_
 // (a VkImage) on `cmd` (a VkCommandBuffer). Caller holds the lock. Returns
 // false when the VA is not a known render target. `dst_storage_view` (a
 // VkImageView of `dst_image` that takes storage writes, or null): an upscale
-// writes it directly instead of blitting a copy.
+// writes it directly instead of blitting a copy. `by_fsr` (or null): set to
+// whether FSR 1 upscaled it, a picture smaller than the rectangle - else a
+// blit stretched or copied it.
 bool host_gpu_blit_display(void* cmd, std::uint64_t display_va, void* dst_image, std::int32_t dst_x, std::int32_t dst_y,
                            std::uint32_t dst_w, std::uint32_t dst_h, std::uint32_t src_width, std::uint32_t src_height,
-                           std::uint32_t src_x = 0, std::uint32_t src_y = 0, void* dst_storage_view = nullptr);
+                           std::uint32_t src_x = 0, std::uint32_t src_y = 0, void* dst_storage_view = nullptr, bool* by_fsr = nullptr);
+// FSR 1 as host_gpu_blit_display upscales the display buffer, for another
+// picture in the same command buffer (frame generation's HUD-less one): the
+// sw x sh of `src_image` (a VkImage of `src_format`, src_w x src_h, in
+// GENERAL) from (src_x, src_y) into the rectangle (dst_x, dst_y, dst_w x
+// dst_h) of `dst_image` (in TRANSFER_DST_OPTIMAL). Caller holds the lock;
+// false when FSR 1 cannot run (BBHOST_UPSCALE=linear, no pipelines).
+bool host_gpu_fsr_upscale(void* cmd, void* src_image, std::uint32_t src_format, std::uint32_t src_w, std::uint32_t src_h,
+                          std::uint32_t src_x, std::uint32_t src_y, std::uint32_t sw, std::uint32_t sh, void* dst_image, std::int32_t dst_x,
+                          std::int32_t dst_y, std::uint32_t dst_w, std::uint32_t dst_h);
 // Writes the displayed render target as an image: PNG when the path ends in
 // ".png", binary PPM otherwise (headless inspection). `all_targets`: also
 // every colour RT (F12) as <stem>-rt-<base> in the same format and the draw

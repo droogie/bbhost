@@ -2,6 +2,7 @@
 
 #include "core/config.h"
 #include "engine/loading.h"
+#include "host/gpu.h"
 #include "host/settings.h"
 #include "log.h"
 
@@ -401,7 +402,7 @@ void framegen_note_hudless(std::uint64_t display_va, std::uint64_t id, VkImage i
 }
 
 void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D dst, VkExtent2D dst_size, std::int32_t src_x,
-                    std::int32_t src_y, std::uint32_t src_w, std::uint32_t src_h) {
+                    std::int32_t src_y, std::uint32_t src_w, std::uint32_t src_h, bool fsr) {
     g_present_ready = false;
     if (!g_fg_ctx || !g_sc_hudless) return;
     Hudless h;
@@ -456,8 +457,34 @@ void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D ds
     r.dstOffsets[1] = {dst.x + static_cast<std::int32_t>(dst_size.width), dst.y + static_cast<std::int32_t>(dst_size.height), 1};
     const bool same = r.srcOffsets[1].x - r.srcOffsets[0].x == static_cast<std::int32_t>(dst_size.width) &&
                       r.srcOffsets[1].y - r.srcOffsets[0].y == static_cast<std::int32_t>(dst_size.height);
-    vkCmdBlitImage(cmd, h.image, VK_IMAGE_LAYOUT_GENERAL, g_sc_hudless, VK_IMAGE_LAYOUT_GENERAL, 1, &r,
-                   same ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    // A frame FSR 1 upscaled (a picture smaller than its rectangle: Upscaling
+    // Off or TAA at a Resolution below the window's): its HUD-less picture by
+    // FSR 1 too, from the same rectangle into the same one. AMD takes whatever
+    // differs between the frame and this picture for the UI and puts it back
+    // as it is over the generated frames; stretched by a blit, the picture
+    // differed at every edge EASU drew and every detail RCAS sharpened - most
+    // of the 3D, which so moved at the real frames' rate (the generated frames
+    // presented, the screen as smooth as without them).
+    bool by_fsr = false;
+    if (fsr && !same) {
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        by_fsr = host_gpu_fsr_upscale(cmd, h.image, static_cast<std::uint32_t>(h.format), h.w, h.h,
+                                      static_cast<std::uint32_t>(r.srcOffsets[0].x), static_cast<std::uint32_t>(r.srcOffsets[0].y),
+                                      static_cast<std::uint32_t>(r.srcOffsets[1].x - r.srcOffsets[0].x),
+                                      static_cast<std::uint32_t>(r.srcOffsets[1].y - r.srcOffsets[0].y), g_sc_hudless, dst.x, dst.y,
+                                      dst_size.width, dst_size.height);
+        static bool told = false;
+        if (!told)
+            host_log("framegen: the frame is upscaled by FSR 1, and its HUD-less picture %s (%dx%d to %ux%u)",
+                     by_fsr ? "too" : "could not be: stretched", r.srcOffsets[1].x - r.srcOffsets[0].x,
+                     r.srcOffsets[1].y - r.srcOffsets[0].y, dst_size.width, dst_size.height);
+        told = true;
+    }
+    if (!by_fsr)
+        vkCmdBlitImage(cmd, h.image, VK_IMAGE_LAYOUT_GENERAL, g_sc_hudless, b.oldLayout, 1, &r, same ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);

@@ -16241,7 +16241,8 @@ void bind_stage_images(VkDescriptorSet set, const gcn::TranslateResult& meta, co
 }
 
 bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, VkImage dst, VkRect2D area, VkExtent2D src,
-                                std::uint32_t src_x, std::uint32_t src_y, VkImageView dst_view) {
+                                std::uint32_t src_x, std::uint32_t src_y, VkImageView dst_view, bool* by_fsr) {
+    if (by_fsr) *by_fsr = false;
     auto it = g_rts.find(display_va);
     if (it == g_rts.end() || !it->second.initialised) return false;
     RtImage& r = it->second;
@@ -16253,8 +16254,10 @@ bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, V
     // Smaller than the window (a lower render size, the Deck's 960x600): FSR 1
     // rather than a bilinear stretch (host/fsr.cpp).
     if (sw <= area.extent.width && sh <= area.extent.height && (sw < area.extent.width || sh < area.extent.height) &&
-        fsr_upscale_locked(cmd, r.image, r.format, r.width, r.height, x0, y0, sw, sh, dst, area, dst_view))
+        fsr_upscale_locked(cmd, r.image, r.format, r.width, r.height, x0, y0, sw, sh, dst, area, dst_view)) {
+        if (by_fsr) *by_fsr = true;
         return true;
+    }
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[0] = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), 0};
@@ -29884,10 +29887,20 @@ std::string host_gpu_segment_report_spliced() {
 
 bool host_gpu_blit_display(void* cmd, std::uint64_t display_va, void* dst_image, std::int32_t dst_x, std::int32_t dst_y,
                            std::uint32_t dst_w, std::uint32_t dst_h, std::uint32_t src_width, std::uint32_t src_height, std::uint32_t src_x,
-                           std::uint32_t src_y, void* dst_storage_view) {
+                           std::uint32_t src_y, void* dst_storage_view, bool* by_fsr) {
     return render_blit_display_locked(static_cast<VkCommandBuffer>(cmd), display_va, static_cast<VkImage>(dst_image),
                                       {{dst_x, dst_y}, {dst_w, dst_h}}, {src_width, src_height}, src_x, src_y,
-                                      static_cast<VkImageView>(dst_storage_view));
+                                      static_cast<VkImageView>(dst_storage_view), by_fsr);
+}
+
+bool host_gpu_fsr_upscale(void* cmd, void* src_image, std::uint32_t src_format, std::uint32_t src_w, std::uint32_t src_h,
+                          std::uint32_t src_x, std::uint32_t src_y, std::uint32_t sw, std::uint32_t sh, void* dst_image, std::int32_t dst_x,
+                          std::int32_t dst_y, std::uint32_t dst_w, std::uint32_t dst_h) {
+    // FSR 1's second use (host/fsr.cpp): its own sets and targets beside the
+    // display buffer's, which the same command buffer has just upscaled.
+    return fsr_upscale_locked(static_cast<VkCommandBuffer>(cmd), static_cast<VkImage>(src_image), static_cast<VkFormat>(src_format), src_w,
+                              src_h, src_x, src_y, sw, sh, static_cast<VkImage>(dst_image), {{dst_x, dst_y}, {dst_w, dst_h}},
+                              VK_NULL_HANDLE, 1);
 }
 
 bool host_gpu_display_image(std::uint64_t display_va, void** image, std::uint32_t* format, std::uint32_t* width,

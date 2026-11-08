@@ -82,7 +82,9 @@ GpuHandles host_gpu_handles() { return {}; }
 void host_gpu_lock() {}
 void host_gpu_unlock() {}
 bool host_gpu_blit_display(void*, std::uint64_t, void*, std::int32_t, std::int32_t, std::uint32_t, std::uint32_t, std::uint32_t,
-                           std::uint32_t, std::uint32_t, std::uint32_t, void*) { return false; }
+                           std::uint32_t, std::uint32_t, std::uint32_t, void*, bool*) { return false; }
+bool host_gpu_fsr_upscale(void*, void*, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+                          std::uint32_t, void*, std::int32_t, std::int32_t, std::uint32_t, std::uint32_t) { return false; }
 bool host_gpu_dump_display(std::uint64_t, const char*, bool) { return false; }
 void host_gpu_request_dump() {}
 bool host_gpu_take_dump_request(std::string*) { return false; }
