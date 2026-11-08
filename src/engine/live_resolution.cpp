@@ -1408,8 +1408,14 @@ bool live_resolution_install(ElfImage* image) {
     const std::uint64_t start_px = static_cast<std::uint64_t>(w) * static_cast<std::uint32_t>(h);
     const bool tight = live && host_gpu_memory_tight();
     // How large a live change may go: the largest display's size (a picture
-    // larger than every screen only scales down), or the starting size when
-    // that is larger. The display buffers and the render-target heap are made
+    // larger than every screen only scales down) - one display's own width
+    // and height, the one with the most pixels, on a tie the one shaped like
+    // the starting size (host_desktop_largest_size): the widest and the
+    // tallest of all, a landscape 2560x1440 beside a portrait 1440x2560, made
+    // 2560x2560 display buffers no screen shows, every frame drawn into a
+    // target of its own and copied into them, and the render-target heap
+    // grown for 5 million pixels - or the starting size when that is larger.
+    // The display buffers and the render-target heap are made
     // for it at the start and cost memory pinned for the GPU for the whole
     // run whether a change ever comes or not - made at 5120x2160 they were
     // 4 x 42.5 MiB of display buffers, a 5120x2160 depth target, whole-image
@@ -1431,7 +1437,7 @@ bool live_resolution_install(ElfImage* image) {
             max_h = std::min<std::uint32_t>(eh, kMaxH);
             max_why = "BBHOST_LIVE_MAX";
         }
-    } else if (host_desktop_max_size(&desk_w, &desk_h)) {
+    } else if (host_desktop_largest_size(&desk_w, &desk_h, w, h)) {
         max_w = std::min<std::uint32_t>(static_cast<std::uint32_t>(desk_w), kMaxW);
         max_h = std::min<std::uint32_t>(static_cast<std::uint32_t>(desk_h), kMaxH);
         max_why = "the largest display";
@@ -1579,6 +1585,20 @@ bool live_resolution_request(unsigned w, unsigned h, bool confirm) {
     if (!live_resolution_can(w, h)) {
         if (g_installed && static_cast<std::uint64_t>(w) * h > g_live_max_px)
             host_log("resolution: %ux%u needs more render-target memory than this run was given at its start; it applies when the game next starts", w, h);
+        else if (g_installed && (w > g_display[0] || h > g_display[1])) {
+            // A size the display buffers do not hold: the window on a display
+            // taller or wider than the one they were made for (of no more
+            // pixels: a turned one), or a Resolution past them. They are the
+            // game's own, made once at its start: a start at that size makes
+            // them that large.
+            static std::uint64_t told = 0;
+            if (told != pack(w, h))
+                host_log("resolution: %ux%u is %s than the display buffers (%ux%u, made at the start for the largest display); it applies "
+                         "when the game starts at that size",
+                         w, h, w > g_display[0] && h > g_display[1] ? "larger" : w > g_display[0] ? "wider" : "taller", g_display[0],
+                         g_display[1]);
+            told = pack(w, h);
+        }
         return false;
     }
     g_request_confirm.store(confirm);

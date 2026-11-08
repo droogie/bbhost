@@ -852,6 +852,10 @@ if(UNIX)
   add_executable(dmem_place_test tests/dmem_place_test.cpp)
   target_include_directories(dmem_place_test PRIVATE src)
   add_test(NAME dmem_place_test COMMAND dmem_place_test)
+  # Which display the display buffers are made for: the most pixels, then the starting size's shape, then the primary.
+  add_executable(display_pick_test tests/display_pick_test.cpp)
+  target_include_directories(display_pick_test PRIVATE src)
+  add_test(NAME display_pick_test COMMAND display_pick_test)
   # The buffer shadow's page copies grow a run only where both ends meet.
   add_executable(copy_runs_test tests/copy_runs_test.cpp)
   target_include_directories(copy_runs_test PRIVATE src)
