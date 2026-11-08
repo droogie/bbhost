@@ -5,6 +5,7 @@
 #include "host/settings.h"
 #include "log.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <string>
 
@@ -55,6 +56,7 @@ constexpr float kTaaMipBias = 0.0f;
 #include "upscaler_bridge.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -304,7 +306,9 @@ void upscaler_jitter_sized(int method, std::uint32_t render_w, std::uint32_t out
 }
 
 float upscaler_mip_bias_sized(int method, std::uint32_t render_w, std::uint32_t output_w) {
-    if (method == kUpscaleTaa) return kTaaMipBias;
+    // TAA's own, and as the others below the output: by the ratio.
+    if (method == kUpscaleTaa)
+        return kTaaMipBias + (render_w && output_w ? static_cast<float>(std::log2(static_cast<double>(render_w) / output_w)) : 0.0f);
     if (!g_ub || !method || !render_w || !output_w) return 0.0f;
     return static_cast<float>(std::log2(static_cast<double>(render_w) / output_w) - 1.0);
 }
@@ -369,7 +373,10 @@ void upscaler_jitter_sized(int method, std::uint32_t, std::uint32_t, std::uint32
     *x = *y = 0.0f;
     if (method == kUpscaleTaa) taa_jitter(frame, x, y);
 }
-float upscaler_mip_bias_sized(int method, std::uint32_t, std::uint32_t) { return method == kUpscaleTaa ? kTaaMipBias : 0.0f; }
+float upscaler_mip_bias_sized(int method, std::uint32_t render_w, std::uint32_t output_w) {
+    if (method != kUpscaleTaa) return 0.0f;
+    return kTaaMipBias + (render_w && output_w ? static_cast<float>(std::log2(static_cast<double>(render_w) / output_w)) : 0.0f);
+}
 bool upscaler_evaluate(VkCommandBuffer, const UpscaleCall&) { return false; }
 void upscaler_jitter(int method, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t frame, float* x, float* y) {
     *x = *y = 0.0f;

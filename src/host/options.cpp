@@ -1912,7 +1912,7 @@ const char* const* value_tips(int id, bool dlss) {
     static const char* const kUpscalerTips[] = {
         "The game's own anti-aliasing; the 3D at the Resolution.",
         "TAA: bbhost's own temporal anti-aliasing - steadier edges and less shimmer, a little softer. Any GPU, the 3D at the "
-        "Resolution. The fastest of these.",
+        "Resolution; one below the window keeps the HUD at the window's size. The fastest of these.",
         "AMD FSR 3: any GPU.",
         "AMD FSR 4: AMD's newest, where the GPU and driver run it; FSR 3 where they do not.",
         "NVIDIA DLSS: RTX cards only.",
@@ -2526,11 +2526,12 @@ bool host_opt_upscaler_chosen() {
     static const int env = [] {
         const char* e = std::getenv("BBHOST_UPSCALE");
         if (!e || !*e) return -1;
-        return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0 ? 1 : 0;
+        return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0 || std::strcmp(e, "taa") == 0 ? 1 : 0;
     }();
-    // (TAA, 4, keeps the 3D and the game at the Resolution.)
+    // TAA (4) too: a Resolution below the window draws the 3D at it and
+    // keeps the game and its HUD at the window's size, as FSR and DLSS do.
     const int u = host_settings_ref().upscaler;
-    return env >= 0 ? env != 0 : u != 0 && u != 4;
+    return env >= 0 ? env != 0 : u != 0;
 }
 
 // (TAA wants the motion too, though it is no upscaler that sizes the 3D.)

@@ -56,9 +56,11 @@ UpscalerCaps upscaler_caps();
 // host/upscale_pass.cpp, any GPU, no bridge) - and only one that can run here.
 int upscaler_method();
 constexpr int kUpscaleTaa = 3;
-// Whether a method draws the 3D smaller and brings it back (DLSS, FSR); TAA
-// is always the Resolution's own size.
-inline bool upscaler_method_scales(int method) { return method == 1 || method == 2; }
+// Whether a method draws the 3D smaller and brings it back (DLSS, FSR, TAA):
+// with one, the game and its HUD are the window's size and the 3D the
+// Resolution's below it. TAA has no quality of its own - its 3D is the
+// Resolution, brought up after its pass (host/upscale_pass.cpp).
+inline bool upscaler_method_scales(int method) { return method == 1 || method == 2 || method == kUpscaleTaa; }
 bool upscaler_fsr3_override();
 
 // One upscale, recorded into `cb` outside a render pass (host/upscale_pass.cpp
