@@ -1,0 +1,42 @@
+# Velomap 4K: the motion blur's velocity map (and the depth it is drawn
+# against) at a fixed 3840x2160, whatever the render size. The game makes it at
+# half the render size (0x26c3de4: the size read, halved); Kyo's Performance
+# Patch v3 pins it at 640x360. This writes 3840x2160 in the same form - the same
+# three sites the performance patch writes - so it wins over it (a later order):
+#   0x26c3de4  velocity map:  mov eax, 3840; mov [rsp+0x200], eax; mov eax, 2160; mov [rsp+0x204], eax
+#   0x125b1a3  half depth:    3840x2160 (the depth test the map is drawn with; the same size as the map)
+#   0x125b1d6  quarter depth: 1920x1080
+# The upscalers and TAA read the map by its own size, so any size serves them.
+# Steps aside while Screen space reflections (which puts the depth back at the
+# game's sizes) or HD motion blur (its own sizes for the same sites) is on.
+# One of velomap-1080p, velomap-1440p and velomap-4k at a time (group
+# velomap-size: turning one on turns the others off). Restart to apply.
+#
+# Off until turned on: the setup window's Patches tab, the patch menu in the
+# game (F9), or `velomap-4k = true` under [patches] in bbhost.toml.
+[patch]
+name = "velomap-4k"
+title = "Velomap 4K"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Motion blur's velocity map rendered at 3840x2160, with its depth (overrides the Performance patch's 640x360)."
+enabled = false
+order = 8003
+group = "velomap-size"
+
+[site.velomap-size]
+address = "0x026c3de4"
+expect = "41 8b 07 d1 e8 89 84 24 00 02 00 00 41 8b 47 04 d1 e8 89 84 24 04 02 00 00"
+bytes = "b8 00 0f 00 00 89 84 24 00 02 00 00 b8 70 08 00 00 90 89 84 24 04 02 00 00"
+yields = ["ssr", "hd-motion-blur"]
+
+[site.depth-half-size]
+address = "0x0125b1a3"
+expect = "8b 03 d1 e8 89 04 24 8b 43 04 d1 e8 89 44 24 04"
+bytes = "c7 04 24 00 0f 00 00 c7 44 24 04 70 08 00 00 90"
+yields = ["ssr", "hd-motion-blur"]
+
+[site.depth-quarter-size]
+address = "0x0125b1d6"
+expect = "8b 03 c1 e8 02 89 04 24 8b 43 04 c1 e8 02 89 44 24 04"
+bytes = "c7 04 24 80 07 00 00 90 c7 44 24 04 38 04 00 00 90 90"
+yields = ["ssr", "hd-motion-blur"]
