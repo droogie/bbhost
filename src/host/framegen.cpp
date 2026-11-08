@@ -54,7 +54,14 @@ std::mutex g_hudless_mu;
 // the renderer's, the configure on the presenter's - where AMD's sample uses
 // it from one: one at a time.
 std::mutex g_ctx_mu;
-std::atomic<float> g_shown_per_frame{1.0f};
+// Frames AMD's swapchain presented for each of ours over the last 60 of ours:
+// 0 until this swapchain has been measured once (framegen_present).
+std::atomic<float> g_shown_per_frame{0.0f};
+// Its counts, this swapchain's (framegen_present; reset as one is made).
+std::uint64_t g_count_ours = 0, g_count_base = 0, g_count_base60 = 0;
+// The frames that went without generation and why, this swapchain's too
+// (framegen_frame; reset with the counts above).
+std::uint64_t g_skip_frames = 0, g_skip_none = 0, g_skip_again = 0;
 Hudless g_hudless[4];  // under g_hudless_mu
 
 // The presenter's side: the HUD-less picture at the swapchain's size, and the
@@ -214,6 +221,11 @@ bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkS
         g_fg_ctx = nullptr;
     }
     g_max_render = {fg.maxRenderSize.width, fg.maxRenderSize.height};
+    // The counts start again with this swapchain: the last one's factor shown
+    // for its first ticks was the FPS counter's bracket after a toggle.
+    g_shown_per_frame.store(0.0f, std::memory_order_relaxed);
+    g_count_ours = g_count_base = g_count_base60 = 0;
+    g_skip_frames = g_skip_none = g_skip_again = 0;
     g_swapchain = made;
     g_device = device;
     g_phys = phys;
@@ -233,7 +245,7 @@ bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkS
 
 bool framegen_active() { return g_swap_ctx != nullptr; }
 
-float framegen_shown_per_frame() { return g_swap_ctx ? g_shown_per_frame.load(std::memory_order_relaxed) : 1.0f; }
+float framegen_shown_per_frame() { return g_swap_ctx ? g_shown_per_frame.load(std::memory_order_relaxed) : 1.0f; }  // 0: not measured yet
 
 VkResult framegen_get_images(VkDevice device, VkSwapchainKHR swapchain, std::uint32_t* count, VkImage* images) {
     return g_fns.pOutGetSwapchainImagesKHR(device, swapchain, count, images);
@@ -298,18 +310,19 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
     }
     // What reaches the screen, real and generated, against the game's frames:
     // the FPS counter's factor every 60, the log's line every 600.
-    static std::uint64_t frames = 0, base = 0, base60 = 0;
-    if (g_fns.pOutGetLastPresentCountFFXAPI && (frames + 1) % 60 == 0) {
+    // (AMD's count of its presents, real and generated - what it handed the
+    // display, not a measure of what the display showed - against ours; this
+    // swapchain's alone: the counts start again as one is made.)
+    if (g_fns.pOutGetLastPresentCountFFXAPI && (g_count_ours + 1) % 60 == 0) {
         const std::uint64_t shown = g_fns.pOutGetLastPresentCountFFXAPI(g_swapchain);
-        if (shown < base60) base60 = 0, base = shown;  // a new swapchain counts from 0
-        if (base60 && shown > base60) g_shown_per_frame.store(static_cast<float>(shown - base60) / 60.0f, std::memory_order_relaxed);
-        base60 = shown;
+        if (g_count_base60 && shown > g_count_base60)
+            g_shown_per_frame.store(static_cast<float>(shown - g_count_base60) / 60.0f, std::memory_order_relaxed);
+        g_count_base60 = shown ? shown : 1;
     }
-    if (g_fns.pOutGetLastPresentCountFFXAPI && ++frames % 600 == 0) {
+    if (g_fns.pOutGetLastPresentCountFFXAPI && ++g_count_ours % 600 == 0) {
         const std::uint64_t shown = g_fns.pOutGetLastPresentCountFFXAPI(g_swapchain);
-        if (shown < base) base = 0;
-        host_log("framegen: %llu frames shown for the last 600 of the game's", static_cast<unsigned long long>(shown - base));
-        base = shown;
+        host_log("framegen: AMD presented %llu frames for the last 600 of ours", static_cast<unsigned long long>(shown - g_count_base));
+        g_count_base = shown;
     }
     return r;
 }
@@ -398,17 +411,17 @@ void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D ds
             if (s.display_va == display_va) h = s;
         }
     }
-    // Why frames go without generation, every 600 presents (the log's "frames shown" line).
-    static std::uint64_t calls = 0, none = 0, again = 0;
-    if (++calls % 600 == 0 && (none || again)) {
+    // Why frames go without generation, every 600 presents (beside the log's
+    // "AMD presented" line, over this swapchain's frames as it is).
+    if (++g_skip_frames % 600 == 0 && (g_skip_none || g_skip_again)) {
         host_log("framegen: of the last 600 frames %llu had no HUD-less copy, %llu were shown before (last prepared %llu, presented %llu)",
-                 static_cast<unsigned long long>(none), static_cast<unsigned long long>(again), static_cast<unsigned long long>(h.id),
-                 static_cast<unsigned long long>(g_present_id));
-        none = again = 0;
+                 static_cast<unsigned long long>(g_skip_none), static_cast<unsigned long long>(g_skip_again),
+                 static_cast<unsigned long long>(h.id), static_cast<unsigned long long>(g_present_id));
+        g_skip_none = g_skip_again = 0;
     }
     // A frame seen before (the same buffer shown again) is not one to generate after.
     if (!h.image || h.id <= g_present_id) {
-        ++(h.image ? again : none);
+        ++(h.image ? g_skip_again : g_skip_none);
         static std::atomic<int> told{0};
         if (told.fetch_add(1) < 3)
             host_log("framegen: no HUD-less copy to present display buffer 0x%llx with (%s)", static_cast<unsigned long long>(display_va),

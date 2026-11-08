@@ -2537,6 +2537,7 @@ bool host_window_pump() {
             shown = last ? static_cast<int>(fps + 0.5) : 0;
             // With frame generation, beside it in brackets what is on screen:
             // the game's frames and the ones generated between them.
+            // (None until AMD's swapchain has been measured: framegen_shown_per_frame 0.)
             shown_total = last && framegen_active() ? static_cast<int>(fps * framegen_shown_per_frame() + 0.5) : 0;
             shown_at = now;
             const GpuBusy b = host_gpu_busy();
