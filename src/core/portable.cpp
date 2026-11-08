@@ -1,5 +1,4 @@
 #include "core/portable.h"
-#include "core/display_pick.h"
 #include "log.h"
 
 #include <pthread.h>
@@ -331,27 +330,30 @@ std::atomic<bool> g_headless{false};
 
 void host_set_headless(bool headless) { g_headless.store(headless); }
 
-bool host_desktop_largest_size(int* w, int* h, int like_w, int like_h) {
-    // One display's own width and height - the one with the most pixels, on a
-    // tie the one shaped like like_w x like_h, then the primary - not the
-    // widest and the tallest of all (core/display_pick.h).
-    LargestDisplay pick{like_w, like_h};
+bool host_desktop_max_size(int* w, int* h) {
 #if defined(_WIN32)
     // EnumDisplaySettings gives each display's mode in physical pixels,
     // whatever the process's DPI awareness (the monitor rectangles would be
     // scaled for a process that is not aware).
+    int bw = 0, bh = 0;
     DISPLAY_DEVICEW dd{};
     dd.cb = sizeof(dd);
     for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
         if (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) {
             DEVMODEW dm{};
             dm.dmSize = sizeof(dm);
-            if (EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm))
-                pick.take(static_cast<int>(dm.dmPelsWidth), static_cast<int>(dm.dmPelsHeight), (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0);
+            if (EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) {
+                bw = std::max(bw, static_cast<int>(dm.dmPelsWidth));
+                bh = std::max(bh, static_cast<int>(dm.dmPelsHeight));
+            }
         }
         dd = DISPLAY_DEVICEW{};
         dd.cb = sizeof(dd);
     }
+    if (bw <= 0 || bh <= 0) return false;
+    *w = bw;
+    *h = bh;
+    return true;
 #elif defined(BBHOST_HAVE_SDL3)
     // The displays SDL's video driver lists (X11 or Wayland), each desktop
     // mode in physical pixels. The video subsystem is brought up for the
@@ -360,23 +362,27 @@ bool host_desktop_largest_size(int* w, int* h, int like_w, int like_h) {
     // have no display server.
     if (g_headless.load()) return false;
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) return false;
-    int count = 0;
-    const SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+    int count = 0, bw = 0, bh = 0;
     if (SDL_DisplayID* ids = SDL_GetDisplays(&count)) {
         for (int i = 0; i < count; ++i) {
             const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(ids[i]);
             if (!m) continue;
             const float d = m->pixel_density > 0.0f ? m->pixel_density : 1.0f;
-            pick.take(static_cast<int>(static_cast<float>(m->w) * d + 0.5f), static_cast<int>(static_cast<float>(m->h) * d + 0.5f), ids[i] == primary);
+            bw = std::max(bw, static_cast<int>(static_cast<float>(m->w) * d + 0.5f));
+            bh = std::max(bh, static_cast<int>(static_cast<float>(m->h) * d + 0.5f));
         }
         SDL_free(ids);
     }
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
-#endif
-    if (pick.w <= 0 || pick.h <= 0) return false;
-    *w = pick.w;
-    *h = pick.h;
+    if (bw <= 0 || bh <= 0) return false;
+    *w = bw;
+    *h = bh;
     return true;
+#else
+    (void)w;
+    (void)h;
+    return false;
+#endif
 }
 
 bool host_desktop_primary_size(int* w, int* h) {
@@ -391,7 +397,7 @@ bool host_desktop_primary_size(int* w, int* h) {
     *h = static_cast<int>(dm.dmPelsHeight);
     return true;
 #elif defined(BBHOST_HAVE_SDL3)
-    // As host_desktop_largest_size, the primary display alone.
+    // As host_desktop_max_size, the primary display alone.
     if (g_headless.load()) return false;
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) return false;
     int bw = 0, bh = 0;

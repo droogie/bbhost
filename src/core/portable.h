@@ -52,15 +52,13 @@ void host_thread_background();
 // The hardware threads this process may run on: its CPU affinity (a taskset,
 // numactl, `start /affinity`, a job object's), else every one the system has.
 unsigned host_cpu_threads();
-// The largest of the desktop's displays - the most pixels; on a tie the one
-// shaped like like_w x like_h (landscape or portrait) when given, then the
-// primary - its own width and height in physical pixels (its current mode),
-// not the widest and tallest of all of them. False when the platform does not
-// say: a headless run (host_set_headless), or a build without SDL off Windows.
-bool host_desktop_largest_size(int* w, int* h, int like_w = 0, int like_h = 0);
+// The largest width and height among the desktop's displays, in physical
+// pixels (each display's current mode). False when the platform does not say:
+// a headless run (host_set_headless), or a build without SDL off Windows.
+bool host_desktop_max_size(int* w, int* h);
 // The primary display's size in physical pixels (its current mode): where a
 // window opens when it is given no position, so the screen Borderless and
-// Fullscreen fill. False as host_desktop_largest_size.
+// Fullscreen fill. False as host_desktop_max_size.
 bool host_desktop_primary_size(int* w, int* h);
 // The refresh rate of the display the window opens on (the primary one), as
 // the display gives it (59.94, 143.998), asked before the window shell starts:
@@ -68,7 +66,7 @@ bool host_desktop_primary_size(int* w, int* h);
 // headless run, or a build without SDL off Windows.
 float host_desktop_refresh_hz();
 // Whether this run opens no window (main, once the configuration is final):
-// host_desktop_largest_size and host_desktop_refresh_hz then ask no display server.
+// host_desktop_max_size and host_desktop_refresh_hz then ask no display server.
 void host_set_headless(bool headless);
 // The name Linux can hold (15 characters): leading dotted parts dropped
 // first ("Core.Res.PostProcessor_0" -> "PostProcessor_0"), then the tail.
