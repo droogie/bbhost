@@ -14,6 +14,7 @@
 #include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/options.h"
+#include "host/window.h"
 #include "log.h"
 
 #include <algorithm>
@@ -77,7 +78,7 @@ constexpr std::uint64_t kSwfPlayerCtor = 0x2358360, kSwfPlayerDtor = 0x2358670, 
 
 // The largest entries of the Resolution setting, wide and tall: 11520x2160
 // (three 16:9 screens) and 7680x4320 (8K) - the display buffers fit any size
-// up to the largest display's, within these. With no display to go by, the
+// up to the window's display's, within these. With no display to go by, the
 // widest and tallest of the entries up to 5120x2160 (21:9), as before the
 // list grew past it.
 constexpr std::uint32_t kMaxW = 11520, kMaxH = 4320;
@@ -1407,9 +1408,14 @@ bool live_resolution_install(ElfImage* image) {
     }();
     const std::uint64_t start_px = static_cast<std::uint64_t>(w) * static_cast<std::uint32_t>(h);
     const bool tight = live && host_gpu_memory_tight();
-    // How large a live change may go: the largest display's size (a picture
-    // larger than every screen only scales down), or the starting size when
-    // that is larger. The display buffers and the render-target heap are made
+    // How large a live change may go: the size of the display the window is
+    // on - before the window is made, the primary display's, where it opens
+    // (as options' output_for) - or the starting size when that is larger.
+    // Not the largest width and height of all displays: beside a portrait
+    // display (2560x1440 and 1440x2560, 2560x2560) the buffers were a size no
+    // screen has, so a picture at the screen's own size never matched them and
+    // the scene took the copy path (a target of its own, copied into the HUD's
+    // target), and their memory and clears were nearly twice the screen's. The display buffers and the render-target heap are made
     // for it at the start and cost memory pinned for the GPU for the whole
     // run whether a change ever comes or not - made at 5120x2160 they were
     // 4 x 42.5 MiB of display buffers, a 5120x2160 depth target, whole-image
@@ -1431,10 +1437,10 @@ bool live_resolution_install(ElfImage* image) {
             max_h = std::min<std::uint32_t>(eh, kMaxH);
             max_why = "BBHOST_LIVE_MAX";
         }
-    } else if (host_desktop_max_size(&desk_w, &desk_h)) {
+    } else if (host_window_desktop_size(&desk_w, &desk_h) || host_desktop_primary_size(&desk_w, &desk_h)) {
         max_w = std::min<std::uint32_t>(static_cast<std::uint32_t>(desk_w), kMaxW);
         max_h = std::min<std::uint32_t>(static_cast<std::uint32_t>(desk_h), kMaxH);
-        max_why = "the largest display";
+        max_why = "the window's display";
     } else if (live && host_gpu_small_vram()) {
         // No display size to go by (a headless run) and little video
         // memory: the starting size, or 1080p if smaller, instead of
