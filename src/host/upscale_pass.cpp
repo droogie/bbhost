@@ -117,7 +117,7 @@ VkImageView g_picture_view = VK_NULL_HANDLE;  // this frame's final picture (ren
 OwnImage g_sharp;                   // the picture sharpened (Sharpness), the output size; made at the first use
 OwnImage g_taa_hist[2];             // TAA's two histories (record_taa): one read, one written, changing places each frame
 int g_taa_read = 0;                 // the one this frame's TAA reads
-int g_last_method = 0;              // the last call's method (another one's history is not this one's)
+int g_last_method = 0;              // the last call's method, FSR 3's flag in (another one's history and LOD bias are not this one's)
 // Frame generation (host/framegen.h): the frames prepared so far - each
 // frame's number - and the one this frame was prepared as (0: not), which its
 // HUD-less copy is then of.
@@ -1557,7 +1557,12 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     // GPU cannot run): the motion and its prepare at the scene's size, and the
     // scene left as the game drew it.
     const bool motion_only = !method && framegen_active();
-    if (!method && !motion_only) return false;
+    if (!method && !motion_only) {
+        // Upscaling off: a method chosen again later starts over - its history
+        // and its LOD bias are its own, not the ones kept from before.
+        g_last_method = 0;
+        return false;
+    }
     // The output size: render scale's when the scene is its render size,
     // else the scene's own (DLAA, FSR native AA).
     RenderScale rs;
@@ -1586,7 +1591,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         return false;
     }
     const std::uint32_t ow = scaled ? rs.output_w : scene.width, oh = scaled ? rs.output_h : scene.height;
-    if (scene.width != g_w || scene.height != g_h || ow != g_ow || oh != g_oh || motion_only != !g_output.image) {
+    const bool remade = scene.width != g_w || scene.height != g_h || ow != g_ow || oh != g_oh || motion_only != !g_output.image;
+    if (remade) {
         drop(g_output);
         drop(g_motion);
         drop(g_depth_r32);
@@ -1621,18 +1627,7 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         if (motion_only)
             host_log("framegen: the motion at %ux%u (the scene's size, no upscaler running), scene format %d, depth format %d", g_w, g_h,
                      static_cast<int>(scene.format), static_cast<int>(depth.format));
-        // The materials' textures sampled as at the output size: the
-        // bridge's mip bias (BBHOST_UPSCALE_MIP_BIAS=0: none, a test).
-        static const bool mip_bias_on = [] {
-            const char* e = std::getenv("BBHOST_UPSCALE_MIP_BIAS");
-            return !(e && e[0] == '0');
-        }();
-        g_mip_bias = !mip_bias_on || motion_only ? 0.0f
-                     : g_scaled               ? upscaler_mip_bias_sized(method, g_w, g_ow)
-                                              : upscaler_mip_bias(method, 0, g_ow, g_oh);
         if (!motion_only) {
-            host_log("upscaler: the camera's draws sample their textures with a LOD bias of %.3f%s", static_cast<double>(g_mip_bias),
-                     mip_bias_on ? "" : " (BBHOST_UPSCALE_MIP_BIAS=0)");
             if (g_scaled)
                 host_log("upscaler: %s from %ux%u to %ux%u (Upscaling quality %d), scene format %d, depth format %d; YEBIS's copy reads the picture",
                          method == 1 ? "DLSS" : "FSR", g_w, g_h, g_ow, g_oh, rs.quality, static_cast<int>(scene.format),
@@ -1658,9 +1653,29 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         }
     }
 
-    if (method != g_last_method) {
-        g_last_method = method;
-        g_reset = true;
+    // The method as the bridge runs it: FSR 4 and FSR 3 are one method with
+    // a flag (upscaler_fsr3_override), and a change between them is a change
+    // of upscaler like any other.
+    const int method_key = method == 2 && upscaler_fsr3_override() ? 2 | 0x100 : method;
+    if (method_key != g_last_method || remade) {
+        // The materials' textures sampled as at the output size: the method's
+        // own mip bias at these sizes (BBHOST_UPSCALE_MIP_BIAS=0: none, a
+        // test) - worked out whenever the method or the images change. Kept
+        // from whichever method made the images, TAA after DLSS, FSR 3 or FSR 4
+        // at Native AA (the same sizes) sampled with their bias of -1.
+        static const bool mip_bias_on = [] {
+            const char* e = std::getenv("BBHOST_UPSCALE_MIP_BIAS");
+            return !(e && e[0] == '0');
+        }();
+        const float bias = !mip_bias_on || motion_only ? 0.0f
+                           : g_scaled               ? upscaler_mip_bias_sized(method, g_w, g_ow)
+                                                    : upscaler_mip_bias(method, 0, g_ow, g_oh);
+        if (!motion_only && (bias != g_mip_bias || remade))
+            host_log("upscaler: the camera's draws sample their textures with a LOD bias of %.3f%s", static_cast<double>(bias),
+                     mip_bias_on ? "" : " (BBHOST_UPSCALE_MIP_BIAS=0)");
+        g_mip_bias = bias;
+        if (method_key != g_last_method) g_reset = true;
+        g_last_method = method_key;
     }
     begin_recording_locked();
     if (scene.view_clear) view_clear_apply_locked(scene);
