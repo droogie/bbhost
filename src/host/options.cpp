@@ -659,7 +659,9 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFrameCap},
     {Row::Option, nullptr, kFrameClock},
     {Row::Option, nullptr, kEffectTiming},
-    {Row::Option, nullptr, kFrameGeneration},
+#if defined(_WIN32)
+    {Row::Option, nullptr, kFrameGeneration},  // AMD's FidelityFX, Windows' alone: no row elsewhere
+#endif
     {Row::Option, nullptr, kSkipLogos},
     {Row::Option, nullptr, kPerformanceMode},
     {Row::Option, nullptr, kFpsCounter},
@@ -712,8 +714,11 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kDynamicShadows},
     {Row::Option, nullptr, kShadowResolution},
     // Frame generation on Graphics too, beside the upscaler (Kyo: on both
-    // pages); the same setting as the Game page's row.
+    // pages); the same setting as the Game page's row, and like it Windows'
+    // alone.
+#if defined(_WIN32)
     {Row::Option, nullptr, kFrameGeneration},
+#endif
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kUpscaler},
     {Row::Option, nullptr, kTaaStrength},  // (shown with TAA only: row_hidden)
@@ -1826,6 +1831,12 @@ void host_options_load() {
     }
     // BBHOST_FRAMEGEN=1 or 0: Frame generation on or off over the file.
     if (const char* e = std::getenv("BBHOST_FRAMEGEN"); e && e[0]) g_set[kFrameGeneration].index = e[0] == '0' ? 0 : 1;
+#if !defined(_WIN32)
+    // Frame generation is AMD's FidelityFX on Windows alone (host/framegen.cpp)
+    // and has no row elsewhere: off here whatever a file from Windows says, so
+    // nothing that cannot be turned off holds the frame rate to its limit.
+    g_set[kFrameGeneration].index = 0;
+#endif
     if (const char* e = std::getenv("BBHOST_MOUSE_CAMERA"); e && e[0]) {
         g_set[kMouseCamera].index = e[0] == '0' ? 0 : 1;
     }

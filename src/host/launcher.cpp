@@ -1112,7 +1112,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 }
                 ui::tooltip_for_item("Effect timing", kHostEffectTimingNote);
                 // Frame generation: the same setting as the Graphics page's,
-                // changed and saved at once.
+                // changed and saved at once. AMD's FidelityFX, Windows' alone:
+                // no row elsewhere (host/options.cpp keeps it off there).
+#if defined(_WIN32)
                 {
                     bool fg = host_opt_get("frame_generation");
                     if (ui::toggle_row("Frame generation", nullptr, &fg,
@@ -1124,6 +1126,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     if (fg) host_frame_rate_fit(&cap_choice, &cap_custom, &cap_custom_fps);
                     host_frame_generation_warning(cap_choice, cap_custom, cap_custom_fps);
                 }
+#endif
                 ui::toggle_row("Skip company logos", nullptr, &skip_logos,
                                "The three company logos and the Exit Game warning are skipped as the game starts.");
                 ui::toggle_row("Performance mode", nullptr, &performance_mode,

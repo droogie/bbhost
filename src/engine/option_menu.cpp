@@ -732,9 +732,10 @@ constexpr int kEnhanceRows = static_cast<int>(sizeof(g_enhance) / sizeof(g_enhan
 
 // PC Upscaling: the settings by their index, as F10 and the setup window keep
 // them (host/options.cpp) - one setting, one order, three front ends. Frame
-// generation a toggle, Sharpness a slider (its 0-100% in tenths), Reflection
-// quality a left/right pair, and the two lists last: a pick list opens over
-// the rows under it (as PC Settings' two do).
+// generation a toggle (on Windows alone: AMD's FidelityFX, no row elsewhere),
+// Sharpness a slider (its 0-100% in tenths), Reflection quality a left/right
+// pair, and the two lists last: a pick list opens over the rows under it (as
+// PC Settings' two do).
 Toggle g_up_frame_gen{"frame_generation", kUpFrameGen, 0, 0xff};
 Slider g_up_sharpness{"sharpness", kUpSharpness, 0, 0xff};
 // TAA strength beside Sharpness: the section's lists have to come last, and it
@@ -748,7 +749,11 @@ const Choice kUpscalers[] = {{0, 125032}, {1, 125040}, {2, 125033}, {3, 125034},
 const Choice kUpscaleQualities[] = {{0, 125036}, {1, 125037}, {2, 125038}, {3, 125039}};  // Performance .. Native AA
 std::int32_t g_up_scaler = 0, g_up_scaler_last = -1;
 std::int32_t g_up_quality = 2, g_up_quality_last = -1;
+#if defined(_WIN32)
 constexpr int kUpscaleRows = 6;
+#else
+constexpr int kUpscaleRows = 5;  // no Frame generation: the five rows the section's movie has (engine/menu_assets.cpp)
+#endif
 
 
 void seed_camera_tuning() {
@@ -812,7 +817,9 @@ void seed_upscale() {
 // PC Upscaling's rows that are not toggles or sliders: a change here goes to
 // the setting; a change made in F10 is taken up so the row shows it next time.
 void push_upscale() {
+#if defined(_WIN32)
     push(g_up_frame_gen);
+#endif
     push(g_up_sharpness);
     push(g_up_taa_strength);
     const auto pick = [](const char* key, std::int32_t& value, std::int32_t& last) {
@@ -989,15 +996,18 @@ GUEST_ABI void pc_effects_handler(void* dialog, void* params) {
     log_rows("PCEffects", dialog, kEffectsRows, kEffectsRows);
 }
 
-// PC Upscaling: a toggle, two sliders and a pair, then Upscaling and its quality
-// as the two pick lists last (the quality's list opens over the Defaults
-// caption, Upscaling's over the quality's row - as PC Settings' two).
+// PC Upscaling: a toggle (Windows: Frame generation), two sliders and a pair,
+// then Upscaling and its quality as the two pick lists last (the quality's
+// list opens over the Defaults caption, Upscaling's over the quality's row -
+// as PC Settings' two).
 GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
     host_log("pc-options: PCUpscale opened, dialog=%p params=%p", dialog, params);
     alignas(16) std::uint8_t scratch[0x100]{};
     hle_call_guest<std::int64_t>(guest_fn(kScratchInit), &scratch);
     seed_upscale();
+#if defined(_WIN32)
     add_toggle_row(dialog, &g_up_frame_gen.value, g_up_frame_gen.id, default_of(g_up_frame_gen));
+#endif
     add_slider_row(dialog, &g_up_sharpness.value, g_up_sharpness.id, default_of(g_up_sharpness));
     add_slider_row(dialog, &g_up_taa_strength.value, g_up_taa_strength.id, default_of(g_up_taa_strength));
     add_pair_row(dialog, &g_up_reflection, kUpReflection, kReflectionQualities,
