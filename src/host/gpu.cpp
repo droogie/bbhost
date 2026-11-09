@@ -5208,10 +5208,15 @@ bool init_locked() {
     {
         // Edited shaders' off switch (host/shader_overrides.h): BBHOST_SHADER_OVERRIDES=0|1
         // wins over bbhost.toml's video.shader_overrides.
+        // The compile session (Compile shaders now) has no draws: it fills the
+        // caches with the game's own shaders, which edited ones never enter.
         const char* e = std::getenv("BBHOST_SHADER_OVERRIDES");
         const bool env = e && (e[0] == '0' || e[0] == '1') && !e[1];
-        hlsl_set_overrides(env ? e[0] == '1' : config().shader_overrides,
-                           env ? "BBHOST_SHADER_OVERRIDES=0" : "bbhost.toml's video.shader_overrides = false");
+        const bool session = g_compile_session.load();
+        hlsl_set_overrides(!session && (env ? e[0] == '1' : config().shader_overrides),
+                           session ? "the shader compile builds the game's own shaders"
+                           : env   ? "BBHOST_SHADER_OVERRIDES=0"
+                                   : "bbhost.toml's video.shader_overrides = false");
     }
     overrides_set_data_maker(&shader_data_make);  // the plugins' shader data, made at an owner's first compile
     if (const char* root = hle_fs_data_root(); root && *root) hlsl_set_folders(std::string(root) + "/bbhost");
