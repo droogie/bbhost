@@ -392,7 +392,8 @@ drawn with the shader's translation instead (one whose constant buffers do not
 all bind) keeps the game's. A compute shader's
 new source is compiled where it is first dispatched when it was not met before
 (a short stall). The log's start and exit reports list each override, who gave
-it and what became of it; `BBHOST_SHADER_WATCH=1` reads the plugins' folders
+it and what became of it - the exit's every one set during the run, one given
+back with the flip it went at; `BBHOST_SHADER_WATCH=1` reads the plugins' folders
 and the player's again while the game runs; `video.shader_overrides = false` or
 `BBHOST_SHADER_OVERRIDES=0` turns all of them off. Not yet: textures or
 samplers of an override's own, and an override for some draws of a shader and

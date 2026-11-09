@@ -5219,6 +5219,7 @@ bool init_locked() {
                                    : "bbhost.toml's video.shader_overrides = false");
     }
     overrides_set_data_maker(&shader_data_make);  // the plugins' shader data, made at an owner's first compile
+    overrides_set_clock(&hle_video_flip_count);   // the exit report names a removed override's flip
     if (const char* root = hle_fs_data_root(); root && *root) hlsl_set_folders(std::string(root) + "/bbhost");
     hlsl_set_name_lookup(&shader_bundle_file_name);
     translation_cache_load(translation_cache_path());

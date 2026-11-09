@@ -100,8 +100,9 @@ that HLSL and have the game use your version.
    overrides: N - <shader> (your folder), ...`). The first time a shader is
    used, its edited file is compiled, and the log says whether it was taken
    (`render: HLSL override <file> compiled and taken for <shader>`). The exit
-   report has a line for each edited shader: taken, refused and why, or not
-   met.
+   report has a line for each edited shader the run had: taken, refused and
+   why, or not met - or, for a file removed while the game ran, the flip it
+   went at and how many stages it was built into while it was there.
 
 For each shader, the game looks for an edited file in this order:
 

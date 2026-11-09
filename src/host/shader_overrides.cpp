@@ -88,6 +88,15 @@ struct Pending {
     std::string folder;
 };
 
+// A source of a name an owner gave at some time in the run (the exit report):
+// the owner's name as it was (a dropped owner is gone from the owners), and
+// once the owner gives the name no more, the flip it went at.
+struct Seen {
+    std::string owner;
+    bool gone = false;
+    std::uint64_t gone_flip = 0;
+};
+
 struct Registry {
     std::mutex mu;
     bool on = false;
@@ -103,6 +112,8 @@ struct Registry {
     std::unordered_map<std::uint64_t, std::shared_ptr<const Set>> sets;   // by salt; never erased in a run
     std::map<std::tuple<int, std::string, std::uint64_t>, Outcome> outcomes;  // by owner, name and identity
     std::map<std::pair<int, std::string>, Pending> pending;  // by owner and name: compiling ahead
+    std::map<std::pair<int, std::string>, Seen> seen;         // by owner and name: every one set this run
+    std::uint64_t (*flips)() = nullptr;                       // the game's flip count (overrides_set_clock)
     std::size_t player_unnamed = 0;  // the player's .hlsl files named after no shader
     std::atomic<std::uint64_t> compiles{0}, compile_us{0}, stages{0}, pipelines{0};
     std::atomic<std::uint64_t> window_compiles{0}, window_us{0}, window_stages{0}, window_pipelines{0};
@@ -178,9 +189,12 @@ bool list_folder(int owner, const std::string& dir, std::map<std::string, std::s
     return true;
 }
 
+void seen_locked(Registry& r);
+
 // What applies, made again from the owners' sources; the generation moves
 // when it changed. Under mu.
 bool rebuild_locked(Registry& r) {
+    seen_locked(r);  // every change of the sources passes here: the run's record of them
     std::unordered_map<std::string, std::shared_ptr<const OverrideSource>> eff;
     if (r.on) {
         const auto offer = [&](const std::shared_ptr<const OverrideSource>& s) {
@@ -282,6 +296,26 @@ std::vector<std::string> names_locked(const Registry& r, int owner) {
         if (key.first == owner) names.insert(key.second);
     }
     return {names.begin(), names.end()};
+}
+
+// The run's record of the sources (the exit report): each name an owner gives
+// now, with the owner's name; one it gives no more marked gone, at the flip it
+// went at. Under mu.
+void seen_locked(Registry& r) {
+    std::set<std::pair<int, std::string>> now;
+    for (const auto& [id, o] : r.owners) {
+        for (const std::string& name : names_locked(r, id)) {
+            Seen& s = r.seen[{id, name}];
+            s.owner = id == kOverridePlayer ? std::string("your folder") : o.name;
+            s.gone = false;
+            now.emplace(id, name);
+        }
+    }
+    for (auto& [key, s] : r.seen) {
+        if (s.gone || now.count(key)) continue;
+        s.gone = true;
+        s.gone_flip = r.flips ? r.flips() : 0;
+    }
 }
 
 // Whether an owner before `owner` has a source named `name` (so one of its
@@ -965,21 +999,38 @@ void override_note_pipeline() {
 std::vector<std::string> overrides_report() {
     Registry& r = reg();
     std::lock_guard<std::mutex> lk(r.mu);
+    seen_locked(r);
     std::vector<std::string> lines;
-    std::size_t n[6] = {}, all = 0;
-    for (const auto& [id, o] : r.owners) {
-        for (const std::string& name : names_locked(r, id)) {
+    std::size_t n[6] = {}, gone = 0, all = 0;
+    for (const auto& [key, seen] : r.seen) {
+        const auto& [id, name] = key;
+        ++all;
+        std::string what;
+        if (seen.gone) {
+            // Taken away: when, and what its sources did while it was set.
+            ++gone;
+            std::uint64_t taken = 0, refused = 0;
+            std::string why;
+            for (auto it = r.outcomes.lower_bound(std::make_tuple(id, name, std::uint64_t{0}));
+                 it != r.outcomes.end() && std::get<0>(it->first) == id && std::get<1>(it->first) == name; ++it) {
+                taken += it->second.taken;
+                refused += it->second.refused;
+                if (!it->second.why.empty()) why = it->second.why;
+            }
+            what = std::string("removed") + (r.flips ? " at flip " + std::to_string(seen.gone_flip) : std::string()) + ", ";
+            if (taken) what += "taken by " + std::to_string(taken) + (taken == 1 ? " stage build" : " stage builds") + " while it was set";
+            else if (refused) what += "refused while it was set: " + why;
+            else what += "no stage built with it while it was set";
+        } else {
             std::string why;
             const int st = state_locked(r, id, name, &why);
             ++n[st];
-            ++all;
-            if (lines.size() >= 64) continue;
-            std::string what;
             switch (st) {
                 case kOverrideTaken: {
                     const std::shared_ptr<const OverrideSource> own = own_locked(r, id, name);
                     const auto oc = own ? r.outcomes.find({id, name, own->identity}) : r.outcomes.end();
-                    what = "taken by " + std::to_string(oc != r.outcomes.end() ? oc->second.taken : 0) + " stage builds";
+                    const std::uint64_t k = oc != r.outcomes.end() ? oc->second.taken : 0;
+                    what = "taken by " + std::to_string(k) + (k == 1 ? " stage build" : " stage builds");
                     if (!why.empty()) what += "; " + why;
                     break;
                 }
@@ -988,20 +1039,26 @@ std::vector<std::string> overrides_report() {
                 case kOverrideOff: what = "off: " + why; break;
                 default: what = "not met: " + why; break;
             }
-            lines.push_back("render: HLSL override " + name + " (" + (id == kOverridePlayer ? std::string("your folder") : o.name) + "): " + what);
         }
+        if (lines.size() < 32) lines.push_back("render: HLSL override " + name + " (" + seen.owner + "): " + what);
     }
     if (!all) return {};
     char b[400];
     std::snprintf(b, sizeof(b),
-                  "render: HLSL overrides at exit: %zu (%zu taken, %zu refused, %zu not met, %zu not used, %zu off)%s; %llu modules compiled "
-                  "(%.1f s of DXC), %llu stages and %llu pipelines built with them",
-                  all, n[kOverrideTaken], n[kOverrideRefused], n[kOverrideWaiting], n[kOverrideShadowed], n[kOverrideOff],
-                  all > lines.size() ? (", " + std::to_string(all - lines.size()) + " not listed").c_str() : "",
+                  "render: HLSL overrides at exit: %zu set in the run (%zu taken, %zu refused, %zu not met, %zu not used, %zu off, %zu removed)%s; "
+                  "%llu modules compiled (%.1f s of DXC), %llu stages and %llu pipelines built with them",
+                  all, n[kOverrideTaken], n[kOverrideRefused], n[kOverrideWaiting], n[kOverrideShadowed], n[kOverrideOff], gone,
+                  all > lines.size() ? (", " + std::to_string(all - lines.size()) + " more not listed").c_str() : "",
                   static_cast<unsigned long long>(r.compiles.load()), r.compile_us.load() / 1e6, static_cast<unsigned long long>(r.stages.load()),
                   static_cast<unsigned long long>(r.pipelines.load()));
     lines.insert(lines.begin(), b);
     return lines;
+}
+
+void overrides_set_clock(std::uint64_t (*flips)()) {
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    r.flips = flips;
 }
 
 std::string overrides_window() {

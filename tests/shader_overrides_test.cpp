@@ -15,6 +15,7 @@
 
 #include "gcn/isa.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -84,6 +85,10 @@ std::string scaled(const std::vector<std::uint32_t>& lift, const char* scale) {
     return src;
 }
 
+// The game's flip count as the exit report reads it (overrides_set_clock): the test's own.
+std::uint64_t g_flip = 0;
+std::uint64_t test_flips() { return g_flip; }
+
 // The renderer's maker of an owner's shader data buffer: an address of its own.
 std::uint64_t fake_buffer(int owner, const std::uint8_t*) { return 0x0000001234560000ull + static_cast<std::uint64_t>(owner) * 0x10000u; }
 
@@ -106,6 +111,7 @@ gcn::LiftResult stage(const Ps& ps, const char* name, std::uint64_t salt, bool& 
 
 int main() {
     host_log_decide(true);          // the log to stderr: what the overrides say, for a reader of the test's output
+    overrides_set_clock(&test_flips);
     setenv("BBHOST_HLSL", "1", 1);  // compiled where met: nothing behind the test
     unsetenv("BBHOST_HLSL_DUMP");
     if (!hlsl_dxc().loaded()) {
@@ -286,6 +292,7 @@ int main() {
 
     // 5. A file changed after it was listed: refused for now, listed again,
     // and built with its new text at the next key.
+    g_flip = 1234;  // the exit report's flip for what goes from here on
     overrides_drop_owner(1);
     std::ofstream(dir / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary) << a;
     hlsl_set_folders(dir.string());
@@ -325,8 +332,29 @@ int main() {
     overrides_owner_on(4, false);
     CHECK(overrides_state(4, "cccc0003.ps", &why) == kOverrideWaiting && why == "its owner is off");
     overrides_owner_on(4, true);
-    const std::vector<std::string> report = overrides_report();
-    CHECK(report.size() == 5 && report[0].find("at exit: 4 (0 taken, 2 refused, 1 not met, 1 not used, 0 off)") != std::string::npos);
+    // The exit report: every override set at any time in the run - the four
+    // set now, and the six taken away (plugin one's and two's, the player's
+    // file, plugin nine's from before the start) with the flip they went at
+    // and what they did while set.
+    std::vector<std::string> report = overrides_report();
+    const auto has = [&](const std::string& part) {
+        return std::any_of(report.begin(), report.end(), [&](const std::string& l) { return l.find(part) != std::string::npos; });
+    };
+    CHECK(report.size() == 11 && report[0].find("at exit: 10 set in the run (0 taken, 2 refused, 1 not met, 1 not used, 0 off, 6 removed)") != std::string::npos);
+    CHECK(has("aaaa0001.ps (plugin one): removed at flip 1234, taken by ") && has("aaaa0001.ps (your folder): removed at flip 1234, taken by "));
+    CHECK(has("aaaa0009.ps (plugin nine): removed at flip 0, no stage built with it while it was set"));
+    CHECK(has("aaaa0001.ps (plugin two): removed at flip 0, ") && has("cccc0003.ps (plugin four): not met: "));
+    // Bounded as the start's line is: the first 32 listed, the rest counted.
+    overrides_owner(6, "plugin six", std::string(), true);
+    for (int k = 0; k < 40; ++k) {
+        char name[16];
+        std::snprintf(name, sizeof(name), "dddd%04x.ps", k);
+        CHECK(overrides_set_text(6, name, a.c_str()) == 0);
+    }
+    report = overrides_report();
+    CHECK(report.size() == 33 && report[0].find("at exit: 50 set in the run") != std::string::npos &&
+          report[0].find(", 18 more not listed;") != std::string::npos);
+    overrides_drop_owner(6);
     hlsl_set_overrides(false, "switched off for the test");
     hlsl_set_folders(dir.string());
     CHECK(override_salt("aaaa0001") == 0 && !overrides_on());

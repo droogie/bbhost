@@ -161,10 +161,15 @@ int overrides_state(int owner, const std::string& name, std::string* why);
 void override_note_compile(std::uint64_t us);
 void override_note_stage();
 void override_note_pipeline();
-// The exit report's lines: every edited shader, who gave it and what became
-// of it (empty without any); and the 300-flip report's since the last call.
+// The exit report's lines: every edited shader set at any time in the run, who
+// gave it and what became of it - its state now, or for one taken away the
+// flip it went at and what it did while set - the first 32 listed, the rest
+// counted (empty without any); and the 300-flip report's since the last call.
 std::vector<std::string> overrides_report();
 std::string overrides_window();
+// The game's flip count, which the exit report names a removal by (gpu.cpp:
+// hle_video_flip_count; none in the tests).
+void overrides_set_clock(std::uint64_t (*flips)());
 
 // ---- The watch (BBHOST_SHADER_WATCH=1, or a period in milliseconds) ----
 // Every folder of edited shaders - the player's and the other owners' - is
