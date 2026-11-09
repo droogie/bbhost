@@ -4,9 +4,10 @@
 // owner's texts before its folders; a return to an earlier source compiling
 // nothing; the variant's file before the shader's before the lift hash's,
 // which ties itself to its program at that lift's first sight; a file changed
-// after it was listed, listed again; an owner turned off or gone; a geometry
-// lift's stage. Synthetic pixel shaders through the HLSL path (BBHOST_HLSL=1,
-// compiled where they are met). Skips (77) without DXC.
+// after it was listed, listed again; an owner turned off or gone; a change
+// compiled ahead of its switch, for the variants met, off the drawing thread;
+// a geometry lift's stage. Synthetic pixel shaders through the HLSL path
+// (BBHOST_HLSL=1, compiled where they are met). Skips (77) without DXC.
 #include "host/translation_cache.cpp"
 
 #include "gcn/isa.h"
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -79,6 +81,12 @@ std::string scaled(const std::vector<std::uint32_t>& lift, const char* scale) {
     return src;
 }
 
+// Until no changed source waits for its compile ahead (60 s at most).
+bool settle() {
+    for (int i = 0; i < 6000 && !overrides_ahead_idle(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return overrides_ahead_idle();
+}
+
 // A stage of `ps` named `name`, keyed with the program's salt as it stands now
 // (the renderer's draw), and whether it took an edited shader's module.
 gcn::LiftResult stage(const Ps& ps, const char* name, std::uint64_t salt, bool& took) {
@@ -121,15 +129,20 @@ int main() {
     // back, compiled once each.
     overrides_owner(1, "plugin one", (dir / "plugin1").string(), true);
     overrides_owner(2, "plugin two", (dir / "plugin2").string(), true);
+    // Its program was met: the text is compiled ahead on bb-hlsl-ahead and
+    // applies once it is - the stage then compiles nothing.
     CHECK(overrides_set_text(1, "aaaa0001.ps", a.c_str()) == 0);
-    CHECK(override_gen() != 0);
+    CHECK(settle() && override_gen() != 0);
+    CHECK(g_hlsl_ahead.compiles.load() == 1);
     const std::uint64_t s_a = override_salt("aaaa0001");
     CHECK(s_a != 0);
+    const std::uint64_t before_a = g_hlsl_overrides.compiles.load();
     const gcn::LiftResult ma = stage(p, "aaaa0001", s_a, took);
     CHECK(took && ma.ok() && ma.spirv != base.spirv);
+    CHECK(g_hlsl_overrides.compiles.load() == before_a);
     const std::uint64_t gen_a = override_gen();
     CHECK(overrides_set_text(1, "aaaa0001.ps", a.c_str()) == 0 && override_gen() == gen_a);  // the same text again: no change
-    CHECK(overrides_set_text(1, "aaaa0001.ps", b.c_str()) == 0 && override_gen() != gen_a);
+    CHECK(overrides_set_text(1, "aaaa0001.ps", b.c_str()) == 0 && settle() && override_gen() != gen_a);
     const std::uint64_t s_b = override_salt("aaaa0001");
     CHECK(s_b != 0 && s_b != s_a);
     const gcn::LiftResult mb = stage(p, "aaaa0001", s_b, took);
@@ -137,7 +150,7 @@ int main() {
     // The race: a draw keyed before the change builds after it - with its own salt's source.
     const gcn::LiftResult late = stage(p, "aaaa0001", s_a, took);
     CHECK(took && late.spirv == ma.spirv);
-    CHECK(overrides_set_text(1, "aaaa0001.ps", a.c_str()) == 0);
+    CHECK(overrides_set_text(1, "aaaa0001.ps", a.c_str()) == 0 && settle());
     CHECK(override_salt("aaaa0001") == s_a);
     const std::uint64_t compiles = g_hlsl_overrides.compiles.load();
     const gcn::LiftResult again = stage(p, "aaaa0001", s_a, took);
@@ -149,11 +162,12 @@ int main() {
 
     // 3. Owners: the player's folder first, then the owners in their order;
     // an owner's texts before its folders.
-    CHECK(overrides_set_text(2, "aaaa0001.ps", b.c_str()) == 0);
+    CHECK(overrides_set_text(2, "aaaa0001.ps", b.c_str()) == 0 && settle());
+    CHECK(g_hlsl_overrides.compiles.load() == compiles);  // shadowed by owner 1's: nothing compiled ahead
     std::shared_ptr<const OverrideSource> src;
     CHECK(override_pick(override_salt("aaaa0001"), "aaaa0001", "ps", lift_hash_hex(lp.spirv), src) && src->owner == 1);
     std::ofstream(dir / "plugin1" / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary) << b;
-    CHECK(overrides_add_folder(1, "shaders") == 1);  // relative: from the owner's own folder
+    CHECK(overrides_add_folder(1, "shaders") == 1 && settle());  // relative: from the owner's own folder
     CHECK(overrides_add_folder(1, "missing") == -1);
     CHECK(override_salt("aaaa0001") == s_a);         // its text comes first
     CHECK(override_pick(s_a, "aaaa0001", "ps", lift_hash_hex(lp.spirv), src) && src->owner == 1 && src->text);
@@ -166,6 +180,7 @@ int main() {
     std::filesystem::remove(dir / "shaders" / "aaaa0001.ps.hlsl", ec);
     hlsl_set_folders(dir.string());
     CHECK(override_salt("aaaa0001") == s_a);
+    CHECK(settle());
     overrides_owner_on(1, false);  // turned off: the next owner's
     CHECK(override_pick(override_salt("aaaa0001"), "aaaa0001", "ps", lift_hash_hex(lp.spirv), src) && src->owner == 2);
     overrides_owner_on(1, true);
@@ -177,7 +192,7 @@ int main() {
     // 4. Names: the variant's file comes before the shader's, the shader's
     // before the lift hash's.
     const std::string hp = lift_hash_hex(lp.spirv);
-    CHECK(overrides_set_text(1, ("aaaa0001.ps~" + hp).c_str(), b.c_str()) == 0);
+    CHECK(overrides_set_text(1, ("aaaa0001.ps~" + hp).c_str(), b.c_str()) == 0 && settle());
     const std::uint64_t s_var = override_salt("aaaa0001");
     CHECK(override_pick(s_var, "aaaa0001", "ps", hp, src) && src->name == "aaaa0001.ps~" + hp);
     CHECK(override_pick(s_var, "aaaa0001", "ps", lift_hash_hex(lq.spirv), src) && src->name == "aaaa0001.ps");  // another variant
@@ -186,7 +201,7 @@ int main() {
     // program's next salt names it), never before.
     const std::string hq = lift_hash_hex(lq.spirv);
     const std::string qa = scaled(lq.spirv, "0.5f");
-    CHECK(overrides_set_text(1, (hq + ".ps").c_str(), qa.c_str()) == 0);
+    CHECK(overrides_set_text(1, (hq + ".ps").c_str(), qa.c_str()) == 0 && settle());
     CHECK(override_salt("bbbb0002") == 0);
     const gcn::LiftResult q0 = stage(q, "bbbb0002", 0, took);
     CHECK(!took);
@@ -206,7 +221,8 @@ int main() {
     std::ofstream(dir / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary | std::ios::app) << "// one more line\n";
     const std::uint64_t gen_file = override_gen();
     const gcn::LiftResult stale = stage(p, "aaaa0001", s_file, took);
-    CHECK(!took && stale.spirv == base.spirv && override_gen() != gen_file);  // its stage's own module; listed again
+    CHECK(!took && stale.spirv == base.spirv);  // its stage's own module; listed again, and compiled ahead
+    CHECK(settle() && override_gen() != gen_file);
     const std::uint64_t s_file2 = override_salt("aaaa0001");
     CHECK(s_file2 != 0 && s_file2 != s_file);
     const gcn::LiftResult fresh = stage(p, "aaaa0001", s_file2, took);
@@ -217,8 +233,9 @@ int main() {
 
     // 6. A refused text: the stage keeps its own module, decided once.
     overrides_owner(3, "plugin three", std::string(), true);
-    CHECK(overrides_set_text(3, "aaaa0001.ps", "this is not HLSL\n") == 0);
     const std::uint64_t refused = g_hlsl_overrides.refused.load();
+    CHECK(overrides_set_text(3, "aaaa0001.ps", "this is not HLSL\n") == 0 && settle());
+    CHECK(g_hlsl_overrides.refused.load() == refused + 1);  // refused as it was compiled ahead
     const gcn::LiftResult r1 = stage(p, "aaaa0001", override_salt("aaaa0001"), took);
     CHECK(!took && r1.spirv == base.spirv && g_hlsl_overrides.refused.load() == refused + 1);
     (void)stage(p, "aaaa0001", override_salt("aaaa0001"), took);

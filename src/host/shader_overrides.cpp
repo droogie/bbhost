@@ -78,9 +78,17 @@ struct Outcome {
     std::string why;  // the last refusal's
 };
 
+// A changed source waiting for its compile ahead (override_prepare): a text,
+// or a folder's file (`folder` its folder).
+struct Pending {
+    std::shared_ptr<const OverrideSource> src;
+    std::string folder;
+};
+
 struct Registry {
     std::mutex mu;
     bool on = false;
+    std::atomic<bool> on_flag{false};  // `on`, read without the lock (overrides_on)
     std::string why_off;
     std::map<int, Owner> owners;  // in their order: the player's folder first
     // What applies: each name's source, the first owner's that has one.
@@ -90,6 +98,7 @@ struct Registry {
     std::unordered_map<std::string, std::set<std::uint64_t>> program_lifts;  // such hashes met for a program
     std::unordered_map<std::uint64_t, std::shared_ptr<const Set>> sets;   // by salt; never erased in a run
     std::map<std::tuple<int, std::string, std::uint64_t>, Outcome> outcomes;  // by owner, name and identity
+    std::map<std::pair<int, std::string>, Pending> pending;  // by owner and name: compiling ahead
     std::set<std::pair<int, std::string>> shadow_logged;
     std::atomic<bool> fallback{false};
 };
@@ -188,25 +197,82 @@ bool rebuild_locked(Registry& r) {
     return true;
 }
 
+// Whether an owner before `owner` has a source named `name` (so one of its
+// own of that name would not apply: nothing to compile ahead). Under mu.
+bool shadowed_locked(const Registry& r, int owner, const std::string& name) {
+    for (const auto& [id, o] : r.owners) {
+        if (id >= owner) break;
+        if (!o.on) continue;
+        if (o.texts.count(name)) return true;
+        for (const Owner::Folder& f : o.folders) {
+            if (f.files.count(name)) return true;
+        }
+    }
+    return false;
+}
+
+// A pending source taken where it goes (its owner's texts or folder), unless
+// another took its place or it was taken away; under mu, rebuilt by the caller.
+bool install_locked(Registry& r, const std::shared_ptr<const OverrideSource>& s) {
+    const auto p = r.pending.find({s->owner, s->name});
+    if (p == r.pending.end() || p->second.src != s) return false;
+    const std::string folder = p->second.folder;
+    r.pending.erase(p);
+    const auto o = r.owners.find(s->owner);
+    if (o == r.owners.end()) return false;
+    if (folder.empty()) {
+        o->second.texts[s->name] = s;
+        return true;
+    }
+    const auto f = std::find_if(o->second.folders.begin(), o->second.folders.end(), [&](const Owner::Folder& x) { return x.dir == folder; });
+    if (f == o->second.folders.end()) return false;
+    f->files[s->name] = s;
+    return true;
+}
+
+// A changed file of a folder `dir`: gone at once, or its new source compiled
+// ahead (override_prepare) and taken when that is done. Not under mu.
+void file_changed(int owner, const std::string& dir, const std::string& name, std::shared_ptr<const OverrideSource> now) {
+    Registry& r = reg();
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        const auto o = r.owners.find(owner);
+        if (o == r.owners.end()) return;
+        const auto f = std::find_if(o->second.folders.begin(), o->second.folders.end(), [&](const Owner::Folder& x) { return x.dir == dir; });
+        if (f == o->second.folders.end()) return;
+        if (!now) {
+            r.pending.erase({owner, name});
+            if (f->files.erase(name)) rebuild_locked(r);
+            return;
+        }
+        const auto was = f->files.find(name);
+        if (was != f->files.end() && was->second->identity == now->identity) return;  // listed already
+        const auto p = r.pending.find({owner, name});
+        if (p != r.pending.end() && p->second.src->identity == now->identity) return;  // compiling ahead already
+        r.pending[{owner, name}] = {now, dir};
+    }
+    if (!override_prepare(now)) override_install(now);
+}
+
 // A file found changed where it was read: listed again (its new identity, or
 // gone), so its shader's next draw keys and builds with what it holds now.
 void relist(const OverrideSource& s) {
-    Registry& r = reg();
     std::shared_ptr<const OverrideSource> now = file_source(s.owner, s.name, s.path);
-    std::lock_guard<std::mutex> lk(r.mu);
-    const auto o = r.owners.find(s.owner);
-    if (o == r.owners.end()) return;
-    for (Owner::Folder& f : o->second.folders) {
-        const auto it = f.files.find(s.name);
-        if (it == f.files.end() || it->second->path != s.path) continue;
-        if (now && now->identity == it->second->identity) return;  // another thread listed it already
-        if (now) it->second = now;
-        else f.files.erase(it);
+    std::string dir;
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        const auto o = r.owners.find(s.owner);
+        if (o == r.owners.end()) return;
+        for (const Owner::Folder& f : o->second.folders) {
+            const auto it = f.files.find(s.name);
+            if (it != f.files.end() && it->second->path == s.path) dir = f.dir;
+        }
+        if (dir.empty()) return;
         host_log("render: HLSL override %s changed since it was listed: its shader is built with it again at its next draw",
                  label_locked(r, s).c_str());
-        rebuild_locked(r);
-        return;
     }
+    file_changed(s.owner, dir, s.name, std::move(now));
 }
 
 }  // namespace
@@ -252,6 +318,7 @@ void overrides_start(bool on, const std::string& why_off, const std::string& bbh
     if (on && !dir.empty()) list_folder(kOverridePlayer, dir, files, &unnamed);
     std::lock_guard<std::mutex> lk(r.mu);
     r.on = on;
+    r.on_flag.store(on, std::memory_order_release);
     r.why_off = why_off;
     Owner& player = r.owners[kOverridePlayer];
     player.name = "shaders/";
@@ -266,11 +333,7 @@ void overrides_start(bool on, const std::string& why_off, const std::string& bbh
     rebuild_locked(r);
 }
 
-bool overrides_on() {
-    Registry& r = reg();
-    std::lock_guard<std::mutex> lk(r.mu);
-    return r.on;
-}
+bool overrides_on() { return reg().on_flag.load(std::memory_order_acquire); }
 
 void overrides_owner(int owner, const std::string& name, const std::string& own_dir, bool on) {
     if (owner == kOverridePlayer) return;
@@ -296,6 +359,7 @@ void overrides_drop_owner(int owner) {
     if (owner == kOverridePlayer) return;
     Registry& r = reg();
     std::lock_guard<std::mutex> lk(r.mu);
+    for (auto it = r.pending.begin(); it != r.pending.end();) it = it->first.first == owner ? r.pending.erase(it) : std::next(it);
     if (r.owners.erase(owner)) rebuild_locked(r);
 }
 
@@ -315,18 +379,51 @@ int overrides_set_text(int owner, const char* shader, const char* hlsl) {
         s->identity = h.done();
     }
     Registry& r = reg();
-    std::lock_guard<std::mutex> lk(r.mu);
-    const auto o = r.owners.find(owner);
-    if (o == r.owners.end()) return 1;
-    if (!s) {
-        if (o->second.texts.erase(shader)) rebuild_locked(r);
-        return 0;
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        const auto o = r.owners.find(owner);
+        if (o == r.owners.end()) return 1;
+        if (!s) {  // taken away: at once, with any text compiling ahead for it
+            r.pending.erase({owner, shader});
+            if (o->second.texts.erase(shader)) rebuild_locked(r);
+            return 0;
+        }
+        const auto slot = o->second.texts.find(shader);
+        if (slot != o->second.texts.end() && slot->second->identity == s->identity) {  // the same text again
+            r.pending.erase({owner, shader});
+            return 0;
+        }
+        const auto p = r.pending.find({owner, shader});
+        if (p != r.pending.end() && p->second.src->identity == s->identity) return 0;  // compiling ahead already
+        r.pending[{owner, shader}] = {s, std::string()};
+        if (shadowed_locked(r, owner, shader)) {  // another owner's comes first: nothing of it to compile ahead
+            if (install_locked(r, s)) rebuild_locked(r);
+            return 0;
+        }
     }
-    std::shared_ptr<const OverrideSource>& slot = o->second.texts[shader];
-    if (slot && slot->identity == s->identity) return 0;  // the same text again
-    slot = std::move(s);
-    rebuild_locked(r);
+    // Compiled ahead for the variants met so far, then taken; at once when none was met.
+    if (!override_prepare(s)) override_install(s);
     return 0;
+}
+
+
+void override_install(const std::shared_ptr<const OverrideSource>& s) {
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    if (install_locked(r, s)) rebuild_locked(r);
+}
+
+bool overrides_ahead_idle() {
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    return r.pending.empty();
+}
+
+void override_attribute(std::uint64_t lift_hash, const std::string& program) {
+    if (program.empty()) return;
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    r.program_lifts[program].insert(lift_hash);
 }
 
 int overrides_add_folder(int owner, const char* dir) {
@@ -352,21 +449,43 @@ int overrides_add_folder(int owner, const char* dir) {
     std::map<std::string, std::shared_ptr<const OverrideSource>> files;
     if (!list_folder(owner, where, files, nullptr)) return -1;
     const int n = static_cast<int>(files.size());
-    std::lock_guard<std::mutex> lk(r.mu);
-    const auto o = r.owners.find(owner);
-    if (o == r.owners.end()) return -1;
-    auto f = std::find_if(o->second.folders.begin(), o->second.folders.end(), [&](const Owner::Folder& x) { return x.dir == where; });
-    if (f == o->second.folders.end()) {
-        o->second.folders.push_back({where, std::move(files)});
-    } else {
-        // Listed again: the sources of unchanged files stay the same, so what applies does too.
+    // A file met before in another form (a folder listed again) is compiled
+    // ahead, as a changed text is; the rest - the shaders not met yet, all of
+    // them at the start - apply at once, together.
+    std::vector<std::shared_ptr<const OverrideSource>> ahead;
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        const auto o = r.owners.find(owner);
+        if (o == r.owners.end()) return -1;
+        auto f = std::find_if(o->second.folders.begin(), o->second.folders.end(), [&](const Owner::Folder& x) { return x.dir == where; });
+        if (f == o->second.folders.end()) {
+            o->second.folders.push_back({where, {}});
+            f = o->second.folders.end() - 1;
+        }
+        std::map<std::string, std::shared_ptr<const OverrideSource>> now;
         for (auto& [name, s] : files) {
             const auto was = f->files.find(name);
-            if (was != f->files.end() && was->second->identity == s->identity) s = was->second;
+            if (was != f->files.end() && was->second->identity == s->identity) {
+                now[name] = was->second;  // unchanged: the same source, so what applies stays
+                continue;
+            }
+            r.pending[{owner, name}] = {s, where};
+            ahead.push_back(s);
+            if (was != f->files.end()) now[name] = was->second;  // the old one until the new one is compiled
         }
-        f->files = std::move(files);
+        f->files = std::move(now);
+        rebuild_locked(r);
     }
-    rebuild_locked(r);
+    std::vector<std::shared_ptr<const OverrideSource>> direct;
+    for (const std::shared_ptr<const OverrideSource>& s : ahead) {
+        if (!override_prepare(s)) direct.push_back(s);
+    }
+    if (!direct.empty()) {
+        std::lock_guard<std::mutex> lk(r.mu);
+        bool any = false;
+        for (const std::shared_ptr<const OverrideSource>& s : direct) any |= install_locked(r, s);
+        if (any) rebuild_locked(r);
+    }
     return n;
 }
 

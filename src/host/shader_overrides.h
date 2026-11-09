@@ -66,6 +66,12 @@ int overrides_set_text(int owner, const char* shader, const char* hlsl);
 // or "": every folder of the owner's taken away): the number of them, or -1
 // when it is not a folder.
 int overrides_add_folder(int owner, const char* dir);
+// A new or changed source is compiled ahead, for every variant of its shader
+// met so far, before it takes effect (override_prepare, override_install):
+// the draws keep the source they had until then, so a change compiles nothing
+// on the thread that draws. One taken away goes at once. True while none
+// waits (the tests').
+bool overrides_ahead_idle();
 
 // ---- The renderer's ----
 // Bumped at each change of what applies; 0 until anything does.
@@ -94,6 +100,14 @@ std::string override_dxc_text(const OverrideSource& s, const std::string& text);
 void override_outcome(const OverrideSource& s, bool taken, const std::string& why);
 // The source for the logs: "shaders/<file>" or "<owner>'s <shader>".
 std::string override_label(const OverrideSource& s);
+// A new or changed source's compile ahead: true when it is queued for the
+// lifts met so far that its name applies to - override_install takes it once
+// they are compiled; false when none was met (the caller installs it now).
+bool override_prepare(const std::shared_ptr<const OverrideSource>& s);
+// A source compiled ahead applies now, unless another took its place.
+void override_install(const std::shared_ptr<const OverrideSource>& s);
+// A lift met for a program has this hash (a <hash>.<stage> source's compile ahead).
+void override_attribute(std::uint64_t lift_hash, const std::string& program);
 // A name split as a file's: false when it is not a shader's.
 bool override_parse(const std::string& name, std::string& stable, std::string& stage, std::string& hash16);
 

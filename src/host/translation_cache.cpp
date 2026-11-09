@@ -1317,6 +1317,102 @@ bool hlsl_override(const std::vector<std::uint32_t>& lifted, const gcn::HlslOpti
     return hlsl_override_module(lifted, hash, hopt, dxc, *src, out);
 }
 
+// ---- The lifts met: what a changed edited shader is compiled ahead for ----
+// Every lift the HLSL path meets while edited shaders apply, by its program
+// and stage, the first met first: its entry in this cache (or its words,
+// without one) and the options it was printed with. A new or changed source
+// is compiled for each one its name applies to on bb-hlsl-ahead before it
+// takes effect (override_prepare), so the draws keep the source they had
+// until then and the change compiles nothing on the thread that draws.
+struct HlslMet {
+    struct Lift {
+        Key key{};
+        bool cached = false;
+        std::vector<std::uint32_t> words;  // the lift itself, when it was made without the cache
+        gcn::HlslOptions hopt;             // its title and tessellation fields
+    };
+    std::mutex mu;
+    std::unordered_map<std::string, std::vector<std::shared_ptr<const Lift>>> by_program;  // "<program>.<stage>"
+    std::unordered_set<Key, KeyHash> keys;      // the cached lifts recorded
+    std::unordered_set<std::uint64_t> hashes;  // and the others, by lift_hash
+};
+HlslMet& g_hlsl_met = *new HlslMet;  // never destroyed: bb-hlsl-ahead reads it until the process ends
+
+void hlsl_note_met(const std::vector<std::uint32_t>& lifted, const Key* lift_key, const gcn::HlslOptions& hopt) {
+    if (hopt.title.empty() || !overrides_on()) return;
+    const std::uint64_t hash = lift_key ? 0 : lift_hash(lifted);
+    const std::string id = hopt.title + "." + lift_stage_tag(lifted);
+    std::lock_guard<std::mutex> lk(g_hlsl_met.mu);
+    if (lift_key ? !g_hlsl_met.keys.insert(*lift_key).second : !g_hlsl_met.hashes.insert(hash).second) return;
+    auto m = std::make_shared<HlslMet::Lift>();
+    if (lift_key) {
+        m->key = *lift_key;
+        m->cached = true;
+    } else {
+        m->words = lifted;
+    }
+    m->hopt.title = hopt.title;
+    m->hopt.tess_quads = hopt.tess_quads;
+    m->hopt.tess_spacing = hopt.tess_spacing;
+    m->hopt.tess_cw = hopt.tess_cw;
+    g_hlsl_met.by_program[id].push_back(std::move(m));
+}
+
+bool hlsl_met_words(const HlslMet::Lift& m, std::vector<std::uint32_t>& words) {
+    if (!m.cached) {
+        words = m.words;
+        return !words.empty();
+    }
+    gcn::LiftResult l;
+    if (!lookup(m.key, [&](Reader& r) { return read_lift(r, l); }) || !l.ok()) return false;
+    words = std::move(l.spirv);
+    return true;
+}
+
+struct HlslAhead {
+    struct Job {
+        std::shared_ptr<const OverrideSource> src;
+        std::vector<std::shared_ptr<const HlslMet::Lift>> lifts;
+        std::string hash16;  // a variant's or a lift hash's name: that lift's alone
+        bool by_lift = false;  // a lift hash's: the programs whose lift it is are tied to it
+    };
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<Job> jobs;  // under mu
+    bool started = false;  // under mu
+    std::atomic<std::uint64_t> sources{0}, compiles{0};
+};
+HlslAhead& g_hlsl_ahead = *new HlslAhead;
+
+void hlsl_ahead_thread() {
+    host_thread_set_name("bb-hlsl-ahead");
+    host_thread_background();
+    for (;;) {
+        HlslAhead::Job job;
+        {
+            std::unique_lock<std::mutex> lk(g_hlsl_ahead.mu);
+            g_hlsl_ahead.cv.wait(lk, [] { return !g_hlsl_ahead.jobs.empty(); });
+            job = std::move(g_hlsl_ahead.jobs.front());
+            g_hlsl_ahead.jobs.pop_front();
+        }
+        const Dxc& dxc = hlsl_dxc();
+        for (const std::shared_ptr<const HlslMet::Lift>& m : job.lifts) {
+            std::vector<std::uint32_t> words;
+            if (!hlsl_met_words(*m, words)) continue;
+            const std::uint64_t hash = lift_hash(words);
+            char hex[24];
+            std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(hash));
+            if (!job.hash16.empty() && job.hash16 != hex) continue;
+            if (job.by_lift) override_attribute(hash, m->hopt.title);
+            std::vector<std::uint32_t> out;
+            (void)hlsl_override_module(words, hash, m->hopt, dxc, *job.src, out);
+            g_hlsl_ahead.compiles.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_hlsl_ahead.sources.fetch_add(1, std::memory_order_relaxed);
+        override_install(job.src);
+    }
+}
+
 // ---- Rebuilt motion vectors (host/options.h host_opt_motion_rebuilt_bits) ----
 // The game's moving meshes draw their motion into motion blur's velocity map
 // with GXFlver_*_Velo pixel shaders, from each vertex where it is (attr0) and
@@ -1607,6 +1703,7 @@ void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOpt
         hopt.tess_spacing = to->tess_spacing;
         hopt.tess_cw = to->tess_cw;
     }
+    hlsl_note_met(l.spirv, lift_key, hopt);  // what a changed edited shader is compiled ahead for
     const Dxc& dxc = hlsl_dxc();
     if (!dxc.loaded()) {
         hlsl_keep("DXC not found");
@@ -1717,6 +1814,45 @@ bool hlsl_took_override() {
     return took;
 }
 std::string hlsl_file_name(const std::string& program) { return hlsl_stable_name(program); }
+
+bool override_prepare(const std::shared_ptr<const OverrideSource>& s) {
+    std::string stable, stage, hash16;
+    if (!overrides_on() || !override_parse(s->name, stable, stage, hash16)) return false;
+    HlslAhead::Job job;
+    {
+        std::lock_guard<std::mutex> lk(g_hlsl_met.mu);
+        if (!stable.empty()) {
+            // Its program, by GX's name (after the bundle entry's '@').
+            const auto it = g_hlsl_met.by_program.find(stable.substr(stable.rfind('@') + 1) + "." + stage);
+            if (it != g_hlsl_met.by_program.end()) job.lifts = it->second;
+        } else {
+            // A lift hash's: the stage's lifts of every program, the one with that hash found by its words.
+            const std::string tail = "." + stage;
+            for (const auto& [id, lifts] : g_hlsl_met.by_program) {
+                if (id.size() > tail.size() && id.compare(id.size() - tail.size(), tail.size(), tail) == 0)
+                    job.lifts.insert(job.lifts.end(), lifts.begin(), lifts.end());
+            }
+        }
+    }
+    // Only lifts of the program the name is for (a bundle entry of another name is not its).
+    if (!stable.empty()) {
+        job.lifts.erase(std::remove_if(job.lifts.begin(), job.lifts.end(),
+                                       [&](const std::shared_ptr<const HlslMet::Lift>& m) { return hlsl_stable_name(m->hopt.title) != stable; }),
+                        job.lifts.end());
+    }
+    if (job.lifts.empty()) return false;
+    job.src = s;
+    job.hash16 = hash16;
+    job.by_lift = stable.empty();
+    std::lock_guard<std::mutex> lk(g_hlsl_ahead.mu);
+    g_hlsl_ahead.jobs.push_back(std::move(job));
+    if (!g_hlsl_ahead.started) {
+        g_hlsl_ahead.started = true;
+        std::thread(hlsl_ahead_thread).detach();
+    }
+    g_hlsl_ahead.cv.notify_one();
+    return true;
+}
 void hlsl_set_name_lookup(std::string (*lookup)(const std::string& name)) { g_hlsl_name_lookup.store(lookup); }
 int hlsl_lane_now() { return t_hlsl_lane; }
 void hlsl_set_busy_probe(bool (*busy)()) { g_hlsl_busy.store(busy); }
