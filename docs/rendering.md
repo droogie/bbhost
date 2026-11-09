@@ -335,7 +335,12 @@ the memory under it instead, which the GPU's writes never reach; `=0` goes by
 addresses).
 Render targets are Vulkan images sized from the engine's own views, and can be
 re-created at any resolution while the game runs, the way the PC engine's GX
-device resizes.
+device resizes. At such a change - a Resolution or an Upscaling quality chosen
+while the game runs - the old size's targets go with the change, before the
+next frame makes the new size's in their room, unless the resource the game
+makes next at the same address takes them; kept for the ten seconds an area
+load's are, both sizes' targets were in video memory at once after every
+change, and the new size's took a new block of the image heap.
 Images are kept in `VK_IMAGE_LAYOUT_GENERAL`, which a driver with
 `VK_KHR_unified_image_layouts` handles as well as any other layout. AMD's own
 drivers without it keep no compression for a depth target in `GENERAL`: a clear

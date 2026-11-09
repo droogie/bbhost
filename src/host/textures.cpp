@@ -5300,8 +5300,13 @@ struct RetireEntry {
     std::size_t bytes;
     std::uint64_t after;
     std::uint64_t gen;  // the resource that died (GxResourceInfo::gen); 0: whatever no live resource covers
+    bool rebuild;       // it died in a size change's rebuild (textures_rebuild_window)
 };
 std::mutex g_retire_mu;
+// Set while a resolution or render-size change makes the game's targets
+// again (host_gpu_targets_rebuild): the resources that die meanwhile are the
+// old size's.
+std::atomic<bool> g_targets_rebuild{false};
 std::vector<RetireEntry> g_retire_pending;  // under g_retire_mu
 std::atomic<std::uint64_t> g_retired_surfaces{0}, g_retired_bytes{0}, g_retire_kept_live{0}, g_retire_kept_other_gen{0},
     g_retired_by_gen{0}, g_retired_by_gen_live{0}, g_retire_kept_written{0}, g_retire_taken_next{0};
@@ -5336,9 +5341,12 @@ std::uint64_t textures_forget_region_locked(std::uint64_t lo, std::uint64_t hi) 
 }
 
 void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {
+    const bool rebuild = g_targets_rebuild.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_retire_mu);
-    g_retire_pending.push_back({base, bytes, after_submitted, gen});
+    g_retire_pending.push_back({base, bytes, after_submitted, gen, rebuild});
 }
+
+void textures_rebuild_window(bool on) { g_targets_rebuild.store(on, std::memory_order_relaxed); }
 
 // Textures GX mapped for the CPU to write (none has been, in any run so far):
 // their surfaces go dirty, drained under the renderer's lock before a surface
@@ -5389,7 +5397,7 @@ void retire_surfaces_locked() {
     }
     bool any = false;
     for (const RetireEntry& e : due) {
-        if (res_identity_on() && e.gen) render_retire_generation_locked(e.base, e.bytes, e.gen, e.after);
+        if (res_identity_on() && e.gen) render_retire_generation_locked(e.base, e.bytes, e.gen, e.after, e.rebuild);
         for (auto it = g_surfaces.lower_bound(e.base); it != g_surfaces.end() && it->first < e.base + e.bytes;) {
             Surface& sf = it->second;
             // By identity: the dead resource's image goes, whatever has taken

@@ -522,8 +522,8 @@ Setting g_set[kSettingCount] = {
     // through the bridge and DLSS do no sharpening of their own. 0% none, the
     // default (the picture as the upscaler leaves it); 100% AMD's most.
     {"sharpness", "Sharpness", signed_steps(0, 100, "%", false), 0,
-     "Sharpens the upscaled 3D (FSR or DLSS) before the post effects and the HUD, which it never touches. 0% leaves the "
-     "upscaler's picture as it is; higher brings out more detail, at 100% with some ringing on hard edges. Needs Upscaling on.",
+     "Sharpens the 3D after TAA, FSR or DLSS, before the post effects and the HUD, which it never touches. 0% leaves the "
+     "picture as it is; higher brings out more detail, at 100% with some ringing on hard edges. Needs Upscaling on.",
      false},
     // AMD's frame generation (host/framegen.h): its swapchain in the
     // presenter's place; a frame it makes from the 3D between two of the

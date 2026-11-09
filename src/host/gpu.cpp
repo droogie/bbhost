@@ -12668,6 +12668,21 @@ void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_
     textures_retire(base, bytes, after_submitted, gen);  // its own lock: callable from the kernel's unmap
 }
 
+void host_gpu_targets_rebuild(bool on) {
+    textures_rebuild_window(on);
+    if (on) return;
+    // The change ran with the command processor drained, so the old size's
+    // retirements are due: a submission of their own carries them out (its
+    // textures_before_submit) and is retired at once, which gives their room
+    // in the image heap back before the next frame makes the new size's
+    // targets. Retired with the next frame's work instead, the old images
+    // still held it while the new size's were placed.
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok) return;
+    begin_recording_locked();
+    flush_locked();
+}
+
 void host_gpu_texture_written(std::uint64_t base, std::size_t bytes) {
     textures_gx_written(base, bytes);  // its own lock, as the retirement's
 }

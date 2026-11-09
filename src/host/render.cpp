@@ -16362,6 +16362,7 @@ bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes,
 std::uint64_t g_gen_retired_targets = 0, g_gen_retired_bytes = 0, g_gen_kept_written = 0, g_gen_adopted = 0;  // under g.mu
 std::uint64_t g_gen_dead_marked = 0;  // under g.mu: targets and snapshots whose resource died, waiting out the idle time
 std::uint64_t g_gen_taken_next = 0;   // under g.mu: taken by the texture made over their memory without data (gx_successor_gen)
+std::uint64_t g_gen_rebuild_n = 0, g_gen_rebuild_bytes = 0;  // under g.mu: of the retired, at once at a size change's rebuild
 
 // A target or snapshot whose GX resource died goes once it has been idle for
 // the reuse idle time, unless the memory's next resource takes it first: at
@@ -16395,30 +16396,71 @@ void retire_target_locked(std::map<std::uint64_t, RtImage>::iterator it, bool sn
     destroy_rt_image(r);
 }
 
-void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted) {
-    (void)bytes;
+// A resolution or render-size change (host_gpu_targets_rebuild) is not an
+// area load: the game lets go of its targets and makes the new size's in the
+// same call, laid out again over the render-target heap, so by the time the
+// old ones' retirements run, their memory's next resources are all made. An
+// old image stays only with the resource made next at its own address - a
+// draw there finds it, and makes it again if the shape changed - or with the
+// dead resource made again whole (its images at their offsets mean the same).
+// One a new resource covers from elsewhere is nothing's to draw into, yet
+// went on from layout to layout with each covering resource's generation;
+// and the old size's images waited out the reuse idle time beside the new
+// ones - at 2560x1600, 200-360 MiB of them for ten seconds after each change,
+// while the new size's targets took a new image heap block: a 6 GB card that
+// had 400 MiB to spare went past the driver's budget at the first change.
+std::uint64_t rebuild_successor_gen(std::uint64_t dead_memory, std::size_t dead_bytes, std::uint64_t image_base) {
+    GxResourceInfo live;
+    if (gx_resource_at(image_base, 1, &live) && live.memory == image_base && live.type >= 2 && !live.initial_data) return live.gen;
+    if (gx_resource_at(dead_memory, 1, &live) && live.memory == dead_memory && live.bytes == dead_bytes && live.type >= 2 && !live.initial_data)
+        return live.gen;
+    return 0;
+}
+
+void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted, bool rebuild) {
+    bool gone = false;
     for (int k = 0; k < 2; ++k) {
         std::map<std::uint64_t, RtImage>& m = k ? g_snapshots : g_rts;
-        for (auto it = m.lower_bound(base); it != m.end() && it->first < base + bytes; ++it) {
+        for (auto it = m.lower_bound(base); it != m.end() && it->first < base + bytes;) {
             RtImage& r = it->second;
-            if (r.gx_gen != gen) continue;
+            if (r.gx_gen != gen) {
+                ++it;
+                continue;
+            }
             if (r.written_seq > after_submitted) {
                 // Drawn into by a submission made after its resource died: the
                 // memory's newer resource took it over (same base and shape).
                 r.gx_gen = rt_resource_gen(r.base, rt_size_bytes(r));
                 ++g_gen_kept_written;
+                ++it;
                 continue;
             }
-            if (const std::uint64_t next = gx_successor_gen(base, r.base, rt_size_bytes(r))) {
+            if (const std::uint64_t next = rebuild ? rebuild_successor_gen(base, bytes, r.base) : gx_successor_gen(base, r.base, rt_size_bytes(r))) {
                 r.gx_gen = next;
                 ++g_gen_taken_next;
+                ++it;
+                continue;
+            }
+            if (rebuild) {
+                // The old size's alone: it goes now (destroyed once the work in
+                // flight has run), not after the idle time.
+                ++g_gen_rebuild_n;
+                g_gen_rebuild_bytes += r.memory.size;
+                retire_target_locked(it, k == 1);
+                it = m.erase(it);
+                gone = true;
                 continue;
             }
             r.dead_ms = steady_ms();
             r.dead_after = after_submitted;
             r.dead_memory = base;
             ++g_gen_dead_marked;
+            ++it;
         }
+    }
+    if (gone) {
+        ++g_rt_gen;
+        bump_view_epoch();
     }
 }
 
@@ -16592,14 +16634,16 @@ std::string draw_gen_report_locked() {
 }
 
 std::string image_reuse_report_locked() {
-    char buf[640];
+    char buf[768];
     std::snprintf(buf, sizeof(buf),
-                  "targets and snapshots retired with their GX resource once idle %llu (%llu MiB), kept as drawn after it died %llu (by the "
+                  "targets and snapshots retired with their GX resource %llu (%llu MiB; %llu of them, %llu MiB, at once at a resolution or "
+                  "render-size change, the rest once idle), kept as drawn after it died %llu (by the "
                   "time it died %llu, later %llu), taken by a texture made over their memory without data %llu, waiting %llu, targets made "
                   "again there within the idle time %llu; "
                   "images retired as their memory went to newer objects: targets and snapshots %llu (%llu MiB), shader-written textures %llu "
                   "(%llu MiB); targets made again within the idle time %llu; %llu sweeps, %llu us on average, the longest %llu us",
                   static_cast<unsigned long long>(g_gen_retired_targets), static_cast<unsigned long long>(g_gen_retired_bytes >> 20),
+                  static_cast<unsigned long long>(g_gen_rebuild_n), static_cast<unsigned long long>(g_gen_rebuild_bytes >> 20),
                   static_cast<unsigned long long>(g_gen_kept_written + g_gen_adopted), static_cast<unsigned long long>(g_gen_kept_written),
                   static_cast<unsigned long long>(g_gen_adopted), static_cast<unsigned long long>(g_gen_taken_next),
                   static_cast<unsigned long long>(dead_targets_waiting_locked()),
