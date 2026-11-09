@@ -13,6 +13,7 @@ namespace {
 
 std::atomic<std::uint32_t> g_snap{0};
 std::atomic<bool> g_nearest{false};
+std::atomic<bool> g_affine{false};
 std::atomic<bool> g_scale{false};
 std::atomic<std::uint32_t> g_scale_lines{0};
 std::atomic<bool> g_colour_8bit{false};
@@ -35,6 +36,11 @@ void scene_look_set_snap(std::uint32_t lines) {
     if (g_snap.exchange(lines, std::memory_order_relaxed) == lines) return;
     if (void (*fn)() = g_snap_change.load(std::memory_order_acquire)) fn();
 }
+void scene_look_set_affine(bool on) {
+    if (g_affine.exchange(on, std::memory_order_relaxed) == on) return;
+    if (void (*fn)() = g_snap_change.load(std::memory_order_acquire)) fn();
+}
+bool scene_look_affine() { return g_affine.load(std::memory_order_relaxed); }
 void scene_look_on_snap_change(void (*fn)()) { g_snap_change.store(fn, std::memory_order_release); }
 std::uint32_t scene_look_snap() { return g_snap.load(std::memory_order_relaxed); }
 
@@ -127,7 +133,7 @@ void scene_look_set_grading_nearest(bool on) { g_grading_nearest.store(on, std::
 bool scene_look_grading_nearest() { return g_grading_nearest.load(std::memory_order_relaxed); }
 
 bool scene_look_camera() {
-    return scene_look_snap() || scene_look_nearest() || scene_look_scale() || scene_look_cutaway(nullptr) || scene_look_pixel_cut(nullptr);
+    return scene_look_snap() || scene_look_affine() || scene_look_nearest() || scene_look_scale() || scene_look_cutaway(nullptr) || scene_look_pixel_cut(nullptr);
 }
 
 void scene_look_on_targets_change(void (*fn)()) { g_targets_change.store(fn, std::memory_order_release); }

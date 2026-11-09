@@ -82,6 +82,7 @@ void fake_scene_filter(int filter) { H.calls.push_back("filter " + std::to_strin
 void fake_scene_scale(int scale, std::uint32_t lines) { H.calls.push_back("scale " + std::to_string(scale) + " " + std::to_string(lines)); }
 void fake_scene_colour_bits(int bits) { H.calls.push_back("colour " + std::to_string(bits)); }
 void fake_grading_filter(int filter) { H.calls.push_back("grading " + std::to_string(filter)); }
+void fake_scene_affine(int on) { H.calls.push_back("affine " + std::to_string(on)); }
 void fake_audio_crush(int rate, int bits, float lowpass) {
     H.calls.push_back("crush " + std::to_string(rate) + " " + std::to_string(bits) + " " + std::to_string(static_cast<int>(lowpass + 0.5f)));
 }
@@ -134,6 +135,7 @@ BbHostApi make_api(std::uint32_t version) {
         api.grading_filter = fake_grading_filter;
     }
     if (version >= 21) api.audio_crush = fake_audio_crush;
+    if (version >= 27) api.scene_affine = fake_scene_affine;
     return api;
 }
 
@@ -190,6 +192,7 @@ int main(int argc, char** argv) {
         CHECK(when["look"] == "look_3d=true");
         CHECK(defaults["look_3d"] == "true");
         CHECK(defaults["unfiltered"] == "true");
+        CHECK(defaults["affine"] == "true");
         CHECK(defaults["colour_8bit"] == "true");
         CHECK(defaults["snap"] == "240p");
         CHECK(defaults["resolution"] == "Native");
@@ -214,6 +217,7 @@ int main(int argc, char** argv) {
         CHECK(has(H.calls, "grading 1"));
         CHECK(has(H.calls, "filter 1"));
         CHECK(has(H.calls, "snap 240"));
+        CHECK(has(H.calls, "affine 1"));
         CHECK(has(H.calls, "crush 0 0 0"));  // the game's own sound
         const std::size_t at_init = H.calls.size();
         CHECK(p.image(&api) == 0);
@@ -233,6 +237,8 @@ int main(int argc, char** argv) {
             CHECK(has(H.calls, "snap 0"));
             H.option_fn("unfiltered", "false", H.option_user);
             CHECK(has(H.calls, "filter 0"));
+            H.option_fn("affine", "false", H.option_user);
+            CHECK(has(H.calls, "affine 0"));
             H.option_fn("colour_8bit", "false", H.option_user);
             CHECK(has(H.calls, "colour 0"));
             CHECK(has(H.calls, "grading 0"));  // the grading smooth again
@@ -295,6 +301,7 @@ int main(int argc, char** argv) {
         CHECK(has(H.calls, "colour 0"));
         CHECK(has(H.calls, "grading 0"));
         CHECK(has(H.calls, "scale 0 0"));
+        CHECK(has(H.calls, "affine 0"));
         CHECK(has(H.calls, "crush 0 0 0"));
         if (g_failures) dump("other eboot");
     }

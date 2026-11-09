@@ -1272,6 +1272,14 @@ void api_scene_dither(std::uint32_t bits) {
     else host_log("plugin: the picture not dithered");
 }
 
+// Version 27: affine texture mapping (host/pixel_affine.h, host/scene_look.h).
+void api_scene_affine(int on) {
+    const bool was = scene_look_affine();
+    scene_look_set_affine(on != 0);
+    if (scene_look_affine() != was)
+        host_log(on ? "plugin: the 3D's textures mapped affine, without the perspective" : "plugin: the 3D's textures mapped with the perspective");
+}
+
 // Version 21: old-hardware sound (host/audio_crush.h).
 void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
     audio_crush_set(rate_hz, bits, lowpass_hz);
@@ -1306,6 +1314,7 @@ const BbHostApi g_api = {
     &api_view_cutaway_objects,
     &api_scene_dither,
     &api_camera_zoom,
+    &api_scene_affine,
 };
 
 std::string read_file(const std::string& path) {

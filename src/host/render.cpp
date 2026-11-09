@@ -19,6 +19,7 @@
 #include "host/scene_look.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
+#include "host/pixel_affine.h"
 #include "host/pixel_cutaway.h"
 #include "host/vertex_cutaway.h"
 #include "host/vertex_snap.h"
@@ -3326,6 +3327,10 @@ struct DrawState {
     // Not recorded: a recipe's twin with distance a cone but none of the
     // rest is the live form (recipe_file::read).
     bool pixel_cut_live = false;
+    // A plugin's affine texture mapping (plugin API 27, host/pixel_affine.h):
+    // a camera draw's pixel stage the twin with its texture coordinates
+    // linear; salted into the key like the snap.
+    bool affine = false;
     // A plugin's draw into the G-buffer (kGxDrawGbuffer): the host's pixel
     // shader in place of the draw's (build_gfx_pipeline), targets 0-5 written
     // whole and the rest masked (fixed_state). Salted into the key like the
@@ -6386,6 +6391,8 @@ std::atomic<std::uint64_t> g_pixel_cut_twins{0}, g_pixel_cut_refused{0};  // the
 constexpr std::uint64_t kSnapSalt = 0x5a4a9c11ull;
 constexpr std::uint64_t kGbufferSalt = 0x6b0ffe12ull;  // DrawState::host_gbuffer
 constexpr std::uint64_t kPixelCutSalt = 0x7c11ac03ull;  // DrawState::pixel_cut
+constexpr std::uint64_t kAffineSalt = 0x8aff1e04ull;  // DrawState::affine
+std::atomic<std::uint64_t> g_affine_twins{0}, g_affine_refused{0};  // affine texture mapping's pixel stages
 
 // The map's G-buffer draws mark the stencil, and the lights test it: a
 // pixel left unmarked is not lit, and the lights shade each mark's surfaces
@@ -7807,6 +7814,24 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     std::memcpy(pl.snap_cells, s.snap_cells, sizeof(pl.snap_cells));
     if (look_twin(s.snap_cells) && (gs_lift || snap_stage(pl.vs, vs_key, s.snap_cells, vs_name, vs_cacheable)))
         pl.vs_key = fnv1a(s.snap_cells, sizeof(s.snap_cells), vs_key ^ kSnapSalt);
+    // Affine texture mapping (host/pixel_affine.h): the pixel stage's twin,
+    // its texture coordinates linear - before the cutaway's, which takes it.
+    // A stage with none (a depth pass, a flat colour) is drawn as it is.
+    if (s.affine && pl.ps.module && !pl.gs_native) {
+        gcn::TranslateResult twin = pl.ps.meta();
+        std::string why;
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (pixel_affine(twin.spirv, &why) && make_module(twin.spirv, module)) {
+            const bool lifted = pl.ps.lifted;
+            pl.ps.fresh() = std::move(twin);
+            pl.ps.lifted = lifted;
+            pl.ps.module = module;
+            pl.ps_key = fnv1a(&kAffineSalt, sizeof(kAffineSalt), pl.ps_key ^ kAffineSalt);
+            g_affine_twins.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_affine_refused.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // The cutaway per pixel (host/pixel_cutaway.h): the pixel stage's twin, or
     // a stage of the test alone for a draw with none. The characters and the
     // objects were left out per draw (draw_impl: the G-buffer's stencil).
@@ -9221,11 +9246,11 @@ void replay_recipe(Precompiler& w, const std::shared_ptr<const PipelineRecipe>& 
 // whose numbers come from the draw's viewport and the camera: those are left
 // to their draws. At most 8 sets a run; a newer set skips what an older one
 // has not built yet.
-void look_prewarm(const float cells[6], bool pixel_cut) {
+void look_prewarm(const float cells[6], bool pixel_cut, bool affine) {
     if (!pipeline_manifest_on() || !g_pmanifest.recording.load(std::memory_order_relaxed)) return;
     struct Seen {
         float cells[6];
-        bool pixel_cut;
+        bool pixel_cut, affine;
     };
     static std::mutex mu;
     static std::vector<Seen> seen;
@@ -9233,31 +9258,33 @@ void look_prewarm(const float cells[6], bool pixel_cut) {
     {
         std::lock_guard<std::mutex> lk(mu);
         for (const Seen& v : seen)
-            if (v.pixel_cut == pixel_cut && !std::memcmp(v.cells, cells, sizeof(v.cells))) return;
+            if (v.pixel_cut == pixel_cut && v.affine == affine && !std::memcmp(v.cells, cells, sizeof(v.cells))) return;
         if (seen.size() >= 8) return;
         Seen v{};
         std::memcpy(v.cells, cells, sizeof(v.cells));
         v.pixel_cut = pixel_cut;
+        v.affine = affine;
         seen.push_back(v);
         gen = g_look_gen.fetch_add(1, std::memory_order_relaxed) + 1;
     }
     // The copies off the command processor: the recipes' words are megabytes.
     std::array<float, 6> c;
     std::copy(cells, cells + 6, c.begin());
-    std::thread([c, pixel_cut, gen] {
+    std::thread([c, pixel_cut, affine, gen] {
         std::vector<std::shared_ptr<PipelineRecipe>> twins;
         {
             std::lock_guard<std::mutex> lk(g_pmanifest.mu);
             twins.reserve(g_pmanifest.by_key.size());
             for (const auto& [key, rc] : g_pmanifest.by_key) {
                 const DrawState& s = rc->s;
-                if (rc->derived || look_twin(s.snap_cells) || s.pixel_cut_on || s.rect || !rc->depth_format) continue;
+                if (rc->derived || look_twin(s.snap_cells) || s.pixel_cut_on || s.affine || s.rect || !rc->depth_format) continue;
                 if (pixel_cut && (s.depth_control & 6u) == 6u) continue;
                 auto t = std::make_shared<PipelineRecipe>(*rc);
                 t->derived = true;
                 t->look_gen = gen;
                 t->key = 0;
                 std::copy(c.begin(), c.end(), t->s.snap_cells);
+                t->s.affine = affine;
                 twins.push_back(std::move(t));
             }
         }
@@ -9274,10 +9301,10 @@ void look_prewarm(const float cells[6], bool pixel_cut) {
             }
         }
         w.cv.notify_all();
-        host_log("render: a plugin's look (grid %gx%g, cutaway radius %g%s): %zu of the manifest's pipelines queued for their twins ahead of "
+        host_log("render: a plugin's look (grid %gx%g, cutaway radius %g%s%s): %zu of the manifest's pipelines queued for their twins ahead of "
                  "their draws",
                  static_cast<double>(c[0]), static_cast<double>(c[1]), static_cast<double>(c[5]), pixel_cut ? ", depth writers left to the cutaway per pixel" : "",
-                 twins.size());
+                 affine ? ", textures affine" : "", twins.size());
     }).detach();
 }
 // Ahead of any camera draw - the manifest read, or the plugin's snap set or
@@ -9293,17 +9320,19 @@ void look_prewarm_start() {
     float cells[6] = {};
     if (scene_look_snap()) scene_look_snap_cells(w, h, &cells[0], &cells[1]);
     scene_look_cutaway(&cells[2]);
-    if (look_twin(cells)) look_prewarm(cells, scene_look_pixel_cut(nullptr));
+    const bool affine = scene_look_affine();
+    if (look_twin(cells) || affine) look_prewarm(cells, scene_look_pixel_cut(nullptr), affine);
 }
 // The draw's numbers, checked against this thread's last before the shared list.
-void look_prewarm_seen(const float cells[6]) {
+void look_prewarm_seen(const float cells[6], bool affine) {
     thread_local float last[6] = {};
-    thread_local bool last_cut = false;
+    thread_local bool last_cut = false, last_affine = false;
     const bool cut = scene_look_pixel_cut(nullptr);
-    if (cut == last_cut && !std::memcmp(last, cells, sizeof(last))) return;
+    if (cut == last_cut && affine == last_affine && !std::memcmp(last, cells, sizeof(last))) return;
     std::memcpy(last, cells, sizeof(last));
     last_cut = cut;
-    look_prewarm(cells, cut);
+    last_affine = affine;
+    look_prewarm(cells, cut, affine);
 }
 
 // A translation error without its offset and detail, as a failure reason.
@@ -10484,7 +10513,8 @@ void write(Writer& out, const PipelineRecipe& rc) {
     // LS and the hull as it names the others: flags 1024 and 2048).
     w.u32((s.tess_hw ? 1u : 0u) | (s.tess_attrs ? 2u : 0u) | (s.tess_hull ? 4u : 0u) | (s.tess_quads ? 8u : 0u) | (s.tess_cw ? 16u : 0u) |
           (s.tess_native ? 32u : 0u) | (rc.has_ls ? 64u : 0u) | (rc.has_hs ? 128u : 0u) | (rc.has_ls_fetch ? 256u : 0u) |
-          (!rc.ls_passes.empty() ? 1024u : 0u) | (rc.has_gs ? 4096u : 0u) | (look_twin(s.snap_cells) || s.pixel_cut_on ? 8192u : 0u));
+          (!rc.ls_passes.empty() ? 1024u : 0u) | (rc.has_gs ? 4096u : 0u) | (look_twin(s.snap_cells) || s.pixel_cut_on ? 8192u : 0u) |
+          (s.affine ? 16384u : 0u));
     for (std::uint32_t v : {s.tess_control_points, s.tess_attr_vec4s, s.ls_rsrc1, s.ls_rsrc2, s.hs_rsrc1, s.hs_rsrc2, s.tess_window,
                             static_cast<std::uint32_t>(s.tess_spacing), s.domain_level}) {
         w.u32(v);
@@ -10772,6 +10802,9 @@ bool read(Reader& in, PipelineRecipe& rc) {
         s.gs = true;
         rc.has_gs = true;
     }
+    // A plugin's affine texture mapping (flag 16384, no numbers: a manifest
+    // from before it has none and reads as it did).
+    s.affine = (tf & 16384) != 0;
     // A plugin's look (version 6, flag 8192).
     if (tf & 8192) {
         pod(r, s.snap_cells);
@@ -10924,6 +10957,11 @@ void precompile_report() {
     if (g_snap_twins.load() || g_snap_refused.load()) {
         host_log("render: vertex snap (a plugin's look): %llu stages snapped, %llu drawn unsnapped (the rewrite refused them)",
                  static_cast<unsigned long long>(g_snap_twins.load()), static_cast<unsigned long long>(g_snap_refused.load()));
+    }
+    if (g_affine_twins.load() || g_affine_refused.load()) {
+        host_log("render: affine texture mapping (a plugin's look): %llu pixel stages made affine, %llu with no texture coordinate to "
+                 "take (or refused)",
+                 static_cast<unsigned long long>(g_affine_twins.load()), static_cast<unsigned long long>(g_affine_refused.load()));
     }
     if (g_pixel_cut_twins.load() || g_pixel_cut_refused.load()) {
         host_log("render: cutaway per pixel (a plugin's): %llu pixel stages cut, %llu drawn whole (the rewrite refused them)",
@@ -24153,11 +24191,13 @@ static bool draw_impl(const GpuDraw& d) {
     if ((scene_look_snap() || scene_look_cutaway(nullptr)) && look_camera_draw(s)) {
         if (scene_look_snap()) scene_look_snap_cells(s.depth->width, s.depth->height, &s.snap_cells[0], &s.snap_cells[1]);
         scene_look_cutaway(&s.snap_cells[2]);
-        if (look_twin(s.snap_cells)) {
-            key = fnv1a(s.snap_cells, sizeof(s.snap_cells), key ^ kSnapSalt);
-            look_prewarm_seen(s.snap_cells);
-        }
+        if (look_twin(s.snap_cells)) key = fnv1a(s.snap_cells, sizeof(s.snap_cells), key ^ kSnapSalt);
     }
+    // And affine texture mapping (host/pixel_affine.h): the same camera
+    // draws' pixel stages, one twin each.
+    s.affine = scene_look_affine() && look_camera_draw(s);
+    if (s.affine) key = fnv1a(&kAffineSalt, sizeof(kAffineSalt), key ^ kAffineSalt);
+    if (look_twin(s.snap_cells) || s.affine) look_prewarm_seen(s.snap_cells, s.affine);
     // The cutaway per pixel: the camera draws' pixel stages, with the draw's
     // viewport to take each pixel back to view space.
     s.pixel_cut_on = false;

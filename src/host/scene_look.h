@@ -39,6 +39,12 @@ bool scene_look_pixel_cut(PixelCut* out);
 void scene_look_set_object_cut(float start);
 float scene_look_object_cut();
 
+// Affine texture mapping (plugin API 27, host/pixel_affine.h): the camera
+// draws' pixel stages take their texture coordinates without the perspective.
+// A change calls scene_look_on_snap_change's function too (the twins ahead).
+void scene_look_set_affine(bool on);
+bool scene_look_affine();
+
 // The camera draws' textures sampled nearest.
 void scene_look_set_nearest(bool on);
 bool scene_look_nearest();

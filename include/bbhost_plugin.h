@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 26
+#define BB_PLUGIN_API_VERSION 27
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -637,6 +637,15 @@ typedef struct BbHostApi {
      * Reset was pressed. From the first call on they are the plugin's and
      * the game's camera no longer zooms. Any thread. 0 on success. */
     int (*camera_zoom)(int* steps, int* reset);
+    /* Version 27: affine texture mapping, as the PS1's GPU drew without a
+     * depth per pixel: the 3D's texture coordinates (scene_snap's draws)
+     * stepped evenly across the screen between a polygon's corners, not with
+     * the perspective, so a texture slides and bends over a polygon as it
+     * turns. Coordinates divided by a position on the way (screen reads: the
+     * soft particles', the lights') keep their perspective. 1 on, 0 (the
+     * default) off; each change makes the camera draws' pipelines again. Any
+     * thread. */
+    void (*scene_affine)(int on);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

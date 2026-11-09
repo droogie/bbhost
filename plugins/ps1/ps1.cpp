@@ -9,6 +9,7 @@
 //   [ps1]
 //   look_3d = true         # the PS1 look below (false: the game's own picture, the sound alone)
 //   snap = "240p"          # the grid the vertices land on: Off, 480p/360p/240p/120p
+//   affine = true          # the 3D's textures mapped without the perspective, as the PS1's warped
 //   colour_8bit = true     # the 3D's colour targets RGBA8 (and the colour grading unsmoothed)
 //   dither = true          # the picture in 15-bit colour through the PS1's 4x4 dither, before the HUD
 //   unfiltered = true      # the 3D's textures sampled nearest: no bilinear, trilinear or anisotropic filtering
@@ -40,6 +41,15 @@
 // No "Native" (the 3D's own pixels): at a high Resolution its wobble is too
 // small to see, the same as Off; a saved Native (or 0.1.0's "3D pixels")
 // reads as Off.
+//
+// Affine textures (scene_affine, API 27). The PS1's GPU had no depth per
+// pixel: it stepped a polygon's texture coordinates evenly across the screen
+// between its corners, not with the perspective, so a texture slid and bent
+// over a large polygon - a floor, a wall - as it turned toward or away from
+// the camera. The host takes the camera draws' texture coordinates the same
+// way; coordinates that are screen positions (the soft particles' and the
+// lights' reads of the depth and the G-buffer) keep their perspective. On by
+// default; on a host before API 27 it does nothing.
 //
 // Unfiltered textures (scene_filter). The PS1 had no bilinear filtering: each
 // pixel took its texel whole. The camera draws' samplers become nearest, the
@@ -101,9 +111,9 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "ps1",
     "Bloodborne PS1",
-    "0.4.0",
+    "0.5.0",
     "Kyo",
-    "Vertex snapping like the PS1, optional 8-bit colour space and a decoupled render: the 3D at its own resolution, the HUD and menus "
+    "Vertex snapping and affine texture mapping like the PS1, optional 8-bit colour space and a decoupled render: the 3D at its own resolution, the HUD and menus "
     "native. Optionally the sound of an old console's sound chip. Turns on and off in the game.",
 };
 
@@ -116,6 +126,10 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "The grid the 3D's corners land on, as the PS1's landed on its pixels: they jump from cell to cell as they move. 240p "
      "is the PS1's own screen. The grid follows the screen's shape (240p is 427 cells across at 16:9).",
      "240p", 0, 0, "Off|480p|360p|240p|120p"},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "affine", "Affine textures",
+     "The 3D's textures mapped without the perspective, as the PS1 mapped them: they slide and bend over a large polygon - a "
+     "floor, a wall - as it turns toward or away from the camera.",
+     "true"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "unfiltered", "Unfiltered textures",
      "The 3D's textures sampled nearest - no bilinear, trilinear or anisotropic filtering - as the PS1 had none.", "true"},
     {BB_OPT_BOOL | BB_OPT_LIVE, "colour_8bit", "8-bit colour",
@@ -170,6 +184,12 @@ std::uint32_t snap_of(const char* v) { return lines_of(v); }
 bool g_on = true;
 
 void set_snap(const char* v) { api->scene_snap(snap_of(v)); }
+bool has_affine(const BbHostApi* host) {
+    return host->version >= 27 && host->size >= offsetof(BbHostApi, scene_affine) + sizeof(void*) && host->scene_affine;
+}
+void set_affine(bool on) {
+    if (has_affine(api)) api->scene_affine(on ? 1 : 0);
+}
 void set_unfiltered(bool on) { api->scene_filter(on ? BB_FILTER_NEAREST : BB_FILTER_AS_IS); }
 void set_colour_8bit(bool on) {
     api->scene_colour_bits(on ? 8 : 0);
@@ -198,6 +218,7 @@ void apply_look() {
         api->grading_filter(BB_FILTER_AS_IS);
         api->scene_scale(BB_SCALE_AS_IS, 0);
         set_dither(false);
+        set_affine(false);
         return;
     }
     // config()'s text lasts until the next call: each value copied first.
@@ -207,6 +228,7 @@ void apply_look() {
     set_colour_8bit(colour_8bit);
     set_unfiltered(unfiltered);
     set_snap(snap.c_str());
+    set_affine(truthy(option("ps1.affine", "true")));
     set_dither(truthy(option("ps1.dither", "true")));
 }
 
@@ -270,6 +292,7 @@ void on_option(const char* key, const char* value, void*) {
     } else if (!look_on()) {
         // The look's own settings: kept in the config for when it is on.
     } else if (std::strcmp(key, "snap") == 0) set_snap(value);
+    else if (std::strcmp(key, "affine") == 0) set_affine(truthy(value));
     else if (std::strcmp(key, "unfiltered") == 0) set_unfiltered(truthy(value));
     else if (std::strcmp(key, "colour_8bit") == 0) set_colour_8bit(truthy(value));
     else if (std::strcmp(key, "dither") == 0) set_dither(truthy(value));
@@ -305,6 +328,7 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
         host->grading_filter(BB_FILTER_AS_IS);
         host->scene_scale(BB_SCALE_AS_IS, 0);
         if (has_dither(host)) host->scene_dither(0);
+        if (has_affine(host)) host->scene_affine(0);
         if (has_audio_crush(host)) host->audio_crush(0, 0, 0.0f);
         host->log("ps1: not the 1.09 eboot; off");
         return 1;
@@ -319,8 +343,9 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     const bool unfiltered = truthy(option("ps1.unfiltered", "true")), colour_8bit = truthy(option("ps1.colour_8bit", "true"));
     const bool look = look_on();
     if (look) {
-        const bool dither = truthy(option("ps1.dither", "true"));
-        host->log("ps1: Bloodborne PS1 on: vertex snap %s, textures %s, colour %s, %s, the 3D at %s, sound %s", snap.c_str(),
+        const bool dither = truthy(option("ps1.dither", "true")), affine = truthy(option("ps1.affine", "true"));
+        host->log("ps1: Bloodborne PS1 on: vertex snap %s, textures %s and %s, colour %s, %s, the 3D at %s, sound %s", snap.c_str(),
+                  !affine ? "with the perspective" : has_affine(host) ? "affine" : "with the perspective (affine needs plugin API 27)",
                   unfiltered ? "unfiltered" : "as the game filters them", colour_8bit ? "8-bit" : "as the game makes it",
                   !dither ? "no dither" : has_dither(host) ? "dithered to 15-bit" : "no dither (needs plugin API 25)", resolution.c_str(),
                   has_audio_crush(host) ? g_sound.choice.c_str() : "as it is (needs plugin API 21)");

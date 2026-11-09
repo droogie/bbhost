@@ -4,8 +4,11 @@
 // returns and no GLSL import (the GLSL compilers' form), a geometry stage's
 // emits, and the stages it must leave alone. Each rewrite is valid SPIR-V,
 // snaps before every return or emit, keeps its arithmetic NoContraction, and
-// a refusal leaves the module as it was.
+// a refusal leaves the module as it was. And PS1 affine texture mapping
+// (host/pixel_affine.h): a pixel stage's texture coordinates made linear,
+// its screen position and its colour not.
 #include "gcn/spirv.h"
+#include "host/pixel_affine.h"
 #include "host/pixel_cutaway.h"
 #include "host/vertex_cutaway.h"
 #include "host/vertex_snap.h"
@@ -331,9 +334,112 @@ void check_pixel_cut(const char* what, std::vector<u32> m, std::uint64_t live = 
     }
 }
 
+// A pixel stage with three inputs: a texture coordinate (sampled as it is,
+// through a function variable), a clip position (its xy / w sampled: a screen
+// read) and a colour (never sampled), and a flat one; for pixel_affine.
+std::vector<u32> fragment_sampling() {
+    Asm a;
+    const u32 main = a.id(), out_c = a.id(), uv = a.id(), clip = a.id(), col = a.id(), flat = a.id(), t_void = a.id(), t_fn = a.id(),
+              t_f32 = a.id(), t_v2 = a.id(), t_v4 = a.id(), p_out = a.id(), p_in = a.id(), p_fn = a.id(), t_img = a.id(), t_simg = a.id(),
+              p_simg = a.id(), tex = a.id(), l0 = a.id(), local = a.id();
+    a.op(spv::OpCapability, {spv::CapShader});
+    a.op(spv::OpMemoryModel, {0, 1});
+    a.op_str(spv::OpEntryPoint, {spv::EmFragment, main}, "main", {out_c, uv, clip, col, flat});
+    a.op(spv::OpExecutionMode, {main, spv::ExOriginUpperLeft});
+    a.op(spv::OpDecorate, {out_c, spv::DecLocation, 0});
+    a.op(spv::OpDecorate, {uv, spv::DecLocation, 0});
+    a.op(spv::OpDecorate, {clip, spv::DecLocation, 1});
+    a.op(spv::OpDecorate, {col, spv::DecLocation, 2});
+    a.op(spv::OpDecorate, {flat, spv::DecLocation, 3});
+    a.op(spv::OpDecorate, {flat, spv::DecFlat});
+    a.op(spv::OpDecorate, {tex, spv::DecDescriptorSet, 0});
+    a.op(spv::OpDecorate, {tex, spv::DecBinding, 0});
+    a.op(spv::OpTypeVoid, {t_void});
+    a.op(spv::OpTypeFunction, {t_fn, t_void});
+    a.op(spv::OpTypeFloat, {t_f32, 32});
+    a.op(spv::OpTypeVector, {t_v2, t_f32, 2});
+    a.op(spv::OpTypeVector, {t_v4, t_f32, 4});
+    a.op(spv::OpTypePointer, {p_out, spv::ScOutput, t_v4});
+    a.op(spv::OpTypePointer, {p_in, spv::ScInput, t_v4});
+    a.op(spv::OpTypePointer, {p_fn, spv::ScFunction, t_v4});
+    a.op(spv::OpTypeImage, {t_img, t_f32, 1 /* 2D */, 0, 0, 0, 1, 0});
+    a.op(spv::OpTypeSampledImage, {t_simg, t_img});
+    a.op(spv::OpTypePointer, {p_simg, spv::ScUniformConstant, t_simg});
+    a.op(spv::OpVariable, {p_out, out_c, spv::ScOutput});
+    for (const u32 v : {uv, clip, col, flat}) a.op(spv::OpVariable, {p_in, v, spv::ScInput});
+    a.op(spv::OpVariable, {p_simg, tex, spv::ScUniformConstant});
+    a.op(spv::OpFunction, {t_void, main, 0, t_fn});
+    a.op(spv::OpLabel, {l0});
+    a.op(spv::OpVariable, {p_fn, local, spv::ScFunction});
+    // The texture coordinate through the function variable, sampled.
+    const u32 uv4 = a.id(), uv4b = a.id(), uvxy = a.id(), si = a.id(), t0 = a.id();
+    a.op(spv::OpLoad, {t_v4, uv4, uv});
+    a.op(spv::OpStore, {local, uv4});
+    a.op(spv::OpLoad, {t_v4, uv4b, local});
+    a.op(spv::OpVectorShuffle, {t_v2, uvxy, uv4b, uv4b, 0, 1});
+    a.op(spv::OpLoad, {t_simg, si, tex});
+    a.op(spv::OpImageSampleImplicitLod, {t_v4, t0, si, uvxy});
+    // The clip position's xy / w, sampled with the texture's result added.
+    const u32 c4 = a.id(), cx = a.id(), cy = a.id(), cw = a.id(), sx = a.id(), sy = a.id(), sxy = a.id(), t1 = a.id();
+    a.op(spv::OpLoad, {t_v4, c4, clip});
+    a.op(spv::OpCompositeExtract, {t_f32, cx, c4, 0});
+    a.op(spv::OpCompositeExtract, {t_f32, cy, c4, 1});
+    a.op(spv::OpCompositeExtract, {t_f32, cw, c4, 3});
+    a.op(spv::OpFDiv, {t_f32, sx, cx, cw});
+    a.op(spv::OpFDiv, {t_f32, sy, cy, cw});
+    a.op(spv::OpCompositeConstruct, {t_v2, sxy, sx, sy});
+    a.op(spv::OpImageSampleImplicitLod, {t_v4, t1, si, sxy});
+    // The colour times both: the samples' results carry no coordinate.
+    const u32 k4 = a.id(), m0 = a.id(), m1 = a.id(), f4 = a.id(), m2 = a.id();
+    a.op(spv::OpLoad, {t_v4, k4, col});
+    a.op(spv::OpFMul, {t_v4, m0, t0, t1});
+    a.op(spv::OpFDiv, {t_v4, m1, m0, k4});  // divided by the colour: not a screen read for it
+    a.op(spv::OpLoad, {t_v4, f4, flat});
+    a.op(spv::OpFAdd, {t_v4, m2, m1, f4});
+    a.op(spv::OpStore, {out_c, m2});
+    a.op(spv::OpReturn, {});
+    a.op(spv::OpFunctionEnd, {});
+    return a.done();
+}
+
+// The NoPerspective decorations a module has, by their variables.
+std::vector<u32> linear_inputs(const std::vector<u32>& m) {
+    std::vector<u32> v;
+    for (std::size_t i = 5; i < m.size(); i += m[i] >> 16)
+        if ((m[i] & 0xffff) == spv::OpDecorate && m[i + 2] == spv::DecNoPerspective) v.push_back(m[i + 1]);
+    return v;
+}
+
 }  // namespace
 
 int main() {
+    {
+        std::vector<u32> m = fragment_sampling();
+        std::string why, msg;
+        CHECK(valid(m, &msg));
+        std::uint32_t made = 0;
+        const bool ok = pixel_affine(m, &why, &made);
+        if (!ok) std::fprintf(stderr, "affine refused: %s\n", why.c_str());
+        CHECK(ok);
+        const bool v = valid(m, &msg);
+        if (!v) std::fprintf(stderr, "affine: invalid: %s\n", msg.c_str());
+        CHECK(v);
+        // Only the texture coordinate (id 3: main, out_c, then uv).
+        CHECK(made == 1);
+        CHECK(linear_inputs(m) == std::vector<u32>{3});
+        // Again: nothing left to take.
+        const std::vector<u32> once = m;
+        CHECK(!pixel_affine(m, &why));
+        CHECK(m == once);
+    }
+    {
+        std::vector<u32> m = vertex_own_variable();
+        const std::vector<u32> before = m;
+        CHECK(!pixel_affine(m));
+        CHECK(m == before);
+        std::vector<u32> f = fragment_with_body(false);  // no inputs
+        CHECK(!pixel_affine(f));
+    }
     check_pixel_cut("pixel cutaway: no FragCoord", fragment_with_body(false));
     check_pixel_cut("pixel cutaway: its own FragCoord", fragment_with_body(true));
     check_pixel_cut("pixel cutaway: live, the map's", fragment_with_body(false), 0x7f0012345600ull, 1.0f);
