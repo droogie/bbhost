@@ -259,6 +259,14 @@ target_include_directories(bb_plugin_hello PRIVATE include)
 set_target_properties(bb_plugin_hello PROPERTIES OUTPUT_NAME hello PREFIX ""
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins)
 
+# The shader overrides' test plugin (plugin API 27, tools/shader_tint_plugin.c):
+# a test of the host, never a mod - built only when asked for (and by its
+# test), beside the build, never into plugins/ where bbhost would load it, and
+# in no package (tools/package_plugins.sh names the official plugins).
+add_library(shader_tint_probe MODULE EXCLUDE_FROM_ALL tools/shader_tint_plugin.c)
+target_include_directories(shader_tint_probe PRIVATE include)
+set_target_properties(shader_tint_probe PROPERTIES OUTPUT_NAME shader_tint PREFIX "")
+
 # Official plugins (docs/plugins.md): C++ against
 # include/bbhost (sdk.hpp), built to build/plugins next to the example. On
 # Windows each carries its own C++ runtime, so a DLL needs nothing beside it.
@@ -661,6 +669,15 @@ if(UNIX)
   target_link_libraries(ps1_plugin_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(ps1_plugin_test bb_plugin_ps1)
   add_test(NAME ps1_plugin_test COMMAND ps1_plugin_test $<TARGET_FILE:bb_plugin_ps1>)
+  # The shader overrides' test plugin on a pretend host (tools/shader_tint_plugin.c):
+  # its own source asked for until met, patched, on and off by turns, its
+  # strength in its shader data each frame; nothing asked of an older host.
+  add_executable(shader_tint_test tests/shader_tint_test.cpp)
+  target_include_directories(shader_tint_test PRIVATE include)
+  target_compile_features(shader_tint_test PRIVATE cxx_std_17)
+  target_link_libraries(shader_tint_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(shader_tint_test shader_tint_probe)
+  add_test(NAME shader_tint_test COMMAND shader_tint_test $<TARGET_FILE:shader_tint_probe>)
   # The NGX bridge (src/ngx_bridge): its parts without NVIDIA's code always;
   # with the bridge built, the library itself through bbhost's call order, and
   # host/upscaler.cpp's Linux loader with it, under Numity1504's name, under
