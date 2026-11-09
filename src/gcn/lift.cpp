@@ -8071,9 +8071,12 @@ private:
     void emit() {
         m.capability(spv::CapShader);
         m.capability(spv::CapInt64);
-        if (compute() || oob_counting()) {
+        if (compute() || oob_counting() || capturing()) {
             // Guest memory through physical storage buffer pointers, as the
-            // reference reaches it (and the counters, gcn::set_oob_count).
+            // reference reaches it (and the counters, gcn::set_oob_count, and
+            // a vertex stage's position capture, capture_position:
+            // declare_guest_memory's pointers need the capability whoever
+            // asks for them).
             m.capability(spv::CapPhysicalStorageBufferAddresses);
             m.extension("SPV_KHR_physical_storage_buffer");
             m.memory_model(5348 /* PhysicalStorageBuffer64 */, 1 /* GLSL450 */);
