@@ -30,3 +30,7 @@ void camera_params_changed(std::uint64_t file);
 // `reset` back to the Camera distance setting's. A multiplier on that
 // setting, not saved; the camera eases there as it does for the setting.
 void camera_zoom(int steps, bool reset);
+// A plugin's own zoom (plugin API 26, camera_zoom_take): once taken, the
+// presses camera_zoom gets are kept for it - the steps and whether a reset
+// came - and the game's camera no longer zooms. Any thread.
+int camera_zoom_take(bool* reset);

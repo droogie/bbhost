@@ -77,17 +77,16 @@ bool scene_look_cutaway(float* out) {
 void scene_look_set_pixel_cut(const PixelCut& cut) {
     const bool on = cut.radius > 0.0f && cut.distance > 0.0f;
     std::lock_guard<std::mutex> lk(g_cut_mu);
-    // Rounded: each new set is a new twin of every camera draw's pixel stage.
-    const auto round_to = [](float v, float step) { return std::round(v / step) * step; };
+    // As given: the twins read them live (render.cpp pixel_cut_live_write),
+    // or, where they are baked in, round them there.
     g_pixel_cut = cut;
-    g_pixel_cut.distance = round_to(cut.distance, 0.25f);
-    g_pixel_cut.radius = round_to(cut.radius, 0.25f);
     g_pixel_cut_on.store(on, std::memory_order_release);
 }
 std::atomic<float> g_object_cut{-1.0f};
 void scene_look_set_object_cut(float start) {
-    // Rounded as the distance is: each new start is a new twin of the objects' pixel stages.
-    g_object_cut.store(start >= 0.0f && start < 1.0f ? std::round(start * 20.0f) / 20.0f : -1.0f, std::memory_order_relaxed);
+    // Read live by the twins (render.cpp pixel_cut_live_write); where the
+    // numbers are baked in, the objects' distance is rounded there.
+    g_object_cut.store(start >= 0.0f && start < 1.0f ? start : -1.0f, std::memory_order_relaxed);
 }
 float scene_look_object_cut() { return g_object_cut.load(std::memory_order_relaxed); }
 std::atomic<std::uint32_t> g_dither{0};

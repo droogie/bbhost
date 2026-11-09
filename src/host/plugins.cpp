@@ -8,6 +8,7 @@
 #include "core/memory.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "engine/camera.h"
 #include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
 #include "engine/gx_state.h"
@@ -1235,7 +1236,8 @@ void api_view_cutaway2(const BbCutaway* c) {
     }
     const bool was = scene_look_pixel_cut(nullptr);
     scene_look_set_pixel_cut(p);
-    if (scene_look_pixel_cut(nullptr))
+    // Said when it turns on: a zoom sets it each frame.
+    if (scene_look_pixel_cut(nullptr) && !was)
         host_log("plugin: cutaway per pixel within %.2f m (+%.2f a metre nearer) of the view's axis, %.2f m up and %.2f m in front "
                  "of the point %.2f m off, faded over %.2f m",
                  static_cast<double>(p.radius), static_cast<double>(p.widen), static_cast<double>(p.height),
@@ -1246,9 +1248,21 @@ void api_view_cutaway2(const BbCutaway* c) {
 
 // Version 24: the objects' cone (host/scene_look.h).
 void api_view_cutaway_objects(float start) {
+    const bool was = scene_look_object_cut() >= 0.0f;
     scene_look_set_object_cut(start);
-    if (start >= 0.0f && start < 1.0f)
+    if (start >= 0.0f && start < 1.0f && !was)
         host_log("plugin: the map's objects cut too, by the same cone from %.2f of the way to the camera", static_cast<double>(start));
+}
+
+// Version 26: the Camera Zoom presses for the plugin (engine/camera.h).
+int api_camera_zoom(int* steps, int* reset) {
+    bool r = false;
+    const int n = camera_zoom_take(&r);
+    if (steps) *steps = n;
+    if (reset) *reset = r ? 1 : 0;
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true)) host_log("plugin: the Camera Zoom keys zoom a plugin's view, not the game's camera");
+    return 0;
 }
 
 // Version 25: the PS1's dither over the finished picture (host/scene_look.h).
@@ -1291,6 +1305,7 @@ const BbHostApi g_api = {
     &api_view_cutaway2,
     &api_view_cutaway_objects,
     &api_scene_dither,
+    &api_camera_zoom,
 };
 
 std::string read_file(const std::string& path) {
