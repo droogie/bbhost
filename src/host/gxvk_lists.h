@@ -105,24 +105,27 @@ void settle(bool homes_bind, const char* homes_why);
 extern const bool g_times;
 inline bool times() { return g_times; }
 
-// The pool rests while a frame cap holds: while the main loop's frame limiter
-// waits 15% of the frame time or more (two half-second windows in a row) the
-// pool commits nothing and the command processor draws every GX-native draw in
-// order, as with the pool off - at a cap the command processor's time holds no
-// frame back, and a commit there costs more than the draw it saves (a pool
-// thread parked between the frame's bursts wakes on a cold, slow core) - and
-// the pool works again when the limiter waits under 8% of a window - the cap no
-// longer holds the frame - or the command processor, drawing everything, is
-// busy 85% of it. After a short rest the next one waits longer (5 s, doubling
-// to 160 s). BBHOST_GXVK_LISTS_REST=0: it never rests.
+// The pool works only where it shortens the frame (host/gxvk_rest.h): resting,
+// it commits nothing and the command processor draws every GX-native draw in
+// order, as with the pool off (the constant buffers' homes on as before). It
+// rests while a frame cap holds the frame, while the frame is the GPU's, and
+// wherever the command processor drawing in order does not hold the game
+// back - found while it works by a probe now and then (a rest of three
+// half-second windows) - and works where it does. A loading screen changes
+// nothing. BBHOST_GXVK_LISTS_REST=0: it never rests.
 extern std::atomic<bool> g_resting;
 inline bool resting() { return g_resting.load(std::memory_order_relaxed); }
 // The main loop's frame limiter, once a frame (engine/frame_rate.cpp): how long
-// it waited, and the rate it held the frame to (0: none, as on a loading screen).
-void frame_paced(std::uint64_t wait_ns, float cap_fps);
+// it waited, the rate it held the frame to (0: none, as on a loading screen)
+// and whether a loading screen is up (engine/loading.h).
+void frame_paced(std::uint64_t wait_ns, float cap_fps, bool loading);
 // The command processor's queue 0 (bb-cp0) spent `ns` on a job (hle/gnm_exec.cpp):
 // its busy share, for the rest's lines.
 void cp_busy(std::uint64_t ns);
+// A game thread waited `ns` for the command processor's backlog (hle/gnm_exec.cpp,
+// the back-pressure the bottleneck meter calls "held back by the command
+// processor"): counted always, for the rest's rule.
+void cp_held(std::uint64_t ns);
 
 // The pool's cores (stage 4b.1b, BBHOST_GXVK_LIST_CPUS: auto, the default
 // with splice - the last physical cores of the process's CPUs, one a pool

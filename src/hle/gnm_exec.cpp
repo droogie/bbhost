@@ -3588,7 +3588,9 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
     // (the bottleneck meter's back-pressure, host/perf_meter.h).
     const std::uint64_t t0 = host_clock_monotonic_ns();
     q->drained.wait(lk, room);
-    perf_meter_backlog_wait(host_clock_monotonic_ns() - t0);
+    const std::uint64_t held = host_clock_monotonic_ns() - t0;
+    perf_meter_backlog_wait(held);
+    gxvk_lists::cp_held(held);  // the draw pool's duty: whether the command processor in order holds the game back
 }
 
 void hle_gnm_cp_drain() {
