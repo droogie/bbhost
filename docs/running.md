@@ -724,10 +724,11 @@ anti-aliasing:
 |---|---|
 | TAA | bbhost's own temporal anti-aliasing: any GPU, Windows and Linux, the 3D at the Resolution - one below the window keeps the game and its HUD at the window's size, as DLSS and FSR do |
 | DLSS | NVIDIA RTX cards, on Windows and on Linux: DLAA, Quality, Balanced or Performance (the 3D at the full Resolution, two thirds, about 59% or half each way) and its model (DLSS preset K, J, L or M) |
-| FSR 3, FSR 4 | AMD FidelityFX, on Windows: FSR 4 where the GPU and driver run it, FSR 3 on any GPU |
+| FSR 3 | AMD FidelityFX FSR 3.1.6, any GPU, on Windows and Linux (the Steam Deck included): Native AA, Quality, Balanced or Performance |
+| FSR 4 | AMD's newest, on Windows only, where the GPU and driver run it (FSR 3 elsewhere) |
 
-Frame generation (AMD FidelityFX) also runs on Windows only. Sharpness
-sharpens what TAA, FSR or DLSS gives. While one of them runs, the game's own
+Frame generation (AMD FidelityFX) runs on Windows only. Sharpness sharpens
+what TAA, FSR or DLSS gives. While one of them runs, the game's own
 Anti-aliasing pass is off: it came after their picture and only softened it
 again.
 
@@ -748,17 +749,26 @@ On Windows the package carries the upscalers' files beside `bbhost.exe`:
 Numity1504's Upscaler Bridge (`upscaler_bridge.dll`), which bbhost calls them
 through, NVIDIA's `nvngx_dlss.dll` and AMD's FidelityFX DLLs.
 
+On Linux, FSR 3 runs through `libbbhost_fidelityfx_vk.so` beside the binary,
+bbhost's own build of AMD's FidelityFX SDK v2.4.0 source (MIT) - its API, its
+Vulkan backend and FSR 3 - the same SDK release as the Windows package's
+DLLs, so both run FSR 3.1.6. The Linux package and the Steam Deck kit carry
+it; bbhost loads it from its own folder at start, and the log's `upscaler:`
+lines say whether it runs (`FSR available: 3.1.6`) or why not. It needs a
+Vulkan 1.1 GPU with subgroup quad operations in compute shaders, which every
+current driver has.
+
 On Linux, DLSS needs an NVIDIA RTX card with NVIDIA's own driver, a recent
 one (the driver brings NVIDIA's NGX, which runs DLSS; Nouveau and NVK cannot).
 The Linux package carries `libbbhost_ngx_bridge.so`, bbhost's NGX bridge (the
 Upscaler Bridge's API over NVIDIA's NGX, MIT), and NVIDIA's DLSS runtime,
 `libnvidia-ngx-dlss.so.310.9.16`, beside the binary; bbhost loads the bridge
-from its own folder at start. On any other GPU the Upscaling list offers Off
-and TAA, and the log's `upscaler:` lines say why DLSS is not available. The
-Steam Deck kit carries neither file (the Deck's GPU is AMD's).
+from its own folder at start. On any other GPU the Upscaling list offers no
+DLSS, and the log's `upscaler:` lines say why. The Steam Deck kit carries
+neither file (the Deck's GPU is AMD's).
 
 `BBHOST_UPSCALE=dlss|taa|fsr|fsr3` picks the method for a run over the
-setting, and `BBHOST_UPSCALER=0` loads no bridge at all. On Linux,
+setting, and `BBHOST_UPSCALER=0` loads no bridge or FidelityFX library at all. On Linux,
 `BBHOST_NGX_LOG=1` (2: verbose) has NVIDIA's NGX log into bbhost's log, and
 into its own files in `ngx/` in the settings folder.
 
