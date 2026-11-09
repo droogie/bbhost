@@ -89,9 +89,12 @@ W=/src/build-linux-portable
 P=$W/prefix
 # libstdc++ 14, not 24.04's default 13: the HLE libc calls std::acosf and friends,
 # which libstdc++ has only had since 14. Clang takes the newest GCC it finds.
-if [ ! -x /usr/bin/clang ] || [ ! -f /usr/lib/x86_64-linux-gnu/libSPIRV-Tools-opt.a ] || [ ! -d /usr/include/c++/14 ] || [ ! -x /usr/bin/patch ]; then
+# curl and patch: the configure step fetches the pinned SDKs (tools/fetch_ngx.sh,
+# tools/fetch_fidelityfx.sh, tools/fetch_dxc.sh) into their caches in this tree
+# and patches AMD's sources.
+if [ ! -x /usr/bin/clang ] || [ ! -f /usr/lib/x86_64-linux-gnu/libSPIRV-Tools-opt.a ] || [ ! -d /usr/include/c++/14 ] || [ ! -x /usr/bin/patch ] || [ ! -x /usr/bin/curl ]; then
     apt-get update -q > /tmp/apt-update.log 2>&1
-    apt-get install -y -q --no-install-recommends clang lld llvm cmake ninja-build pkg-config make nasm patch \
+    apt-get install -y -q --no-install-recommends clang lld llvm cmake ninja-build pkg-config make nasm patch curl \
         libstdc++-14-dev libcurl4-openssl-dev libvulkan-dev zlib1g-dev spirv-tools \
         libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev \
         libxkbcommon-dev libwayland-dev wayland-protocols libegl-dev libdecor-0-dev libpulse-dev \
