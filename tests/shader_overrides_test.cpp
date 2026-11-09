@@ -354,6 +354,19 @@ int main() {
     CHECK(overrides_watch_scan() && settle());
     const std::uint64_t s_edit = override_salt("aaaa0001");
     CHECK(s_edit != s_new && s_edit != s_three);
+    {
+        // An edit of the same size with its time put back - a copy that keeps
+        // the file's time, a file time of whole seconds - is seen by its text.
+        const auto when = std::filesystem::last_write_time(dir / "shaders" / "aaaa0001.ps.hlsl", ec);
+        std::string t = b + "// again\n";
+        t[t.size() - 2] = 'N';  // "// agaiN": the same size
+        std::ofstream(dir / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary) << t;
+        std::filesystem::last_write_time(dir / "shaders" / "aaaa0001.ps.hlsl", when, ec);
+        CHECK(!ec && std::filesystem::last_write_time(dir / "shaders" / "aaaa0001.ps.hlsl", ec) == when);
+        CHECK(overrides_watch_scan() && settle());
+        const std::uint64_t s_same = override_salt("aaaa0001");
+        CHECK(s_same != s_edit && s_same != s_three);
+    }
     std::filesystem::remove(dir / "shaders" / "aaaa0001.ps.hlsl", ec);
     CHECK(overrides_watch_scan() && settle());
     CHECK(override_salt("aaaa0001") == s_three);

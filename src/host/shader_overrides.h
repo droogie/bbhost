@@ -8,18 +8,18 @@
 // whose name is not known).
 //
 // They apply while the game runs. A program's overrides are one set, named by
-// a salt - the hash of its sources' names, identities and owners (a text's
-// own hash; a file's path, size and modification time) - which the renderer
-// keeps on the program (render.cpp CachedProgram, gpu.cpp CachedCompute) and
-// mixes into its draws' and dispatches' keys and into the key of every lifted
-// stage it builds from it. A stage compiles the sources its salt names
-// (override_pick), and a set never changes once a salt names it: a stage's
-// module is the source of its key whatever changed since, a change builds the
-// pipelines of the one program it touches again, and a return to an earlier
-// source finds the stages and pipelines made for it. Salted stages and
-// pipelines are kept for the run only: never in the stage or pipeline
-// manifests, the translation cache or the pipeline cache's file. With no
-// override the generation (override_gen) stays 0 and every salt is 0: one
+// a salt - the hash of its sources' names, identities and owners (a text's own
+// hash; a file's path, size, modification time and text's hash) - which the
+// renderer keeps on the program (render.cpp CachedProgram, gpu.cpp
+// CachedCompute) and mixes into its draws' and dispatches' keys and into the
+// key of every lifted stage it builds from it. A stage compiles the sources
+// its salt names (override_pick), and a set never changes once a salt names
+// it: a stage's module is the source of its key whatever changed since, a
+// change builds the pipelines of the one program it touches again, and a
+// return to an earlier source finds the stages and pipelines made for it.
+// Salted stages and pipelines are kept for the run only: never in the stage or
+// pipeline manifests, the translation cache or the pipeline cache's file. With
+// no override the generation (override_gen) stays 0 and every salt is 0: one
 // load a draw.
 //
 // Owners: the player's folder (kOverridePlayer) comes first, then the others
@@ -46,7 +46,8 @@ struct OverrideSource {
     std::shared_ptr<const std::string> text;  // a text given as such (a file's is read where it compiles)
     std::uint64_t size = 0;
     std::int64_t mtime = 0;      // a file's, as listed
-    std::uint64_t identity = 0;  // the text's hash, or the file's path, size and time
+    std::uint64_t content = 0;   // a file's text's hash, as listed
+    std::uint64_t identity = 0;  // the text's hash, or the file's path, size, time and text's hash
 };
 
 // At device start, after the Shaders setting (hlsl_set_setting): `on` - the

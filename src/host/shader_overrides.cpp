@@ -131,16 +131,29 @@ std::shared_ptr<const OverrideSource> file_source(int owner, const std::string& 
     if (ec) return nullptr;
     const std::int64_t mtime = static_cast<std::int64_t>(std::filesystem::last_write_time(p, ec).time_since_epoch().count());
     if (ec) return nullptr;
+    // Its text's hash as well: a file's time can be whole seconds (Windows'
+    // here), so a copy of the same size in the same second keeps size and time.
+    // (Past kMaxText, what no source can be, it is not read.)
+    std::string text;
+    if (size <= kMaxText) {
+        std::ifstream in(p, std::ios::binary);
+        if (!in) return nullptr;
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
     auto s = std::make_shared<OverrideSource>();
     s->name = name;
     s->owner = owner;
     s->path = p.string();
     s->size = size;
     s->mtime = mtime;
+    Hash64 t;
+    t.str(text);
+    s->content = t.done();
     Hash64 h;
     h.str(s->path);
     h.u64(size);
     h.u64(static_cast<std::uint64_t>(mtime));
+    h.u64(s->content);
     s->identity = h.done();
     return s;
 }
@@ -722,6 +735,10 @@ bool override_read(const OverrideSource& s, std::string& text, std::string& why)
         text = *s.text;
         return true;
     }
+    if (s.size > kMaxText) {
+        why = "the file is over 4 MiB";
+        return false;
+    }
     {
         std::ifstream in(s.path, std::ios::binary);
         text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
@@ -730,7 +747,9 @@ bool override_read(const OverrideSource& s, std::string& text, std::string& why)
     std::error_code ec;
     const std::uint64_t size = std::filesystem::file_size(s.path, ec);
     const std::int64_t mtime = ec ? 0 : static_cast<std::int64_t>(std::filesystem::last_write_time(s.path, ec).time_since_epoch().count());
-    if (ec || size != s.size || mtime != s.mtime || text.size() != s.size) {
+    Hash64 t;
+    t.str(text);
+    if (ec || size != s.size || mtime != s.mtime || text.size() != s.size || t.done() != s.content) {
         why = "the file changed since it was listed";
         relist(s);
         return false;
