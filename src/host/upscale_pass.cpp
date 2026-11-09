@@ -75,6 +75,7 @@
 #include "host/scene_look.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
+#include "host/view_block.h"
 #include "log.h"
 
 #include <algorithm>
@@ -200,25 +201,16 @@ struct VeloCopy {
 };
 VeloCopy g_velo_copy;
 
-// The engine's per-view block (864 bytes, the G-buffer's vertex stage), in
-// floats: 36-51 the inverse projection (its first row's x the tangent of half
-// the horizontal field of view, its second's y the vertical, the third
-// (0,0,0,1), the fourth the depth terms), 180-195 the camera, view to world
-// (the last row (0,0,0,1), each row's w the eye). Numity1504's appendix A.
-// The last view block's tangents and depth decode (view distance =
-// 1 / (z raw + w)), for the cutaway (upscale_view_terms).
+// The engine's per-view block (864 bytes, the G-buffer's vertex stage; its
+// floats and its test in host/view_block.h). The last view block's tangents
+// and depth decode (view distance = 1 / (z raw + w)), for the cutaway
+// (upscale_view_terms).
 std::atomic<float> g_view_tan_x{0}, g_view_tan_y{0}, g_view_z{0}, g_view_w{0};
 
 bool camera_of(const float* f, Camera* c) {
-    for (int i = 0; i < 216; ++i) {
-        if (!std::isfinite(f[i])) return false;
-    }
-    const float tx = f[36], ty = f[41];
-    if (!(tx > 0.1f && tx < 10.0f && ty > 0.1f && ty < 10.0f)) return false;
-    if (f[44] != 0.0f || f[45] != 0.0f || f[46] != 0.0f || f[47] != 1.0f) return false;
-    if (f[192] != 0.0f || f[193] != 0.0f || f[194] != 0.0f || f[195] != 1.0f) return false;
-    const float z = f[50], w = f[51];
-    if (!(std::fabs(z) > 1e-6f) || std::fabs(f[48]) > 1e-4f || std::fabs(f[49]) > 1e-4f) return false;
+    if (view_block::refusal(f)) return false;
+    const float tx = f[view_block::kInvProj + 0], ty = f[view_block::kInvProj + 5];
+    const float z = f[view_block::kInvProj + 14], w = f[view_block::kInvProj + 15];
     c->tan_x = tx;
     c->tan_y = ty;
     c->a = -w / z;
@@ -227,7 +219,7 @@ bool camera_of(const float* f, Camera* c) {
     g_view_tan_y.store(ty, std::memory_order_relaxed);
     g_view_z.store(z, std::memory_order_relaxed);
     g_view_w.store(w, std::memory_order_relaxed);
-    std::memcpy(c->rows, f + 180, sizeof(c->rows));
+    std::memcpy(c->rows, f + view_block::kCamera, sizeof(c->rows));
     return true;
 }
 
@@ -2412,7 +2404,7 @@ void upscale_velo_note_locked(int kind, std::uint64_t base, float kx, float ky) 
 
 bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes) {
     std::lock_guard<std::mutex> lk(g_note_mu);
-    if (g_cam_noted || !base || bytes < 864) return g_cam_noted;
+    if (g_cam_noted || !base || bytes < view_block::kFloats * 4) return g_cam_noted;
     Camera c;
     if (!camera_of(reinterpret_cast<const float*>(static_cast<std::uintptr_t>(base)), &c)) return false;
     static std::atomic<int> logs{0};
@@ -2426,9 +2418,9 @@ bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes) {
 }
 
 bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes) {
-    if (!base || bytes < 864) return false;
+    if (!base || bytes < view_block::kFloats * 4) return false;
     const auto* f = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(base));
-    if (f[47] != 1.0f || f[195] != 1.0f) return false;  // (cheaply first: most buffers are not one)
+    if (!view_block::may_be(f)) return false;  // (cheaply first: most buffers are not one)
     if (!g_cam_noted) return upscale_camera_note_locked(base, bytes);
     Camera c;
     return camera_of(f, &c);

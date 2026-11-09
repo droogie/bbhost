@@ -1088,6 +1088,10 @@ if(UNIX)
   add_executable(clip_control_test tests/clip_control_test.cpp)
   target_include_directories(clip_control_test PRIVATE src)
   add_test(NAME clip_control_test COMMAND clip_control_test)
+  # The engine's per-view block found at every screen shape and field of view (tests/view_block_test.cpp).
+  add_executable(view_block_test tests/view_block_test.cpp)
+  target_include_directories(view_block_test PRIVATE src)
+  add_test(NAME view_block_test COMMAND view_block_test)
   # The constant-buffer proof's copies and compares without the game (tests/cb_proof_test.cpp).
   add_executable(cb_proof_test tests/cb_proof_test.cpp)
   target_include_directories(cb_proof_test PRIVATE src include)
