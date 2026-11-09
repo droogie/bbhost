@@ -354,8 +354,8 @@ Setting g_set[kSettingCount] = {
     {"motion_blur", "Motion blur", {"Off", "On"}, 1,
      "The blur on fast camera and character movement.", false},
     {"anti_alias", "Anti-aliasing", {"Off", "On"}, 1,
-     "The game's own anti-aliasing pass, over the finished picture. Off while TAA, or a plugin's own anti-aliasing, takes its "
-     "place.",
+     "The game's own anti-aliasing pass, over the finished picture. Off while TAA, FSR, DLSS or a plugin's own anti-aliasing "
+     "takes its place: they do the anti-aliasing, and this pass after them would only soften the picture again.",
      false},
     {"depth_of_field", "Depth of field", {"Off", "On"}, 1,
      "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
@@ -2528,17 +2528,18 @@ const char* upscaler_note() {
     return note.c_str();
 }
 
-// The Anti-aliasing row's note: its own, or that it is off while TAA or a
-// plugin's own anti-aliasing takes its place (engine/graphics_patch.cpp).
+// The Anti-aliasing row's note: its own, or that it is off while an upscaler
+// or a plugin's own anti-aliasing takes its place (engine/graphics_patch.cpp).
 const char* anti_alias_note() {
     static std::string note;
     if (const std::string who = aa_taker(); !who.empty()) {
         note = "Off while the " + who + " plugin is on: it does the anti-aliasing itself.";
         return note.c_str();
     }
-    // (In game TAA as it runs - a Vulkan layer beside bbhost can keep it off -
-    // in the setup window as chosen.)
-    if (g_setup_page ? shown_index(kUpscaler) == 1 : upscaler_method() == kUpscaleTaa) return "Off while TAA runs: TAA takes its place.";
+    // (In game the upscaler as it runs - a Vulkan layer beside bbhost can keep
+    // TAA off, DLSS and FSR need their files - in the setup window as chosen.)
+    if (g_setup_page ? shown_index(kUpscaler) != 0 : upscaler_method() != 0)
+        return "Off while TAA, FSR or DLSS runs: it does the anti-aliasing, and this pass after it would only soften the picture again.";
     return g_set[kAntiAlias].note;
 }
 

@@ -64,7 +64,7 @@
 116035	Display-Limited
 117000	Ambient Occlusion	Screen-space ambient occlusion.
 117005	Motion Blur	The blur on fast camera and character movement.
-117001	Anti-Aliasing	The game's own anti-aliasing pass. Off while TAA or a plugin's anti-aliasing takes its place.
+117001	Anti-Aliasing	The game's own anti-aliasing. Off while TAA, FSR, DLSS or a plugin's anti-aliasing replaces it.
 117002	Depth of Field	Blurs distant scenery. Off keeps far views sharp.
 117020	PC Graphics	
 117003	Chromatic Aberration	The colour fringing at the edges of the frame.

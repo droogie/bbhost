@@ -727,7 +727,9 @@ anti-aliasing:
 | FSR 3, FSR 4 | AMD FidelityFX, on Windows: FSR 4 where the GPU and driver run it, FSR 3 on any GPU |
 
 Frame generation (AMD FidelityFX) also runs on Windows only. Sharpness
-sharpens what TAA, FSR or DLSS gives.
+sharpens what TAA, FSR or DLSS gives. While one of them runs, the game's own
+Anti-aliasing pass is off: it came after their picture and only softened it
+again.
 
 Character motion (Graphics, or System > PC Upscaling in the game) is where
 the upscalers and frame generation take the motion of the hunter, enemies and
