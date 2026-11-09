@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 25
+#define BB_PLUGIN_API_VERSION 26
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -613,15 +613,17 @@ typedef struct BbHostApi {
      * the G-buffer has no blending). The view only turns and moves: `pitch`
      * (radians below the horizon) and `distance` (to the point looked at, at
      * the screen's middle) place it; the field of view and the depth come from
-     * the drawn view itself. NULL or radius 0 turns it off. Each new set makes
-     * the camera draws' pipelines again, so set it as the distance changes,
-     * not every frame. Any thread. */
+     * the drawn view itself. NULL or radius 0 turns it off. Turning it on
+     * makes the camera draws' pipelines again once; after that (since version
+     * 26) the numbers are read live, so a new set each frame - a zoom easing
+     * in - builds nothing. Any thread. */
     void (*view_cutaway2)(const struct BbCutaway* cut);
     /* Version 24: view_cutaway2's cone for the map's objects too (never the
      * characters or what they carry), its tip `start` of the way from the
      * point looked at toward the camera - 0.5 halfway - and the rest of it
      * as view_cutaway2 sets it. Below 0 (the default) the objects are never
-     * cut. Any thread. */
+     * cut. Read live since version 26: it may change each frame. Any
+     * thread. */
     void (*view_cutaway_objects)(float start);
     /* Version 25: the finished picture - the 3D and its post effects, before
      * the HUD and the menus are drawn over it - rounded to `bits` a channel
@@ -629,6 +631,12 @@ typedef struct BbHostApi {
      * of the 3D (scene_scale's lines: as coarse as the 3D). 5 is the PS1's
      * 15-bit colour; 0 (the default) off. Any thread. */
     void (*scene_dither)(uint32_t bits);
+    /* Version 26: the player's Camera Zoom presses (the wheel and the middle
+     * button by default, as bound; in the world only) since the last call:
+     * `steps` notches out (in when negative), `reset` 1 when Camera Zoom
+     * Reset was pressed. From the first call on they are the plugin's and
+     * the game's camera no longer zooms. Any thread. 0 on success. */
+    int (*camera_zoom)(int* steps, int* reset);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

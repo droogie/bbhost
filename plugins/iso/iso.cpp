@@ -1,6 +1,7 @@
 // Isometric: a Diablo-like camera - high above the hunter, looking down at a
 // fixed angle, turned left and right by the right stick (or the mouse) and
-// zoomed by the wheel, never pulled in by walls - with the omni-roll built in.
+// zoomed by the Camera Zoom keys (the wheel; the middle button back to the
+// Distance), eased, never pulled in by walls - with the omni-roll built in.
 //
 //   [plugins]
 //   iso = true
@@ -15,7 +16,7 @@
 //   cutaway = true      # roofs and walls between the view and the hunter faded out
 //   cutaway_size = 2.0  # the cone's tip, metres across, just above the hunter
 //   cutaway_spread = 0.6  # metres wider for each metre toward the view
-//   cutaway_objects = true  # the map's objects too, by the cone from halfway to the view
+//   cutaway_objects = true  # the map's objects too, above the hunter's head
 //
 // Always on with the view: the omni-roll (4-way quicksteps, Modern Movement's
 // without its quick item), the lock-on at 60 m all round with 30 s out of
@@ -71,7 +72,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "iso",
     "Isometric",
-    "0.5.0",
+    "0.6.0",
     "Kyo",
     "A Diablo-like camera: high above the hunter at a fixed angle, turned by the right stick or the mouse, zoomed by the "
     "wheel, never pulled in by walls; the aim stays level. With the omni-roll built in.",
@@ -96,16 +97,17 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "1.0", 0, 2.5},
     {BB_OPT_BOOL | BB_OPT_LIVE, "cutaway", "Cutaway",
      "Roofs, ceilings and walls between the view and the hunter faded out: a cone above the hunter, widening toward the "
-     "view. Players and enemies (and what they carry) are never cut. Each zoom step builds the map's shaders for it "
-     "once (a short pause the first time).",
+     "view. Players and enemies (and what they carry) are never cut. Turning it on builds the map's shaders for it "
+     "once (a short pause); zooming builds nothing.",
      "true"},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "cutaway_size", "Cutaway size", "Metres across the cone's tip, just above the hunter.", "2.0",
      0.5, 6},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "cutaway_spread", "Cutaway spread",
      "How fast the cone widens toward the view: metres wider for each metre nearer it.", "0.6", 0, 1.5},
     {BB_OPT_BOOL | BB_OPT_LIVE, "cutaway_objects", "Cut objects",
-     "The map's objects - furniture, crates, lamps - cut too, by the same cone from halfway between the hunter and the "
-     "view: what hangs or stands high between them goes, what stands near the hunter stays.",
+     "The map's objects - furniture, barrels, lamps - cut too, by the same cone from just above the hunter's head: "
+     "what hangs or stands above them goes, what stands beside them stays. The host cannot tell objects from "
+     "characters, so the top of a very tall enemy right beside the hunter may fade too.",
      "true"},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "follow", "Follow lag",
      "Seconds the view takes to catch up with the hunter (0: fixed to them).", "0.08", 0, 0.5},
@@ -137,6 +139,7 @@ struct Settings {
 
 constexpr float kPi = 3.14159265358979f;
 constexpr float kZoomStep = 1.15f, kZoomNear = 3.0f, kZoomFar = 40.0f;
+constexpr float kZoomEase = 0.1f;  // seconds the view takes to settle (about two thirds) on a new zoom
 // The game's camera off the follow camera by this much (metres, radians of
 // field of view) is another camera's - the monocular's: the view hands over.
 constexpr float kAwayPos = 0.3f, kAwayFov = 0.05f, kHandOver = 0.2f;  // seconds
@@ -202,7 +205,7 @@ const std::uint64_t kAutoRotation[] = {0x183c6e8, 0x183c984, 0x183dde6, 0x183c87
 constexpr std::size_t kRotY = 0x144;
 
 struct View {
-    float zoom = 1.0f;
+    float zoom = 1.0f, zoom_want = 1.0f;  // the distance's multiplier, and where it eases to
     float focus[3]{};
     bool have_focus = false;
     float away = 0;        // 0 the iso view, 1 the game's camera (the monocular), eased between
@@ -342,6 +345,9 @@ float field(const std::uint8_t* base, std::size_t at) {
     return v;
 }
 
+// The host's Camera Zoom keys (plugin API 26).
+bool zoom_keys() { return api->version >= 26 && api->size >= offsetof(BbHostApi, camera_zoom) + sizeof(void*); }
+
 // The game's camera, read only: the view's yaw (CamRotY), and how far the
 // manager's camera is from the follow camera's (another camera taking over).
 void on_camera(BbCamera* c, void*) {
@@ -367,18 +373,31 @@ void on_camera(BbCamera* c, void*) {
     if (!view.started) {
         view.started = true;
         view.last = std::chrono::steady_clock::now();
-        api->input_take(nullptr, 0, 0, 1, 0);  // the wheel zooms the view, not the game's camera
+        // The Camera Zoom keys zoom the view, not the game's camera: the
+        // host's (API 26, as the player bound them), else the wheel.
+        if (!zoom_keys()) api->input_take(nullptr, 0, 0, 1, 0);
         api->log("iso: on (angle %.0f, distance %.1f m, fov %.0f)", static_cast<double>(s.pitch),
                  static_cast<double>(s.distance), static_cast<double>(s.fov));
     }
-    // The wheel's notches: each 15% nearer or further.
-    BbInput in;
-    if (api->input(&in) == 0 && in.playing && in.wheel != 0) {
+    // Each notch 15% nearer or further; Camera Zoom Reset (the middle
+    // button) back to the Distance. on_view eases there.
+    int steps = 0, reset = 0;
+    if (zoom_keys()) {
+        api->camera_zoom(&steps, &reset);
+    } else {
+        BbInput in;
+        if (api->input(&in) == 0 && in.playing) {
+            steps = static_cast<int>(-in.wheel);
+            reset = (in.pressed & 4u) != 0;
+        }
+    }
+    if (reset) view.zoom_want = 1.0f;
+    if (steps) {
         const float base = s.distance > 0.1f ? s.distance : 0.1f;
-        float z = view.zoom * std::pow(kZoomStep, -in.wheel);
+        float z = view.zoom_want * std::pow(kZoomStep, static_cast<float>(steps));
         if (z * base < kZoomNear) z = kZoomNear / base;
         if (z * base > kZoomFar) z = kZoomFar / base;
-        view.zoom = z;
+        view.zoom_want = z;
     }
     // ISO_LOG=1: twice a second, the game's camera and the hunter.
     static const bool trace = std::getenv("ISO_LOG") != nullptr;
@@ -441,15 +460,18 @@ int sound_update_hook(BbHookCtx* c, void*) {
 // The cutaway (plugin API 23): a cone over the hunter, its tip `size` across
 // a little above the point looked at, widening `spread` metres a metre toward
 // the camera, faded at its edges - roofs, ceilings and near walls. The map's
-// objects (plugin API 24) by the same cone from halfway to the camera (Kyo):
-// the host cannot tell them from the characters, so the characters take it
-// too - out of reach of all but one standing high between the view and the
-// hunter. Sent when its numbers change - each new set builds the map's
-// pipelines again - and off while another camera has the view.
+// objects (plugin API 24) by the same cone, its tip moved up the view's axis
+// to kObjectTipHeight over the hunter's feet: they start to fade 2 m over
+// them. (Halfway to the camera, as it was, left barrels a few
+// metres over the hunter whole.) The host cannot tell objects from the
+// characters, so the characters take it too: only the top of one taller than
+// 2 m right beside the hunter. Sent when its numbers change - a host before
+// API 26 builds the map's pipelines again for each set - and off while
+// another camera has the view.
 constexpr float kCutHeight = 0.6f;   // metres over the point looked at before anything is cut
 constexpr float kCutMargin = 0.5f;   // metres in front of it
 constexpr float kCutFeather = 1.5f;  // metres it fades in over
-constexpr float kObjectCutStart = 0.5f;  // the objects' cone: its tip halfway to the camera
+constexpr float kObjectTipHeight = 1.4f;  // metres over the hunter's feet of the objects' cone's tip
 void cutaway(float dist) {
     static BbCutaway sent{};
     static bool sent_any = false;
@@ -464,12 +486,25 @@ void cutaway(float dist) {
         want.feather = kCutFeather;
     }
     static float sent_start = -2.0f;
-    const float start = want.radius > 0 && s.cutaway_objects ? kObjectCutStart : -1.0f;
-    if (start != sent_start && api->version >= 24 && api->size >= offsetof(BbHostApi, view_cutaway_objects) + sizeof(void*)) {
+    // The tip's share of the way to the camera that puts it kObjectTipHeight
+    // up: the height a metre along the axis is sin(pitch).
+    float start = -1.0f;
+    if (want.radius > 0 && s.cutaway_objects) {
+        const float up = dist * std::sin(want.pitch);
+        start = up > 0.01f ? (kObjectTipHeight - s.height) / up : 0.0f;
+        if (start < 0.0f) start = 0.0f;
+        if (start > 0.9f) start = 0.9f;
+        // Before API 26 each new start builds the objects' pipelines again.
+        if (!zoom_keys()) start = std::round(start * 20.0f) / 20.0f;
+    }
+    if (std::fabs(start - sent_start) > 0.002f && api->version >= 24 && api->size >= offsetof(BbHostApi, view_cutaway_objects) + sizeof(void*)) {
         sent_start = start;
         api->view_cutaway_objects(start);
     }
-    if (sent_any && std::fabs(want.distance - sent.distance) < 0.125f && want.radius == sent.radius && want.widen == sent.widen &&
+    // Before API 26 each new set builds the map's pipelines again: only a
+    // real step. Since, the host reads them live.
+    const float close = zoom_keys() ? 0.01f : 0.125f;
+    if (sent_any && std::fabs(want.distance - sent.distance) < close && want.radius == sent.radius && want.widen == sent.widen &&
         want.pitch == sent.pitch)
         return;
     sent = want;
@@ -519,6 +554,12 @@ void on_view(BbCamera* c, void*) {
     float fwd[3] = {sy * cp, -sp, cy * cp};
     float up[3] = {sy * sp, cp, cy * sp};
     float fov = s.fov * kPi / 180.0f;
+    // The zoom eased, evenly in and out (by its logarithm).
+    if (view.zoom != view.zoom_want) {
+        const float k = 1.0f - std::exp(-dt / kZoomEase);
+        view.zoom = std::exp(std::log(view.zoom) + (std::log(view.zoom_want) - std::log(view.zoom)) * k);
+        if (std::fabs(view.zoom / view.zoom_want - 1.0f) < 0.002f) view.zoom = view.zoom_want;
+    }
     float dist = s.distance * view.zoom;
     // Flatten: a narrower view from further back, framed the same at the
     // hunter. The game's limits (its 38-48 degree clamp) are the follow

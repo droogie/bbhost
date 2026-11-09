@@ -3321,6 +3321,11 @@ struct DrawState {
     // numbers with this draw's viewport; salted into the key like the snap.
     bool pixel_cut_on = false;
     PixelCut pixel_cut{};
+    // pixel_cut is the live form (host/pixel_cutaway.h PixelCutLive): its
+    // numbers in the live buffer, the key the same however the view moves.
+    // Not recorded: a recipe's twin with distance a cone but none of the
+    // rest is the live form (recipe_file::read).
+    bool pixel_cut_live = false;
     // A plugin's draw into the G-buffer (kGxDrawGbuffer): the host's pixel
     // shader in place of the draw's (build_gfx_pipeline), targets 0-5 written
     // whole and the rest masked (fixed_state). Salted into the key like the
@@ -6888,6 +6893,43 @@ VkBuffer addressed_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryP
     return buffer;
 }
 
+// The cutaway per pixel's live numbers (host/pixel_cutaway.h PixelCutLive):
+// one small mapped buffer for the run, at an address the twins bake in, so a
+// zoom or a field of view change writes it and builds nothing. 0 when it
+// could not be made: the twins bake every number in, as before.
+struct PixelCutLiveBuffer {
+    std::once_flag once;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceAddress address = 0;
+    std::uint8_t* map = nullptr;
+    std::mutex mu;
+    PixelCutLive last{};
+} g_cut_live;
+std::uint64_t pixel_cut_live_address() {
+    std::call_once(g_cut_live.once, [] {
+        g_cut_live.buffer = addressed_buffer(sizeof(PixelCutLive), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, g_cut_live.memory,
+                                             g_cut_live.address, &g_cut_live.map, "cutaway live numbers");
+        if (!g_cut_live.buffer) {
+            g_cut_live.address = 0;
+            host_log("render: cutaway: no buffer for its live numbers - each zoom builds the twins again");
+        } else {
+            std::memset(g_cut_live.map, 0, sizeof(PixelCutLive));
+        }
+    });
+    return g_cut_live.address;
+}
+// The frame's numbers into the buffer. A frame still on the GPU reads the
+// newer ones: a frame's worth of a zoom early, nothing worse.
+void pixel_cut_live_write(const PixelCutLive& n) {
+    std::lock_guard<std::mutex> lk(g_cut_live.mu);
+    if (!std::memcmp(&n, &g_cut_live.last, sizeof(n))) return;
+    g_cut_live.last = n;
+    std::memcpy(g_cut_live.map, &n, sizeof(n));
+}
+
 bool particle_args_ready_locked() {
     ParticleArgs& a = g_pargs;
     if (a.tried) return a.pipeline != VK_NULL_HANDLE;
@@ -7772,7 +7814,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // A camera draw with no pixel stage (the map's depth-only passes): one
         // of the cutaway alone, so the cut surfaces leave no depth behind.
         gcn::TranslateResult only{};
-        only.spirv = pixel_cutaway_only(s.pixel_cut);
+        only.spirv = pixel_cutaway_only(s.pixel_cut, s.pixel_cut_live ? pixel_cut_live_address() : 0);
         VkShaderModule module = VK_NULL_HANDLE;
         if (!only.spirv.empty() && make_module(only.spirv, module)) {
             pl.ps.fresh() = std::move(only);
@@ -7788,7 +7830,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             std::string why;
             VkShaderModule module = VK_NULL_HANDLE;
             const PixelCut cut = s.pixel_cut;
-            if (pixel_cutaway(twin.spirv, cut, &why) && make_module(twin.spirv, module)) {
+            if (pixel_cutaway(twin.spirv, cut, &why, s.pixel_cut_live ? pixel_cut_live_address() : 0) && make_module(twin.spirv, module)) {
                 const bool lifted = pl.ps.lifted;
                 pl.ps.fresh() = std::move(twin);
                 pl.ps.lifted = lifted;
@@ -10735,6 +10777,9 @@ bool read(Reader& in, PipelineRecipe& rc) {
         pod(r, s.snap_cells);
         s.pixel_cut_on = r.u32() != 0;
         if (s.pixel_cut_on) pod(r, s.pixel_cut);
+        // The live form: which cone for its distance and none of the numbers
+        // the live buffer holds.
+        s.pixel_cut_live = s.pixel_cut_on && s.pixel_cut.tan_x == 0.0f && s.pixel_cut.radius == 0.0f && s.pixel_cut.distance > 0.0f;
     }
     // The addresses the build tests for a program are the run's that recorded
     // it; the recipe's build takes the copies (tess_program).
@@ -24116,6 +24161,7 @@ static bool draw_impl(const GpuDraw& d) {
     // The cutaway per pixel: the camera draws' pixel stages, with the draw's
     // viewport to take each pixel back to view space.
     s.pixel_cut_on = false;
+    s.pixel_cut_live = false;
     // The G-buffer's stencil marks what a draw is: the map's own pieces 9;
     // the characters (players, enemies, their parts) and the map's objects
     // (furniture, crates, lamps) alike 8, and a few of either 12 - neither
@@ -24147,17 +24193,49 @@ static bool draw_impl(const GpuDraw& d) {
         s.pixel_cut.offset_x = s.vport[1];
         s.pixel_cut.scale_y = s.vport[2];
         s.pixel_cut.offset_y = s.vport[3];
-        s.pixel_cut.tan_x = std::round(view_tan[0] * 1024.0f) / 1024.0f;
-        s.pixel_cut.tan_y = std::round(view_tan[1] * 1024.0f) / 1024.0f;
-        s.pixel_cut.depth_z = bits12(view_depth[0]);
-        s.pixel_cut.depth_w = bits12(view_depth[1]);
-        if (chr_or_obj) s.pixel_cut.distance = std::round(s.pixel_cut.distance * (1.0f - object_start) * 4.0f) / 4.0f;
+        s.pixel_cut_live = pixel_cut_live_address() != 0;
+        if (s.pixel_cut_live) {
+            // The numbers into the live buffer; the key keeps the viewport,
+            // the fixed height, margin and feather, and which cone it is.
+            PixelCutLive n{};
+            n.tan_x = view_tan[0];
+            n.tan_y = view_tan[1];
+            n.distance = s.pixel_cut.distance;
+            n.sin_pitch = s.pixel_cut.sin_pitch;
+            n.cos_pitch = s.pixel_cut.cos_pitch;
+            n.radius = s.pixel_cut.radius;
+            n.widen = s.pixel_cut.widen;
+            n.depth_z = view_depth[0];
+            n.depth_w = view_depth[1];
+            const float objects = scene_look_object_cut();
+            n.object_distance = objects >= 0.0f ? s.pixel_cut.distance * (1.0f - objects) : s.pixel_cut.distance;
+            pixel_cut_live_write(n);
+            const PixelCut c = s.pixel_cut;
+            s.pixel_cut = PixelCut{};
+            s.pixel_cut.scale_x = c.scale_x;
+            s.pixel_cut.offset_x = c.offset_x;
+            s.pixel_cut.scale_y = c.scale_y;
+            s.pixel_cut.offset_y = c.offset_y;
+            s.pixel_cut.height = c.height;
+            s.pixel_cut.margin = c.margin;
+            s.pixel_cut.feather = c.feather;
+            s.pixel_cut.distance = chr_or_obj ? 2.0f : 1.0f;
+        } else {
+            s.pixel_cut.tan_x = std::round(view_tan[0] * 1024.0f) / 1024.0f;
+            s.pixel_cut.tan_y = std::round(view_tan[1] * 1024.0f) / 1024.0f;
+            s.pixel_cut.depth_z = bits12(view_depth[0]);
+            s.pixel_cut.depth_w = bits12(view_depth[1]);
+            // Rounded: each new set is a new twin of every camera draw's pixel stage.
+            s.pixel_cut.distance = std::round(s.pixel_cut.distance * (chr_or_obj ? 1.0f - object_start : 1.0f) * 4.0f) / 4.0f;
+            s.pixel_cut.radius = std::round(s.pixel_cut.radius * 4.0f) / 4.0f;
+        }
         s.pixel_cut_on = true;
         key = fnv1a(&s.pixel_cut, sizeof(s.pixel_cut), key ^ kPixelCutSalt);
         static std::atomic<int> said{0};
         if (said.fetch_add(1, std::memory_order_relaxed) == 0)
-            host_log("render: cutaway: the view's tangents %.3f %.3f, depth 1 / (%g z + %g)", static_cast<double>(s.pixel_cut.tan_x),
-                     static_cast<double>(s.pixel_cut.tan_y), static_cast<double>(s.pixel_cut.depth_z), static_cast<double>(s.pixel_cut.depth_w));
+            host_log("render: cutaway: the view's tangents %.3f %.3f, depth 1 / (%g z + %g)%s", static_cast<double>(view_tan[0]),
+                     static_cast<double>(view_tan[1]), static_cast<double>(view_depth[0]), static_cast<double>(view_depth[1]),
+                     s.pixel_cut_live ? ", read live" : "");
     }
     draw_stamp.to(kRenderCostKey);
     GpuPhaseTimer pipeline_timer(kPhasePipeline, phase_weight);
