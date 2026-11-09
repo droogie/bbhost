@@ -2722,6 +2722,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     if (look) gxvk_lists::cp_look_begin(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
                     const bool flags_needed = host_gpu_segment_flags_needed();
                     if (flags_needed) host_gpu_segment_follows(segment_follows_next(b + n));
+                    if (gxvk_lists::splice_compare()) host_gpu_splice_compare_begin(token_id);
                     native_draw(in, "native");
                     if (flags_needed) host_gpu_segment_follows(false);
                     if (gxvk_lists::splice_compare()) host_gpu_splice_compare(token_id);
