@@ -78,6 +78,7 @@
 #include <mutex>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <set>
 #include <tuple>
 #include <string>
@@ -9391,6 +9392,41 @@ const bool g_eft_twins = [] {
 }();
 std::atomic<std::uint64_t> g_eft_twins_built{0};
 
+// An edited shader of a program compiled ahead (host/shader_overrides.h):
+// beside the game's own stage `key`, its lifted variant under the program's
+// salt as it stands now - the key a draw makes with that salt - with its
+// library, made with the run's own pipeline cache. So the first draw keyed
+// with the salt finds its stage: an edited file present at the start draws
+// from its program's first draw, as when it was compiled into the game's own
+// stage. Nothing records it. `vertex`: a vertex stage (lift_cached's), and
+// `library` the library to build of it; null `domain`: not a domain shader's.
+// Does nothing without edited shaders, for a key made already, or when the
+// stage cache is off.
+void precompile_salted(const std::string& name, std::uint64_t key, bool vertex, const gcn::Program& prog, const gcn::TranslateOptions& options,
+                       const gcn::TessLift* domain, const std::function<bool(const ShaderStage&)>& library) {
+    if (!g_stage_cache_on || !override_gen()) return;
+    const std::uint64_t salt = override_salt(name);
+    const std::uint64_t skey = salted_key(key, salt);
+    if (!salt || cached_stage(skey)) return;
+    ShaderStage st;
+    st.fresh() = translate_cached(prog, options);
+    if (!st.meta().ok()) return;
+    hlsl_name_next(name, salt);
+    gcn::LiftResult lifted = domain ? lift_tess_cached(TranslationUse::kLiftDomain, prog, options, st.meta(), *domain)
+                                    : lift_cached(vertex, prog, options, st.meta());
+    name_stage(lifted, st.meta(), name);
+    if (!lifted.ok()) return;  // the game's own stage is the translation then: the salt names nothing
+    st.fresh().spirv = std::move(lifted.spirv);
+    if (!vertex) st.fresh().wave64_needs = 0;  // as build_gfx_pipeline's lift
+    st.lifted = true;
+    if (!make_module(st.meta().spirv, st.module)) return;
+    cache_stage(skey, st.meta(), st.module, true);
+    const RunOnlyCache run_only(true);
+    t_library_owner = name.c_str();
+    if (use_pipeline_library()) library(st);
+    t_library_owner = nullptr;
+}
+
 void precompile_ps(Precompiler& w, const PrecompileJob& job) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto give_up = [&](const std::string& why) {
@@ -9544,6 +9580,22 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         if (ok && !job.sweep) g_eft_twins_built.fetch_add(1, std::memory_order_relaxed);
         if (!ok) twin_key = 0;
     }
+    // The program's edited shaders: its variant, and the variant's twin.
+    if (lift && cacheable) {
+        const gcn::TranslateOptions options = ps_translate_options(in);
+        precompile_salted(job.name, key, false, prog, options, nullptr, [&](const ShaderStage& st) {
+            if (!layout || !fragment_library(st.meta(), st.module, set, layout)) return false;
+            if (!twin_key) return true;
+            gcn::TranslateResult twin = st.meta();
+            VkShaderModule twin_module = VK_NULL_HANDLE;
+            const std::uint64_t salted_twin = salted_key(twin_key, override_salt(job.name));
+            if (cached_stage(salted_twin)) return true;
+            spirv_drop_early_fragment_tests(twin.spirv);
+            if (!make_module(twin.spirv, twin_module)) return false;
+            cache_stage(salted_twin, twin, twin_module, true);
+            return fragment_library(twin, twin_module, set, layout) != VK_NULL_HANDLE;
+        });
+    }
     if (job.sweep) {
         drop_module();
         {
@@ -9666,6 +9718,28 @@ void precompile_manifest(const ManifestStage& m) {
             ok = layout && pre_raster_library(stage, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets) != VK_NULL_HANDLE;
         }
         t_library_owner = nullptr;
+    }
+    // The program's edited shaders: its lifted stage's variant beside it.
+    if (ok && m.lift && !m.domain_level) {
+        const VkDescriptorSetLayout set = g.gfx_set_layout;
+        const VkDescriptorSetLayout sets[2] = {set, set};
+        const VkPipelineLayout layout = set ? stage_pipeline_layout(set, set) : VK_NULL_HANDLE;
+        const ShaderStage no_gs;
+        if (m.stage) {
+            precompile_salted(m.name, key, false, prog, ps_translate_options(m.ps_inputs()), nullptr, [&](const ShaderStage& st) {
+                return layout && fragment_library(st.meta(), st.module, set, layout) != VK_NULL_HANDLE;
+            });
+        } else if (m.tess_hw) {  // a domain shader on the host's tessellator: no library of its own
+            gcn::TessLift tl;
+            tl.attr_vec4s = m.tess_attr_vec4s;
+            precompile_salted(m.name, key, true, prog, vs_translate_options(m.vs_inputs(), m.fetch_words.empty() ? nullptr : &fetch_prog), &tl,
+                              [](const ShaderStage&) { return true; });
+        } else {
+            precompile_salted(m.name, key, true, prog, vs_translate_options(m.vs_inputs(), m.fetch_words.empty() ? nullptr : &fetch_prog), nullptr,
+                              [&](const ShaderStage& st) {
+                                  return layout && pre_raster_library(st, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets) != VK_NULL_HANDLE;
+                              });
+        }
     }
     g_manifest.compile_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_manifest.mu);
@@ -9826,6 +9900,12 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
         if (!library) {
             why = "pre-rasterization library";
             return false;
+        }
+        // The program's edited shaders: its variant beside it.
+        if (lift && cacheable) {
+            precompile_salted(job.name, key, true, prog, vs_translate_options(in, nullptr), nullptr, [&](const ShaderStage& st) {
+                return layout && pre_raster_library(st, no_gs, VK_POLYGON_MODE_FILL, false, layout, sets) != VK_NULL_HANDLE;
+            });
         }
         return true;
     };
