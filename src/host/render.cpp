@@ -747,6 +747,12 @@ struct GxRing {
     bool failed = false;
 };
 GxRing g_gx_ring;
+// Whether [base, +bytes) lies in the ring: a table a draw's user data placed there (gx_ring_place), whose bytes that
+// draw's commit wrote. (The base is set once, under the ring's lock, before any placement is handed out.)
+bool gx_ring_holds(std::uint64_t base, std::uint64_t bytes) {
+    const std::uint64_t lo = g_gx_ring.base;
+    return lo && base >= lo && base + bytes <= lo + g_gx_ring.size;
+}
 std::atomic<std::uint64_t> g_vertex_tables{0}, g_gx_user_stages{0}, g_gx_user_fallbacks{0};
 // BBHOST_GX_COST=1: the renderer's GX work timed per
 // draw, and sampled constant buffers checked against their contents at the
@@ -17461,6 +17467,16 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             known = gxvk::heap_snap_mode() == gxvk::HeapSnap::kOn;
             check = !known;
         }
+        // A table in GX's ring (gx_ring_place) - read through a pointer pair
+        // when the pipeline's lean variant is not built yet and the draw builds
+        // all of its user data's tables - holds bytes this draw's own build
+        // wrote, final at that build: nothing copies into the ring, no GPU write
+        // lands on it and no twin covers it. Its lookups' answers are known
+        // (none), so it is copied as the draw records, in order and in the
+        // pool's list mode alike - which stopped at it (kBsCbLookups) and left
+        // 74-90% of the draws to the command processor in the first session
+        // after each update, until the lean variants were built.
+        if (!known && !in_heap && outcome == kUnmapped && base && !b.written && gx_ring_holds(base, bytes)) known = true;
         // A run part's draw (BBHOST_RUN_COMMIT) stops at a binding the shader
         // stores to - the store changes what later draws are answered - and at
         // copies to put in place.
