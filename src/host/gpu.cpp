@@ -4335,6 +4335,23 @@ bool init_locked() {
         }
         host_log("gpu: GL's clip space %s", g.has_depth_clip_control ? "clipped at -w (VK_EXT_depth_clip_control)"
                                                                       : "clipped at 0 as D3D's (no VK_EXT_depth_clip_control, or BBHOST_GL_CLIP_SPACE=0)");
+        // FSR 3's two pyramid shaders (bbhost's FidelityFX library on Linux,
+        // host/upscaler_ffx.h) declare compute shaders' derivative groups -
+        // DXC's form of their QuadReadAcross* - which the device must turn on
+        // for them to be valid (AMD's own Windows shaders declare the same).
+        if (upscaler_wants_compute_derivatives()) {
+            if (has(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+                VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR qd{};
+                qd.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+                VkPhysicalDeviceFeatures2 qf{};
+                qf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                qf.pNext = &qd;
+                vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+                g.compute_derivatives = qd.computeDerivativeGroupLinear;
+            }
+            host_log("gpu: compute shaders' derivative groups for FSR 3 %s", g.compute_derivatives ? "on (VK_KHR_compute_shader_derivatives)"
+                                                                                                  : "not offered by this device: FSR 3 runs without them, as on Windows");
+        }
         // VK_EXT_memory_budget: what the driver says this process holds per
         // heap - the number to compare with nvidia-smi when instances starve.
         g.has_memory_budget = has("VK_EXT_memory_budget");
@@ -4454,6 +4471,7 @@ bool init_locked() {
     }
     if (g.dynamic_depth_clamp) dext.push_back("VK_EXT_extended_dynamic_state3");
     if (g.has_depth_clip_control) dext.push_back("VK_EXT_depth_clip_control");
+    if (g.compute_derivatives) dext.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     if (g_want_present && has_swapchain) {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         g.present_capable = true;
@@ -4531,6 +4549,13 @@ bool init_locked() {
     if (g.has_depth_clip_control) {
         fdcc.pNext = f13.pNext;
         f13.pNext = &fdcc;
+    }
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR fderiv{};
+    fderiv.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+    fderiv.computeDerivativeGroupLinear = VK_TRUE;
+    if (g.compute_derivatives) {
+        fderiv.pNext = f13.pNext;
+        f13.pNext = &fderiv;
     }
     // Pixel shaders at wave32 (gcn/wave.h).
     // The translated stages use subgroup operations in SPIR-V 1.5 without

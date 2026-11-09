@@ -12,8 +12,8 @@
  * Vulkan API. NGX's core is part of NVIDIA's Linux driver; the DLSS runtime (libnvidia-ngx-dlss.so.<version>) lies in
  * the vendor folder, which is the feature path NGX is given. NGX is asked nothing until an NVIDIA GPU with NVIDIA's own
  * driver is in sight: on any other machine (an AMD card, lavapipe in the tests) the instance and the device are made
- * exactly as the host asks and DLSS reports why it cannot run. FSR is not available here: AMD's FidelityFX runtime is
- * Windows DLLs, and get_caps says so.
+ * exactly as the host asks and DLSS reports why it cannot run. FSR is not here: on Linux bbhost runs it through its own build
+ * of AMD's FidelityFX library (host/upscaler_ffx.h), and get_caps says so.
  *
  * Where it differs from the Windows bridge: no crash inside NVIDIA's code is caught (UB_ERR_CRASH is never returned -
  * the host's own fault handler sees it), and no vulkan-1.dll check (UB_ERR_BLOCKED). NGX's log lines come to the log
@@ -58,7 +58,7 @@ constexpr char kVersionNumber[] = "1.0.0";
 constexpr char kVersion[] = "ngx-bridge 1.0.0";  // get_caps' bridge_version: which bridge ran, in the host's log
 // NGX's project id when the host gives none (ub_open_desc.project_id): this bridge's own.
 constexpr char kProjectId[] = "55df37c7-823f-4257-a144-58eed328a47f";
-constexpr char kFsrReason[] = "AMD ships FSR 3 and FSR 4 for Windows only: FSR is not available on Linux";
+constexpr char kFsrReason[] = "FSR on Linux is bbhost's own FidelityFX library's (libbbhost_fidelityfx_vk.so), not this bridge's";
 constexpr std::uint32_t kDefaultPreset = NVSDK_NGX_DLSS_Hint_Render_Preset_K;
 
 struct Feature {
@@ -335,7 +335,7 @@ ub_result UB_CALL open_context(const ub_open_desc* desc, ub_context** out) {
         g_ngx_log.store(c->log, std::memory_order_release);
         g_ctx = c;
         *out = c;
-        say(c, UB_LOG_INFO, "bbhost's NGX bridge %s for Linux (Numity1504's upscaler bridge API %u): DLSS through NVIDIA's NGX SDK %s, %s%s; FSR is Windows' alone",
+        say(c, UB_LOG_INFO, "bbhost's NGX bridge %s for Linux (Numity1504's upscaler bridge API %u): DLSS through NVIDIA's NGX SDK %s, %s%s",
             kVersionNumber, UB_API_VERSION, NGX_BRIDGE_SDK, c->runtime_name.empty() ? "no DLSS runtime in " : "the runtime ",
             c->runtime_name.empty() ? c->vendor_folder.c_str() : (c->vendor_folder + "/" + c->runtime_name).c_str());
         if (c->jitter_sx != 1.0f || c->jitter_sy != 1.0f)

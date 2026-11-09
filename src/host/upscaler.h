@@ -42,10 +42,17 @@ const VkDeviceCreateInfo* upscaler_prepare_device(VkInstance instance, VkPhysica
 void upscaler_device_done(VkResult r);
 // After the device: the vendors' runtimes started, and what can run logged.
 void upscaler_attach(VkInstance instance, VkPhysicalDevice phys, VkDevice device, std::uint32_t frames_in_flight);
+// Whether the device should turn on compute shaders' derivative groups
+// (VK_KHR_compute_shader_derivatives' computeDerivativeGroupLinear), which
+// FSR 3's two pyramid shaders declare - DXC writes their QuadReadAcross*
+// that way: on Linux once bbhost's FidelityFX library is loaded
+// (upscaler_open), host/gpu.cpp asking before it makes the device.
+bool upscaler_wants_compute_derivatives();
 
 // What can run here, as the bridge says (attach first).
 struct UpscalerCaps {
-    bool loaded = false;  // the bridge is in and attached
+    bool loaded = false;      // the bridge is in and attached
+    bool fsr_loaded = false;  // Linux: bbhost's FidelityFX library (FSR 3) is in and attached
     bool dlss = false, fsr = false, fsr4 = false;
     std::string dlss_version, fsr_versions, dlss_reason, fsr_reason;
 };

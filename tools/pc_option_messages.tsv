@@ -184,7 +184,7 @@
 125000	Frame Generation	A frame made between each two of the game's. The game then runs at most half your refresh rate.
 125001	Sharpness	Sharpens the 3D after TAA, FSR or DLSS; 0 leaves it as it is. Needs Upscaling on.
 125002	Reflection Quality	Reflection resolution: Quarter is about four times cheaper; Half is the game's own, sharper.
-125003	Upscaling	Replaces the game's AA: TAA or FSR 3 (any GPU), FSR 4 (AMD, where offered) or DLSS (NVIDIA RTX).
+125003	Upscaling	Replaces the game's AA: TAA or FSR 3 (any GPU), FSR 4 (AMD, Windows only) or DLSS (NVIDIA RTX).
 125004	Upscaling Quality	The 3D's drawn size: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
 125005	TAA Strength	How much TAA smooths: higher is steadier but may leave a faint trail, lower crisper. Default 5.
 125006	Character Motion	Precise: each character's own motion, clean edges, about 1% at 4K. Velocity Map: softer edges.

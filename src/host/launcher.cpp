@@ -1112,7 +1112,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 }
                 ui::tooltip_for_item("Effect timing", kHostEffectTimingNote);
                 // Frame generation: the same setting as the Graphics page's,
-                // changed and saved at once. AMD's FidelityFX, Windows' alone:
+                // changed and saved at once. AMD's frame generation, Windows' alone:
                 // no row elsewhere (host/options.cpp keeps it off there).
 #if defined(_WIN32)
                 {

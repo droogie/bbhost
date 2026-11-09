@@ -357,7 +357,7 @@ if(Vulkan_FOUND)
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/gxvk_homes_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/vertex_snap.cpp src/host/vertex_cutaway.cpp src/host/pixel_cutaway.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/upscaler.cpp src/host/upscale_pass.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/gxvk_homes_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/vertex_snap.cpp src/host/vertex_cutaway.cpp src/host/pixel_cutaway.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/upscaler.cpp src/host/upscaler_ffx.cpp src/host/upscale_pass.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/copy_census.cpp src/host/copy_compare.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
@@ -776,8 +776,8 @@ if(UNIX)
     add_executable(ngx_bridge_test tests/ngx_bridge_test.cpp src/ngx_bridge/bridge_core.cpp)
     target_include_directories(ngx_bridge_test PRIVATE src third_party/upscaler_bridge)
     target_link_libraries(ngx_bridge_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
-    add_executable(upscaler_load_test tests/upscaler_load_test.cpp src/host/upscaler.cpp)
-    target_include_directories(upscaler_load_test PRIVATE src third_party/upscaler_bridge ${CMAKE_BINARY_DIR}/gen)
+    add_executable(upscaler_load_test tests/upscaler_load_test.cpp src/host/upscaler.cpp src/host/upscaler_ffx.cpp)
+    target_include_directories(upscaler_load_test PRIVATE src third_party/upscaler_bridge third_party/fidelityfx ${CMAKE_BINARY_DIR}/gen)
     target_link_libraries(upscaler_load_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     add_dependencies(upscaler_load_test bbhost_version)
     add_test(NAME upscaler_load_none COMMAND upscaler_load_test none)
@@ -792,6 +792,16 @@ if(UNIX)
       add_test(NAME upscaler_load_order COMMAND upscaler_load_test order $<TARGET_FILE:bbhost_ngx_bridge>)
     else()
       add_test(NAME ngx_bridge_test COMMAND ngx_bridge_test)
+    endif()
+    # host/upscaler.cpp's FSR on Linux: bbhost's FidelityFX library beside
+    # bbhost, alone and with the NGX bridge, and on a device it cannot run on.
+    if(TARGET bbhost_fidelityfx_vk)
+      add_dependencies(upscaler_load_test bbhost_fidelityfx_vk)
+      add_test(NAME upscaler_load_fsr COMMAND upscaler_load_test fsr $<TARGET_FILE:bbhost_fidelityfx_vk>)
+      add_test(NAME upscaler_load_fsr_noquad COMMAND upscaler_load_test fsr-noquad $<TARGET_FILE:bbhost_fidelityfx_vk>)
+      if(TARGET bbhost_ngx_bridge)
+        add_test(NAME upscaler_load_fsr_bridge COMMAND upscaler_load_test fsr $<TARGET_FILE:bbhost_fidelityfx_vk> $<TARGET_FILE:bbhost_ngx_bridge>)
+      endif()
     endif()
     # bbhost's FidelityFX library (src/ffx_vk) on a real device - lavapipe in
     # the tests: FSR 3 upscales a jittered synthetic picture, accumulated and
