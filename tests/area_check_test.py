@@ -259,6 +259,20 @@ class TourTest(unittest.TestCase):
         self.assertEqual(len([l for l in lines if l.startswith("dump rom-water-arena-")]), 5)
         self.assertNotIn("pitch", ac.tour(ac.pick_areas("chalice-aynbgu4m"), dict(ac.DEFAULTS), "perf"))
 
+    def test_sewer_places(self):
+        """The sewers under Central Yharnam: four standpoints outside the 12,
+        each Central Yharnam's lamp travel and then a warp onto the sewer's
+        floor."""
+        for ident in ("sewer-tunnel", "sewer-rats", "sewer-pit", "sewer-west"):
+            a = ac.AREA_BY_ID[ident]
+            self.assertNotIn(a, ac.AREAS)  # 'all' leaves them out
+            self.assertEqual((a.block, a.return_point), ("m24_01_00_00", 2412951))
+            self.assertIsNotNone(a.as_dict()["stand"])
+        lines = ac.tour(ac.pick_areas("sewer-pit"), dict(ac.DEFAULTS), "perf").splitlines()
+        t = lines.index("travel 2412951 18010000 sewer-pit")
+        self.assertEqual(lines[t + 1], "warp sewer-pit:view -182.000 -74.500 -76.000 -2.1066 1.0")
+        self.assertIn("mark sewer-pit:measure", lines)
+
     def test_capture_tour_and_settings(self):
         areas = ac.pick_areas("hunters-nightmare")
         opts = dict(ac.DEFAULTS, pipeline_cache=True, env=[])

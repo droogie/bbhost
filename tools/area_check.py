@@ -277,6 +277,19 @@ EXTRA_AREAS = (
          looks=(("arena", -508.0, -270.5, 378.0, 58.5, {"dumps": 5, "gap": 2.5}),
                 ("cliff", -508.0, -270.5, 378.0, -105.0),
                 ("feet", -508.0, -270.5, 378.0, 58.5, {"pitch": 0.9, "dumps": 5, "gap": 2.5, "f12": True}))),
+    # The sewers under Central Yharnam (m24_01_00_00's MSB names their pieces 下水トンネル, the pillared tunnel, and
+    # 下水道壁, the sewer's wooden walls; they are in that block alone): four standpoints from Central Yharnam's lamp, each
+    # a warp onto a floor the MSB stands its rats on, facing along the passage. The rats' pit is the heaviest of the four
+    # to draw (~1,030 draws a flip, against 810-870 and 585) and the one the frame-rate checks take; in the tunnel the
+    # player drifts 4-5 m beside the giant pig's body, so a measurement there wanders.
+    Area("sewer-tunnel", "Central Yharnam sewers: the pillared tunnel, facing south-west", "m24_01_00_00", 2412951,
+         stand=(-96.0, -77.6, -5.3, 45.0)),
+    Area("sewer-rats", "Central Yharnam sewers: the passage past the tunnel's end, facing the pit", "m24_01_00_00", 2412951,
+         stand=(-131.0, -77.6, -46.0, 59.3)),
+    Area("sewer-pit", "Central Yharnam sewers: the rats' pit, facing back up the passage", "m24_01_00_00", 2412951,
+         stand=(-182.0, -74.5, -76.0, -120.7)),
+    Area("sewer-west", "Central Yharnam sewers: the upper west passage, facing east", "m24_01_00_00", 2412951,
+         stand=(-230.0, -59.8, -35.0, -64.5)),
 )
 AREA_BY_ID = {a.id: a for a in AREAS + EXTRA_AREAS}
 
