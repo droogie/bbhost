@@ -3,9 +3,10 @@
 # counterpart of tools/win_package.sh: the binary without its DWARF, the patch
 # manifests it applies (patches/, looked for next to the binary), the plugin
 # header, the example config, DXC's release library for the HLSL shader path
-# with its licences (tools/fetch_dxc.sh), DLSS - the NGX bridge built beside the
-# binary and NVIDIA's DLSS runtime (tools/fetch_ngx.sh), each with its licence -
-# a README with what the machine must
+# with its licences (tools/fetch_dxc.sh), FSR 3 - bbhost's FidelityFX library
+# built beside the binary, with AMD's licence - and DLSS - the NGX bridge built
+# beside the binary and NVIDIA's DLSS runtime (tools/fetch_ngx.sh), each with
+# its licence - a README with what the machine must
 # have, a launcher that keeps a log file, and the empty data/, logs/ and
 # build/ (frame dumps) the run writes into: the release's Linux bundle. Nothing in it picks
 # a server: bbhost's defaults are the live server's (https://thehuntersdream.com).
@@ -52,6 +53,23 @@ dxc_tag=$(cat third_party/dxc/VERSION)
 # out of one that has it. tools/check_release_bundle.sh fails a release without
 # them, and tools/package_steamdeck.sh takes them out of the Steam Deck's kit
 # (an AMD GPU).
+# FSR 3 on any GPU: bbhost's build of AMD's FidelityFX library (src/ffx_vk:
+# AMD's MIT source, tools/fetch_fidelityfx.sh), which bbhost loads from beside
+# itself (host/upscaler_ffx.cpp), without its DWARF, with AMD's licence and
+# bbhost's for its own files (MIT) - never bbhost's GPL. A build without it
+# (BBHOST_FFX=OFF, or AMD's source not fetched) packs none; BBHOST_PACKAGE_FSR=0
+# leaves it out of one that has it. tools/check_release_bundle.sh fails a
+# release without it; the Steam Deck kit keeps it.
+ffx=$(dirname "$bin")/libbbhost_fidelityfx_vk.so
+fsr=0
+if [ "${BBHOST_PACKAGE_FSR:-1}" != 0 ] && [ -f "$ffx" ]; then
+    objcopy --strip-debug "$ffx" "$dir/libbbhost_fidelityfx_vk.so" 2>/dev/null || llvm-objcopy --strip-debug "$ffx" "$dir/libbbhost_fidelityfx_vk.so"
+    mkdir -p "$dir/licenses/fidelityfx"
+    cp third_party/fidelityfx/LICENSE-signedbin.md "$dir/licenses/fidelityfx/LICENSE.md"
+    cp src/ffx_vk/LICENSE "$dir/licenses/fidelityfx/LICENSE-bbhost.txt"
+    fsr=1
+fi
+ffx_tag=$(tools/fetch_fidelityfx.sh --tag)
 bridge=$(dirname "$bin")/libbbhost_ngx_bridge.so
 dlss=0
 if [ "${BBHOST_PACKAGE_DLSS:-1}" != 0 ] && [ -f "$bridge" ]; then
@@ -101,15 +119,32 @@ exit "${PIPESTATUS[0]}"
 EOF
 chmod +x "$dir/run-bbhost.sh"
 
-# The README's Upscaling section, where the package has DLSS.
-dlss_text=
-if [ "$dlss" = 1 ]; then
-    dlss_text="Upscaling
-  Graphics > Upscaling offers TAA, bbhost's own (any GPU), and on an NVIDIA
-  RTX card with NVIDIA's own driver, a recent one, DLSS: its quality from
-  Performance to DLAA, and its model (K, J, L or M). DLSS runs through these
-  files beside bbhost, each under its own licence; bbhost's licence permits
-  combining bbhost with them (LICENSE-EXCEPTION):
+# The README's Upscaling section, where the package has FSR 3 or DLSS. The
+# DLSS part runs from its "  DLSS, " line to the blank line after it, which
+# tools/package_steamdeck.sh takes out with DLSS's files.
+upscale_text=
+if [ "$fsr" = 1 ] || [ "$dlss" = 1 ]; then
+    upscale_text="Upscaling
+  Graphics > Upscaling offers TAA, bbhost's own temporal anti-aliasing, on any
+  GPU, and these, each through files beside bbhost under its own licence;
+  bbhost's licence permits combining bbhost with them (LICENSE-EXCEPTION).
+
+"
+    if [ "$fsr" = 1 ]; then
+        upscale_text="${upscale_text}  FSR 3, AMD's, on any GPU: its quality from Performance to Native AA, the
+  same FSR 3.1.6 as on Windows.
+    - libbbhost_fidelityfx_vk.so: AMD FidelityFX's API, its Vulkan backend
+      and FSR 3, built by bbhost from AMD's FidelityFX SDK $ffx_tag source
+      (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK), MIT,
+      Copyright (C) Advanced Micro Devices, Inc., with bbhost's portability
+      files (MIT); licences in licenses/fidelityfx. bbhost is not sponsored
+      or endorsed by AMD.
+
+"
+    fi
+    if [ "$dlss" = 1 ]; then
+        upscale_text="${upscale_text}  DLSS, on an NVIDIA RTX card with NVIDIA's own driver, a recent one: its
+  quality from Performance to DLAA, and its model (K, J, L or M).
     - $dlss_runtime:
       NVIDIA DLSS, Copyright (C) NVIDIA Corporation, from the DLSS SDK
       (https://github.com/NVIDIA/DLSS), unmodified, for NVIDIA RTX graphics
@@ -119,8 +154,11 @@ if [ "$dlss" = 1 ]; then
       licenses/ngx_bridge), which bbhost calls DLSS through; it contains
       NVIDIA's NGX SDK library, under NVIDIA's licence too. It implements the
       Upscaler Bridge API by Numity1504 (MIT, licenses/upscaler_bridge).
-  On another GPU DLSS is not offered, and the log says why. FSR 3, FSR 4 and
-  frame generation run on Windows only.
+
+"
+    fi
+    upscale_text="${upscale_text}  Where one cannot run it is not offered, and the log's upscaler: lines say
+  why. FSR 4 and frame generation run on Windows only.
 
 "
 fi
@@ -171,7 +209,7 @@ window's Shaders tab compiles them all at once (Compile shaders now), and its
 Shaders setting picks Lifted to keep the translator's own. Without it that
 path keeps every shader as it was; nothing else uses it.
 
-${dlss_text}Setup
+${upscale_text}Setup
   Untar this folder somewhere of its own, for example ~/Games/bbhost, and run
   ./run-bbhost.sh from a terminal there. The first time, the setup window
   opens: pick the game folder and the decrypted eboot with the Browse buttons
@@ -268,6 +306,7 @@ cp -r "$dir" "$stage/"
 find "$stage" -type d -exec chmod 755 {} + && find "$stage" -type f -exec chmod 644 {} +
 chmod 755 "$stage/$name/bbhost" "$stage/$name/run-bbhost.sh"
 [ "$dlss" = 0 ] || chmod 755 "$stage/$name/libbbhost_ngx_bridge.so" "$stage/$name/$dlss_runtime"
+[ "$fsr" = 0 ] || chmod 755 "$stage/$name/libbbhost_fidelityfx_vk.so"
 rm -f "$out/$name.tar.gz"
 tar czf "$out/$name.tar.gz" -C "$stage" --owner=0 --group=0 "$name"
 echo "package: $out/$name.tar.gz ($(( $(stat -c %s "$out/$name.tar.gz") / 1048576 )) MB); symbols: $out/$name.debug"
