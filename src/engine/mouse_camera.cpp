@@ -199,6 +199,8 @@ bool redirect(ElfImage* image, std::uint64_t va, std::size_t n, const void* dest
 
 float mouse_camera_degrees_per_count(float sensitivity) { return mouse_camera::degrees_per_count(sensitivity); }
 
+int mouse_camera_setting_from_ds3(int setting) { return mouse_camera::setting_from_ds3(setting); }
+
 bool mouse_camera_installed() { return g_mode != Mode::None; }
 
 void mouse_camera_install(ElfImage* image) {
@@ -207,8 +209,8 @@ void mouse_camera_install(ElfImage* image) {
     const int placed = decomp_placed("NS_SPRJ::ChrExFollowCam::Update");
     if (placed == 1) {
         g_mode = Mode::Ours;
-        host_log("mouse camera: as Dark Souls III turns it - %.3f degrees a count at sensitivity 5, after the stick and "
-                 "only without it; a flick switches the lock-on target - in our follow camera",
+        host_log("mouse camera: by an angle a count, as Dark Souls III turns it - %.3f degrees at sensitivity 5, after the "
+                 "stick and only without it; a flick switches the lock-on target - in our follow camera",
                  mouse_camera_degrees_per_count(5));
         return;
     }
@@ -255,8 +257,8 @@ void mouse_camera_install(ElfImage* image) {
     }
     if (g_hold_fixed) host_log("mouse camera: a patch holds the camera's auto-rotation already, with any device");
     g_mode = placed == 2 ? Mode::Compare : Mode::Hooks;
-    host_log("mouse camera: as Dark Souls III turns it - %.3f degrees a count at sensitivity 5, after the stick and only "
-             "without it; a flick switches the lock-on target - by hooks on the game's follow camera%s",
+    host_log("mouse camera: by an angle a count, as Dark Souls III turns it - %.3f degrees at sensitivity 5, after the "
+             "stick and only without it; a flick switches the lock-on target - by hooks on the game's follow camera%s",
              mouse_camera_degrees_per_count(5), placed == 2 ? " (beside ours, compared)" : "");
 }
 

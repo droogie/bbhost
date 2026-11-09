@@ -140,7 +140,7 @@
 117077	10320x1440 (43:6, three 21:9 screens)
 118000	Mouse Camera	The mouse turns the camera outside menus.
 118004	Field of View	How wide the camera sees. 0 is the game's own; each step widens it 5%.
-118001	Camera Sensitivity	How fast the mouse turns the camera.
+118001	Mouse Sensitivity	How far the mouse turns the camera. Each step turns it about half again as far.
 118002	Mouse X-Axis	The mouse's horizontal camera direction.
 118003	Mouse Y-Axis	The mouse's vertical camera direction.
 118020	PC Controls

@@ -168,13 +168,18 @@ back in. The message, Yes/No and quantity boxes take OK as soon as they are up
 its fade-out. `BBHOST_MENU_FADE_WAIT=1` keeps the game's waits.
 
 The mouse turns the camera the way Dark Souls III's PC version does: by an
-angle for each count the mouse reports, 0.25 degrees at the default
-sensitivity of 5 (0.1 at 0, 0.4 at 10), with no acceleration, no dead zone
-and no top speed, at any frame rate. The right stick turns it as on the
+angle for each count the mouse reports, with no acceleration, no dead zone
+and no top speed, at any frame rate. Mouse sensitivity sets the angle, from
+0.005 degrees a count at 0 to 0.4 at 100, each step about 4.5% further than
+the one below; the default, 50, is 0.045, which suits most mice at 800 to
+1600 DPI. (Dark Souls III's own scale ran from 0.1 to 0.4, too fast for most
+mice at its slowest; a setting saved before v0.2.28 keeps the angle it had,
+unless it was the old default.) The right stick turns it as on the
 console, and while the stick is moving the mouse waits. With a target locked
-on, a quick flick of the mouse switches targets. Mouse sensitivity and
-inverting either axis are on the game's PC Controls page; the game's own
-Camera settings are the stick's.
+on, a quick flick of the mouse switches targets. Mouse Sensitivity and
+inverting either axis are on the game's System > PC Controls page, and
+with the other input settings in F10 and the setup window; the game's own
+Camera Sensitivity, under Controls, is the stick's.
 
 With the mouse, the camera also stays where you put it: it does not turn by
 itself as the character moves - following the character round, or turning

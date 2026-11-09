@@ -50,7 +50,7 @@ struct HostSettings {
     // Controls
     bool mouse_menu = true;     // the pointer drives the menus through the pad
     bool mouse_camera = true;   // the mouse turns the camera outside menus
-    float mouse_sens = 5.0f;    // 0..10 in tenths, DS3's: 0.2 * (s * 0.15 + 0.5) degrees a count (engine/mouse_camera.h)
+    float mouse_sens = 5.0f;    // 0..10 in tenths: 0.005 to 0.4 degrees a count (engine/mouse_camera_step.h)
     bool mouse_invert_x = false, mouse_invert_y = false;
     // While the mouse turns the camera (the keyboard and mouse used last): off
     // holds the camera's own turns as the character moves (engine/mouse_camera.h).

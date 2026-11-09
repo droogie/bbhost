@@ -13,6 +13,7 @@
 #include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
 #include "engine/live_resolution.h"
+#include "engine/mouse_camera.h"
 #include "engine/patch_manifest.h"
 #include "hle/modules.h"
 #include "hle/np.h"
@@ -300,11 +301,13 @@ Setting g_set[kSettingCount] = {
     // does and what a PC player expects. Off hands the camera back to the pad.
     {"mouse_camera", "Mouse camera", {"Off", "On"}, 1,
      "The mouse turns the camera outside menus. Off leaves it to the pad.", false},
-    // 0..10, the range of the game's own Camera Sensitivity slider, which is
-    // the widget the PC Controls screen draws it with, and DS3's: the same
-    // angle a count at each step (engine/mouse_camera.h), 5 its default.
+    // 0-100: the 0..10 of the game's own Camera Sensitivity slider, the widget
+    // the PC Controls screen draws it with, in tenths - an angle a count from
+    // 0.005 to 0.4 degrees, each step about 4.5% further, 50 (0.045) its
+    // default (engine/mouse_camera_step.h).
     {"mouse_sens", "Mouse sensitivity", hundred(), 50,
-     "How far a given mouse movement turns the camera.", false},
+     "How far a mouse movement turns the camera, each step about 4.5% further than the one below. 50 suits most mice at "
+     "800 to 1600 DPI.", false},
     {"mouse_invert_x", "Reverse mouse X-axis", {"Off", "On"}, 0,
      "Reverses the mouse's horizontal camera movement.", false},
     {"mouse_invert_y", "Reverse mouse Y-axis", {"Off", "On"}, 0,
@@ -1382,8 +1385,9 @@ void apply(int id) {
 // the wheel and the middle button); an older file's Transform on the middle
 // button, its default until then, gives it to Camera Zoom Reset. 7: Window
 // mode's Borderless and an exclusive Fullscreen; an older file's Fullscreen
-// was the borderless one.
-constexpr int kOptionsVersion = 7;
+// was the borderless one. 8: Mouse sensitivity from 0.005 to 0.4 degrees a
+// count; an older file saved Dark Souls III's scale, 0.1 to 0.4.
+constexpr int kOptionsVersion = 8;
 
 void save() {
     if (!g_dirty) {
@@ -1474,8 +1478,8 @@ void rebuild_settings() {
     }
     h.mouse_menu = on_of(kMouseMenu);
     h.mouse_camera = on_of(kMouseCamera);
-    // DS3's mouse sensitivity (engine/mouse_camera.h): its 0..10 and its
-    // default, a tenth a step (0-100).
+    // Mouse sensitivity's 0..10 (engine/mouse_camera_step.h), a tenth a step
+    // (0-100).
     h.mouse_sens = index_of(kMouseSens) < 0 ? 5.0f : static_cast<float>(index_of(kMouseSens)) / 10.0f;
     h.mouse_invert_x = on_of(kMouseInvertX);
     h.mouse_invert_y = on_of(kMouseInvertY);
@@ -1770,6 +1774,19 @@ void host_options_load() {
             for (const int id : {kBloom, kSaturation, kFog, kAoStrength, kCameraDistance, kCameraHeight, kMouseSens}) {
                 if (g_saved[static_cast<std::size_t>(id)]) g_set[id].index = std::min(g_set[id].index, 10) * 10;
             }
+        }
+        // Before version 8 Mouse sensitivity was Dark Souls III's scale, 0.1 to
+        // 0.4 degrees a count: a value the player set turns as far as before on
+        // today's 0.005 to 0.4, and the old default (50) is today's - DS3's
+        // slowest was faster than most mice want (engine/mouse_camera_step.h).
+        if (file_version < 8 && g_saved[static_cast<std::size_t>(kMouseSens)]) {
+            const int was = g_set[kMouseSens].index;
+            if (was != 50) {
+                g_set[kMouseSens].index = mouse_camera_setting_from_ds3(was);
+                host_log("options: Mouse sensitivity %d on the old scale reads as %d, the same turn for a count", was,
+                         g_set[kMouseSens].index);
+            }
+            g_dirty = true;
         }
         // Before version 7 Window mode's Fullscreen was borderless: it is
         // Borderless now, and Fullscreen the exclusive mode.
