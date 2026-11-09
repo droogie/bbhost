@@ -31,6 +31,7 @@
 #include "host/gxvk_homes.h"
 #include "host/gxvk_lists.h"
 #include "host/options.h"
+#include "host/render_hooks.h"
 #include "host/upscaler.h"
 
 #include "gcn/container.h"
@@ -8371,11 +8372,19 @@ bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool 
     return true;
 }
 
+// An image or view a plugin's render hook was handed: the hooks' next one of
+// its place is a new generation (host/render_hooks.h), even if the driver
+// makes the next under the same handle.
+static void render_hooks_note_gone(const void* handle) {
+    if (handle && render_hooks_on()) render_hooks_gone_locked(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle)));
+}
+
 void defer_destroy_image(VkImage image, const ImageMemory& m) {
     if (m.block < 0) {
         defer_destroy_image(image, m.memory);
         return;
     }
+    render_hooks_note_gone(image);
     bump_view_epoch();
     if (image) g.slots[g.slot].dead_images.push_back(image);
     g.slots[g.slot].dead_ranges.push_back(m);
@@ -9032,12 +9041,14 @@ void start_memory_reserve() {
 }
 
 void defer_destroy_image(VkImage image, VkDeviceMemory memory) {
+    render_hooks_note_gone(image);
     bump_view_epoch();
     if (image) g.slots[g.slot].dead_images.push_back(image);
     if (memory) g.slots[g.slot].dead_memory.push_back(memory);
 }
 
 void defer_destroy_view(VkImageView view) {
+    render_hooks_note_gone(view);
     bump_view_epoch();
     if (!view) return;
     set_cache_forget_view_locked(view);
@@ -9052,6 +9063,7 @@ void defer_destroy_view(VkImageView view) {
 // view memos every frame: on a Steam Deck building views was 9.5% of the
 // command processor, the words memo hit 47%.
 void defer_destroy_private_view(VkImageView view) {
+    render_hooks_note_gone(view);
     if (view) g.slots[g.slot].dead_views.push_back(view);
 }
 

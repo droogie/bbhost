@@ -215,7 +215,7 @@ typedef struct BbCutaway {
 } BbCutaway;
 
 /* Version 27: the frame as bbhost draws it, for effects of a plugin's own
- * (frame_info).
+ * recorded into it (frame_info, on_render).
  *
  * The conventions. A matrix is 16 floats in column-major order (m[column * 4
  * + row]: GLSL's mat4 and GLM's layout, HLSL's column_major) applied to
@@ -260,15 +260,15 @@ typedef struct BbFrameCamera {
 #define BB_QUALITY_BALANCED 2u    /* about 59% */
 #define BB_QUALITY_PERFORMANCE 3u /* half */
 
-/* What a 3D frame is (frame_info). Size first: a newer host appends fields
- * after `prev`. */
+/* What a 3D frame is (frame_info, BbRenderCall.frame). Size first: a newer
+ * host appends fields after `prev`. */
 typedef struct BbFrameInfo {
     uint32_t size;            /* the bytes filled */
     uint32_t flags;           /* BB_FRAME_* */
     uint64_t frame;           /* 1 for the first 3D frame described, one more for each after it (a frame without the
                                  3D - a loading screen - is none) */
     uint64_t flip;            /* the host's flips so far as it was recorded: its log's flip numbers */
-    uint32_t render_width, render_height;  /* the 3D's size */
+    uint32_t render_width, render_height;  /* the 3D's: the scene's, the depth's, the motion's and the glow's size */
     uint32_t output_width, output_height;  /* the picture's: the upscaler's output, the 3D's size without one */
     uint32_t method;          /* BB_UPSCALE_*: what takes the 3D to the picture this frame */
     uint32_t quality;         /* BB_QUALITY_*, as the upscaler is told it (the sizes are exact) */
@@ -281,6 +281,69 @@ typedef struct BbFrameInfo {
     BbFrameCamera now;        /* this frame's camera */
     BbFrameCamera prev;       /* the last frame's */
 } BbFrameInfo;
+
+/* on_render's points, and what a hook may ask for. */
+#define BB_RENDER_BEFORE_UPSCALE 1u /* the 3D drawn - lit, its transparency on it - before the upscaler, TAA, the
+                                       embers, the sharpening and frame generation read it; with none running too */
+#define BB_RENDER_AFTER_UPSCALE 2u  /* the final picture, after all of them, before the post-processing copies it */
+#define BB_RENDER_MOTION 0x100u     /* or-ed in: the frame's motion made for the hooks (BbRenderCall.motion) whether
+                                       or not an upscaler or frame generation runs */
+
+#define BB_IMAGE_WRITE 1u  /* BbRenderImage.flags: the hook may write it */
+
+/* An image of the frame as Vulkan has it (cast to the Vulkan types). */
+typedef struct BbRenderImage {
+    uint64_t image;       /* VkImage; 0: not in this call */
+    uint64_t view;        /* VkImageView: 2D, its one level and layer, its format (a depth image's depth aspect) */
+    uint64_t generation;  /* a new number whenever the host makes the image or its view again (a Resolution change):
+                             while it stays the same, the handles are the same image and view in every call */
+    uint32_t format;      /* VkFormat */
+    uint32_t layout;      /* VkImageLayout it is in - and must be in again when the hook returns */
+    uint32_t usage;       /* VkImageUsageFlags it was made with: what the hook can do with it */
+    uint32_t width, height;
+    uint32_t flags;       /* BB_IMAGE_* */
+} BbRenderImage;
+
+typedef void (*BbVkVoidFunction)(void);
+
+/* The Vulkan device bbhost draws with: one for the run. */
+typedef struct BbRenderDevice {
+    uint32_t size;              /* sizeof(BbRenderDevice) as the host fills it */
+    uint32_t api_version;       /* the Vulkan version it is used at (1.3), with synchronization2, buffer device
+                                   address and storage images read and written without a format */
+    void* instance;             /* VkInstance */
+    void* physical_device;      /* VkPhysicalDevice */
+    void* device;               /* VkDevice */
+    BbVkVoidFunction (*get_instance_proc_addr)(void* instance, const char* name); /* vkGetInstanceProcAddr */
+    BbVkVoidFunction (*get_device_proc_addr)(void* device, const char* name);     /* vkGetDeviceProcAddr */
+    uint32_t queue_family;      /* the family of the queue the frames go to: graphics, compute and transfer */
+    uint32_t frames_in_flight;  /* what a hook records may still be read by the GPU this many frames later: a
+                                   resource its commands used is destroyed (or written again) no sooner */
+} BbRenderDevice;
+
+/* One call of a render hook. Size first: a newer host appends fields after
+ * `picture`. */
+typedef struct BbRenderCall {
+    uint32_t size;                 /* sizeof(BbRenderCall) as the host fills it */
+    uint32_t point;                /* BB_RENDER_BEFORE_UPSCALE or BB_RENDER_AFTER_UPSCALE */
+    void* command_buffer;          /* VkCommandBuffer: the frame's, recording, outside any render pass (this call only) */
+    const BbFrameInfo* frame;      /* this frame's (this call only) */
+    const BbRenderDevice* device;  /* the run's (valid for the whole run) */
+    BbRenderImage scene;           /* the lit 3D at the render size in linear light, before the post-processing:
+                                      RGBA16F, or B10G11R11 with the Performance patch. Written before the upscale
+                                      (BB_IMAGE_WRITE), read after it. A render target: sampled and transfer, never
+                                      storage - a hook copies or blits its result in */
+    BbRenderImage depth;           /* the G-buffer's depth at the render size, jittered as the scene (read) */
+    BbRenderImage motion;          /* with BB_RENDER_MOTION: R16G16_SFLOAT at the render size, the render pixels from
+                                      each pixel to where its surface was in the last frame, x right, y down, without
+                                      the jitter (read) */
+    BbRenderImage glow;            /* the scene's second target - the effects' glow, which the bloom reads - at the
+                                      render size, when the frame has one (read) */
+    BbRenderImage picture;         /* after the upscale: the final picture at the output size - what the
+                                      post-processing reads (written); the scene itself when no upscaler runs; 0
+                                      before the upscale */
+} BbRenderCall;
+typedef void (*BbRenderFn)(const BbRenderCall* call, void* user);
 
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
@@ -706,13 +769,35 @@ typedef struct BbHostApi {
      * the game's camera no longer zooms. Any thread. 0 on success. */
     int (*camera_zoom)(int* steps, int* reset);
 
-    /* Version 27: the frame as it is drawn (the conventions above
-     * BbFrameCamera). */
-    /* The last 3D frame described, into *out: set out->size to sizeof(*out)
-     * first; the host fills as much as both know and sets out->size to that.
-     * From the first call on the host describes every 3D frame. Any thread.
-     * 0 on success; 1 before a frame is described, or for a size under 8. */
+    /* Version 27: the frame as it is drawn, and plugins' compute work in it
+     * (the conventions above BbFrameCamera). */
+    /* The 3D frame being recorded (inside a hook), else the last one
+     * described, into *out: set out->size to sizeof(*out) first; the host
+     * fills as much as both know and sets out->size to that. From the first
+     * call on (or the first on_render) the host describes every 3D frame.
+     * Any thread. 0 on success; 1 before a frame is described, or for a size
+     * under 8. */
     int (*frame_info)(BbFrameInfo* out);
+    /* fn(call, user) at each of `points` (BB_RENDER_BEFORE_UPSCALE,
+     * BB_RENDER_AFTER_UPSCALE, or-ed; | BB_RENDER_MOTION for the motion) of
+     * every 3D frame, on the thread that records the frame - not the game's
+     * main thread - with the renderer's lock held: the command buffer is
+     * outside any render pass, every image in `call` is in the layout it
+     * gives, and what the frame wrote to them is visible to compute and
+     * transfer. fn records compute and transfer work only - dispatches,
+     * copies, blits, clears and the barriers between its own steps: no render
+     * pass, draw, graphics pipeline or dynamic state - and leaves each image
+     * in its layout. It never submits, ends the command buffer or waits for
+     * the GPU (no queue, fence, semaphore or query-wait calls), and calls
+     * nothing of the host's but log, frame_info and on_render. The host makes
+     * what fn wrote visible to what follows and binds its own state again
+     * after it. A later call with the same fn and user replaces its points;
+     * no points take it away. `name` is the plugin's BbPluginInfo name: its
+     * hooks are not called while it is off (BB_PLUGIN_LIVE_SWITCH), and go if
+     * it is unloaded. Several hooks run in the order they were registered.
+     * From bb_plugin_init on, any thread. 0 on success; 1 for a bad
+     * argument. */
+    int (*on_render)(const char* name, uint32_t points, BbRenderFn fn, void* user);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

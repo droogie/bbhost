@@ -5,6 +5,7 @@
 
 #include "host/bindings.h"
 #include "host/overlay.h"
+#include "host/render_hooks.h"
 #include "host/scene_look.h"
 #include "host/upscaler.h"
 #include "host/window.h"
@@ -2674,9 +2675,10 @@ bool host_opt_upscaler_chosen() {
     return env >= 0 ? env != 0 : u != 0;
 }
 
-// (TAA wants the motion too, though it is no upscaler that sizes the 3D.)
+// (TAA wants the motion too, though it is no upscaler that sizes the 3D, and
+// so does a plugin's render hook that asks for it: host/render_hooks.h.)
 bool host_opt_motion_wanted() {
-    return host_opt_upscaler_chosen() || upscaler_method() == kUpscaleTaa || host_settings_ref().frame_generation;
+    return host_opt_upscaler_chosen() || upscaler_method() == kUpscaleTaa || host_settings_ref().frame_generation || render_hooks_want_motion();
 }
 
 int host_opt_motion_rebuilt_bits() {

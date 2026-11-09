@@ -2,7 +2,8 @@
 
 // Plugin API 27's rules as plain functions (include/bbhost_plugin.h frame_info,
 // on_render, aa_claim): no Vulkan and no state of their own. A frame's cameras
-// from the view block's terms, the frame's reset and its cut test.
+// from the view block's terms, the frame's reset and its cut test, and the
+// generations of the images the render hooks are handed.
 // host/render_hooks.cpp uses them; tests/render_api_test.cpp checks them.
 
 #include "bbhost_plugin.h"
@@ -177,6 +178,40 @@ struct FrameShape {
 // more than a quarter of a second since the last frame.
 inline bool frame_reset(bool first, const FrameShape& last, const FrameShape& now, bool camera, bool prev, bool cut, double seconds) {
     return first || !(last == now) || !camera || !prev || cut || seconds > 0.25;
+}
+
+// One of the images the render hooks are handed (BbRenderImage), as it was
+// handed last: its handles and shape, its generation, and whether the host
+// let go of the image or its view since (render_hooks_gone).
+struct ImageSlot {
+    std::uint64_t image = 0, view = 0, generation = 0;
+    std::uint32_t format = 0, width = 0, height = 0;
+    bool gone = false;
+};
+
+// The generation of the image handed in `s` now: a new one from `serial` (one
+// counter for every slot, so none repeats) when anything of it differs from
+// the last time or the host let go of what it had - a driver can make a new
+// image under a handle it has freed - else the same. 0 for no image.
+inline std::uint64_t image_generation(ImageSlot& s, std::uint64_t image, std::uint64_t view, std::uint32_t format, std::uint32_t width,
+                                      std::uint32_t height, std::uint64_t& serial) {
+    if (!image) return 0;
+    if (s.gone || image != s.image || view != s.view || format != s.format || width != s.width || height != s.height || !s.generation) {
+        s.image = image;
+        s.view = view;
+        s.format = format;
+        s.width = width;
+        s.height = height;
+        s.generation = ++serial;
+        s.gone = false;
+    }
+    return s.generation;
+}
+
+// The host lets go of an image or a view (its deferred destruction): a slot
+// that handed it out gives the next one a new generation.
+inline void image_gone(ImageSlot& s, std::uint64_t handle) {
+    if (handle && (handle == s.image || handle == s.view)) s.gone = true;
 }
 
 }  // namespace render_api

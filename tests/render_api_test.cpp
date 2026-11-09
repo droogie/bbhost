@@ -5,8 +5,8 @@
 // decode of a pixel (motion_at.glsl's, in C++ here): the basis and eye, the
 // view's inverse, a point's clip position, its depth and its pixel, the way
 // back from a pixel and its depth to the world, the jittered projection, and
-// a depth that runs the other way. Then the cut test's thresholds and the
-// reset's reasons.
+// a depth that runs the other way. Then the cut test's thresholds, the
+// reset's reasons, and the generations the render hooks hand out.
 #include "host/render_api.h"
 
 #include <cmath>
@@ -229,16 +229,48 @@ void test_reset() {
     CHECK(render_api::frame_reset(false, a, a, true, true, false, 0.26));      // a pause
 }
 
+// The images' generations: the same image keeps its number, anything of it
+// changed takes a new one, the host letting go of it takes a new one even
+// when the next image comes back under the same handle, and no number is
+// handed out twice across the slots.
+void test_generations() {
+    render_api::ImageSlot scene, depth;
+    std::uint64_t serial = 0;
+    CHECK(render_api::image_generation(scene, 0, 0, 97, 1920, 1080, serial) == 0);  // no image: none
+    const std::uint64_t g1 = render_api::image_generation(scene, 0x1000, 0x2000, 97, 1920, 1080, serial);
+    CHECK(g1 != 0);
+    CHECK(render_api::image_generation(scene, 0x1000, 0x2000, 97, 1920, 1080, serial) == g1);
+    const std::uint64_t d1 = render_api::image_generation(depth, 0x3000, 0x4000, 130, 1920, 1080, serial);
+    CHECK(d1 != g1);
+    const std::uint64_t g2 = render_api::image_generation(scene, 0x1000, 0x2000, 97, 2560, 1440, serial);  // a Resolution change
+    CHECK(g2 != g1 && g2 != d1);
+    const std::uint64_t g3 = render_api::image_generation(scene, 0x5000, 0x2000, 97, 2560, 1440, serial);  // another image
+    CHECK(g3 != g2);
+    const std::uint64_t g4 = render_api::image_generation(scene, 0x5000, 0x6000, 97, 2560, 1440, serial);  // another view
+    CHECK(g4 != g3);
+    const std::uint64_t g5 = render_api::image_generation(scene, 0x5000, 0x6000, 64, 2560, 1440, serial);  // another format
+    CHECK(g5 != g4);
+    render_api::image_gone(scene, 0x7777);  // someone else's
+    CHECK(render_api::image_generation(scene, 0x5000, 0x6000, 64, 2560, 1440, serial) == g5);
+    render_api::image_gone(scene, 0x5000);  // let go of: the same handle again is a new image
+    const std::uint64_t g6 = render_api::image_generation(scene, 0x5000, 0x6000, 64, 2560, 1440, serial);
+    CHECK(g6 != g5);
+    render_api::image_gone(scene, 0x6000);  // its view
+    CHECK(render_api::image_generation(scene, 0x5000, 0x6000, 64, 2560, 1440, serial) != g6);
+    CHECK(render_api::image_generation(depth, 0x3000, 0x4000, 130, 1920, 1080, serial) == d1);
+}
+
 }  // namespace
 
 int main() {
     test_camera();
     test_cut();
     test_reset();
+    test_generations();
     if (g_failures) {
         std::fprintf(stderr, "render_api_test: %d failures\n", g_failures);
         return 1;
     }
-    std::printf("render_api_test: the cameras, cuts and resets as plugin API 27 defines them\n");
+    std::printf("render_api_test: the cameras, cuts, resets and image generations as plugin API 27 defines them\n");
     return 0;
 }

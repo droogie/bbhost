@@ -32,6 +32,7 @@
 #include "hle/modules.h"
 #include "host/audio_crush.h"
 #include "host/bindings.h"
+#include "host/options.h"
 #include "host/ruleset.h"
 #include "host/pixel_cutaway.h"
 #include "host/render_hooks.h"
@@ -1273,8 +1274,28 @@ void api_scene_dither(std::uint32_t bits) {
     else host_log("plugin: the picture not dithered");
 }
 
-// Version 27: the frame as it is drawn (host/render_hooks.h).
+// A change the settings' listeners follow (the velocity map's patches, the
+// render size, the game's own anti-aliasing pass): the settings published
+// again, on the options' thread - nothing before the start, which reads them
+// itself.
+void republish_settings() {
+    if (g_early) return;
+    if (host_window_active())
+        host_options_post([] { host_opt_republish(); });
+    else
+        host_opt_republish();
+}
+
+// Version 27: the frame as it is drawn, and plugins' compute work in it
+// (host/render_hooks.h, host/upscale_pass.cpp).
 int api_frame_info(BbFrameInfo* out) { return render_frame_info(out); }
+
+int api_on_render(const char* name, std::uint32_t points, BbRenderFn fn, void* user) {
+    bool motion_changed = false;
+    if (render_hooks_add(name, points, fn, user, &motion_changed) != 0) return 1;
+    if (motion_changed) republish_settings();  // host_opt_motion_wanted follows
+    return 0;
+}
 
 // Version 21: old-hardware sound (host/audio_crush.h).
 void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
@@ -1311,6 +1332,7 @@ const BbHostApi g_api = {
     &api_scene_dither,
     &api_camera_zoom,
     &api_frame_info,
+    &api_on_render,
 };
 
 std::string read_file(const std::string& path) {
@@ -1480,10 +1502,13 @@ void plugins_load() {
             continue;
         }
 
+        // Its render hooks (plugin API 27) are not called while it is off.
+        if (p.visitor || p.dormant) render_hooks_plugin_on(p.name, false);
         if (p.init) {
             const int r = p.init(&g_api);
             if (r != 0) {
                 host_log("plugin: %s: init returned %d; unloaded", p.name.c_str(), r);
+                render_hooks_drop(p.name);  // what it registered goes with it
                 close_lib(h);
                 continue;
             }
@@ -1527,6 +1552,7 @@ void plugins_image(ElfImage* image) {
             const int r = p.image(&g_api);
             if (r != 0) {
                 host_log("plugin: %s: image phase returned %d; unloaded", p.name.c_str(), r);
+                render_hooks_drop(p.name);
                 close_lib(p.handle);
                 g_plugins.erase(g_plugins.begin() + static_cast<std::ptrdiff_t>(i));
                 continue;
@@ -1571,6 +1597,7 @@ void plugins_frame() {
                 if (p.name == r.name) p.dormant = !on;
             }
             host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
+            if (render_hooks_plugin_on(r.name, on)) republish_settings();
         } else {
             const std::string raw = toml_value(r.value);
             config_value_set(r.name + "." + r.key, raw);
