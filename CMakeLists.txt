@@ -94,6 +94,7 @@ add_executable(bbhost
   src/core/win_watch.cpp
   src/host/win_crash.cpp
   src/host/plugins.cpp
+  src/host/render_hooks.cpp
   src/host/scene_look.cpp
   src/core/tls_rewrite.cpp
   src/core/config.cpp
@@ -673,6 +674,16 @@ if(UNIX)
   target_include_directories(sdk_headers_test PRIVATE include)
   target_compile_features(sdk_headers_test PRIVATE cxx_std_17)
   add_test(NAME sdk_headers_test COMMAND sdk_headers_test)
+  # Plugin API 27 (host/render_api.h): a frame's cameras from the view block, its reset and cut test.
+  add_executable(render_api_test tests/render_api_test.cpp)
+  target_include_directories(render_api_test PRIVATE src include)
+  target_compile_features(render_api_test PRIVATE cxx_std_17)
+  add_test(NAME render_api_test COMMAND render_api_test)
+  # The plugin API's version 27 structures as C: their sizes and places, which plugins are built against.
+  add_executable(plugin_abi_test tests/plugin_abi_test.c)
+  target_include_directories(plugin_abi_test PRIVATE include)
+  set_target_properties(plugin_abi_test PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
+  add_test(NAME plugin_abi_test COMMAND plugin_abi_test)
   add_executable(libc_native_test tests/libc_native_test.cpp src/hle/sysv_va.cpp)
   target_include_directories(libc_native_test PRIVATE src)
   target_compile_features(libc_native_test PRIVATE cxx_std_17)

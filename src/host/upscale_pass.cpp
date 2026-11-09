@@ -71,6 +71,7 @@
 #include "host/shaders/upscale_embers.spv.h"
 #include "host/shaders/upscale_rcas.spv.h"
 #include "host/options.h"
+#include "host/render_hooks.h"
 #include "host/scene_look.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
@@ -1470,6 +1471,48 @@ int velo_previous_env() {
     return on;
 }
 
+// Plugin API 27 (host/render_hooks.h): what the call point did of its frame
+// for the plugins.
+struct HookFrame {
+    bool described = false;
+};
+
+// The frame described for the plugins: its sizes, what takes the 3D to the
+// picture, and its camera as the motion takes it (this frame's view block,
+// when a camera draw noted one).
+void describe_frame_locked(HookFrame& hf, std::uint32_t render_w, std::uint32_t render_h, std::uint32_t output_w, std::uint32_t output_h,
+                           std::uint32_t method, std::uint32_t quality, float jitter_x, float jitter_y) {
+    RenderFrameDesc d;
+    d.render_w = render_w;
+    d.render_h = render_h;
+    d.output_w = output_w;
+    d.output_h = output_h;
+    d.method = method;
+    d.quality = quality;
+    d.jitter_x = jitter_x;
+    d.jitter_y = jitter_y;
+    d.camera = g_cam_noted;
+    if (d.camera) {
+        d.tan_x = g_cam_now.tan_x;
+        d.tan_y = g_cam_now.tan_y;
+        d.a = g_cam_now.a;
+        d.r2w = g_cam_now.r2w;
+        std::memcpy(d.rows, g_cam_now.rows, sizeof(d.rows));
+    }
+    render_frame_describe_locked(d);
+    hf.described = true;
+}
+
+// A frame no upscaler takes (Upscaling off, or one the path below gave up on
+// before its motion): described as drawn, at the scene's size, its camera
+// taken - which the upscaler's motion then does not keep, as after a frame
+// with no camera.
+void frame_alone_locked(const RtImage& scene, HookFrame& hf) {
+    describe_frame_locked(hf, scene.width, scene.height, scene.width, scene.height, BB_UPSCALE_NONE, BB_QUALITY_NATIVE, 0.0f, 0.0f);
+    g_cam_noted = false;
+    g_cam_prev_ok = false;
+}
+
 }  // namespace
 
 bool upscale_motion_on() { return upscaler_method() || framegen_active(); }
@@ -1577,7 +1620,9 @@ void upscale_velo_copy_locked(RtImage& velo) {
             VK_ACCESS_SHADER_READ_BIT);
 }
 
-bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y, const RtImage* glow) {
+namespace {
+
+bool upscale_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y, const RtImage* glow, HookFrame& hf) {
     const int method = upscaler_method();
     // Frame generation with no upscaler running (Upscaling off, or one this
     // GPU cannot run): the motion and its prepare at the scene's size, and the
@@ -1810,6 +1855,11 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         g_cam_prev_ok = false;
         g_reset = true;
     }
+    // The frame described for the plugins (plugin API 27), with the camera its motion took.
+    if (render_hooks_on())
+        describe_frame_locked(hf, g_w, g_h, g_ow, g_oh, motion_only ? BB_UPSCALE_NONE : static_cast<std::uint32_t>(method),
+                              motion_only || !g_scaled ? BB_QUALITY_NATIVE : static_cast<std::uint32_t>(rs.quality), motion_only ? 0.0f : jitter_x,
+                              motion_only ? 0.0f : jitter_y);
     g_cam_noted = false;
     g_terms = camera_terms();
     if (motion_only) {
@@ -1907,6 +1957,17 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         host_log("upscaler: first upscale of the scene 0x%llx (depth 0x%llx)", static_cast<unsigned long long>(scene.base),
                  static_cast<unsigned long long>(depth.base));
     return true;
+}
+
+}  // namespace
+
+bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y, const RtImage* glow) {
+    HookFrame hf;
+    const bool ran = upscale_locked(scene, depth, jitter_x, jitter_y, glow, hf);
+    // A frame the path gave up on before its motion, or with no upscaler and no
+    // frame generation: described as drawn for the plugins (plugin API 27).
+    if (!hf.described && render_hooks_on()) frame_alone_locked(scene, hf);
+    return ran;
 }
 
 bool upscale_pass_hudless_due_locked() { return g_fg_pending != 0; }

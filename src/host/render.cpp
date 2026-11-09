@@ -16,6 +16,7 @@
 #include "host/full_write.h"
 #include "host/gpu_internal.h"
 #include "host/options.h"
+#include "host/render_hooks.h"
 #include "host/scene_look.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
@@ -25315,8 +25316,11 @@ static bool draw_impl(const GpuDraw& d) {
         static std::atomic<std::uint64_t> cut_read_flip{~0ull};
         const bool motion = upscale_motion_on();
         const bool cut_read = !motion && scene_look_pixel_cut(nullptr) && cut_read_flip.load(std::memory_order_relaxed) != hle_video_flip_count();
+        // A plugin taking the frames (plugin API 27, host/render_hooks.h): with
+        // no upscaler's motion, the frame's first camera draw's.
+        const bool hooks_read = !motion && render_hooks_on() && !upscale_camera_noted();
         const bool camera = st == 0 && !gate && g_upscale.depth && s.depth && s.depth->base == g_upscale.depth && !s.rect &&
-                            meta.buffers.size() <= 16 && pl.velo != 2 && (motion || cut_read);
+                            meta.buffers.size() <= 16 && pl.velo != 2 && (motion || cut_read || hooks_read);
         // A pass of the game's velocity map: its scale's constant buffer.
         if (st == 1 && !pl.velo_known) velo_classify(pl);
         const bool velo = st == 1 && pl.velo && pl.velo != 4 && s.color[0] && pl.velo_cb < meta.buffers.size() &&
@@ -25502,7 +25506,7 @@ static bool draw_impl(const GpuDraw& d) {
             for (std::size_t i = 0; i < meta.buffers.size() && !camera_draw; ++i)
                 camera_draw = upscale_camera_block_locked(gate_bases[i], static_cast<std::uint64_t>(meta.buffers[i].max_dw) * 4);
             if (cut_read && camera_draw) cut_read_flip.store(hle_video_flip_count(), std::memory_order_relaxed);
-            if (!motion) camera_draw = false;  // read for the cutaway alone
+            if (!motion) camera_draw = false;  // read for the cutaway or a plugin's frame alone
         }
         // The velocity map's scales, for the upscaler's motion (upscale_pass.cpp).
         if (velo && pl.velo == 3) {
@@ -26497,18 +26501,22 @@ static bool draw_impl(const GpuDraw& d) {
     // first pass) samples, learned from that draw; its depth is the one drawn
     // with it (the G-buffer's). The first frame that copy is seen in, the
     // upscale runs at that copy. Frame generation without an upscaler takes
-    // the motion there too (upscale_pass_run_locked).
-    if (upscale_motion_on()) {
+    // the motion there too (upscale_pass_run_locked), and a plugin taking the
+    // frames (plugin API 27, host/render_hooks.h) the same call with no
+    // upscaler - but never the velocity map's work.
+    const bool upscale_motion = upscale_motion_on();
+    if (upscale_motion || render_hooks_on()) {
         // The velocity map, before the frame's first pass of it draws (its
         // clear, when no camera pass covers it) and before the motion blur's
         // dilation spreads it (the copy the motion reads) - once a frame each.
-        if (pl.velo && pl.velo != 4 && s.color[0] && !s.color[0]->depth && upscale_velo_clear_due(s.color[0]->base, pl.velo)) {
+        if (upscale_motion && pl.velo && pl.velo != 4 && s.color[0] && !s.color[0]->depth &&
+            upscale_velo_clear_due(s.color[0]->base, pl.velo)) {
             if (part) {
                 run_part_stop(kRunStopOrder);
                 return false;
             }
             upscale_velo_clear_locked(*s.color[0]);
-        } else if (pl.velo == 4) {
+        } else if (upscale_motion && pl.velo == 4) {
             for (const StageImages::Image& im : stage_images[1].images) {
                 RtImage* velo = im.resolved && upscale_velo_copy_due(image_base(im)) ? find_render_target(image_base(im)) : nullptr;
                 if (!velo || velo->depth) continue;

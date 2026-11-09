@@ -34,6 +34,7 @@
 #include "host/bindings.h"
 #include "host/ruleset.h"
 #include "host/pixel_cutaway.h"
+#include "host/render_hooks.h"
 #include "host/scene_look.h"
 #include "host/updater.h"
 #include "host/window.h"
@@ -1272,6 +1273,9 @@ void api_scene_dither(std::uint32_t bits) {
     else host_log("plugin: the picture not dithered");
 }
 
+// Version 27: the frame as it is drawn (host/render_hooks.h).
+int api_frame_info(BbFrameInfo* out) { return render_frame_info(out); }
+
 // Version 21: old-hardware sound (host/audio_crush.h).
 void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
     audio_crush_set(rate_hz, bits, lowpass_hz);
@@ -1306,6 +1310,7 @@ const BbHostApi g_api = {
     &api_view_cutaway_objects,
     &api_scene_dither,
     &api_camera_zoom,
+    &api_frame_info,
 };
 
 std::string read_file(const std::string& path) {

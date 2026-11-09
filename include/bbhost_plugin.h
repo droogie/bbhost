@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 18.
+/* bbhost plugin API, version 27.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 26
+#define BB_PLUGIN_API_VERSION 27
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -213,6 +213,74 @@ typedef struct BbCutaway {
     float margin;        /* metres in front of the point looked at where the cut starts */
     float feather;       /* metres over which it fades in */
 } BbCutaway;
+
+/* Version 27: the frame as bbhost draws it, for effects of a plugin's own
+ * (frame_info).
+ *
+ * The conventions. A matrix is 16 floats in column-major order (m[column * 4
+ * + row]: GLSL's mat4 and GLM's layout, HLSL's column_major) applied to
+ * column vectors: clip = proj * view * (x, y, z, 1). The world is the game's,
+ * in metres, y up (player_position's, BbCamera's). The view: x right, y up, z
+ * the way the camera looks, in metres. Clip space is Vulkan's over the 3D's
+ * images: divided by w (the view's z), x runs from -1 at their left edge to +1
+ * at their right, y from -1 at their top to +1 at their bottom, and z is the
+ * value the G-buffer's depth holds - 0 at the near plane and 1 at the far one
+ * as the game draws (the other way round with BB_FRAME_DEPTH_REVERSED). A
+ * pixel (px, py) of a w x h image is centred at ((px + 0.5) / w * 2 - 1,
+ * (py + 0.5) / h * 2 - 1); the picture at the output size covers the same
+ * view. Angles are radians, sizes pixels, times seconds. */
+
+/* A camera as the frame drew it - an on_view plugin's change included -
+ * without the jitter. */
+typedef struct BbFrameCamera {
+    BbCamera camera;          /* its basis (right, up, forward) and eye in the world - the four in a row are its
+                                 view-to-world matrix, column by column - fov_y, aspect, and near_z and far_z: the
+                                 view distances the depth's 0 and 1 stand for (1e6 at most: an infinite far plane) */
+    float view[16];           /* world to view */
+    float proj[16];           /* view to clip. The frame's camera draws were moved by the jitter: their projection is
+                                 this one with m[8] = 2 * jitter_x / render_width and m[9] = 2 * jitter_y / render_height */
+    float view_proj[16];      /* proj * view: world to clip */
+    float inv_view_proj[16];  /* clip to world: a pixel's (x, y, depth, 1) to a world point times w */
+} BbFrameCamera;
+
+#define BB_FRAME_CAMERA 1u          /* `now` is this frame's: its camera draws were seen (else the last known; reset) */
+#define BB_FRAME_PREV 2u            /* `prev` is the last frame's (else this frame's again) */
+#define BB_FRAME_CUT 4u             /* the camera jumped since the last frame - moved more than 4 m, turned more than 75
+                                       degrees or its field of view by more than 10: a cut (reset) */
+#define BB_FRAME_DEPTH_REVERSED 8u  /* the depth holds 1 at the near plane and 0 at the far one */
+
+#define BB_UPSCALE_NONE 0u  /* BbFrameInfo.method: the 3D is the picture as drawn - Upscaling Off, an upscaler this
+                               machine cannot run, or a plugin's anti-aliasing */
+#define BB_UPSCALE_DLSS 1u
+#define BB_UPSCALE_FSR 2u   /* FSR 3 or FSR 4 */
+#define BB_UPSCALE_TAA 3u   /* bbhost's own */
+
+#define BB_QUALITY_NATIVE 0u      /* the 3D at the picture's size: DLAA, FSR's native AA, TAA */
+#define BB_QUALITY_QUALITY 1u     /* two thirds each way - also a Resolution below the window's, whatever its share */
+#define BB_QUALITY_BALANCED 2u    /* about 59% */
+#define BB_QUALITY_PERFORMANCE 3u /* half */
+
+/* What a 3D frame is (frame_info). Size first: a newer host appends fields
+ * after `prev`. */
+typedef struct BbFrameInfo {
+    uint32_t size;            /* the bytes filled */
+    uint32_t flags;           /* BB_FRAME_* */
+    uint64_t frame;           /* 1 for the first 3D frame described, one more for each after it (a frame without the
+                                 3D - a loading screen - is none) */
+    uint64_t flip;            /* the host's flips so far as it was recorded: its log's flip numbers */
+    uint32_t render_width, render_height;  /* the 3D's size */
+    uint32_t output_width, output_height;  /* the picture's: the upscaler's output, the 3D's size without one */
+    uint32_t method;          /* BB_UPSCALE_*: what takes the 3D to the picture this frame */
+    uint32_t quality;         /* BB_QUALITY_*, as the upscaler is told it (the sizes are exact) */
+    float jitter_x, jitter_y; /* render pixels this frame's camera draws were moved by, +x right, +y down: what the
+                                 upscaler is told; 0 when none runs */
+    float frame_seconds;      /* real time since the last frame described */
+    uint32_t reset;           /* 1: nothing to blend with - the first frame, a new render or output size or method,
+                                 no camera this frame or the last, a cut, or more than a quarter of a second since the
+                                 last frame */
+    BbFrameCamera now;        /* this frame's camera */
+    BbFrameCamera prev;       /* the last frame's */
+} BbFrameInfo;
 
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
@@ -637,6 +705,14 @@ typedef struct BbHostApi {
      * Reset was pressed. From the first call on they are the plugin's and
      * the game's camera no longer zooms. Any thread. 0 on success. */
     int (*camera_zoom)(int* steps, int* reset);
+
+    /* Version 27: the frame as it is drawn (the conventions above
+     * BbFrameCamera). */
+    /* The last 3D frame described, into *out: set out->size to sizeof(*out)
+     * first; the host fills as much as both know and sets out->size to that.
+     * From the first call on the host describes every 3D frame. Any thread.
+     * 0 on success; 1 before a frame is described, or for a size under 8. */
+    int (*frame_info)(BbFrameInfo* out);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */
