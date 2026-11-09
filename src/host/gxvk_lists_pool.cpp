@@ -541,7 +541,7 @@ void settle(bool homes_bind, const char* homes_why) {
     std::call_once(once, [&] {
         const int env = pool_mode_from_env();
         const int n = pool_threads();
-        const unsigned hw = std::thread::hardware_concurrency();
+        const unsigned hw = host_cpu_threads();
         int mode = env < 0 ? 0 : env;
         if (env < 0) {
             // Unset: stage 4b.2's segments where the homes bind by handle (their spliced share needs them), off elsewhere.
