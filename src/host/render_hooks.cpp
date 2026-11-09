@@ -1,6 +1,7 @@
 #include "host/render_hooks.h"
 
 #include "hle/modules.h"
+#include "host/plugins.h"
 #include "host/render_api.h"
 #include "log.h"
 
@@ -188,6 +189,7 @@ void render_frame_describe_locked(const RenderFrameDesc& d) {
     const bool cut = d.camera && g_last_camera && render_api::frame_cut(f.now.camera, g_last_cam.camera);
     if (cut) f.flags |= BB_FRAME_CUT;
     if (reversed) f.flags |= BB_FRAME_DEPTH_REVERSED;
+    if (plugins_aa_claim() == kAaTake) f.flags |= BB_FRAME_AA_PLUGIN;
     const render_api::FrameShape shape{d.render_w, d.render_h, d.output_w, d.output_h, d.method};
     f.reset = render_api::frame_reset(first, g_last_shape, shape, d.camera, g_last_camera, cut, seconds) ? 1u : 0u;
     // Said when the shape changes (the first frame, a Resolution, an upscaler).

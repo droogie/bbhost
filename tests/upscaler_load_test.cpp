@@ -16,8 +16,11 @@
 //                                        (upscaler_bridge.so) is the one loaded
 // The executable's folder is a temporary one the test fills (config_exe_dir
 // is the test's), and BBHOST_NGX_OFF=1 keeps NVIDIA's code out whatever
-// happens.
+// happens. A plugin's anti-aliasing claim (plugin API 27) is the test's own:
+// taking it over turns TAA off, leaving it to bbhost lets TAA run beside a
+// Vulkan layer - BBHOST_UPSCALE_LAYER=1 pretends one (upscaler_load_layer).
 #include "fake_vulkan.h"
+#include "host/plugins.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
 #include "log.h"
@@ -34,6 +37,7 @@
 namespace {
 std::string g_exe_dir, g_user_dir;
 HostSettings g_settings;
+int g_claim = kAaNone;
 int g_fail = 0;
 void check(bool ok, const char* what) {
     if (!ok) {
@@ -59,6 +63,7 @@ bool mapped(const char* name) {
 std::string config_exe_dir() { return g_exe_dir; }
 std::string config_user_dir() { return g_user_dir; }
 const HostSettings& host_settings_ref() { return g_settings; }
+int plugins_aa_claim() { return g_claim; }
 extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance i, const char* name) {
     return fake_vk::get_instance_proc_addr(i, name);
 }
@@ -150,7 +155,22 @@ int main(int argc, char** argv) {
     g_settings.upscaler = 2;
     check(upscaler_method() == 0, "FSR chosen: the game's anti-aliasing instead");
     g_settings.upscaler = 4;
-    check(upscaler_method() == kUpscaleTaa, "TAA runs");
+    const char* layer_env = std::getenv("BBHOST_UPSCALE_LAYER");
+    const bool layer = layer_env && layer_env[0] == '1';
+    check(upscaler_method() == (layer ? 0 : kUpscaleTaa), layer ? "TAA off beside a Vulkan layer" : "TAA runs");
+    check(upscaler_layer_blocks_taa() == layer, "the layer's note: only beside one");
+    // A plugin's claim: taking the anti-aliasing over turns TAA off; leaving it
+    // to bbhost lets TAA run, beside a layer too.
+    g_claim = kAaTake;
+    check(upscaler_method() == 0, "a plugin takes the anti-aliasing over: no TAA");
+    g_settings.upscaler = 1;
+    check(upscaler_method() == 0, "... nor DLSS");
+    g_settings.upscaler = 4;
+    g_claim = kAaLeave;
+    check(upscaler_method() == kUpscaleTaa, "a plugin leaves the anti-aliasing to bbhost: TAA runs");
+    check(!upscaler_layer_blocks_taa(), "... and no layer keeps it off");
+    g_claim = kAaNone;
+    check(upscaler_method() == (layer ? 0 : kUpscaleTaa), "no claim: as before");
     float x = 9, y = 9;
     upscaler_jitter(kUpscaleTaa, 0, 1920, 1080, 1, &x, &y);
     check(x == -0.25f && y > 0.16f && y < 0.17f, "TAA's jitter");
@@ -168,6 +188,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "upscaler_load_test %s: %d failure(s)\n", mode.c_str(), g_fail);
         return 1;
     }
-    std::printf("upscaler_load_test %s: ok\n", mode.c_str());
+    std::printf("upscaler_load_test %s%s: ok\n", mode.c_str(), layer ? " (a Vulkan layer pretended)" : "");
     return 0;
 }

@@ -41,6 +41,7 @@ struct PluginEntry {
     bool loaded = false;       // running in this session
     bool visitor = false;      // running though off: only to play other players' worlds
     bool enabled = false;      // what the config says (opt-in ones default off)
+    int aa = 0;                // its anti-aliasing claim: kAaNone, kAaLeave or kAaTake (its flags', or the live one in game)
     std::vector<PluginOptionDesc> options;
 };
 // The directories plugins load from, in order (exe, per-user, data).
@@ -71,6 +72,18 @@ std::string plugins_ruleset();
 // The plugin of that name is loaded and on for this run (not a visitor):
 // what host features a plugin turns on ask (engine/debug_menu.h).
 bool plugins_active(const std::string& name);
+// Plugin API 27's anti-aliasing claim (bbhost_plugin.h aa_claim): the
+// strongest claim of the plugins that are on - kAaTake before kAaLeave - in
+// one relaxed load (host/upscaler.cpp reads it at every draw).
+constexpr int kAaNone = 0, kAaLeave = 1, kAaTake = 2;
+int plugins_aa_claim();
+// The title of the first loaded plugin that takes it over, which the menus
+// name ("" when none does).
+std::string plugins_aa_owner();
+// The setup window's, before any plugin runs: the title of the first plugin
+// turned on whose BbPluginInfo flags take it over (BB_PLUGIN_AA_TAKE), from
+// the plugin files ("" when none).
+std::string plugins_aa_owner_scanned();
 // The loaded plugins that can play by a host's rules (BB_PLUGIN_ADOPTS_RULES),
 // "randomizer" - the X-BBHost-Adopt header; "" for none.
 std::string plugins_adopts();

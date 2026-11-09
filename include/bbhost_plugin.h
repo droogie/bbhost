@@ -122,6 +122,8 @@ typedef struct BbChr {
                                      the key "" ("true" or "false"), on the main thread, and the plugin
                                      applies or takes back what it does. Not for BB_PLUGIN_GAMEPLAY
                                      plugins (their rules are the session's): the host ignores it there. */
+#define BB_PLUGIN_AA_LEAVE 16u    /* version 27: starts with aa_claim's BB_AA_LEAVE ... */
+#define BB_PLUGIN_AA_TAKE 32u     /* ... or BB_AA_TAKE (both: TAKE) - the setup window reads it before the plugin runs */
 typedef struct BbPluginInfo {
     uint32_t api_version;    /* BB_PLUGIN_API_VERSION it was built against */
     uint32_t flags;          /* BB_PLUGIN_* */
@@ -215,7 +217,8 @@ typedef struct BbCutaway {
 } BbCutaway;
 
 /* Version 27: the frame as bbhost draws it, for effects of a plugin's own
- * recorded into it (frame_info, on_render).
+ * recorded into it (frame_info, on_render), and who does the anti-aliasing
+ * (aa_claim).
  *
  * The conventions. A matrix is 16 floats in column-major order (m[column * 4
  * + row]: GLSL's mat4 and GLM's layout, HLSL's column_major) applied to
@@ -248,6 +251,7 @@ typedef struct BbFrameCamera {
 #define BB_FRAME_CUT 4u             /* the camera jumped since the last frame - moved more than 4 m, turned more than 75
                                        degrees or its field of view by more than 10: a cut (reset) */
 #define BB_FRAME_DEPTH_REVERSED 8u  /* the depth holds 1 at the near plane and 0 at the far one */
+#define BB_FRAME_AA_PLUGIN 16u      /* a plugin does the anti-aliasing (aa_claim's BB_AA_TAKE): bbhost's is off */
 
 #define BB_UPSCALE_NONE 0u  /* BbFrameInfo.method: the 3D is the picture as drawn - Upscaling Off, an upscaler this
                                machine cannot run, or a plugin's anti-aliasing */
@@ -344,6 +348,14 @@ typedef struct BbRenderCall {
                                       before the upscale */
 } BbRenderCall;
 typedef void (*BbRenderFn)(const BbRenderCall* call, void* user);
+
+/* aa_claim's claims. */
+#define BB_AA_NONE 0   /* no claim (the default) */
+#define BB_AA_LEAVE 1  /* the plugin does none and moves no draws: bbhost's runs as the settings say - also beside a
+                          Vulkan layer that would otherwise keep its TAA off */
+#define BB_AA_TAKE 2   /* the plugin does it: while it is on, bbhost moves no draws (no jitter) and runs no TAA, FSR or
+                          DLSS nor the game's own anti-aliasing pass, and draws the 3D at the Resolution, as with
+                          Upscaling Off; the menus name the plugin */
 
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
@@ -769,8 +781,8 @@ typedef struct BbHostApi {
      * the game's camera no longer zooms. Any thread. 0 on success. */
     int (*camera_zoom)(int* steps, int* reset);
 
-    /* Version 27: the frame as it is drawn, and plugins' compute work in it
-     * (the conventions above BbFrameCamera). */
+    /* Version 27: the frame as it is drawn, plugins' compute work in it,
+     * and who does the anti-aliasing (the conventions above BbFrameCamera). */
     /* The 3D frame being recorded (inside a hook), else the last one
      * described, into *out: set out->size to sizeof(*out) first; the host
      * fills as much as both know and sets out->size to that. From the first
@@ -798,6 +810,15 @@ typedef struct BbHostApi {
      * From bb_plugin_init on, any thread. 0 on success; 1 for a bad
      * argument. */
     int (*on_render)(const char* name, uint32_t points, BbRenderFn fn, void* user);
+    /* The calling plugin's anti-aliasing claim: BB_AA_NONE, BB_AA_LEAVE or
+     * BB_AA_TAKE (its BbPluginInfo.flags' BB_PLUGIN_AA_* is the claim it
+     * starts with). The strongest claim of the plugins that are on holds -
+     * BB_AA_TAKE before BB_AA_LEAVE - and a plugin that is off has none. From
+     * bb_plugin_init for the start, or once the game runs from the main
+     * thread (on_frame, on_option): the 3D's size follows at the next quiet
+     * point, as at a Resolution change. Never from a render hook. 0 on
+     * success; 1 for a bad argument or from a hook. */
+    int (*aa_claim)(const char* name, int claim);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

@@ -15,6 +15,7 @@
 #include "hle/modules.h"
 #include "host/bindings.h"
 #include "host/options.h"
+#include "host/plugins.h"
 #include "host/upscaler.h"
 #include "log.h"
 
@@ -406,8 +407,11 @@ void add_slider_row(void* dialog, std::uint8_t* value, std::uint32_t id, std::ui
 // An On/Off row. sub_1f2b3b0 builds the two-entry list from the game's own
 // "on" and "off" messages, so the port does not have to construct a choice
 // entry - the one structure here it would otherwise have to guess.
-void add_toggle_row(void* dialog, void* value, std::uint32_t id, std::uint8_t def) {
+// `help` (may be null): a line help of the port's own in place of id's, drawn
+// from that pointer as the Key Bindings rows' are (add_text_row).
+void add_toggle_row(void* dialog, void* value, std::uint32_t id, std::uint8_t def, const char16_t* help = nullptr) {
     Captions c(id);
+    if (help) std::memcpy(&c.buf[0x40], &help, sizeof(help));
     alignas(16) std::uint8_t list[0x100]{};
     hle_call_guest<std::int64_t>(guest_fn(kBuildOnOff), &list);
     hle_call_guest<std::int64_t>(guest_fn(kAddChoiceRow), dialog, &c.buf[0], value, &list, &def);
@@ -458,9 +462,12 @@ struct Choice {
 };
 
 // A pick-list row. Its entries are the 0x48-byte shape above with an int32
-// value, which is the same shape the game builds for Language.
-void add_list_row(void* dialog, void* value, std::uint32_t id, const Choice* choices, int count, std::int32_t def) {
+// value, which is the same shape the game builds for Language. `help` as
+// add_toggle_row's.
+void add_list_row(void* dialog, void* value, std::uint32_t id, const Choice* choices, int count, std::int32_t def,
+                  const char16_t* help = nullptr) {
     Captions c(id);
+    if (help) std::memcpy(&c.buf[0x40], &help, sizeof(help));
     // The container is an inline array plus a count at +0x908; zeroing it is
     // the whole of its initialisation.
     alignas(16) std::uint8_t list[0x1000]{};
@@ -541,6 +548,24 @@ struct Slider {
     std::uint8_t value;
     std::uint8_t last;
 };
+
+// The line help Upscaling and Anti-Aliasing show while a plugin does the
+// anti-aliasing itself (plugin API 27, host/plugins.h): its title, cut to 40
+// characters, so the line keeps within the 96 the screen shows. Null while
+// none does. Read as each section opens.
+char16_t g_aa_help[100];
+const char16_t* aa_taken_help() {
+    const std::string who = plugins_aa_owner();
+    if (who.empty()) return nullptr;
+    const std::string line = "Off: the " + who.substr(0, 40) + " plugin does the anti-aliasing while it is on.";
+    std::size_t i = 0;
+    for (; i < line.size() && i + 1 < sizeof(g_aa_help) / sizeof(g_aa_help[0]); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(line[i]);
+        g_aa_help[i] = ch < 0x80 ? static_cast<char16_t>(ch) : u'?';  // (the titles are ASCII; the rest shown as ?)
+    }
+    g_aa_help[i] = 0;
+    return g_aa_help;
+}
 
 // PC Graphics: the scene - anti-aliasing, ambient occlusion and its strength
 // (engine/graphics_patch.h), the shaders' form (HLSL Shaders, read at the next
@@ -967,8 +992,9 @@ GUEST_ABI void pc_graphics_handler(void* dialog, void* params) {
     seed(g_gfx_fog);
     g_resolution = host_opt_resolution_index();
     g_last_resolution = g_resolution;
+    const char16_t* aa_help = aa_taken_help();
     for (auto& t : g_graphics) {
-        add_toggle_row(dialog, &t.value, t.id, default_of(t));
+        add_toggle_row(dialog, &t.value, t.id, default_of(t), t.id == kGfxAntiAlias ? aa_help : nullptr);
     }
     add_slider_row(dialog, &g_gfx_ao.value, g_gfx_ao.id, default_of(g_gfx_ao));
     add_slider_row(dialog, &g_gfx_shadow.value, g_gfx_shadow.id, default_of(g_gfx_shadow));
@@ -1023,7 +1049,7 @@ GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
     int n_upscalers = 0;
     for (const Choice& ch : kUpscalers)
         if (ch.value == g_up_scaler || upscaler_offered(ch.value)) upscalers[n_upscalers++] = ch;
-    add_list_row(dialog, &g_up_scaler, kUpScaler, upscalers, n_upscalers, std::max(0, host_opt_default_index("upscaler")));
+    add_list_row(dialog, &g_up_scaler, kUpScaler, upscalers, n_upscalers, std::max(0, host_opt_default_index("upscaler")), aa_taken_help());
     add_list_row(dialog, &g_up_quality, kUpQuality, kUpscaleQualities,
                  static_cast<int>(sizeof(kUpscaleQualities) / sizeof(kUpscaleQualities[0])),
                  std::max(0, host_opt_default_index("upscale_quality")));

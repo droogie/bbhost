@@ -35,6 +35,7 @@
 #include "host/options.h"
 #include "host/ruleset.h"
 #include "host/pixel_cutaway.h"
+#include "host/render_api.h"
 #include "host/render_hooks.h"
 #include "host/scene_look.h"
 #include "host/updater.h"
@@ -42,6 +43,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -53,6 +55,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -1297,6 +1300,78 @@ int api_on_render(const char* name, std::uint32_t points, BbRenderFn fn, void* u
     return 0;
 }
 
+// Who does the anti-aliasing (aa_claim, BbPluginInfo.flags' BB_PLUGIN_AA_*):
+// each plugin's claim by its name, and the one that holds over the plugins
+// that are on (render_api.h aa_resolve) - kept in g_aa, which upscaler_method
+// reads at every draw. Worked out again on the main thread: at each claim,
+// once the plugins are loaded, after their image phase, and at a live switch.
+std::mutex g_aa_mu;
+std::map<std::string, int> g_aa_claims;  // under g_aa_mu
+std::vector<std::string> g_aa_takers;    // the titles of the plugins on that take it over, in load order (under g_aa_mu)
+std::atomic<int> g_aa{kAaNone};
+
+const char* aa_name(int claim) { return claim == kAaTake ? "takes it over" : claim == kAaLeave ? "leaves it to bbhost" : "none"; }
+
+void aa_update() {
+    std::vector<int> claims;
+    std::vector<char> on;
+    std::vector<std::string> titles;
+    {
+        std::lock_guard<std::mutex> lk(g_aa_mu);
+        for (const Plugin& p : g_plugins) {
+            const auto it = g_aa_claims.find(p.name);
+            claims.push_back(it == g_aa_claims.end() ? kAaNone : it->second);
+            on.push_back(!p.visitor && !p.dormant);
+            titles.push_back(p.info && p.info->title && p.info->title[0] ? p.info->title : p.name);
+        }
+    }
+    std::unique_ptr<bool[]> on_a(new bool[on.size() + 1]);
+    for (std::size_t k = 0; k < on.size(); ++k) on_a[k] = on[k] != 0;
+    std::size_t first = 0;
+    const int held = render_api::aa_resolve(claims.data(), on_a.get(), claims.size(), &first);
+    std::vector<std::string> takers;
+    for (std::size_t k = 0; k < claims.size(); ++k) {
+        if (on[k] && claims[k] == kAaTake) takers.push_back(titles[k]);
+    }
+    bool changed;
+    {
+        std::lock_guard<std::mutex> lk(g_aa_mu);
+        changed = takers != g_aa_takers;
+        g_aa_takers = takers;
+    }
+    const int was = g_aa.exchange(held);
+    if (held != was || changed) {
+        if (held == kAaTake && takers.size() > 1) {
+            std::string all;
+            for (std::size_t k = 0; k < takers.size(); ++k) all += (k ? k + 1 == takers.size() ? " and " : ", " : "") + takers[k];
+            host_log("plugin: %s all take the anti-aliasing over: each runs its own; the menus name %s", all.c_str(), takers[0].c_str());
+        } else if (held == kAaTake) {
+            host_log("plugin: %s takes the anti-aliasing over: no jitter, TAA, FSR, DLSS or game anti-aliasing pass while it is on; the 3D at "
+                     "the Resolution",
+                     takers[0].c_str());
+        } else if (held == kAaLeave) {
+            host_log("plugin: the anti-aliasing is left to bbhost: TAA runs even beside a Vulkan layer that would keep it off");
+        } else if (was != kAaNone) {
+            host_log("plugin: the anti-aliasing is bbhost's again");
+        }
+    }
+    // The render size, the game's own size and its anti-aliasing pass follow.
+    if (held != was) republish_settings();
+}
+
+int api_aa_claim(const char* name, int claim) {
+    if (!name || !name[0] || claim < BB_AA_NONE || claim > BB_AA_TAKE || render_hooks_in_call()) return 1;
+    {
+        std::lock_guard<std::mutex> lk(g_aa_mu);
+        int& c = g_aa_claims[name];
+        if (c == claim) return 0;
+        c = claim;
+    }
+    host_log("plugin: %s: its anti-aliasing claim: %s", name, aa_name(claim));
+    aa_update();
+    return 0;
+}
+
 // Version 21: old-hardware sound (host/audio_crush.h).
 void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
     audio_crush_set(rate_hz, bits, lowpass_hz);
@@ -1333,6 +1408,7 @@ const BbHostApi g_api = {
     &api_camera_zoom,
     &api_frame_info,
     &api_on_render,
+    &api_aa_claim,
 };
 
 std::string read_file(const std::string& path) {
@@ -1502,13 +1578,22 @@ void plugins_load() {
             continue;
         }
 
-        // Its render hooks (plugin API 27) are not called while it is off.
+        // Its render hooks (plugin API 27) are not called while it is off, and
+        // its flags' anti-aliasing claim is the one it starts with.
         if (p.visitor || p.dormant) render_hooks_plugin_on(p.name, false);
+        if (const int aa = render_api::aa_of_flags(flags); aa != kAaNone) {
+            std::lock_guard<std::mutex> lk(g_aa_mu);
+            g_aa_claims[p.name] = aa;
+        }
         if (p.init) {
             const int r = p.init(&g_api);
             if (r != 0) {
                 host_log("plugin: %s: init returned %d; unloaded", p.name.c_str(), r);
                 render_hooks_drop(p.name);  // what it registered goes with it
+                {
+                    std::lock_guard<std::mutex> lk(g_aa_mu);
+                    g_aa_claims.erase(p.name);
+                }
                 close_lib(h);
                 continue;
             }
@@ -1530,6 +1615,7 @@ void plugins_load() {
         }
         g_plugins.push_back(p);
     }
+    aa_update();
     g_early = false;
 }
 
@@ -1553,6 +1639,10 @@ void plugins_image(ElfImage* image) {
             if (r != 0) {
                 host_log("plugin: %s: image phase returned %d; unloaded", p.name.c_str(), r);
                 render_hooks_drop(p.name);
+                {
+                    std::lock_guard<std::mutex> lk(g_aa_mu);
+                    g_aa_claims.erase(p.name);
+                }
                 close_lib(p.handle);
                 g_plugins.erase(g_plugins.begin() + static_cast<std::ptrdiff_t>(i));
                 continue;
@@ -1561,6 +1651,7 @@ void plugins_image(ElfImage* image) {
         ++i;
     }
     g_in_image = false;
+    aa_update();
 }
 
 void plugins_frame() {
@@ -1598,6 +1689,7 @@ void plugins_frame() {
             }
             host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
             if (render_hooks_plugin_on(r.name, on)) republish_settings();
+            aa_update();
         } else {
             const std::string raw = toml_value(r.value);
             config_value_set(r.name + "." + r.key, raw);
@@ -1670,6 +1762,7 @@ std::vector<PluginEntry> plugins_scan() {
         }
         e.official = official;
         e.bad_signature = bad;
+        e.aa = render_api::aa_of_flags(e.flags);
         const int sw = config_switch(e.name);
         e.enabled = !bad && (sw == 1 || (sw < 0 && !(e.flags & BB_PLUGIN_OPT_IN)));
         out.push_back(std::move(e));
@@ -1686,6 +1779,11 @@ std::vector<PluginEntry> plugins_catalog() {
         e.loaded = true;
         e.visitor = p.visitor;
         e.enabled = !p.visitor && !p.dormant;
+        {
+            std::lock_guard<std::mutex> lk(g_aa_mu);
+            const auto it = g_aa_claims.find(p.name);
+            e.aa = it == g_aa_claims.end() ? kAaNone : it->second;
+        }
         out.push_back(std::move(e));
     }
     return out;
@@ -1828,6 +1926,25 @@ std::string plugins_ruleset() {
         if (!g_visiting.empty()) return g_visiting;
     }
     return own_ruleset();
+}
+
+int plugins_aa_claim() { return g_aa.load(std::memory_order_relaxed); }
+
+std::string plugins_aa_owner() {
+    std::lock_guard<std::mutex> lk(g_aa_mu);
+    return g_aa_takers.empty() ? std::string() : g_aa_takers.front();
+}
+
+std::string plugins_aa_owner_scanned() {
+    // The files as the setup window found them (they do not change under it);
+    // each one's switch as the config holds it now - the Plugins tab changes it.
+    static const std::vector<PluginEntry> files = plugins_scan();
+    for (const PluginEntry& e : files) {
+        const int sw = config_switch(e.name);
+        const bool on = !e.bad_signature && (sw == 1 || (sw < 0 && !(e.flags & BB_PLUGIN_OPT_IN)));
+        if (on && render_api::aa_of_flags(e.flags) == kAaTake) return e.title;
+    }
+    return {};
 }
 
 std::string plugins_adopts() {

@@ -9,6 +9,7 @@
 #include "engine/patch_manifest.h"
 #include "hle/modules.h"
 #include "host/options.h"
+#include "host/plugins.h"
 #include "host/scene_look.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
@@ -193,6 +194,8 @@ int quality_asked() {
 }
 
 bool upscaler_asked() {
+    // A plugin that does the anti-aliasing itself (plugin API 27): no upscaler, the 3D at the Resolution.
+    if (plugins_aa_claim() == kAaTake) return false;
     if (const char* e = std::getenv("BBHOST_UPSCALE"); e && *e)
         return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0 || std::strcmp(e, "taa") == 0;
     // (TAA, 4, at the Resolution's size below the window: quality_asked.)
@@ -470,6 +473,8 @@ void settings_changed(const HostSettings& s) {
     bool runs = false;
     if (scene_look_scale()) {
         runs = false;  // a plugin's 3D size: no upscaler chosen and there (host/scene_look.cpp)
+    } else if (plugins_aa_claim() == kAaTake) {
+        runs = false;  // a plugin's own anti-aliasing (plugin API 27, host/plugins.h): none of bbhost's
     } else if (std::getenv("BBHOST_UPSCALE")) {
         runs = upscaler_method_scales(upscaler_method());
     } else {

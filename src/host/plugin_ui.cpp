@@ -299,6 +299,18 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
             ImGui::TextUnformatted(p.description.c_str());
             ImGui::PopTextWrapPos();
         }
+        // Plugin API 27's anti-aliasing claim (host/plugins.h): its flags', or in game the one it holds now.
+        if (p.aa == kAaTake) {
+            ImGui::PushTextWrapPos(0.0f);
+#if defined(_WIN32)
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "Does the anti-aliasing itself: while it is on, bbhost's TAA, FSR and DLSS "
+                                                                  "and the game's own anti-aliasing are off, and Graphics > Upscaling says so.");
+#else
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "Does the anti-aliasing itself: while it is on, bbhost's TAA and DLSS and "
+                                                                  "the game's own anti-aliasing are off, and Graphics > Upscaling says so.");
+#endif
+            ImGui::PopTextWrapPos();
+        }
         ImGui::Spacing();
         ImGui::BeginDisabled(p.bad_signature);
         bool on = p.enabled;

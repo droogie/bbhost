@@ -6,7 +6,8 @@
 // view's inverse, a point's clip position, its depth and its pixel, the way
 // back from a pixel and its depth to the world, the jittered projection, and
 // a depth that runs the other way. Then the cut test's thresholds, the
-// reset's reasons, and the generations the render hooks hand out.
+// reset's reasons, the generations the render hooks hand out, and which of
+// the plugins' anti-aliasing claims holds.
 #include "host/render_api.h"
 
 #include <cmath>
@@ -260,6 +261,53 @@ void test_generations() {
     CHECK(render_api::image_generation(depth, 0x3000, 0x4000, 130, 1920, 1080, serial) == d1);
 }
 
+// The anti-aliasing claims (aa_resolve): the strongest of the plugins that
+// are on, TAKE before LEAVE; the first that takes it over named; a plugin
+// that is off counts for nothing.
+void test_claims() {
+    std::size_t first = 9;
+    CHECK(render_api::aa_resolve(nullptr, nullptr, 0, &first) == BB_AA_NONE && first == 0);
+    {
+        const int c[] = {BB_AA_NONE, BB_AA_NONE};
+        const bool on[] = {true, true};
+        CHECK(render_api::aa_resolve(c, on, 2, &first) == BB_AA_NONE && first == 2);
+    }
+    {
+        const int c[] = {BB_AA_NONE, BB_AA_LEAVE};
+        const bool on[] = {true, true};
+        CHECK(render_api::aa_resolve(c, on, 2, &first) == BB_AA_LEAVE && first == 2);
+    }
+    {
+        const int c[] = {BB_AA_LEAVE, BB_AA_TAKE};  // one leaves it, one takes it: the taker holds
+        const bool on[] = {true, true};
+        CHECK(render_api::aa_resolve(c, on, 2, &first) == BB_AA_TAKE && first == 1);
+    }
+    {
+        const int c[] = {BB_AA_TAKE, BB_AA_LEAVE, BB_AA_TAKE};  // two take it: the first is named
+        const bool on[] = {true, true, true};
+        CHECK(render_api::aa_resolve(c, on, 3, &first) == BB_AA_TAKE && first == 0);
+    }
+    {
+        const int c[] = {BB_AA_TAKE, BB_AA_LEAVE};  // the taker turned off (a live switch, a visitor)
+        const bool on[] = {false, true};
+        CHECK(render_api::aa_resolve(c, on, 2, &first) == BB_AA_LEAVE && first == 2);
+    }
+    {
+        const int c[] = {BB_AA_TAKE, BB_AA_TAKE};
+        const bool on[] = {false, true};
+        CHECK(render_api::aa_resolve(c, on, 2, &first) == BB_AA_TAKE && first == 1);
+    }
+    {
+        const int c[] = {7, -1};  // nothing a plugin can claim counts
+        const bool on[] = {true, true};
+        CHECK(render_api::aa_resolve(c, on, 2, &first) == BB_AA_NONE);
+    }
+    CHECK(render_api::aa_of_flags(0) == BB_AA_NONE);
+    CHECK(render_api::aa_of_flags(BB_PLUGIN_AA_LEAVE | BB_PLUGIN_OPT_IN) == BB_AA_LEAVE);
+    CHECK(render_api::aa_of_flags(BB_PLUGIN_AA_TAKE) == BB_AA_TAKE);
+    CHECK(render_api::aa_of_flags(BB_PLUGIN_AA_TAKE | BB_PLUGIN_AA_LEAVE) == BB_AA_TAKE);
+}
+
 }  // namespace
 
 int main() {
@@ -267,10 +315,11 @@ int main() {
     test_cut();
     test_reset();
     test_generations();
+    test_claims();
     if (g_failures) {
         std::fprintf(stderr, "render_api_test: %d failures\n", g_failures);
         return 1;
     }
-    std::printf("render_api_test: the cameras, cuts, resets and image generations as plugin API 27 defines them\n");
+    std::printf("render_api_test: the cameras, cuts, resets, image generations and anti-aliasing claims as plugin API 27 defines them\n");
     return 0;
 }

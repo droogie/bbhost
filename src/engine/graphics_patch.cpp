@@ -15,6 +15,7 @@
 #include "engine/sf_heap_probe.h"
 #include "hle/modules.h"
 #include "host/options.h"
+#include "host/plugins.h"
 #include "host/scene_look.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
@@ -446,8 +447,10 @@ void settings_changed(const HostSettings& hs) {
     // Performance mode clears both (its patch's constructor writes until
     // 2026-11-05), and with it on or off while the game runs they follow.
     // TAA (Graphics > Upscaling) takes the AA's place: FXAA over its picture
-    // only blurred it again.
-    const bool aa = hs.anti_alias && !scene_look_scale() && !hs.performance_mode && upscaler_method() != kUpscaleTaa;
+    // only blurred it again. So does a plugin's own anti-aliasing (plugin API
+    // 27, host/plugins.h: aa_claim's BB_AA_TAKE).
+    const bool aa = hs.anti_alias && !scene_look_scale() && !hs.performance_mode && upscaler_method() != kUpscaleTaa &&
+                    plugins_aa_claim() != kAaTake;
     const bool ssao = hs.ssao && !hs.performance_mode;
     if (ssao != ssao_was || aa != aa_was || velocity != velocity_was || hs.hd_motion_blur != camera_blur_was) {
         ssao_was = ssao;

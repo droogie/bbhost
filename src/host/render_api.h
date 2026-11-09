@@ -2,13 +2,15 @@
 
 // Plugin API 27's rules as plain functions (include/bbhost_plugin.h frame_info,
 // on_render, aa_claim): no Vulkan and no state of their own. A frame's cameras
-// from the view block's terms, the frame's reset and its cut test, and the
-// generations of the images the render hooks are handed.
+// from the view block's terms, the frame's reset and its cut test, the
+// generations of the images the render hooks are handed, and which of the
+// plugins' anti-aliasing claims holds (host/plugins.cpp).
 // host/render_hooks.cpp uses them; tests/render_api_test.cpp checks them.
 
 #include "bbhost_plugin.h"
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 namespace render_api {
@@ -212,6 +214,26 @@ inline std::uint64_t image_generation(ImageSlot& s, std::uint64_t image, std::ui
 // that handed it out gives the next one a new generation.
 inline void image_gone(ImageSlot& s, std::uint64_t handle) {
     if (handle && (handle == s.image || handle == s.view)) s.gone = true;
+}
+
+// The claim a plugin starts with, from its BbPluginInfo.flags.
+inline int aa_of_flags(std::uint32_t flags) {
+    return flags & BB_PLUGIN_AA_TAKE ? BB_AA_TAKE : flags & BB_PLUGIN_AA_LEAVE ? BB_AA_LEAVE : BB_AA_NONE;
+}
+
+// The claim that holds over n plugins' own (BB_AA_*; on[k] false for one that
+// is off - dormant, a visitor - whose claim does not count): BB_AA_TAKE before
+// BB_AA_LEAVE before BB_AA_NONE. *first: the first plugin that takes it over,
+// n when none does.
+inline int aa_resolve(const int* claims, const bool* on, std::size_t n, std::size_t* first) {
+    int held = BB_AA_NONE;
+    *first = n;
+    for (std::size_t k = 0; k < n; ++k) {
+        if (!on[k]) continue;
+        if (claims[k] == BB_AA_TAKE && *first == n) *first = k;
+        if (claims[k] > held && claims[k] <= BB_AA_TAKE) held = claims[k];
+    }
+    return held;
 }
 
 }  // namespace render_api

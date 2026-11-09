@@ -32,6 +32,9 @@ _Static_assert(offsetof(BbRenderCall, scene) == 32, "BbRenderCall.scene");
 _Static_assert(offsetof(BbRenderCall, picture) == 224, "BbRenderCall.picture");
 _Static_assert(offsetof(BbHostApi, frame_info) == offsetof(BbHostApi, camera_zoom) + sizeof(void*), "frame_info after camera_zoom");
 _Static_assert(offsetof(BbHostApi, on_render) == offsetof(BbHostApi, frame_info) + sizeof(void*), "on_render after frame_info");
+_Static_assert(offsetof(BbHostApi, aa_claim) == offsetof(BbHostApi, on_render) + sizeof(void*), "aa_claim after on_render");
+_Static_assert(BB_PLUGIN_AA_LEAVE == 16u && BB_PLUGIN_AA_TAKE == 32u, "the claim's flags");
+_Static_assert(BB_AA_NONE == 0 && BB_AA_LEAVE == 1 && BB_AA_TAKE == 2, "the claims");
 
 int main(void) {
     printf("plugin_abi_test: version %d's structures as plugins see them\n", BB_PLUGIN_API_VERSION);
