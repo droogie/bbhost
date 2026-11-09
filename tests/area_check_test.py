@@ -259,6 +259,20 @@ class TourTest(unittest.TestCase):
         self.assertEqual(len([l for l in lines if l.startswith("dump rom-water-arena-")]), 5)
         self.assertNotIn("pitch", ac.tour(ac.pick_areas("chalice-aynbgu4m"), dict(ac.DEFAULTS), "perf"))
 
+    def test_auto_numa_node(self):
+        """--numa-node auto: node 0 with every CPU allowed, the node an outer numactl confined the harness to (a
+        lavapipe slot's node 1), none where the affinity is part of a node or spans several."""
+        self.assertEqual(ac.parse_cpulist("0-19,40-59\n"), set(range(0, 20)) | set(range(40, 60)))
+        self.assertEqual(ac.parse_cpulist("3"), {3})
+        nodes = {0: set(range(0, 20)) | set(range(40, 60)), 1: set(range(20, 40)) | set(range(60, 80))}
+        every = nodes[0] | nodes[1]
+        self.assertEqual(ac.auto_numa_node(every, nodes), 0)
+        self.assertEqual(ac.auto_numa_node(set(nodes[1]), nodes), 1)
+        self.assertEqual(ac.auto_numa_node(set(nodes[0]), nodes), 0)
+        self.assertIsNone(ac.auto_numa_node(set(range(0, 6)) | set(range(40, 46)), nodes))
+        self.assertIsNone(ac.auto_numa_node(set(range(0, 4)) | set(range(20, 24)), nodes))
+        self.assertEqual(ac.auto_numa_node(set(range(4)), {}), 0)  # no NUMA facts: today's node 0
+
     def test_sewer_places(self):
         """The sewers under Central Yharnam: four standpoints outside the 12,
         each Central Yharnam's lamp travel and then a warp onto the sewer's

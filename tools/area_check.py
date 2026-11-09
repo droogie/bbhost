@@ -506,6 +506,46 @@ def pass_budget(areas, opts, kind):
     return 300 + opts["start"] + per * len(areas) + looks + 60
 
 
+def parse_cpulist(text):
+    """The CPUs a Linux cpulist names ("0-19,40-59")."""
+    cpus = set()
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        cpus.update(range(int(lo), int(hi or lo) + 1))
+    return cpus
+
+
+def numa_nodes():
+    """{node: its CPUs} from /sys/devices/system/node; empty where the system says nothing."""
+    nodes = {}
+    for d in Path("/sys/devices/system/node").glob("node[0-9]*"):
+        try:
+            nodes[int(d.name[4:])] = parse_cpulist((d / "cpulist").read_text())
+        except (OSError, ValueError):
+            pass
+    return nodes
+
+
+def auto_numa_node(allowed=None, nodes=None):
+    """--numa-node auto: the node the game is pinned to. Node 0 where this process may run on every CPU; the node it was
+    confined to by an outer numactl or taskset, where its CPUs are that node's (a lavapipe slot's node 1); none - the game
+    keeps the affinity it is given - where they are only part of a node, or span several (a smaller machine acted out).
+    Pinning to node 0 regardless moved a slot's game off the node it was given."""
+    if allowed is None:
+        allowed = set(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else set()
+    if nodes is None:
+        nodes = numa_nodes()
+    every = set().union(*nodes.values()) if nodes else set()
+    if not nodes or not allowed or allowed >= every:
+        return 0
+    for node, cpus in sorted(nodes.items()):
+        if allowed == cpus:
+            return node
+    return None
+
+
 def estimate(areas, opts, kind):
     """Seconds a pass usually takes (a travel ~25 s)."""
     per = 25 + (3 if any(a.view() for a in areas) else 0)
@@ -2072,7 +2112,7 @@ def resolve_options(args):
         raise ValueError("the seed %s has no saves/ folder (a data folder holding a character in the world)" % seed)
     numa = args.numa_node
     if numa == "auto":
-        numa = 0 if shutil.which("numactl") else None
+        numa = auto_numa_node() if shutil.which("numactl") else None
     elif numa == "none":
         numa = None
     else:
@@ -2295,7 +2335,10 @@ def add_run_options(p):
     p.add_argument("--pipeline-cache", choices=("seed", "off"), default="seed",
                    help="seed: the seed's shader caches and stage manifest, as a player's after an update (default); "
                         "off: BBHOST_PIPELINE_CACHE=0, every shader compiled when first met")
-    p.add_argument("--numa-node", default="auto", help="pin the game to this NUMA node (numactl); auto: node 0 when numactl exists; none")
+    p.add_argument("--numa-node", default="auto",
+                   help="pin the game to this NUMA node (numactl); auto: when numactl exists, the node an outer numactl or "
+                        "taskset confined this harness to, node 0 when it may run anywhere, none when it was confined to part "
+                        "of a node or to several; none: the affinity as given")
     p.add_argument("--p2p-port", type=int, default=9446, help="the run's own P2P port (never the one a player's game uses)")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--height", type=int, default=1080)
