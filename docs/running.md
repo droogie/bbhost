@@ -729,6 +729,15 @@ anti-aliasing:
 Frame generation (AMD FidelityFX) also runs on Windows only. Sharpness
 sharpens what TAA, FSR or DLSS gives.
 
+Character motion (Graphics, or System > PC Upscaling in the game) is where
+the upscalers and frame generation take the motion of the hunter, enemies and
+other moving characters from; the camera's own always comes from the depth.
+Precise, the default, draws each character a second time into the motion,
+with its own position this frame and the last: clean edges and no trail behind
+a running character, for about 1% of the frame rate at 4K, on any GPU. Velocity
+map takes the game's motion blur map alone, 640x360 at any Resolution: a
+little faster, softer at a character's edge, where a faint trail can show.
+
 A plugin can take the anti-aliasing over (plugin API 27, see
 [plugins.md](plugins.md)): while it is on, TAA, FSR and DLSS stay off, the
 Upscaling row names it, and your choice applies again once the plugin is off.

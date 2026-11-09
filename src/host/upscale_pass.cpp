@@ -510,6 +510,14 @@ bool capture_env() {
     return on;
 }
 
+// Character motion (Graphics: Precise or Velocity map, host/options.cpp), read
+// live from the settings' newest snapshot (no lock). Velocity map: no draw is
+// given a place, so the vertex shaders keep their store and skip it (a place
+// of 0) and nothing is translated again; the map, cleared each frame, has
+// nothing drawn into it and the motion comes from the velocity map alone.
+// Turned back on, a draw is matched from the frame after its first place.
+bool char_motion_on() { return host_settings_ref().char_motion; }
+
 VkBuffer cap_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags want, VkDeviceMemory& memory, VkDeviceAddress* address,
                     std::uint8_t** map) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -656,6 +664,14 @@ void record_capture(VkCommandBuffer cb, std::uint32_t w, std::uint32_t h) {
         }
         g_cap.map_w = w;
         g_cap.map_h = h;
+    }
+    // (The setting as this frame's draws had it, said when it changes.)
+    static int said = -1;
+    if (const int on = char_motion_on() ? 1 : 0; on != said && g_cap.ok) {
+        if (said >= 0 || !on)
+            host_log("upscaler: Character motion %s", on ? "Precise: the characters' own positions drawn into the motion"
+                                                         : "Velocity map: the game's map alone, no character drawn into the motion");
+        said = on;
     }
     // This frame's draws in the stream's order, each key's n-th counted in it
     // (the n-th draw of a key stands for the last frame's n-th).
@@ -2583,7 +2599,7 @@ void upscale_capture_viewport_locked(const VkViewport& vp) {
     g_cap.vp_set = true;
 }
 
-bool upscale_capture_on() { return capture_env() && g_cap.ok; }
+bool upscale_capture_on() { return capture_env() && g_cap.ok && char_motion_on(); }
 void upscale_capture_part_draw() { g_cap.part_draws.fetch_add(1, std::memory_order_relaxed); }
 
 // The meshes the game moves: each index buffer its velocity pass ever drew a

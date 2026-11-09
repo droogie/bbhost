@@ -1602,7 +1602,8 @@ void fg_pace_note(std::uint64_t now_ns, std::uint64_t wait_ns, float rate_target
         const std::uint64_t key = static_cast<std::uint64_t>(h.upscaler) | static_cast<std::uint64_t>(h.upscale_quality) << 8 |
                                   static_cast<std::uint64_t>(h.frame_generation) << 16 |
                                   static_cast<std::uint64_t>(h.sharpness * 100.0f + 0.5f) << 24 |
-                                  static_cast<std::uint64_t>(h.taa_strength * 100.0f + 0.5f) << 40;
+                                  static_cast<std::uint64_t>(h.taa_strength * 100.0f + 0.5f) << 40 |
+                                  static_cast<std::uint64_t>(h.char_motion) << 48;
         if (key != p.settings_key) {
             if (p.settings_key && p.held_s > 0.0f)
                 host_log("frame rate: frame generation's held pace %.1f fps let go: the upscaler's settings changed", 1.0 / p.held_s);
