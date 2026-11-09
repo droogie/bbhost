@@ -118,11 +118,21 @@ int main() {
     std::filesystem::create_directories(dir / "shaders", ec);
     std::filesystem::create_directories(dir / "plugin1" / "shaders", ec);
 
+    // 0. Before the renderer starts (the game's first frames, a plugin's first
+    // on_frame): a plugin's text waits - nothing is off yet - and applies
+    // nowhere.
+    CHECK(!overrides_started());
+    overrides_owner(9, "plugin nine", std::string(), true);
+    CHECK(overrides_set_text(9, "aaaa0009.ps", "float4 main() : SV_Target0 { return 0.0f.xxxx; }") == 0);
+    std::string why0;
+    CHECK(overrides_state(9, "aaaa0009.ps", &why0) == kOverrideWaiting && why0 == "the renderer has not started yet");
+    overrides_drop_owner(9);
+
     // 1. Nothing registered: generation 0, every salt 0 - the renderer's fast path.
     CHECK(override_gen() == 0);
     CHECK(override_salt("12345678") == 0);
     hlsl_set_folders(dir.string());  // the player's folder, empty
-    CHECK(override_gen() == 0 && overrides_on());
+    CHECK(override_gen() == 0 && overrides_on() && overrides_started());
 
     const Ps p = make_ps({0, 1, 2, 3}), q = make_ps({1, 0, 2, 3});
     const gcn::LiftResult lp = gcn::lift_pixel_shader(p.prog, p.o, p.ref), lq = gcn::lift_pixel_shader(q.prog, q.o, q.ref);

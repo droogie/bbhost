@@ -1426,6 +1426,9 @@ int api_shader_state(const char* name, const char* shader, char* why, std::size_
 thread_local std::string g_shader_source;
 int api_shader_source(const char* shader, const char** hlsl, std::size_t* size) {
     if (!shader || !hlsl || !size) return 1;
+    // The game's first frames come before the renderer starts: nothing met
+    // yet, and nothing known to be off (gpu::overrides_started).
+    if (!gpu::overrides_started()) return 1;
     if (const int r = gpu::hlsl_override_source(shader, g_shader_source)) return r;
     *hlsl = g_shader_source.c_str();
     *size = g_shader_source.size();

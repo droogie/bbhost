@@ -54,6 +54,10 @@ struct OverrideSource {
 // whose shaders/ is the player's folder (listed here; empty: none).
 void overrides_start(bool on, const std::string& why_off, const std::string& bbhost_dir);
 bool overrides_on();
+// overrides_start has run. Before it - the game's first frames, the plugins'
+// first on_frame calls, come before the renderer starts - nothing is off yet:
+// a source waits, and no shader is met.
+bool overrides_started();
 
 // An owner other than the player's folder: named for the logs, with a folder
 // of its own that relative folders start from; off while `on` is false

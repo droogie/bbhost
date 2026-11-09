@@ -92,6 +92,7 @@ struct Registry {
     std::mutex mu;
     bool on = false;
     std::atomic<bool> on_flag{false};  // `on`, read without the lock (overrides_on)
+    std::atomic<bool> started{false};  // overrides_start has run (set under mu)
     std::string why_off;
     std::map<int, Owner> owners;  // in their order: the player's folder first
     // What applies: each name's source, the first owner's that has one.
@@ -222,6 +223,10 @@ int state_locked(const Registry& r, int owner, const std::string& name, std::str
         if (why) *why = std::move(w);
     };
     if (!own && p == r.pending.end()) return kOverrideNone;
+    if (!r.started.load(std::memory_order_relaxed)) {
+        say("the renderer has not started yet");
+        return kOverrideWaiting;
+    }
     if (!r.on) {
         say(r.why_off.empty() ? std::string("edited shaders do not apply") : r.why_off);
         return kOverrideOff;
@@ -388,6 +393,7 @@ void overrides_start(bool on, const std::string& why_off, const std::string& bbh
     std::lock_guard<std::mutex> lk(r.mu);
     r.on = on;
     r.on_flag.store(on, std::memory_order_release);
+    r.started.store(true, std::memory_order_release);
     r.why_off = why_off;
     Owner& player = r.owners[kOverridePlayer];
     player.name = "shaders/";
@@ -442,6 +448,7 @@ void overrides_start(bool on, const std::string& why_off, const std::string& bbh
 }
 
 bool overrides_on() { return reg().on_flag.load(std::memory_order_acquire); }
+bool overrides_started() { return reg().started.load(std::memory_order_acquire); }
 
 bool overrides_watch_scan() {
     Registry& r = reg();
