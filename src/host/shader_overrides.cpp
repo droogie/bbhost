@@ -1,9 +1,11 @@
 #include "host/shader_overrides.h"
 
+#include "core/portable.h"
 #include "host/translation_cache.h"
 #include "log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -13,6 +15,7 @@
 #include <mutex>
 #include <set>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -393,6 +396,24 @@ void overrides_start(bool on, const std::string& why_off, const std::string& bbh
     if (!dir.empty()) player.folders.push_back({dir, std::move(files)});
     r.player_unnamed = unnamed;
     rebuild_locked(r);
+    // BBHOST_SHADER_WATCH=1 (or a period in milliseconds): every folder listed
+    // again while the game runs, a change applied once compiled.
+    static std::once_flag watching;
+    if (const char* e = std::getenv("BBHOST_SHADER_WATCH"); on && e && *e && std::strcmp(e, "0") != 0) {
+        const int ms = std::atoi(e) > 1 ? std::atoi(e) : 500;
+        std::call_once(watching, [ms, dir] {
+            host_log("render: HLSL overrides: %s and the plugins' folders watched every %d ms (BBHOST_SHADER_WATCH): an edited shader applies "
+                     "once it compiles", dir.empty() ? "no player's folder" : dir.c_str(), ms);
+            std::thread([ms] {
+                host_thread_set_name("bb-shwatch");
+                host_thread_background();
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+                    overrides_watch_scan();
+                }
+            }).detach();
+        });
+    }
     // The start's report: every edited shader, who gave it (the player's
     // folder, a plugin), and the ones another comes first for; or what turned
     // them off, and how many that leaves out.
@@ -421,6 +442,54 @@ void overrides_start(bool on, const std::string& why_off, const std::string& bbh
 }
 
 bool overrides_on() { return reg().on_flag.load(std::memory_order_acquire); }
+
+bool overrides_watch_scan() {
+    Registry& r = reg();
+    struct Folder {
+        int owner;
+        std::string dir;
+        std::map<std::string, std::uint64_t> files;  // name -> identity: the listing's, or the one compiling ahead
+    };
+    std::vector<Folder> folders;
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        if (!r.on) return false;
+        for (const auto& [id, o] : r.owners) {
+            for (const Owner::Folder& f : o.folders) {
+                Folder w{id, f.dir, {}};
+                for (const auto& [name, s] : f.files) w.files[name] = s->identity;
+                for (const auto& [key, p] : r.pending) {
+                    if (key.first == id && p.folder == f.dir) w.files[key.second] = p.src->identity;
+                }
+                folders.push_back(std::move(w));
+            }
+        }
+    }
+    static std::atomic<int> logs{0};
+    bool changed = false;
+    for (const Folder& w : folders) {
+        std::map<std::string, std::shared_ptr<const OverrideSource>> now;
+        list_folder(w.owner, w.dir, now, nullptr);  // a folder gone: every file in it gone
+        const auto note = [&](const std::string& name, const char* what) {
+            changed = true;
+            if (logs.fetch_add(1) < 64) {
+                host_log("render: HLSL overrides: %s/%s.hlsl %s - its shader's next draw takes what applies now", w.dir.c_str(), name.c_str(), what);
+            }
+        };
+        for (const auto& [name, s] : now) {
+            const auto was = w.files.find(name);
+            if (was != w.files.end() && was->second == s->identity) continue;
+            note(name, was == w.files.end() ? "is new" : "changed");
+            file_changed(w.owner, w.dir, name, s);
+        }
+        for (const auto& [name, identity] : w.files) {
+            if (now.count(name)) continue;
+            note(name, "is gone");
+            file_changed(w.owner, w.dir, name, nullptr);
+        }
+    }
+    return changed;
+}
 
 void overrides_owner(int owner, const std::string& name, const std::string& own_dir, bool on) {
     if (owner == kOverridePlayer) return;

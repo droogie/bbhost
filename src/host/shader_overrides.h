@@ -125,6 +125,13 @@ void override_note_pipeline();
 // of it (empty without any); and the 300-flip report's since the last call.
 std::vector<std::string> overrides_report();
 std::string overrides_window();
+
+// ---- The watch (BBHOST_SHADER_WATCH=1, or a period in milliseconds) ----
+// Every folder of edited shaders - the player's and the other owners' - is
+// listed again every half second on bb-shwatch (from overrides_start): a new
+// or changed file is compiled ahead and then applies, one gone goes. One
+// listing of them all; true when it found any change (the tests call it).
+bool overrides_watch_scan();
 // A name split as a file's: false when it is not a shader's.
 bool override_parse(const std::string& name, std::string& stable, std::string& stage, std::string& hash16);
 

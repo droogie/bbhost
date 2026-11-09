@@ -6,7 +6,8 @@
 // which ties itself to its program at that lift's first sight; a file changed
 // after it was listed, listed again; an owner turned off or gone; a change
 // compiled ahead of its switch, for the variants met, off the drawing thread;
-// a geometry lift's stage. Synthetic pixel shaders through the HLSL path
+// states, the report and the off switch; the watch's listing; a geometry
+// lift's stage. Synthetic pixel shaders through the HLSL path
 // (BBHOST_HLSL=1, compiled where they are met). Skips (77) without DXC.
 #include "host/translation_cache.cpp"
 
@@ -268,7 +269,26 @@ int main() {
     hlsl_set_folders(dir.string());
     CHECK(overrides_on() && override_salt("aaaa0001") != 0);
 
-    // 8. A geometry lift's stage is "gs", as the dump names its files.
+    // 8. The watch (BBHOST_SHADER_WATCH's listing, called here): a file put in
+    // the player's folder while the game runs applies once compiled ahead -
+    // before the owners' texts of its name - an edit too, and its removal.
+    const std::uint64_t s_three = override_salt("aaaa0001");
+    CHECK(!overrides_watch_scan());  // nothing changed
+    std::ofstream(dir / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary) << b;
+    CHECK(overrides_watch_scan() && settle());
+    const std::uint64_t s_new = override_salt("aaaa0001");
+    CHECK(s_new != s_three && override_pick(s_new, "aaaa0001", "ps", hp, src) && src->owner == kOverridePlayer);
+    CHECK(stage(p, "aaaa0001", s_new, took).spirv == mb.spirv && took);
+    std::ofstream(dir / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary | std::ios::app) << "// again\n";
+    CHECK(overrides_watch_scan() && settle());
+    const std::uint64_t s_edit = override_salt("aaaa0001");
+    CHECK(s_edit != s_new && s_edit != s_three);
+    std::filesystem::remove(dir / "shaders" / "aaaa0001.ps.hlsl", ec);
+    CHECK(overrides_watch_scan() && settle());
+    CHECK(override_salt("aaaa0001") == s_three);
+    CHECK(!overrides_watch_scan());
+
+    // 9. A geometry lift's stage is "gs", as the dump names its files.
     const std::vector<std::uint32_t> gs = {0x07230203u, 0x00010500u, 0, 10, 0, (5u << 16) | 15u, 3u, 1u, 0x6e69616du /* "main" */, 0};
     CHECK(lift_stage_tag(gs) == "gs");
 
