@@ -168,6 +168,10 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
     str("video.model_detail", &c->model_detail);
     str("video.texture_quality", &c->texture_quality);
     str("video.shaders", &c->shaders);
+    {
+        auto it = kv.find("video.shader_overrides");
+        if (it != kv.end()) c->shader_overrides = !(it->second == "false" || it->second == "0");
+    }
     num("video.vblank_hz", &c->vblank_hz);
     {
         auto it = kv.find("video.frame_clock");

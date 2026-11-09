@@ -541,6 +541,9 @@ struct Gpu {
     // own, merged into `cache` where the side cache is, so that a build taking
     // minutes never holds a save waiting for `cache`'s users (gpu.cpp).
     VkPipelineCache opt_cache = VK_NULL_HANDLE;
+    // Edited shaders' pipelines (host/shader_overrides.h, RunOnlyCache): a
+    // cache for the run alone, never merged into `cache` nor saved.
+    VkPipelineCache run_cache = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     bool has_maint8 = false;
     // VK_KHR_maintenance7's feature on: a render pass instance may hold inline
@@ -734,10 +737,34 @@ inline void draw_failed(DrawFail why) {
 extern std::atomic<bool> g_cache_divert;
 extern std::atomic<int> g_cache_users;
 extern std::atomic<std::uint64_t> g_cache_diverted;  // creations that took the side cache
+// render.cpp: the plugins' shader data (host/shader_overrides.h) - an owner's
+// buffer made with its first contents (its device address; 0 when it could
+// not be), and the latched writes uploaded at a recording's start (gpu.cpp
+// begin_recording_locked). Under g.mu for the second.
+std::uint64_t shader_data_make(int owner, const std::uint8_t* bytes);
+void shader_data_upload_locked();
+
+// While a pipeline holding an edited shader's stages is made on this thread
+// (GfxPipeline::hlsl_salted, a salted compute key): its pipelines and
+// libraries go into the run's own cache (Gpu::run_cache), not the one saved.
+extern thread_local bool t_run_only_cache;
+struct RunOnlyCache {
+    bool was;
+    explicit RunOnlyCache(bool on) : was(t_run_only_cache) {
+        if (on) t_run_only_cache = true;
+    }
+    ~RunOnlyCache() { t_run_only_cache = was; }
+    RunOnlyCache(const RunOnlyCache&) = delete;
+    RunOnlyCache& operator=(const RunOnlyCache&) = delete;
+};
 struct PipelineCacheUse {
     VkPipelineCache cache = VK_NULL_HANDLE;
     bool main = false;
     PipelineCacheUse() {
+        if (t_run_only_cache && g.run_cache) {
+            cache = g.run_cache;  // (not `main`: no save waits for it, and nothing of it is saved)
+            return;
+        }
         g_cache_users.fetch_add(1);
         main = !g_cache_divert.load() || g.side_cache == VK_NULL_HANDLE;
         if (!main) {
@@ -2899,6 +2926,9 @@ public:
     void end_rendering(bool barrier);   // record_end_rendering
     void begin_rendering(const VkRenderingInfo& ri);
     void fill_buffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, std::uint32_t data);
+    // vkCmdUpdateBuffer: `size` bytes of `data` (a multiple of 4, at most
+    // 64 KiB), copied into the stream at once.
+    void update_buffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void* data);
     void copy_buffer(VkBuffer src, VkBuffer dst, std::uint32_t n, const VkBufferCopy* regions);
     void copy_buffer_to_image(VkBuffer buffer, VkImage image, VkImageLayout layout, std::uint32_t n, const VkBufferImageCopy* regions);
     void copy_image_to_buffer(VkImage image, VkImageLayout layout, VkBuffer buffer, std::uint32_t n, const VkBufferImageCopy* regions);

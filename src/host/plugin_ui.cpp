@@ -207,12 +207,14 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
 
 void plugin_ui_refresh(PluginUi& ui) {
     ui.plugins = plugins_scan();
-    // In the game, which of them are running.
+    // In the game, which of them are running, and the anti-aliasing claim each
+    // holds now - one made by aa_claim as well as one its flags declare.
     for (const PluginEntry& loaded : plugins_catalog()) {
         for (PluginEntry& p : ui.plugins) {
             if (p.name != loaded.name) continue;
             p.loaded = !loaded.visitor;  // a visitor is not the player's plugin running
             p.visitor = loaded.visitor;
+            if (!loaded.visitor) p.aa = loaded.aa;
         }
     }
     std::sort(ui.plugins.begin(), ui.plugins.end(), [](const PluginEntry& a, const PluginEntry& b) {
@@ -297,6 +299,18 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
         if (!p.description.empty()) {
             ImGui::PushTextWrapPos(0.0f);
             ImGui::TextUnformatted(p.description.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        // Plugin API 27's anti-aliasing claim (host/plugins.h): its flags', or in game the one it holds now.
+        if (p.aa == kAaTake) {
+            ImGui::PushTextWrapPos(0.0f);
+#if defined(_WIN32)
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "Does the anti-aliasing itself: while it is on, bbhost's TAA, FSR and DLSS "
+                                                                  "and the game's own anti-aliasing are off, and Graphics > Upscaling says so.");
+#else
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "Does the anti-aliasing itself: while it is on, bbhost's TAA and DLSS and "
+                                                                  "the game's own anti-aliasing are off, and Graphics > Upscaling says so.");
+#endif
             ImGui::PopTextWrapPos();
         }
         ImGui::Spacing();

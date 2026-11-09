@@ -2,6 +2,7 @@
 
 #include "bbhost_version.h"
 #include "core/config.h"
+#include "host/plugins.h"
 #include "host/settings.h"
 #include "log.h"
 
@@ -270,9 +271,24 @@ std::atomic<bool> g_failed{false};  // an evaluate failed: the plain picture fro
 // BBsuite's layer beside the exe (a vulkan-1.dll whose version resource's
 // ProductName does not start with "Vulkan": not the loader). It runs its own
 // TAA and jitter, so ours stays off with it - the bridge's UB_ERR_BLOCKED for
-// TAA, which has no bridge to ask (Numity1504's step 9, "Only one AA").
+// TAA, which has no bridge to ask (Numity1504's step 9, "Only one AA") -
+// unless a plugin leaves the anti-aliasing to bbhost (plugin API 27,
+// host/plugins.h): then the layer is that plugin's, and runs no TAA of its own.
+// BBHOST_UPSCALE_LAYER=1 (a test): as if one were there, on any platform.
+static bool layer_test() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_LAYER");
+        const bool layer = e && e[0] == '1';
+        if (layer)
+            host_log("upscaler: BBHOST_UPSCALE_LAYER=1: as if a Vulkan layer were beside bbhost - TAA stays off unless a plugin leaves "
+                     "the anti-aliasing to bbhost");
+        return layer;
+    }();
+    return on;
+}
 #if defined(_WIN32)
 bool bbsuite_layer_present() {
+    if (layer_test()) return true;
     static const bool present = [] {
         wchar_t exe[MAX_PATH];
         const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -299,14 +315,17 @@ bool bbsuite_layer_present() {
         }
         const bool other = product.rfind(L"Vulkan", 0) != 0;
         host_log("upscaler: a vulkan-1.dll beside bbhost.exe (%ls): %s", product.empty() ? L"no product name" : product.c_str(),
-                 other ? "BBsuite's or another layer - TAA stays off (it runs its own)" : "the Vulkan loader");
+                 other ? "BBsuite's or another layer - TAA stays off (it runs its own) unless a plugin leaves the anti-aliasing to bbhost"
+                       : "the Vulkan loader");
         return other;
     }();
     return present;
 }
 #else
-bool bbsuite_layer_present() { return false; }  // (BBsuite is a Windows layer)
+bool bbsuite_layer_present() { return layer_test(); }  // (BBsuite is a Windows layer)
 #endif
+
+bool upscaler_layer_blocks_taa() { return bbsuite_layer_present() && plugins_aa_claim() != kAaLeave; }
 
 bool upscaler_offered(int index) {
 #if defined(_WIN32)
@@ -320,11 +339,23 @@ bool upscaler_offered(int index) {
 }
 
 int upscaler_method() {
+    // A plugin that does the anti-aliasing itself (plugin API 27,
+    // host/plugins.h): none of bbhost's runs while it is on - and so no jitter
+    // and no mip bias either, which follow the method.
+    const int claim = plugins_aa_claim();
+    if (claim == kAaTake) return 0;
     // Chosen, it wins over a plugin's 3D at a size of its own (host/scene_look.h).
     // TAA is bbhost's own: it needs neither the bridge nor its caps - only no
-    // BBsuite beside it.
+    // BBsuite beside it, or a plugin that leaves the anti-aliasing to bbhost.
     const int asked = method_asked();
-    if (asked == kUpscaleTaa) return bbsuite_layer_present() ? 0 : kUpscaleTaa;
+    if (asked == kUpscaleTaa) {
+        if (!bbsuite_layer_present()) return kUpscaleTaa;
+        if (claim != kAaLeave) return 0;
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            host_log("upscaler: a plugin leaves the anti-aliasing to bbhost: TAA runs beside the Vulkan layer");
+        return kUpscaleTaa;
+    }
     if (!asked || !g_attached || g_failed.load(std::memory_order_relaxed)) return 0;
     return (asked == 1 && g_caps_dlss.load(std::memory_order_relaxed)) || (asked == 2 && g_caps_fsr.load(std::memory_order_relaxed)) ? asked : 0;
 }
@@ -423,7 +454,8 @@ const VkDeviceCreateInfo* upscaler_prepare_device(VkInstance, VkPhysicalDevice, 
 void upscaler_device_done(VkResult) {}
 void upscaler_attach(VkInstance, VkPhysicalDevice, VkDevice, std::uint32_t) {}
 UpscalerCaps upscaler_caps() { return {}; }
-int upscaler_method() { return method_asked() == kUpscaleTaa ? kUpscaleTaa : 0; }
+int upscaler_method() { return plugins_aa_claim() != kAaTake && method_asked() == kUpscaleTaa ? kUpscaleTaa : 0; }
+bool upscaler_layer_blocks_taa() { return false; }
 bool upscaler_fsr3_override() { return false; }
 void upscaler_jitter_sized(int method, std::uint32_t, std::uint32_t, std::uint32_t frame, float* x, float* y) {
     *x = *y = 0.0f;

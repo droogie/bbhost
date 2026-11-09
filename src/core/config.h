@@ -44,6 +44,9 @@ struct HostConfig {
     std::string model_detail;  // video.model_detail: the Model detail setting's default ("Full", "Normal", "Low", "Lowest")
     std::string texture_quality;  // video.texture_quality: the Texture quality setting's default ("Lowest", "Low", "Medium", "High")
     std::string shaders;       // video.shaders: the Shaders setting's default ("HLSL" or "Lifted")
+    // video.shader_overrides / BBHOST_SHADER_OVERRIDES=0|1: edited shaders (<data>/bbhost/shaders)
+    // and plugins' shader overrides apply (host/shader_overrides.h); false: none of them does.
+    bool shader_overrides = true;
     int vblank_hz = 0;         // video.vblank_hz: the flip clock's rate; 0 = the display's own
     // video.frame_clock: the Native frame clock setting's default (F10's DISPLAY,
     // the setup window's Game page), off; what they save in bbhost-options.toml

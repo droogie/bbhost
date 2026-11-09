@@ -4101,11 +4101,53 @@ void subgroup_gate() {
     CHECK(all.lift.ok() && gated.lift.ok() && all.lift.spirv == gated.lift.spirv);
 }
 
+// The characters' motion (TranslateOptions::capture_position, on by default:
+// render.cpp vs_capture_on): the position also stored at the capture's device
+// address (StageParams::lds_address, four dwords a vertex by its index) through
+// physical storage buffer pointers - a module that declares their capability,
+// extension and addressing model, as a compute lift does, and validates. Before
+// it, every lifted vertex stage that captured failed spirv-val ("Operand 2 of
+// TypePointer requires one of these capabilities: PhysicalStorageBufferAddresses";
+// the validation layer's VUID-VkShaderModuleCreateInfo-pCode-08737). Without the
+// capture the module stays Logical, as before.
+void capture() {
+    const auto declares = [](const std::vector<std::uint32_t>& spv, bool* cap, bool* ext, std::uint32_t* addressing) {
+        *cap = *ext = false;
+        *addressing = ~0u;
+        for (std::size_t i = 5; i < spv.size() && (spv[i] >> 16);) {
+            const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+            if (op == 17 && n >= 2 && spv[i + 1] == 5347) *cap = true;  // OpCapability PhysicalStorageBufferAddresses
+            if (op == 10 && n >= 2) {  // OpExtension
+                const char* name = reinterpret_cast<const char*>(&spv[i + 1]);
+                if (std::strncmp(name, "SPV_KHR_physical_storage_buffer", (n - 1) * 4) == 0) *ext = true;
+            }
+            if (op == 14 && n >= 3) *addressing = spv[i + 1];  // OpMemoryModel
+            i += n;
+        }
+    };
+    const std::vector<std::uint32_t> words = program();
+    gcn::TranslateOptions o = options(0, 0, true);
+    const Lifted plain = lift_vs(words, o);
+    o.capture_position = true;
+    const Lifted captured = lift_vs(words, o);
+    CHECK(lifted(plain.lift));
+    CHECK(lifted(captured.lift));
+    bool cap = false, ext = false;
+    std::uint32_t addressing = 0;
+    declares(captured.lift.spirv, &cap, &ext, &addressing);
+    CHECK(cap && ext && addressing == 5348);         // PhysicalStorageBuffer64
+    CHECK(count_op(captured.lift.spirv, 120) >= 4);  // OpConvertUToPtr: the position's four dwords (and the page walk's)
+    declares(plain.lift.spirv, &cap, &ext, &addressing);
+    CHECK(!cap && !ext && addressing == 0);          // Logical
+    CHECK(count_op(plain.lift.spirv, 120) == 0);
+}
+
 void run() {
     subgroup_gate();
     formats();
     clip_distances();
     clip_discard();
+    capture();
 }
 
 }  // namespace vertex

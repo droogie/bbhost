@@ -79,7 +79,7 @@ const char* stream::op_name(stream::Op op) {
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
                                         "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker",
-                                        "push buffers",   "list draw",    "execute commands", "list run"};
+                                        "push buffers",   "list draw",    "execute commands", "list run",      "update buffer"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -775,6 +775,11 @@ void replay_block(const Block& b) {
             push_buffer_writes(cmd, r->bind_point, r->layout, r->set, r->n, bindings, infos);
             break;
         }
+        case Op::kUpdateBuffer: {
+            const auto* r = reinterpret_cast<const stream::UpdateBuffer*>(p);
+            vkCmdUpdateBuffer(cmd, r->buffer, r->offset, r->size, p + round8(sizeof(*r)));
+            break;
+        }
         case Op::kCount: break;
         }
         at += h->bytes / 8;
@@ -1458,6 +1463,15 @@ void Rec::fill_buffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, s
     before_op(REC_SITE);
     std::uint8_t* at = append_record(Op::kFill, sizeof(stream::Fill));
     *put_struct<stream::Fill>(at) = stream::Fill{buffer, offset, size, data, 0};
+    after_op();
+}
+
+void Rec::update_buffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void* data) {
+    if (!stream_on()) return vkCmdUpdateBuffer(in_place(REC_SITE), buffer, offset, size, data);
+    before_op(REC_SITE);
+    std::uint8_t* at = append_record(Op::kUpdateBuffer, round8(sizeof(stream::UpdateBuffer)) + round8(static_cast<std::size_t>(size)));
+    *put_struct<stream::UpdateBuffer>(at) = stream::UpdateBuffer{buffer, offset, size};
+    put_array(at, static_cast<const std::uint8_t*>(data), static_cast<std::size_t>(size));
     after_op();
 }
 

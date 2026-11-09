@@ -71,9 +71,11 @@
 #include "host/shaders/upscale_embers.spv.h"
 #include "host/shaders/upscale_rcas.spv.h"
 #include "host/options.h"
+#include "host/render_hooks.h"
 #include "host/scene_look.h"
 #include "host/settings.h"
 #include "host/upscaler.h"
+#include "host/view_block.h"
 #include "log.h"
 
 #include <algorithm>
@@ -97,6 +99,7 @@ struct OwnImage {
     VkImage image = VK_NULL_HANDLE;
     ImageMemory memory;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageUsageFlags usage = 0;
     bool initialised = false;
 };
 
@@ -198,25 +201,16 @@ struct VeloCopy {
 };
 VeloCopy g_velo_copy;
 
-// The engine's per-view block (864 bytes, the G-buffer's vertex stage), in
-// floats: 36-51 the inverse projection (its first row's x the tangent of half
-// the horizontal field of view, its second's y the vertical, the third
-// (0,0,0,1), the fourth the depth terms), 180-195 the camera, view to world
-// (the last row (0,0,0,1), each row's w the eye). Numity1504's appendix A.
-// The last view block's tangents and depth decode (view distance =
-// 1 / (z raw + w)), for the cutaway (upscale_view_terms).
+// The engine's per-view block (864 bytes, the G-buffer's vertex stage; its
+// floats and its test in host/view_block.h). The last view block's tangents
+// and depth decode (view distance = 1 / (z raw + w)), for the cutaway
+// (upscale_view_terms).
 std::atomic<float> g_view_tan_x{0}, g_view_tan_y{0}, g_view_z{0}, g_view_w{0};
 
 bool camera_of(const float* f, Camera* c) {
-    for (int i = 0; i < 216; ++i) {
-        if (!std::isfinite(f[i])) return false;
-    }
-    const float tx = f[36], ty = f[41];
-    if (!(tx > 0.1f && tx < 10.0f && ty > 0.1f && ty < 10.0f)) return false;
-    if (f[44] != 0.0f || f[45] != 0.0f || f[46] != 0.0f || f[47] != 1.0f) return false;
-    if (f[192] != 0.0f || f[193] != 0.0f || f[194] != 0.0f || f[195] != 1.0f) return false;
-    const float z = f[50], w = f[51];
-    if (!(std::fabs(z) > 1e-6f) || std::fabs(f[48]) > 1e-4f || std::fabs(f[49]) > 1e-4f) return false;
+    if (view_block::refusal(f)) return false;
+    const float tx = f[view_block::kInvProj + 0], ty = f[view_block::kInvProj + 5];
+    const float z = f[view_block::kInvProj + 14], w = f[view_block::kInvProj + 15];
     c->tan_x = tx;
     c->tan_y = ty;
     c->a = -w / z;
@@ -225,7 +219,7 @@ bool camera_of(const float* f, Camera* c) {
     g_view_tan_y.store(ty, std::memory_order_relaxed);
     g_view_z.store(z, std::memory_order_relaxed);
     g_view_w.store(w, std::memory_order_relaxed);
-    std::memcpy(c->rows, f + 180, sizeof(c->rows));
+    std::memcpy(c->rows, f + view_block::kCamera, sizeof(c->rows));
     return true;
 }
 
@@ -428,6 +422,7 @@ bool make(OwnImage& o, VkFormat format, VkImageUsageFlags usage, std::uint32_t w
         return false;
     }
     vkBindImageMemory(g.device, o.image, o.memory.memory, o.memory.offset);
+    o.usage = usage;
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = o.image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -846,8 +841,9 @@ bool rcas_pipeline_locked() {
 bool record_rcas(VkCommandBuffer cb, float sharpness) {
     if (!rcas_pipeline_locked()) return false;
     if (!g_sharp.image &&
-        !make(g_sharp, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-              g_ow, g_oh)) {
+        !make(g_sharp, VK_FORMAT_R16G16B16A16_SFLOAT,
+              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, g_ow,
+              g_oh)) {
         drop(g_sharp);
         return false;
     }
@@ -1158,8 +1154,9 @@ bool embers_on() {
 bool record_embers(VkCommandBuffer cb, const OwnImage& picture, const RtImage& scene, const RtImage& glow) {
     if (!embers_on() || !ember_pipeline_locked() || !scene.view || !glow.view) return false;
     if (!g_embers.image &&
-        !make(g_embers, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-              g_ow, g_oh)) {
+        !make(g_embers, VK_FORMAT_R16G16B16A16_SFLOAT,
+              VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, g_ow,
+              g_oh)) {
         drop(g_embers);
         return false;
     }
@@ -1470,9 +1467,220 @@ int velo_previous_env() {
     return on;
 }
 
+// Plugin API 27's render hooks (host/render_hooks.h): what a call of them
+// hands over - the depth with the layout the call point left it in, the
+// motion when one asked for it (g_motion, this frame's), the glow when it is
+// the scene's size, and the final picture (the upscaler's own image; null:
+// the scene is the picture).
+struct HookImages {
+    const RtImage* scene = nullptr;
+    const RtImage* depth = nullptr;
+    VkImageLayout depth_layout = VK_IMAGE_LAYOUT_GENERAL;
+    bool motion = false;
+    const RtImage* glow = nullptr;
+    const OwnImage* picture = nullptr;
+};
+
+// What the call point did of its frame for the plugins: described it, and
+// called the hooks before and after the upscale (or found none to call).
+struct HookFrame {
+    bool described = false;
+    bool before = false, after = false;
+    HookImages images;
+};
+
+// The device the render hooks are given (BbRenderDevice), the loader's two
+// look-ups behind functions of the API's own types.
+BbVkVoidFunction hook_instance_proc(void* instance, const char* name) {
+    return reinterpret_cast<BbVkVoidFunction>(vkGetInstanceProcAddr(static_cast<VkInstance>(instance), name));
+}
+BbVkVoidFunction hook_device_proc(void* device, const char* name) {
+    return reinterpret_cast<BbVkVoidFunction>(vkGetDeviceProcAddr(static_cast<VkDevice>(device), name));
+}
+const BbRenderDevice& hook_device() {
+    static const BbRenderDevice d = [] {
+        BbRenderDevice r{};
+        r.size = sizeof(r);
+        r.api_version = VK_API_VERSION_1_3;
+        r.instance = g.instance;
+        r.physical_device = g.phys;
+        r.device = g.device;
+        r.get_instance_proc_addr = &hook_instance_proc;
+        r.get_device_proc_addr = &hook_device_proc;
+        r.queue_family = g.family;
+        r.frames_in_flight = static_cast<std::uint32_t>(kSlots) + 2;  // as the upscaler bridge is told (gpu.cpp)
+        return r;
+    }();
+    return d;
+}
+
+std::uint64_t handle_of(const void* h) { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(h)); }
+
+// An image as the hooks are handed it (BbRenderImage), its generation its slot's.
+BbRenderImage hook_image(RenderImageSlot slot, VkImage image, VkImageView view, VkFormat format, VkImageLayout layout, VkImageUsageFlags usage,
+                         std::uint32_t w, std::uint32_t h, bool write) {
+    BbRenderImage im{};
+    if (!image || !view) return im;
+    im.image = handle_of(image);
+    im.view = handle_of(view);
+    im.format = static_cast<std::uint32_t>(format);
+    im.layout = static_cast<std::uint32_t>(layout);
+    im.usage = static_cast<std::uint32_t>(usage);
+    im.width = w;
+    im.height = h;
+    im.flags = write ? BB_IMAGE_WRITE : 0u;
+    im.generation = render_hooks_generation_locked(slot, im.image, im.view, im.format, w, h);
+    return im;
+}
+
+// The plugins' hooks at `point` (BB_RENDER_*) into cb, outside a render pass:
+// each in barriers of its own - what the frame wrote so far visible to its
+// compute and transfer before it, what it wrote visible to everything after
+// it, every image left in its layout - and the host's binds forgotten after
+// them all, so the next draw binds everything of its own, as after the
+// bridge's evaluate. A hook records only compute and transfer, which leave
+// the graphics state alone; every pass of the host's binds its own pipeline,
+// sets and constants.
+void call_hooks_locked(std::uint32_t point, VkCommandBuffer cb, const HookImages& im) {
+    static std::vector<RenderHook> hooks;  // under g.mu
+    render_hooks_take(point, &hooks);
+    if (hooks.empty() || !im.scene) return;
+    const bool after = point == BB_RENDER_AFTER_UPSCALE;
+    const RtImage& s = *im.scene;
+    BbRenderCall call{};
+    call.size = sizeof(call);
+    call.point = point;
+    call.command_buffer = cb;
+    call.frame = render_frame_current_locked();
+    call.device = &hook_device();
+    call.scene = hook_image(kSlotScene, s.image, s.view, s.format, VK_IMAGE_LAYOUT_GENERAL, s.usage, s.width, s.height, !after);
+    if (im.depth && g_depth_for == im.depth->image)
+        call.depth = hook_image(kSlotDepth, im.depth->image, g_depth_view, im.depth->format, im.depth_layout, im.depth->usage, im.depth->width,
+                                im.depth->height, false);
+    if (im.motion && g_motion.image)
+        call.motion = hook_image(kSlotMotion, g_motion.image, g_motion.view, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_LAYOUT_GENERAL, g_motion.usage,
+                                 s.width, s.height, false);
+    if (im.glow)
+        call.glow = hook_image(kSlotGlow, im.glow->image, im.glow->view, im.glow->format, VK_IMAGE_LAYOUT_GENERAL, im.glow->usage, im.glow->width,
+                               im.glow->height, false);
+    if (after && im.picture)
+        call.picture = hook_image(kSlotPicture, im.picture->image, im.picture->view, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_LAYOUT_GENERAL,
+                                  im.picture->usage, g_ow, g_oh, true);
+    else if (after)
+        call.picture = hook_image(kSlotPicture, s.image, s.view, s.format, VK_IMAGE_LAYOUT_GENERAL, s.usage, s.width, s.height, true);
+    VkMemoryBarrier in{};
+    in.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    in.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_WRITE_BIT;
+    in.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    VkMemoryBarrier out{};
+    out.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    out.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    out.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    const VkPipelineStageFlags work = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    render_hooks_enter(call.frame);
+    for (const RenderHook& h : hooks) {
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, work, 0, 1, &in, 0, nullptr, 0, nullptr);
+        profile_begin_locked(h.profile);
+        h.fn(&call, h.user);
+        profile_end_locked();
+        vkCmdPipelineBarrier(cb, work, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &out, 0, nullptr, 0, nullptr);
+    }
+    render_hooks_leave();
+    ::run_forget_recorded_locked();
+    static int logs = 0;
+    if (logs < 8) {
+        ++logs;
+        host_log("plugin: render hooks %s the upscale, frame %llu: %zu called; scene %ux%u format %d, depth %s, motion %s, glow %s, picture %s %ux%u",
+                 after ? "after" : "before", static_cast<unsigned long long>(call.frame->frame), hooks.size(), s.width, s.height,
+                 static_cast<int>(s.format), call.depth.image ? "yes" : "no", call.motion.image ? "yes" : "no", call.glow.image ? "yes" : "no",
+                 !after ? "-" : im.picture ? "the upscaler's" : "the scene", call.picture.width, call.picture.height);
+    }
+}
+
+// The G-buffer's depth through a view of its depth aspect (g_depth_view), made
+// again when the depth is another image. False when it cannot be made.
+bool depth_view_locked(const RtImage& depth) {
+    if (depth.image == g_depth_for && g_depth_view) return true;
+    if (g_depth_view) defer_destroy_private_view(g_depth_view);
+    g_depth_view = VK_NULL_HANDLE;
+    g_depth_for = depth.image;
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = depth.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = depth.format;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(g.device, &vci, nullptr, &g_depth_view) != VK_SUCCESS) {
+        g_depth_view = VK_NULL_HANDLE;
+        g_depth_for = VK_NULL_HANDLE;
+        return false;
+    }
+    return true;
+}
+
+// The frame described for the plugins: its sizes, what takes the 3D to the
+// picture, and its camera as the motion takes it (this frame's view block,
+// when a camera draw noted one).
+void describe_frame_locked(HookFrame& hf, std::uint32_t render_w, std::uint32_t render_h, std::uint32_t output_w, std::uint32_t output_h,
+                           std::uint32_t method, std::uint32_t quality, float jitter_x, float jitter_y) {
+    RenderFrameDesc d;
+    d.render_w = render_w;
+    d.render_h = render_h;
+    d.output_w = output_w;
+    d.output_h = output_h;
+    d.method = method;
+    d.quality = quality;
+    d.jitter_x = jitter_x;
+    d.jitter_y = jitter_y;
+    d.camera = g_cam_noted;
+    if (d.camera) {
+        d.tan_x = g_cam_now.tan_x;
+        d.tan_y = g_cam_now.tan_y;
+        d.a = g_cam_now.a;
+        d.r2w = g_cam_now.r2w;
+        std::memcpy(d.rows, g_cam_now.rows, sizeof(d.rows));
+    }
+    render_frame_describe_locked(d);
+    hf.described = true;
+}
+
+// A frame no upscaler takes (Upscaling off, or one the path below gave up on
+// before its motion): described as drawn, at the scene's size, its camera
+// taken - which the upscaler's motion then does not keep, as after a frame
+// with no camera - and, when a plugin has hooks, both hooks with the scene as
+// the picture. Its owed clears made and its pass ended first, the depth in
+// its read-only layout, as the upscaler's path has them.
+void frame_alone_locked(RtImage& scene, RtImage& depth, const RtImage* glow, HookFrame& hf) {
+    if (!hf.described) {
+        describe_frame_locked(hf, scene.width, scene.height, scene.width, scene.height, BB_UPSCALE_NONE, BB_QUALITY_NATIVE, 0.0f, 0.0f);
+        g_cam_noted = false;
+        g_cam_prev_ok = false;
+    }
+    if (!render_hooks_registered()) return;  // frame info alone
+    const bool depth_ok = depth_view_locked(depth);
+    begin_recording_locked();
+    if (scene.view_clear) view_clear_apply_locked(scene);
+    if (depth_ok && depth.view_clear) view_clear_apply_locked(depth);
+    render_end_pass_locked();
+    if (depth_ok && depth.managed_layout) rt_set_layout_locked(depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    HookImages& im = hf.images;
+    im.scene = &scene;
+    im.depth = depth_ok ? &depth : nullptr;
+    im.depth_layout = depth.managed_layout ? depth.layout : VK_IMAGE_LAYOUT_GENERAL;
+    im.motion = false;
+    im.glow = glow && glow->width == scene.width && glow->height == scene.height ? glow : nullptr;
+    im.picture = nullptr;
+    VkCommandBuffer cb = g_cmd();
+    call_hooks_locked(BB_RENDER_BEFORE_UPSCALE, cb, im);
+    hf.before = true;
+    call_hooks_locked(BB_RENDER_AFTER_UPSCALE, cb, im);
+    hf.after = true;
+}
+
 }  // namespace
 
-bool upscale_motion_on() { return upscaler_method() || framegen_active(); }
+bool upscale_motion_on() { return upscaler_method() || framegen_active() || render_hooks_want_motion(); }
 
 std::uint64_t upscale_velo_frame() { return g_velo_frame; }
 
@@ -1577,12 +1785,16 @@ void upscale_velo_copy_locked(RtImage& velo) {
             VK_ACCESS_SHADER_READ_BIT);
 }
 
-bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y, const RtImage* glow) {
+namespace {
+
+bool upscale_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y, const RtImage* glow, HookFrame& hf) {
     const int method = upscaler_method();
     // Frame generation with no upscaler running (Upscaling off, or one this
     // GPU cannot run): the motion and its prepare at the scene's size, and the
-    // scene left as the game drew it.
-    const bool motion_only = !method && framegen_active();
+    // scene left as the game drew it. A plugin's render hook that asks for the
+    // motion (plugin API 27, BB_RENDER_MOTION) has it made the same way.
+    const bool hooks_motion = render_hooks_want_motion();
+    const bool motion_only = !method && (framegen_active() || hooks_motion);
     if (!method && !motion_only) {
         // Upscaling off: a method chosen again later starts over - its history
         // and its LOD bias are its own, not the ones kept from before.
@@ -1654,8 +1866,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
             return false;
         }
         if (motion_only)
-            host_log("framegen: the motion at %ux%u (the scene's size, no upscaler running), scene format %d, depth format %d", g_w, g_h,
-                     static_cast<int>(scene.format), static_cast<int>(depth.format));
+            host_log("%s: the motion at %ux%u (the scene's size, no upscaler running), scene format %d, depth format %d",
+                     framegen_active() ? "framegen" : "plugin: render hooks", g_w, g_h, static_cast<int>(scene.format), static_cast<int>(depth.format));
         if (!motion_only) {
             if (g_scaled)
                 host_log("upscaler: %s from %ux%u to %ux%u (Upscaling quality %d), scene format %d, depth format %d; YEBIS's copy reads the picture",
@@ -1666,21 +1878,7 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
                          method == 1 ? "DLAA" : method == kUpscaleTaa ? "TAA" : "FSR native AA", g_w, g_h, static_cast<int>(scene.format), static_cast<int>(depth.format));
         }
     }
-    if (depth.image != g_depth_for) {
-        if (g_depth_view) defer_destroy_private_view(g_depth_view);
-        g_depth_view = VK_NULL_HANDLE;
-        g_depth_for = depth.image;
-        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vci.image = depth.image;
-        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vci.format = depth.format;
-        vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-        if (vkCreateImageView(g.device, &vci, nullptr, &g_depth_view) != VK_SUCCESS) {
-            g_depth_view = VK_NULL_HANDLE;
-            g_depth_for = VK_NULL_HANDLE;
-            return false;
-        }
-    }
+    if (!depth_view_locked(depth)) return false;
 
     // The method as the bridge runs it: FSR 4 and FSR 3 are one method with
     // a flag (upscaler_fsr3_override), and a change between them is a change
@@ -1788,6 +1986,11 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         if (taa) {
             motion_params(taa_motion, g_w, g_h, g_cam_prev_ok, velo, velo_w, velo_h, velo_mode, whole);
             taa_velo = velo;
+            // A plugin's hook that asks for the motion has the motion pass's,
+            // made before it is called (TAA then writes none of its own).
+            if (hooks_motion)
+                record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_w, velo_h,
+                              velo_mode, whole);
         } else {
             record_motion(cb, g_depth_view, depth_layout, g_motion.image, g_motion.view, g_w, g_h, g_cam_prev_ok, velo, velo_w, velo_h,
                           velo_mode, whole);
@@ -1810,14 +2013,39 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         g_cam_prev_ok = false;
         g_reset = true;
     }
+    // The frame described for the plugins (plugin API 27), with the camera its motion took.
+    if (render_hooks_on())
+        describe_frame_locked(hf, g_w, g_h, g_ow, g_oh, motion_only ? BB_UPSCALE_NONE : static_cast<std::uint32_t>(method),
+                              motion_only || !g_scaled ? BB_QUALITY_NATIVE : static_cast<std::uint32_t>(rs.quality), motion_only ? 0.0f : jitter_x,
+                              motion_only ? 0.0f : jitter_y);
     g_cam_noted = false;
     g_terms = camera_terms();
+    // The plugins' render hooks before the upscaler, TAA, the embers, the
+    // sharpening and frame generation read the scene (plugin API 27), this
+    // frame's motion made by then for one that asked for it.
+    const bool hooks = render_hooks_on();
+    if (hooks) {
+        HookImages& im = hf.images;
+        im.scene = &scene;
+        im.depth = &depth;
+        im.depth_layout = depth_layout;
+        im.motion = hooks_motion;
+        im.glow = glow && glow->width == scene.width && glow->height == scene.height ? glow : nullptr;
+        call_hooks_locked(BB_RENDER_BEFORE_UPSCALE, cb, im);
+        hf.before = true;
+    }
     if (motion_only) {
         // No upscaler: frame generation's prepare alone - no jitter (the
         // draws are moved only while an upscaler runs) - and AMD's binds gone
-        // from cb, as the bridge's are below.
-        prepare_frame_generation(cb, depth, depth_layout, 0.0f, 0.0f, motion_mode < 0 ? -1.0f : 1.0f);
-        ::run_forget_recorded_locked();
+        // from cb, as the bridge's are below. The scene is the picture.
+        if (framegen_active()) {
+            prepare_frame_generation(cb, depth, depth_layout, 0.0f, 0.0f, motion_mode < 0 ? -1.0f : 1.0f);
+            ::run_forget_recorded_locked();
+        }
+        if (hooks) {
+            call_hooks_locked(BB_RENDER_AFTER_UPSCALE, cb, hf.images);
+            hf.after = true;
+        }
         return false;
     }
     UpscaleCall c;
@@ -1847,7 +2075,7 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     const bool ok = method == kUpscaleTaa
                         ? taa && record_taa(cb, scene, g_depth_view, depth_layout, jitter_x, jitter_y, c.reset,
                                             glow && glow->width == scene.width && glow->height == scene.height ? glow : nullptr, taa_motion,
-                                            taa_velo, framegen_active() || show_motion() > 0.0f || check_motion() > 0.0f)
+                                            taa_velo, (framegen_active() || show_motion() > 0.0f || check_motion() > 0.0f) && !hooks_motion)
                         : upscaler_evaluate(cb, c);
     profile_end_locked();
     // The bridge's binds are gone from cb: the next draw binds all of its own.
@@ -1878,6 +2106,13 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     profile_end_locked();
     const OwnImage& picture = *picture_p;
     g_picture_view = picture.view;
+    // The plugins' render hooks on the final picture (plugin API 27): what
+    // YEBIS's copy samples, or at the scene's size what goes back into it next.
+    if (hooks) {
+        hf.images.picture = &picture;
+        call_hooks_locked(BB_RENDER_AFTER_UPSCALE, cb, hf.images);
+        hf.after = true;
+    }
     if (g_scaled) {
         // The picture stays here for YEBIS's copy, which samples it in the
         // scene's place.
@@ -1907,6 +2142,26 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         host_log("upscaler: first upscale of the scene 0x%llx (depth 0x%llx)", static_cast<unsigned long long>(scene.base),
                  static_cast<unsigned long long>(depth.base));
     return true;
+}
+
+}  // namespace
+
+bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, float jitter_y, const RtImage* glow) {
+    HookFrame hf;
+    const bool ran = upscale_locked(scene, depth, jitter_x, jitter_y, glow, hf);
+    if (render_hooks_on()) {
+        // Plugin API 27: a frame the path gave up on before its motion, or one
+        // with no upscaler and no frame generation, described as drawn and
+        // both hooks given the scene; one it gave up on after its first hooks
+        // (the upscaler failed) has the scene as drawn for the picture.
+        if (!hf.before) {
+            frame_alone_locked(scene, depth, glow, hf);
+        } else if (!hf.after) {
+            hf.images.picture = nullptr;
+            call_hooks_locked(BB_RENDER_AFTER_UPSCALE, g_cmd(), hf.images);
+        }
+    }
+    return ran;
 }
 
 bool upscale_pass_hudless_due_locked() { return g_fg_pending != 0; }
@@ -2149,7 +2404,7 @@ void upscale_velo_note_locked(int kind, std::uint64_t base, float kx, float ky) 
 
 bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes) {
     std::lock_guard<std::mutex> lk(g_note_mu);
-    if (g_cam_noted || !base || bytes < 864) return g_cam_noted;
+    if (g_cam_noted || !base || bytes < view_block::kFloats * 4) return g_cam_noted;
     Camera c;
     if (!camera_of(reinterpret_cast<const float*>(static_cast<std::uintptr_t>(base)), &c)) return false;
     static std::atomic<int> logs{0};
@@ -2163,9 +2418,9 @@ bool upscale_camera_note_locked(std::uint64_t base, std::uint64_t bytes) {
 }
 
 bool upscale_camera_block_locked(std::uint64_t base, std::uint64_t bytes) {
-    if (!base || bytes < 864) return false;
+    if (!base || bytes < view_block::kFloats * 4) return false;
     const auto* f = reinterpret_cast<const float*>(static_cast<std::uintptr_t>(base));
-    if (f[47] != 1.0f || f[195] != 1.0f) return false;  // (cheaply first: most buffers are not one)
+    if (!view_block::may_be(f)) return false;  // (cheaply first: most buffers are not one)
     if (!g_cam_noted) return upscale_camera_note_locked(base, bytes);
     Camera c;
     return camera_of(f, &c);

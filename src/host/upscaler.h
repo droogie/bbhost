@@ -70,6 +70,10 @@ bool upscaler_offered(int index);
 // Resolution, brought up after its pass (host/upscale_pass.cpp).
 inline bool upscaler_method_scales(int method) { return method == 1 || method == 2 || method == kUpscaleTaa; }
 bool upscaler_fsr3_override();
+// Whether TAA, chosen, stays off for a Vulkan layer beside bbhost that runs
+// its own (a vulkan-1.dll that is not the loader, on Windows; BBHOST_UPSCALE_LAYER=1
+// anywhere) - no plugin leaving the anti-aliasing to bbhost (plugin API 27).
+bool upscaler_layer_blocks_taa();
 
 // One upscale, recorded into `cb` outside a render pass (host/upscale_pass.cpp
 // at the call point). Each image's layout is the one it is in when `cb`

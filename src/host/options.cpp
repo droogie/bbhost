@@ -5,6 +5,8 @@
 
 #include "host/bindings.h"
 #include "host/overlay.h"
+#include "host/plugins.h"
+#include "host/render_hooks.h"
 #include "host/scene_look.h"
 #include "host/upscaler.h"
 #include "host/window.h"
@@ -351,7 +353,9 @@ Setting g_set[kSettingCount] = {
     {"motion_blur", "Motion blur", {"Off", "On"}, 1,
      "The blur on fast camera and character movement.", false},
     {"anti_alias", "Anti-aliasing", {"Off", "On"}, 1,
-     "The game's own AA pass.", false},
+     "The game's own anti-aliasing pass, over the finished picture. Off while TAA, or a plugin's own anti-aliasing, takes its "
+     "place.",
+     false},
     {"depth_of_field", "Depth of field", {"Off", "On"}, 1,
      "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
     {"chromatic_aberration", "Chromatic aberration", {"Off", "On"}, 1,
@@ -2441,16 +2445,41 @@ void preset_row() {
     setting_row(kDlssPreset);
 }
 
+// The plugin that does the anti-aliasing itself (plugin API 27,
+// host/plugins.h): in game the one the plugins' claims name, in the setup
+// window - before any plugin runs - the first turned on whose flags say so.
+std::string aa_taker() { return g_setup_page ? plugins_aa_owner_scanned() : plugins_aa_owner(); }
+
 // The Upscaling row's note: its own, or - the choice one this GPU or the
 // files beside bbhost.exe cannot run - why, and that the game's own
-// anti-aliasing runs in its place (frame generation still does).
+// anti-aliasing runs in its place (frame generation still does); a plugin
+// that does the anti-aliasing itself, or a Vulkan layer that keeps TAA off.
 const char* upscaler_note() {
     const int u = shown_index(kUpscaler);  // the menu's Off, TAA, FSR 3, FSR 4, DLSS
+    static std::string note;
+#if defined(_WIN32)
+    const char* ours = "TAA, FSR or DLSS";
+#else
+    const char* ours = "TAA or DLSS";
+#endif
+    if (const std::string who = aa_taker(); !who.empty()) {
+        note = g_setup_page ? who + " (a plugin turned on in the Plugins tab) does the anti-aliasing itself: while it is on, bbhost runs no " +
+                                  ours + " (nor Sharpness, which follows them), and the 3D is drawn at the Resolution. Your choice is kept for "
+                                         "when the plugin is off."
+                            : "Off while the " + who + " plugin is on: it does the anti-aliasing itself, so bbhost moves no draws and runs no " +
+                                  ours + " (nor Sharpness, which follows them), and the 3D is drawn at the Resolution. Your choice is kept for "
+                                         "when the plugin is off (F9).";
+        return note.c_str();
+    }
+    if (u == 1 && !g_setup_page && upscaler_layer_blocks_taa()) {
+        note = "TAA is off: the vulkan-1.dll beside bbhost.exe is not the Vulkan loader but a layer with an anti-aliasing of its own. "
+               "Remove it to use TAA, or use that mod as a bbhost plugin that leaves the anti-aliasing to bbhost.";
+        return note.c_str();
+    }
     // (The setup window comes before the bridge loads: nothing known yet. TAA
     // is bbhost's own: it always runs.)
     if (u <= 1 || g_setup_page) return g_set[kUpscaler].note;
     const UpscalerCaps caps = upscaler_caps();
-    static std::string note;
     const bool dlss = u == 4;
 #if !defined(_WIN32)
     // Linux: DLSS through the NGX bridge, and no FSR.
@@ -2479,6 +2508,20 @@ const char* upscaler_note() {
     }
 #endif
     return note.c_str();
+}
+
+// The Anti-aliasing row's note: its own, or that it is off while TAA or a
+// plugin's own anti-aliasing takes its place (engine/graphics_patch.cpp).
+const char* anti_alias_note() {
+    static std::string note;
+    if (const std::string who = aa_taker(); !who.empty()) {
+        note = "Off while the " + who + " plugin is on: it does the anti-aliasing itself.";
+        return note.c_str();
+    }
+    // (In game TAA as it runs - a Vulkan layer beside bbhost can keep it off -
+    // in the setup window as chosen.)
+    if (g_setup_page ? shown_index(kUpscaler) == 1 : upscaler_method() == kUpscaleTaa) return "Off while TAA runs: TAA takes its place.";
+    return g_set[kAntiAlias].note;
 }
 
 // Rows that only mean something under another setting, left out while it is
@@ -2514,6 +2557,7 @@ void host_options_draw_page(int page) {
         if (greyed) ImGui::BeginDisabled();
         if (g_rows[r].setting == kDlssPreset) preset_row();
         else if (g_rows[r].setting == kUpscaler) setting_row(kUpscaler, nullptr, upscaler_note());
+        else if (g_rows[r].setting == kAntiAlias) setting_row(kAntiAlias, nullptr, anti_alias_note());
         else setting_row(g_rows[r].setting);
         if (greyed) ImGui::EndDisabled();
         ImGui::Dummy(ImVec2(0, 1 * ui::scale()));
@@ -2662,6 +2706,7 @@ bool host_opt_resolution(int* w, int* h) {
 
 bool host_opt_upscaler_chosen() {
     if (scene_look_scale()) return false;  // a plugin's 3D at a size of its own, brought up nearest
+    if (plugins_aa_claim() == kAaTake) return false;  // a plugin's anti-aliasing (plugin API 27): the 3D at the Resolution
     // BBHOST_UPSCALE, read once: -1 unset, else whether it names an upscaler.
     static const int env = [] {
         const char* e = std::getenv("BBHOST_UPSCALE");
@@ -2674,9 +2719,10 @@ bool host_opt_upscaler_chosen() {
     return env >= 0 ? env != 0 : u != 0;
 }
 
-// (TAA wants the motion too, though it is no upscaler that sizes the 3D.)
+// (TAA wants the motion too, though it is no upscaler that sizes the 3D, and
+// so does a plugin's render hook that asks for it: host/render_hooks.h.)
 bool host_opt_motion_wanted() {
-    return host_opt_upscaler_chosen() || upscaler_method() == kUpscaleTaa || host_settings_ref().frame_generation;
+    return host_opt_upscaler_chosen() || upscaler_method() == kUpscaleTaa || host_settings_ref().frame_generation || render_hooks_want_motion();
 }
 
 int host_opt_motion_rebuilt_bits() {

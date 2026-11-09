@@ -103,6 +103,10 @@ fps_cap = 30
 # model_detail = "Normal"   # Full, Normal, Low, Lowest: the game's LOD bias
 # texture_quality = "High"  # Lowest (0.125x), Low (0.25x), Medium (0.5x), High (1.0x): the textures' width and height in video memory
 # shaders = "HLSL"          # HLSL (compiled by DXC on this PC, in the background) or Lifted (the translator's SPIR-V only)
+# Edited shaders (<data>/bbhost/shaders, docs/modding.md) and the shaders plugins
+# replace apply on the HLSL path; false turns all of them off (BBHOST_SHADER_OVERRIDES=0
+# or 1 wins over it). Requires a restart.
+# shader_overrides = true
 # OBS's game capture hooks Vulkan programs through a layer that loads into
 # every one of them once OBS is installed. On an AMD card bbhost keeps it out
 # (it hung the GPU there); "on" lets it in, "off" keeps it out on any card.

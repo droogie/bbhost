@@ -94,6 +94,8 @@ add_executable(bbhost
   src/core/win_watch.cpp
   src/host/win_crash.cpp
   src/host/plugins.cpp
+  src/host/render_hooks.cpp
+  src/host/shader_overrides.cpp
   src/host/scene_look.cpp
   src/core/tls_rewrite.cpp
   src/core/config.cpp
@@ -257,6 +259,14 @@ target_include_directories(bb_plugin_hello PRIVATE include)
 set_target_properties(bb_plugin_hello PROPERTIES OUTPUT_NAME hello PREFIX ""
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins)
 
+# The shader overrides' test plugin (plugin API 27, tools/shader_tint_plugin.c):
+# a test of the host, never a mod - built only when asked for (and by its
+# test), beside the build, never into plugins/ where bbhost would load it, and
+# in no package (tools/package_plugins.sh names the official plugins).
+add_library(shader_tint_probe MODULE EXCLUDE_FROM_ALL tools/shader_tint_plugin.c)
+target_include_directories(shader_tint_probe PRIVATE include)
+set_target_properties(shader_tint_probe PROPERTIES OUTPUT_NAME shader_tint PREFIX "")
+
 # Official plugins (docs/plugins.md): C++ against
 # include/bbhost (sdk.hpp), built to build/plugins next to the example. On
 # Windows each carries its own C++ runtime, so a DLL needs nothing beside it.
@@ -351,6 +361,19 @@ if(Vulkan_FOUND)
                                 src/host/copy_census.cpp src/host/copy_compare.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
+  # The render probe (plugin API 27's frame info, render hooks and
+  # anti-aliasing claim checked on the GPU: tools/render_probe): a test aid,
+  # built beside bbhost, never into plugins/ - where every run would load it -
+  # and in no package (tools/package_plugins.sh names the official ones). A
+  # test kit copies it into its own plugins folder.
+  add_library(render_probe MODULE tools/render_probe/render_probe.cpp)
+  target_include_directories(render_probe PRIVATE include tools/render_probe)
+  target_compile_features(render_probe PRIVATE cxx_std_17)
+  target_link_libraries(render_probe PRIVATE Vulkan::Headers)
+  set_target_properties(render_probe PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+  if(WIN32)
+    target_link_options(render_probe PRIVATE -static -static-libgcc -static-libstdc++)
+  endif()
   # The SPIR-V validator: the HLSL path validates the modules DXC compiled
   # without its own validator (a sample's run-time offset; host/translation_cache.cpp).
   # Without it those keep the lift.
@@ -628,6 +651,16 @@ if(UNIX)
   target_link_libraries(boss_rush_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(boss_rush_test bb_plugin_boss_rush)
   add_test(NAME boss_rush_test COMMAND boss_rush_test $<TARGET_FILE:bb_plugin_boss_rush>)
+  # The render probe (tools/render_probe) on a pretend host and a pretend
+  # Vulkan device: what it asks of the device and records, and its own checks.
+  if(TARGET render_probe)
+    add_executable(render_probe_test tests/render_probe_test.cpp)
+    target_include_directories(render_probe_test PRIVATE src include)
+    target_compile_features(render_probe_test PRIVATE cxx_std_17)
+    target_link_libraries(render_probe_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    add_dependencies(render_probe_test render_probe)
+    add_test(NAME render_probe_test COMMAND render_probe_test $<TARGET_FILE:render_probe>)
+  endif()
   # The PS1 Look plugin on a pretend host (plugins/ps1): the look it asks the
   # host for at the start and as its options change, and none on an older host.
   add_executable(ps1_plugin_test tests/ps1_plugin_test.cpp)
@@ -636,6 +669,15 @@ if(UNIX)
   target_link_libraries(ps1_plugin_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(ps1_plugin_test bb_plugin_ps1)
   add_test(NAME ps1_plugin_test COMMAND ps1_plugin_test $<TARGET_FILE:bb_plugin_ps1>)
+  # The shader overrides' test plugin on a pretend host (tools/shader_tint_plugin.c):
+  # its own source asked for until met, patched, on and off by turns, its
+  # strength in its shader data each frame; nothing asked of an older host.
+  add_executable(shader_tint_test tests/shader_tint_test.cpp)
+  target_include_directories(shader_tint_test PRIVATE include)
+  target_compile_features(shader_tint_test PRIVATE cxx_std_17)
+  target_link_libraries(shader_tint_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(shader_tint_test shader_tint_probe)
+  add_test(NAME shader_tint_test COMMAND shader_tint_test $<TARGET_FILE:shader_tint_probe>)
   # The NGX bridge (src/ngx_bridge): its parts without NVIDIA's code always;
   # with the bridge built, the library itself through bbhost's call order, and
   # host/upscaler.cpp's Linux loader with it, under Numity1504's name, under
@@ -650,6 +692,8 @@ if(UNIX)
     target_link_libraries(upscaler_load_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     add_dependencies(upscaler_load_test bbhost_version)
     add_test(NAME upscaler_load_none COMMAND upscaler_load_test none)
+    add_test(NAME upscaler_load_layer COMMAND upscaler_load_test none)
+    set_tests_properties(upscaler_load_layer PROPERTIES ENVIRONMENT BBHOST_UPSCALE_LAYER=1)
     if(TARGET bbhost_ngx_bridge)
       add_dependencies(ngx_bridge_test bbhost_ngx_bridge)
       add_dependencies(upscaler_load_test bbhost_ngx_bridge)
@@ -673,6 +717,16 @@ if(UNIX)
   target_include_directories(sdk_headers_test PRIVATE include)
   target_compile_features(sdk_headers_test PRIVATE cxx_std_17)
   add_test(NAME sdk_headers_test COMMAND sdk_headers_test)
+  # Plugin API 27 (host/render_api.h): a frame's cameras from the view block, its reset and cut test.
+  add_executable(render_api_test tests/render_api_test.cpp)
+  target_include_directories(render_api_test PRIVATE src include)
+  target_compile_features(render_api_test PRIVATE cxx_std_17)
+  add_test(NAME render_api_test COMMAND render_api_test)
+  # The plugin API's version 27 structures as C: their sizes and places, which plugins are built against.
+  add_executable(plugin_abi_test tests/plugin_abi_test.c)
+  target_include_directories(plugin_abi_test PRIVATE include)
+  set_target_properties(plugin_abi_test PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
+  add_test(NAME plugin_abi_test COMMAND plugin_abi_test)
   add_executable(libc_native_test tests/libc_native_test.cpp src/hle/sysv_va.cpp)
   target_include_directories(libc_native_test PRIVATE src)
   target_compile_features(libc_native_test PRIVATE cxx_std_17)
@@ -1034,6 +1088,10 @@ if(UNIX)
   add_executable(clip_control_test tests/clip_control_test.cpp)
   target_include_directories(clip_control_test PRIVATE src)
   add_test(NAME clip_control_test COMMAND clip_control_test)
+  # The engine's per-view block found at every screen shape and field of view (tests/view_block_test.cpp).
+  add_executable(view_block_test tests/view_block_test.cpp)
+  target_include_directories(view_block_test PRIVATE src)
+  add_test(NAME view_block_test COMMAND view_block_test)
   # The constant-buffer proof's copies and compares without the game (tests/cb_proof_test.cpp).
   add_executable(cb_proof_test tests/cb_proof_test.cpp)
   target_include_directories(cb_proof_test PRIVATE src include)
@@ -1131,7 +1189,7 @@ if(UNIX)
   set_tests_properties(gcn_decode_test PROPERTIES SKIP_RETURN_CODE 77)
   # The translation cache (src/host/translation_cache.cpp, which it includes)
   # against the shipped shader bundles.
-  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp src/host/dxc.cpp)
+  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp src/host/dxc.cpp src/host/shader_overrides.cpp)
   target_include_directories(translation_cache_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
   add_dependencies(translation_cache_test bbhost_translator_fingerprint)
@@ -1140,12 +1198,25 @@ if(UNIX)
   # The HLSL default (translation_cache.cpp, which it includes): compiles
   # behind the game, their lanes, the dump and edited HLSL; synthetic shaders,
   # skipped without DXC.
-  add_executable(hlsl_default_test tests/hlsl_default_test.cpp src/core/paced_file.cpp src/host/dxc.cpp)
+  add_executable(hlsl_default_test tests/hlsl_default_test.cpp src/core/paced_file.cpp src/host/dxc.cpp src/host/shader_overrides.cpp)
   target_include_directories(hlsl_default_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(hlsl_default_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
   add_dependencies(hlsl_default_test bbhost_translator_fingerprint)
   add_test(NAME hlsl_default_test COMMAND hlsl_default_test)
   set_tests_properties(hlsl_default_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # Edited shaders as variants (host/shader_overrides.h, with translation_cache.cpp
+  # included): salts, owners, sources compiled once, names; synthetic shaders,
+  # skipped without DXC.
+  add_executable(shader_overrides_test tests/shader_overrides_test.cpp src/core/paced_file.cpp src/host/dxc.cpp src/host/shader_overrides.cpp)
+  target_include_directories(shader_overrides_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(shader_overrides_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
+  add_dependencies(shader_overrides_test bbhost_translator_fingerprint)
+  if(SPIRV_TOOLS_LIB)  # an edited shader's module validated as the host validates it
+    target_compile_definitions(shader_overrides_test PRIVATE BBHOST_HAVE_SPIRV_TOOLS=1)
+    target_link_libraries(shader_overrides_test PRIVATE ${SPIRV_TOOLS_LIB})
+  endif()
+  add_test(NAME shader_overrides_test COMMAND shader_overrides_test)
+  set_tests_properties(shader_overrides_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # The PC options' generated menu assets (engine/menu_assets.cpp, which it
   # includes) against the game's option movie and message bundles. The
   # config is menu_assets_ensure's (SKILL ISSUE in the bundle's stamp): clang

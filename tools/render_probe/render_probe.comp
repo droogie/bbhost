@@ -1,0 +1,80 @@
+#version 460
+// The render probe's pass (tools/render_probe/render_probe.cpp): one 16x16
+// group. Before the upscale it writes the marker - the frame number's low 16
+// bits as 4x4-pixel cells, magenta for a one, black for a zero - into its own
+// image (blitted into the scene's top left after it), and on a 4x4 grid of
+// the 3D checks plugin API 27's frame info against the host's own images:
+// each point's depth taken back to the world through this frame's
+// inv_view_proj and forward through the last frame's view_proj is where the
+// surface was, and the host's motion at the point should say the same. After
+// the upscale it writes the marker in cyan, straight into the picture's top
+// right when the picture is a storage image (mode bit 2), else into its own
+// image for a blit.
+//
+// Compiled offline (tools/build_shaders.sh) into render_probe.spv.h.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D scene_t;
+layout(set = 0, binding = 1) uniform texture2D depth_t;
+layout(set = 0, binding = 2) uniform texture2D motion_t;  // (the scene when there is none: unread)
+layout(set = 0, binding = 3) uniform texture2D glow_t;    // (the scene when there is none: unread)
+layout(set = 0, binding = 4) uniform sampler nearest_s;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D marker;
+layout(set = 0, binding = 6, std430) buffer Slot {
+    mat4 inv_view_proj;   // this frame's clip to world
+    mat4 prev_view_proj;  // the last frame's world to clip
+    uvec4 size;           // render width, height, mode (1 after the upscale, | 2 the picture written in place), frame
+    uvec4 flags;          // motion there, glow there, depth reversed, the picture's width
+    vec4 point[16];       // out: 1 when the point has a surface, its depth, the reprojection's error in render pixels (-1:
+                          // none to compare with), the scene's luminance
+    vec4 motion[16];      // out: the motion from the cameras (xy) and the host's (zw), render pixels
+    vec4 glow[16];        // out: the glow's colour summed (x; 0 without a glow)
+} slot;
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D picture;  // after the upscale, written in place (else the marker again)
+
+vec4 mark(uvec2 xy, uint frame, vec3 one) {
+    const uint bit = (xy.y / 4u) * 4u + xy.x / 4u;
+    return ((frame >> bit) & 1u) != 0u ? vec4(one, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);
+}
+
+void main() {
+    const uvec2 xy = gl_LocalInvocationID.xy;
+    const uint mode = slot.size.z, frame = slot.size.w;
+    if ((mode & 1u) == 0u) {
+        imageStore(marker, ivec2(xy), mark(xy, frame, vec3(1.0, 0.0, 1.0)));
+    } else if ((mode & 2u) != 0u) {
+        imageStore(picture, ivec2(int(slot.flags.w) - 16 + int(xy.x), int(xy.y)), mark(xy, frame, vec3(0.0, 1.0, 1.0)));
+    } else {
+        imageStore(marker, ivec2(xy), mark(xy, frame, vec3(0.0, 1.0, 1.0)));
+    }
+    // The grid's checks: the first row's sixteen threads, before the upscale.
+    if ((mode & 1u) != 0u || xy.y != 0u) return;
+    const uint k = xy.x;
+    const vec2 size = vec2(slot.size.xy);
+    const ivec2 px = ivec2((vec2(float(k % 4u), float(k / 4u)) + 0.5) / 4.0 * size);
+    const vec2 uv = (vec2(px) + 0.5) / size;
+    const float raw = texelFetch(sampler2D(depth_t, nearest_s), px, 0).r;
+    const vec4 col = texelFetch(sampler2D(scene_t, nearest_s), px, 0);
+    const float lum = dot(col.rgb, vec3(0.2126, 0.7152, 0.0722));
+    const float glow = slot.flags.y != 0u ? dot(texelFetch(sampler2D(glow_t, nearest_s), px, 0).rgb, vec3(1.0)) : 0.0;
+    // A surface: not the far plane (the sky).
+    const bool reversed = slot.flags.z != 0u;
+    const bool surface = reversed ? raw > 0.00001 : raw < 0.99999;
+    vec2 expect = vec2(0.0), host = vec2(0.0);
+    float err = -1.0;
+    if (surface) {
+        const vec4 w = slot.inv_view_proj * vec4(uv * 2.0 - 1.0, raw, 1.0);
+        const vec4 c = slot.prev_view_proj * vec4(w.xyz / w.w, 1.0);
+        if (c.w > 0.0001) {
+            const vec2 prev_uv = (c.xy / c.w) * 0.5 + 0.5;
+            expect = (prev_uv - uv) * size;
+            if (slot.flags.x != 0u) {
+                host = texelFetch(sampler2D(motion_t, nearest_s), px, 0).rg;
+                err = length(expect - host);
+            }
+        }
+    }
+    slot.point[k] = vec4(surface ? 1.0 : 0.0, raw, err, lum);
+    slot.motion[k] = vec4(expect, host);
+    slot.glow[k] = vec4(glow, 0.0, 0.0, 0.0);
+}

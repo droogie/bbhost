@@ -1,6 +1,7 @@
 // No Vulkan at build time: GPU work is skipped.
 #include "host/gpu.h"
 #include "host/memory_policy.h"
+#include "host/shader_overrides.h"
 
 bool host_gpu_init(const char* const*, std::uint32_t, bool) { return false; }
 bool host_gpu_available() { return false; }
@@ -23,6 +24,13 @@ void host_gpu_busy_present_done() {}
 std::string host_gpu_busy_report() { return {}; }
 void host_gpu_queue_lock_only() {}
 bool host_gpu_submit_for_flip(std::uint64_t) { return false; }
+void host_gpu_frame_recorded() {}
+// Edited shaders (host/shader_overrides.h) without the HLSL path: none apply.
+namespace gpu {
+std::string hlsl_file_name(const std::string& program) { return program; }
+bool override_prepare(const std::shared_ptr<const OverrideSource>&) { return false; }
+int hlsl_override_source(const std::string&, std::string&) { return 2; }
+}  // namespace gpu
 bool host_gpu_display_image(std::uint64_t, void**, std::uint32_t*, std::uint32_t*, std::uint32_t*) { return false; }
 bool host_gpu_dispatch(const GpuDispatch&) { return false; }
 GpuDispatchClass host_gpu_last_dispatch_class(const char** program) {
