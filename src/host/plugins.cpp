@@ -37,6 +37,7 @@
 #include "host/pixel_cutaway.h"
 #include "host/render_api.h"
 #include "host/render_hooks.h"
+#include "host/shader_overrides.h"
 #include "host/scene_look.h"
 #include "host/updater.h"
 #include "host/window.h"
@@ -79,6 +80,7 @@ struct Plugin {
     bool official = false;  // signed with the release key
     bool visitor = false;   // off, but loaded to play other players' worlds (BB_PLUGIN_ADOPTS_RULES)
     bool dormant = false;   // off, but loaded to be turned on in game (BB_PLUGIN_LIVE_SWITCH); main thread
+    int shader_owner = 0;   // its shader overrides' owner (host/shader_overrides.h): its place in the load order, from 1
 };
 
 // A plugin that turns on and off while the game runs (BB_PLUGIN_LIVE_SWITCH):
@@ -1372,6 +1374,69 @@ int api_aa_claim(const char* name, int claim) {
     return 0;
 }
 
+// Version 27: shader overrides (host/shader_overrides.h). Each plugin is an
+// owner of its own, in the order the plugins load (after the player's
+// folder); off while the plugin is (a visitor, a live switch off).
+static_assert(BB_SHADER_NONE == gpu::kOverrideNone && BB_SHADER_WAITING == gpu::kOverrideWaiting && BB_SHADER_TAKEN == gpu::kOverrideTaken &&
+                  BB_SHADER_REFUSED == gpu::kOverrideRefused && BB_SHADER_SHADOWED == gpu::kOverrideShadowed && BB_SHADER_OFF == gpu::kOverrideOff,
+              "shader_state's values are the overrides' states");
+static_assert(BB_SHADER_DATA_BYTES == gpu::kOverrideDataBytes, "a plugin's shader data");
+std::mutex g_shader_owner_mu;
+std::map<std::string, int> g_shader_owners;  // under g_shader_owner_mu: a plugin's name -> its owner
+int shader_owner(const char* name) {
+    if (!name) return 0;
+    std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+    const auto it = g_shader_owners.find(name);
+    return it == g_shader_owners.end() ? 0 : it->second;
+}
+
+int api_shader_override(const char* name, const char* shader, const char* hlsl) {
+    const int owner = shader_owner(name);
+    if (!owner || !shader) return 1;
+    const int r = gpu::overrides_set_text(owner, shader, hlsl);
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 32) {
+        host_log("plugin: %s: shader %s %s%s", name, shader, hlsl ? "replaced" : "given back to the game",
+                 r ? " - refused: no shader is named so, or the text is over 4 MiB" : "");
+    }
+    return r;
+}
+
+int api_shader_folder(const char* name, const char* dir) {
+    const int owner = shader_owner(name);
+    if (!owner) return -1;
+    const int n = gpu::overrides_add_folder(owner, dir);
+    if (dir && *dir) host_log("plugin: %s: shaders from %s: %d", name, dir, n);
+    return n;
+}
+
+int api_shader_state(const char* name, const char* shader, char* why, std::size_t n) {
+    const int owner = shader_owner(name);
+    std::string w;
+    const int state = owner && shader ? gpu::overrides_state(owner, shader, &w) : BB_SHADER_NONE;
+    if (why && n) {
+        const std::size_t k = std::min(n - 1, w.size());
+        std::memcpy(why, w.data(), k);
+        why[k] = '\0';
+    }
+    return state;
+}
+
+// Per thread, as game_file's: good until that thread's next call.
+thread_local std::string g_shader_source;
+int api_shader_source(const char* shader, const char** hlsl, std::size_t* size) {
+    if (!shader || !hlsl || !size) return 1;
+    if (const int r = gpu::hlsl_override_source(shader, g_shader_source)) return r;
+    *hlsl = g_shader_source.c_str();
+    *size = g_shader_source.size();
+    return 0;
+}
+
+int api_shader_data(const char* name, std::uint32_t offset, const void* data, std::uint32_t size) {
+    const int owner = shader_owner(name);
+    return owner ? gpu::overrides_data_write(owner, offset, data, size) : 1;
+}
+
 // Version 21: old-hardware sound (host/audio_crush.h).
 void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
     audio_crush_set(rate_hz, bits, lowpass_hz);
@@ -1409,6 +1474,7 @@ const BbHostApi g_api = {
     &api_frame_info,
     &api_on_render,
     &api_aa_claim,
+    &api_shader_override, &api_shader_folder, &api_shader_state, &api_shader_source, &api_shader_data,
 };
 
 std::string read_file(const std::string& path) {
@@ -1585,6 +1651,18 @@ void plugins_load() {
             std::lock_guard<std::mutex> lk(g_aa_mu);
             g_aa_claims[p.name] = aa;
         }
+        // Its shader overrides' owner, before its init can ask for one: after
+        // the player's folder and the plugins loaded before it; off while it is.
+        {
+            static int owners = 0;
+            p.shader_owner = ++owners;
+            const char* data = hle_fs_data_root();
+            const bool plain = !std::strpbrk(p.name.c_str(), "/\\.:");
+            gpu::overrides_owner(p.shader_owner, "plugin " + p.name,
+                                 data && *data && plain ? std::string(data) + "/plugins/" + p.name : std::string(), !(p.visitor || p.dormant));
+            std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+            g_shader_owners[p.name] = p.shader_owner;
+        }
         if (p.init) {
             const int r = p.init(&g_api);
             if (r != 0) {
@@ -1593,6 +1671,11 @@ void plugins_load() {
                 {
                     std::lock_guard<std::mutex> lk(g_aa_mu);
                     g_aa_claims.erase(p.name);
+                }
+                gpu::overrides_drop_owner(p.shader_owner);
+                {
+                    std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+                    g_shader_owners.erase(p.name);
                 }
                 close_lib(h);
                 continue;
@@ -1643,6 +1726,11 @@ void plugins_image(ElfImage* image) {
                     std::lock_guard<std::mutex> lk(g_aa_mu);
                     g_aa_claims.erase(p.name);
                 }
+                gpu::overrides_drop_owner(p.shader_owner);
+                {
+                    std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+                    g_shader_owners.erase(p.name);
+                }
                 close_lib(p.handle);
                 g_plugins.erase(g_plugins.begin() + static_cast<std::ptrdiff_t>(i));
                 continue;
@@ -1685,7 +1773,9 @@ void plugins_frame() {
             // A live switch (plugins_set_enabled): the plugin on or off.
             const bool on = r.value == "true";
             for (Plugin& p : g_plugins) {
-                if (p.name == r.name) p.dormant = !on;
+                if (p.name != r.name) continue;
+                p.dormant = !on;
+                gpu::overrides_owner_on(p.shader_owner, on);  // its shader overrides with it
             }
             host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
             if (render_hooks_plugin_on(r.name, on)) republish_settings();

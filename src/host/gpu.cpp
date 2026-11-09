@@ -5213,6 +5213,7 @@ bool init_locked() {
         hlsl_set_overrides(env ? e[0] == '1' : config().shader_overrides,
                            env ? "BBHOST_SHADER_OVERRIDES=0" : "bbhost.toml's video.shader_overrides = false");
     }
+    overrides_set_data_maker(&shader_data_make);  // the plugins' shader data, made at an owner's first compile
     if (const char* root = hle_fs_data_root(); root && *root) hlsl_set_folders(std::string(root) + "/bbhost");
     hlsl_set_name_lookup(&shader_bundle_file_name);
     translation_cache_load(translation_cache_path());
@@ -5335,6 +5336,7 @@ void begin_recording_locked() {
             rec().write_timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.qpool, kQueriesPerSlot - 2);
             sl.span = true;
         }
+        shader_data_upload_locked();  // the plugins' shader data a frame's end latched (host/shader_overrides.h)
     }
 }
 
@@ -11087,6 +11089,10 @@ std::string host_gpu_compile_report() {
     const std::string ov = overrides_window();  // edited shaders built (host/shader_overrides.h)
     if (!ov.empty()) out += (out.empty() ? "" : "; ") + ov;
     return out;
+}
+
+void host_gpu_frame_recorded() {
+    override_data_latch();  // the plugins' shader data: the next frame reads what they wrote by now
 }
 
 void host_gpu_submit() {

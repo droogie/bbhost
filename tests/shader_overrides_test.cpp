@@ -6,8 +6,10 @@
 // which ties itself to its program at that lift's first sight; a file changed
 // after it was listed, listed again; an owner turned off or gone; a change
 // compiled ahead of its switch, for the variants met, off the drawing thread;
-// states, the report and the off switch; the watch's listing; a geometry
-// lift's stage. Synthetic pixel shaders through the HLSL path
+// states, the report and the off switch; the watch's listing; an owner's
+// shader data read through bbhost.hlsli (its device address compiled in, its
+// writes latched a frame at a time); the game's own source at run time; a
+// geometry lift's stage. Synthetic pixel shaders through the HLSL path
 // (BBHOST_HLSL=1, compiled where they are met). Skips (77) without DXC.
 #include "host/translation_cache.cpp"
 
@@ -81,6 +83,9 @@ std::string scaled(const std::vector<std::uint32_t>& lift, const char* scale) {
     if (at != std::string::npos) src.insert(at + 19, std::string("    mrt0 = mrt0 * ") + scale + ";\n");
     return src;
 }
+
+// The renderer's maker of an owner's shader data buffer: an address of its own.
+std::uint64_t fake_buffer(int owner, const std::uint8_t*) { return 0x0000001234560000ull + static_cast<std::uint64_t>(owner) * 0x10000u; }
 
 // Until no changed source waits for its compile ahead (60 s at most).
 bool settle() {
@@ -165,10 +170,63 @@ int main() {
     const gcn::LiftResult plain = stage(p, "aaaa0001", 0, took);
     CHECK(!took && plain.spirv == base.spirv);
 
+    // 2b. The game's own source at run time: the dump's text of the first
+    // variant met; a shader not met yet has none.
+    std::string text;
+    CHECK(hlsl_override_source("aaaa0001.ps", text) == 0);
+    gcn::HlslOptions titled;
+    titled.title = "aaaa0001";
+    CHECK(text == hlsl_dump_text(gcn::emit_hlsl(lp.spirv, titled).source, lift_hash_hex(lp.spirv)));
+    CHECK(hlsl_override_source("aaaa0001.ps~" + lift_hash_hex(lp.spirv), text) == 0);
+    CHECK(hlsl_override_source("aaaa0001.ps~0123456789abcdef", text) == 1);
+    CHECK(hlsl_override_source("dddd0004.ps", text) == 1 && hlsl_override_source("not a name", text) == 1);
+
+    // 2c. Shader data: bbhost.hlsli included, the owner's data read by device
+    // address - compiled in, its interface the lift's - and a DXC error past
+    // the include cites the file's own line.
+    overrides_set_data_maker(&fake_buffer);
+    std::string reads = a;
+    reads.insert(0, "// reads its plugin's numbers\n#include \"bbhost.hlsli\"\n");
+    const std::size_t main_at = reads.rfind("    lifted_main();\n");
+    reads.insert(main_at + 19, "    mrt0 = mrt0 * bb_data_float(4) + bb_data_float4x4(64)[1];\n");
+    overrides_owner(5, "plugin five", std::string(), true);
+    CHECK(overrides_set_text(5, "eeee0005.ps", reads.c_str()) == 0 && settle());
+    const std::uint64_t s_data = override_salt("eeee0005");
+    const gcn::LiftResult md = stage(p, "eeee0005", s_data, took);
+    CHECK(took && md.ok() && gcn::hlsl_interface_diff(lp.spirv, md.spirv).empty());
+    CHECK(override_data_address(5) == fake_buffer(5, nullptr));
+    bool addressed = false;  // the address in the module: OpConstant of a 64-bit integer
+    for (std::size_t i = 5; i + 4 < md.spirv.size(); ++i) {
+        const std::uint64_t at = fake_buffer(5, nullptr);
+        if (md.spirv[i] == (5u << 16 | 43u) && md.spirv[i + 3] == static_cast<std::uint32_t>(at + 4) && md.spirv[i + 4] == static_cast<std::uint32_t>(at >> 32))
+            addressed = true;
+    }
+    CHECK(addressed);
+    std::string broken = reads;
+    broken.insert(broken.find("\n", broken.find("bbhost.hlsli")) + 1, "\n\nthis line is not HLSL\n");  // the file's line 5
+    CHECK(overrides_set_text(5, "eeee0005.ps", broken.c_str()) == 0 && settle());
+    CHECK(overrides_state(5, "eeee0005.ps", &why) == kOverrideRefused && why.find("eeee0005.ps.hlsl:5:") != std::string::npos);
+    // Writes: into the shadow at once, uploaded only once a frame's end
+    // latched them - one copy a frame - and only what was written.
+    std::vector<OverrideUpload> ups;
+    const float k = 0.5f;
+    CHECK(overrides_data_write(5, 4, &k, sizeof(k)) == 0);
+    CHECK(overrides_data_write(5, kOverrideDataBytes - 2, &k, sizeof(k)) == 1 && overrides_data_write(kOverridePlayer, 0, &k, 4) == 1);
+    override_data_latch();
+    CHECK(override_data_take(ups) && ups.size() == 1 && ups[0].owner == 5 && ups[0].offset == 4 && ups[0].bytes.size() == 4);
+    const std::uint16_t half = 0x3c00;
+    CHECK(overrides_data_write(5, 70, &half, sizeof(half)) == 0 && overrides_data_write(5, 64, &k, sizeof(k)) == 0);
+    CHECK(!override_data_take(ups));  // not latched yet: the frame under way keeps its copy
+    override_data_latch();
+    CHECK(override_data_take(ups) && ups.size() == 1 && ups[0].offset == 64 && ups[0].bytes.size() == 8);  // 64..72, by fours
+    override_data_latch();
+    CHECK(!override_data_take(ups));  // nothing new
+
     // 3. Owners: the player's folder first, then the owners in their order;
     // an owner's texts before its folders.
+    const std::uint64_t compiles2 = g_hlsl_overrides.compiles.load();
     CHECK(overrides_set_text(2, "aaaa0001.ps", b.c_str()) == 0 && settle());
-    CHECK(g_hlsl_overrides.compiles.load() == compiles);  // shadowed by owner 1's: nothing compiled ahead
+    CHECK(g_hlsl_overrides.compiles.load() == compiles2);  // shadowed by owner 1's: nothing compiled ahead
     std::shared_ptr<const OverrideSource> src;
     CHECK(override_pick(override_salt("aaaa0001"), "aaaa0001", "ps", lift_hash_hex(lp.spirv), src) && src->owner == 1);
     std::ofstream(dir / "plugin1" / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary) << b;
@@ -258,16 +316,19 @@ int main() {
     CHECK(overrides_state(4, "cccc0003.ps", &why) == kOverrideWaiting && why == "its owner is off");
     overrides_owner_on(4, true);
     const std::vector<std::string> report = overrides_report();
-    CHECK(report.size() == 4 && report[0].find("at exit: 3 (0 taken, 1 refused, 1 not met, 1 not used, 0 off)") != std::string::npos);
+    CHECK(report.size() == 5 && report[0].find("at exit: 4 (0 taken, 2 refused, 1 not met, 1 not used, 0 off)") != std::string::npos);
     hlsl_set_overrides(false, "switched off for the test");
     hlsl_set_folders(dir.string());
     CHECK(override_salt("aaaa0001") == 0 && !overrides_on());
+    CHECK(hlsl_override_source("aaaa0001.ps", text) == 2);
     CHECK(overrides_state(3, "aaaa0001.ps", &why) == kOverrideOff && why == "switched off for the test");
     const gcn::LiftResult off = stage(p, "aaaa0001", 0, took);
     CHECK(!took && off.spirv == base.spirv);
     hlsl_set_overrides(true, std::string());
     hlsl_set_folders(dir.string());
     CHECK(overrides_on() && override_salt("aaaa0001") != 0);
+
+    CHECK(hlsl_override_source("aaaa0001.ps", text) == 0);  // (on again)
 
     // 8. The watch (BBHOST_SHADER_WATCH's listing, called here): a file put in
     // the player's folder while the game runs applies once compiled ahead -

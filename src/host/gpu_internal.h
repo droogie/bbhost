@@ -737,6 +737,13 @@ inline void draw_failed(DrawFail why) {
 extern std::atomic<bool> g_cache_divert;
 extern std::atomic<int> g_cache_users;
 extern std::atomic<std::uint64_t> g_cache_diverted;  // creations that took the side cache
+// render.cpp: the plugins' shader data (host/shader_overrides.h) - an owner's
+// buffer made with its first contents (its device address; 0 when it could
+// not be), and the latched writes uploaded at a recording's start (gpu.cpp
+// begin_recording_locked). Under g.mu for the second.
+std::uint64_t shader_data_make(int owner, const std::uint8_t* bytes);
+void shader_data_upload_locked();
+
 // While a pipeline holding an edited shader's stages is made on this thread
 // (GfxPipeline::hlsl_salted, a salted compute key): its pipelines and
 // libraries go into the run's own cache (Gpu::run_cache), not the one saved.

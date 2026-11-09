@@ -947,6 +947,10 @@ std::string host_gpu_busy_report();
 // Submitting whatever the command processor had recorded of the *next* frame
 // broke its render pass and cost a submission on every presented frame.
 bool host_gpu_submit_for_flip(std::uint64_t need);
+// The command processor recorded a frame's commands in full (its flip's job is
+// done, before the flip is queued): what ends a frame's view of host-side
+// state - the plugins' shader data latched here is what the next frame reads.
+void host_gpu_frame_recorded();
 // Until the game's submissions a flip needs (host_gpu_work_needs() as it
 // arrived) have been handed to the driver's queue - not run: the presenter's
 // copy on its own queue then waits on the GPU for a value already on its way.

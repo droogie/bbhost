@@ -746,6 +746,14 @@ std::string lift_hash_hex(const std::vector<std::uint32_t>& lifted) {
     std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(n.a));
     return buf;
 }
+// A dumped file's text: the printed source with the lift's hash on the
+// second line - the dump's own check, and an edited file's fallback match.
+std::string hlsl_dump_text(const std::string& source, const std::string& hash16) {
+    const std::size_t nl = source.find('\n');
+    if (nl == std::string::npos) return source + "\n// lift " + hash16 + "\n";
+    return source.substr(0, nl + 1) + "// lift " + hash16 + " (this build's lift; the name above is what a translator update keeps)\n" +
+           source.substr(nl + 1);
+}
 // Whether the dumped file at `p` was written for the lift `hash16` (its second
 // line says "// lift <hash>").
 bool dump_is_lift(const std::filesystem::path& p, const std::string& hash16) {
@@ -778,18 +786,10 @@ std::string hlsl_dump(const std::vector<std::uint32_t>& lifted, const gcn::HlslR
     }
     const std::filesystem::path base = std::filesystem::path(dir) / name;
     if (std::filesystem::exists(base.string() + ".hlsl", ec)) return base.string();  // written already
-    if (!h.source.empty()) {
-        // The lift's hash on the second line: the dump's own check, and an
-        // edited file's fallback match.
-        const std::size_t nl = h.source.find('\n');
-        std::ofstream out(base.string() + ".hlsl", std::ios::binary);
-        if (nl == std::string::npos) {
-            out << h.source << "\n// lift " << hash16 << "\n";
-        } else {
-            out << h.source.substr(0, nl + 1) << "// lift " << hash16 << " (this build's lift; the name above is what a translator update keeps)\n"
-                << h.source.substr(nl + 1);
-        }
-    }
+    if (!h.source.empty()) std::ofstream(base.string() + ".hlsl", std::ios::binary) << hlsl_dump_text(h.source, hash16);
+    // bbhost.hlsli beside them, the helpers an edited shader can include (host/shader_overrides.h).
+    static std::atomic<bool> helpers{false};
+    if (!helpers.exchange(true)) std::ofstream(std::filesystem::path(dir) / "bbhost.hlsli", std::ios::binary) << override_include_text();
     std::ofstream(base.string() + ".lift.spv", std::ios::binary)
         .write(reinterpret_cast<const char*>(lifted.data()), static_cast<std::streamsize>(lifted.size() * 4));
     return base.string();
@@ -1264,6 +1264,13 @@ bool hlsl_override_module(const std::vector<std::uint32_t>& lifted, std::uint64_
     } else {
         h.source = override_dxc_text(src, source);
         h.errors.clear();
+        // Its owner's shader data at a device address the module keeps (bbhost.hlsli).
+        if (const std::uint64_t data = override_data_address(src.owner)) {
+            char define[48];
+            std::snprintf(define, sizeof(define), "BBHOST_DATA=0x%016llxull", static_cast<unsigned long long>(data));
+            h.arguments.push_back("-D");
+            h.arguments.push_back(define);
+        }
         DxcOptions o;
         o.optimize = hlsl_level();
         std::string error;
@@ -1331,12 +1338,11 @@ struct HlslMet {
         Key key{};
         bool cached = false;
         std::vector<std::uint32_t> words;  // the lift itself, when it was made without the cache
+        std::uint64_t hash = 0;            // its lift_hash, for one made without the cache
         gcn::HlslOptions hopt;             // its title and tessellation fields
     };
     std::mutex mu;
     std::unordered_map<std::string, std::vector<std::shared_ptr<const Lift>>> by_program;  // "<program>.<stage>"
-    std::unordered_set<Key, KeyHash> keys;      // the cached lifts recorded
-    std::unordered_set<std::uint64_t> hashes;  // and the others, by lift_hash
 };
 HlslMet& g_hlsl_met = *new HlslMet;  // never destroyed: bb-hlsl-ahead reads it until the process ends
 
@@ -1345,19 +1351,23 @@ void hlsl_note_met(const std::vector<std::uint32_t>& lifted, const Key* lift_key
     const std::uint64_t hash = lift_key ? 0 : lift_hash(lifted);
     const std::string id = hopt.title + "." + lift_stage_tag(lifted);
     std::lock_guard<std::mutex> lk(g_hlsl_met.mu);
-    if (lift_key ? !g_hlsl_met.keys.insert(*lift_key).second : !g_hlsl_met.hashes.insert(hash).second) return;
+    std::vector<std::shared_ptr<const HlslMet::Lift>>& met = g_hlsl_met.by_program[id];
+    for (const std::shared_ptr<const HlslMet::Lift>& m : met) {  // a program's few variants: met already?
+        if (lift_key ? m->cached && m->key == *lift_key : !m->cached && m->hash == hash) return;
+    }
     auto m = std::make_shared<HlslMet::Lift>();
     if (lift_key) {
         m->key = *lift_key;
         m->cached = true;
     } else {
         m->words = lifted;
+        m->hash = hash;
     }
     m->hopt.title = hopt.title;
     m->hopt.tess_quads = hopt.tess_quads;
     m->hopt.tess_spacing = hopt.tess_spacing;
     m->hopt.tess_cw = hopt.tess_cw;
-    g_hlsl_met.by_program[id].push_back(std::move(m));
+    met.push_back(std::move(m));
 }
 
 bool hlsl_met_words(const HlslMet::Lift& m, std::vector<std::uint32_t>& words) {
@@ -1817,6 +1827,42 @@ bool hlsl_took_override() {
     return took;
 }
 std::string hlsl_file_name(const std::string& program) { return hlsl_stable_name(program); }
+
+int hlsl_override_source(const std::string& shader, std::string& out) {
+    std::string stable, stage, hash16;
+    if (!overrides_on()) return 2;
+    if (!override_parse(shader, stable, stage, hash16)) return 1;
+    std::vector<std::shared_ptr<const HlslMet::Lift>> lifts;
+    {
+        std::lock_guard<std::mutex> lk(g_hlsl_met.mu);
+        if (!stable.empty()) {
+            const auto it = g_hlsl_met.by_program.find(stable.substr(stable.rfind('@') + 1) + "." + stage);
+            if (it != g_hlsl_met.by_program.end()) lifts = it->second;
+        } else {
+            const std::string tail = "." + stage;
+            for (const auto& [id, met] : g_hlsl_met.by_program) {
+                if (id.size() > tail.size() && id.compare(id.size() - tail.size(), tail.size(), tail) == 0)
+                    lifts.insert(lifts.end(), met.begin(), met.end());
+            }
+        }
+    }
+    // The first met of the program's (its bundle entry the name's), or the
+    // variant whose lift's hash the name gives.
+    for (const std::shared_ptr<const HlslMet::Lift>& m : lifts) {
+        if (!stable.empty() && hlsl_stable_name(m->hopt.title) != stable) continue;
+        std::vector<std::uint32_t> words;
+        if (!hlsl_met_words(*m, words)) continue;
+        const std::string hex = lift_hash_hex(words);
+        if (!hash16.empty() && hex != hash16) continue;
+        gcn::HlslOptions titled = m->hopt;
+        titled.title = hlsl_title(m->hopt.title);
+        const gcn::HlslResult h = gcn::emit_hlsl(words, titled);
+        if (!h.ok()) return 1;
+        out = hlsl_dump_text(h.source, hex);
+        return 0;
+    }
+    return 1;
+}
 
 bool override_prepare(const std::shared_ptr<const OverrideSource>& s) {
     std::string stable, stage, hash16;

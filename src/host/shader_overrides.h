@@ -36,6 +36,7 @@
 namespace gpu {
 
 constexpr int kOverridePlayer = 0;  // the player's folder; other owners from 1, in their order
+constexpr std::uint32_t kOverrideDataBytes = 65536;  // an owner's shader data (BB_SHADER_DATA_BYTES)
 
 // What a stage compiles with: one source as a set holds it.
 struct OverrideSource {
@@ -95,8 +96,14 @@ bool override_pick(std::uint64_t salt, const std::string& stable, const std::str
 // A file's text as it was listed; false with `why` when it changed since - it
 // is listed again then, so its shader is built again at its next draw.
 bool override_read(const OverrideSource& s, std::string& text, std::string& why);
-// The text DXC compiles: a #line that keeps DXC's lines the file's.
+// The text DXC compiles: #lines that keep DXC's lines the file's, and
+// bbhost.hlsli spliced in where it is included (`#include "bbhost.hlsli"`:
+// DXC is given no include handler).
 std::string override_dxc_text(const OverrideSource& s, const std::string& text);
+// bbhost.hlsli: the helpers an edited shader reads its owner's shader data
+// with (BBHOST_DATA, its device address, defined for an owner with data);
+// the dump writes it beside the shaders for an editor.
+const char* override_include_text();
 // What a stage's build made of a source: taken, or refused and why.
 void override_outcome(const OverrideSource& s, bool taken, const std::string& why);
 // The source for the logs: "shaders/<file>" or "<owner>'s <shader>".
@@ -109,6 +116,34 @@ bool override_prepare(const std::shared_ptr<const OverrideSource>& s);
 void override_install(const std::shared_ptr<const OverrideSource>& s);
 // A lift met for a program has this hash (a <hash>.<stage> source's compile ahead).
 void override_attribute(std::uint64_t lift_hash, const std::string& program);
+// The HLSL this build prints for a shader named as the dump names its files
+// (BbHostApi::shader_source): "<name>.<stage>", the first variant met this
+// run; "<name>.<stage>~<lift hash>" (or "<lift hash>.<stage>"), that one -
+// as the dump writes it. 0 with it in `out`; 1 when no stage of it was met
+// yet; 2 when edited shaders do not apply.
+int hlsl_override_source(const std::string& shader, std::string& out);
+
+// ---- An owner's shader data (BbHostApi::shader_data) ----
+// kOverrideDataBytes an owner, 0 at the start: written into a shadow at any
+// time; latched where the command processor ends a frame
+// (override_data_latch, host_gpu_frame_recorded), so each frame reads one
+// copy; uploaded in command order at the next recording's start
+// (override_data_take, render.cpp shader_data_upload_locked). Its buffer is
+// made at the owner's first compile (override_data_address, through
+// render.cpp's maker, the shadow its first contents): the address its
+// shaders are compiled with.
+int overrides_data_write(int owner, std::uint32_t offset, const void* data, std::uint32_t size);
+std::uint64_t override_data_address(int owner);  // 0: none (the player's folder; no buffer)
+void overrides_set_data_maker(std::uint64_t (*make)(int owner, const std::uint8_t* bytes));
+void override_data_latch();
+struct OverrideUpload {
+    int owner = 0;
+    std::uint32_t offset = 0;
+    std::vector<std::uint8_t> bytes;
+};
+// The latched writes for this recording's start (and the pending ones when
+// no frame latched them for 100 ms: a flip by another path); false for none.
+bool override_data_take(std::vector<OverrideUpload>& out);
 
 // ---- States and reports ----
 // What became of an owner's source of a name: as BbHostApi::shader_state's

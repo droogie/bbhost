@@ -819,9 +819,75 @@ typedef struct BbHostApi {
      * point, as at a Resolution change. Never from a render hook. 0 on
      * success; 1 for a bad argument or from a hook. */
     int (*aa_claim)(const char* name, int claim);
+
+    /* Version 27: shader overrides (docs/plugins.md, "Shaders") - a plugin's
+     * HLSL in place of one of the game's shaders, as an edited file in
+     * <data>/bbhost/shaders replaces one (docs/modding.md). `shader` is named
+     * as BBHOST_HLSL_DUMP=1 names the shader's file, less ".hlsl":
+     * "GXGuiShader_Tex.ppo@6d921b0b.ps" - its bundle entry and GX's name, then
+     * the stage (vs, ps, hs, ds, gs or cs) - for every variant of the shader in
+     * that stage whose interface the source declares;
+     * "GXGuiShader_Tex.ppo@6d921b0b.ps~7de085b59d21219a" for that one variant;
+     * "<lift hash>.ps" for a shader whose name is not known. The source is
+     * compiled by DXC for each variant met, and drawn with where it declares
+     * the stage's interface (the dumped file's bindings, inputs and outputs)
+     * and its SPIR-V validates; anywhere else the shader keeps its own. Only on
+     * the HLSL path (the Shaders setting's default). The player's own file of
+     * the same name comes first, then the plugin loaded first (by file name).
+     * A change is compiled for the variants met so far, then takes effect at
+     * the shader's next draw, which builds the pipelines drawing with it again
+     * - once: going back to a source drawn with before takes the pipelines made
+     * for it and compiles nothing. A value that changes goes through
+     * shader_data, not the text. Any thread. */
+    /* `hlsl` (UTF-8, ended by a 0, at most 4 MiB) for `shader`; NULL takes the
+     * plugin's away. The same text again changes nothing. 0 on success; 1 for
+     * a name that is no shader's, an unknown plugin or too long a text. */
+    int (*shader_override)(const char* name, const char* shader, const char* hlsl);
+    /* Every <shader>.hlsl file in `dir` - absolute, or relative to the
+     * plugin's own folder (plugin_dir) - as shader_override takes a text, each
+     * read when its shader is built (and again when it changes, with
+     * BBHOST_SHADER_WATCH=1). The plugin's shader_override texts come before
+     * its folders' files, and a folder before the ones added after it. NULL
+     * takes all its folders away. The number of .hlsl files in it, or -1 when
+     * it is not a folder. */
+    int (*shader_folder)(const char* name, const char* dir);
+    /* What became of the plugin's override of `shader` (BB_SHADER_*), and why
+     * into `why` (n bytes with its ending 0; may be NULL): DXC's first error,
+     * the interface that differs, the file or plugin that comes first, why
+     * overrides are off. */
+    int (*shader_state)(const char* name, const char* shader, char* why, size_t n);
+    /* The HLSL this build prints for `shader`, as BBHOST_HLSL_DUMP writes it -
+     * "<name>.<stage>": the first variant this run met; "...~<lift hash>":
+     * that one - so a plugin can patch the game's own source rather than ship
+     * whole copies, which an update that changes the shader's interface
+     * refuses. Into a buffer the host owns until the calling thread's next
+     * call: *hlsl, and its length without the ending 0 in *size. 0 on success;
+     * 1 while no stage of it has been built this run (as the game creates or
+     * first draws it: ask again from on_frame); 2 when overrides do not apply
+     * (BB_SHADER_OFF). */
+    int (*shader_source)(const char* shader, const char** hlsl, size_t* size);
+    /* `size` bytes at `offset` into the plugin's shader data -
+     * BB_SHADER_DATA_BYTES of its own, 0 at the start - which its overrides
+     * read with bbhost.hlsli's bb_data_* (#include "bbhost.hlsli"). Each frame's
+     * draws read one copy: the data as it stood when the frame before had been
+     * recorded, so write what goes together in one call. Changing it builds
+     * nothing. Any thread. 0 on success; 1 past the end or for an unknown
+     * plugin. */
+    int (*shader_data)(const char* name, uint32_t offset, const void* data, uint32_t size);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */
+
+#define BB_SHADER_DATA_BYTES 65536u /* version 27: a plugin's shader data (shader_data) */
+/* Version 27: shader_state. */
+#define BB_SHADER_NONE 0     /* the plugin has no override of that shader */
+#define BB_SHADER_WAITING 1  /* none of the shader's stages built with it yet: not met since it was set (or compiling) */
+#define BB_SHADER_TAKEN 2    /* compiled and drawn with (why: a variant it does not fit, if any) */
+#define BB_SHADER_REFUSED 3  /* refused - DXC, another interface, invalid SPIR-V, the driver: the shader keeps its own */
+#define BB_SHADER_SHADOWED 4 /* not used: the player's own file of that name, or an earlier plugin's, comes first */
+#define BB_SHADER_OFF 5      /* overrides do not apply: the lift alone (the Shaders setting at Lifted,
+                                BBHOST_HLSL=0) or video.shader_overrides = false (without DXC every
+                                override is refused instead: "DXC not found") */
 #define BB_FILTER_AS_IS 0          /* version 18: scene_filter, grading_filter: the game's filtering */
 #define BB_FILTER_NEAREST 1        /* version 18: the nearest texel of the nearest mip */
 #define BB_SCALE_AS_IS 0           /* version 18: scene_scale: the settings' sizes */

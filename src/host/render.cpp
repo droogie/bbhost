@@ -7158,6 +7158,67 @@ void particle_args_retired_locked(std::uint64_t serial) {
     while (!a.pending.empty() && a.pending.front().serial <= serial) a.pending.pop_front();
 }
 
+// ---- The plugins' shader data (host/shader_overrides.h, plugin API 27 shader_data) ----
+// A buffer an owner, kOverrideDataBytes, at the device address its edited
+// shaders are compiled with (bbhost.hlsli): made at the owner's first
+// compile, its first contents the owner's shadow through its mapping -
+// nothing on the GPU reads it yet - and changed after that only in command
+// order, at a recording's start (shader_data_upload_locked): an earlier
+// frame's draws read what they had, the next frame's the latched copy.
+struct ShaderDataBuffers {
+    std::mutex mu;
+    std::unordered_map<int, VkBuffer> by_owner;  // under mu; never destroyed
+    std::uint64_t uploads = 0, bytes = 0;        // under g.mu
+} g_shader_data;
+
+std::uint64_t shader_data_make(int owner, const std::uint8_t* bytes) {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceAddress address = 0;
+    std::uint8_t* map = nullptr;
+    const VkBuffer buffer = addressed_buffer(kOverrideDataBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, memory, address, &map,
+                                             "plugin shader data");
+    if (!buffer) return 0;
+    std::memcpy(map, bytes, kOverrideDataBytes);
+    vkUnmapMemory(g.device, memory);  // from here on in command order only
+    std::lock_guard<std::mutex> lk(g_shader_data.mu);
+    g_shader_data.by_owner[owner] = buffer;
+    return address;
+}
+
+void shader_data_upload_locked() {
+    static std::vector<OverrideUpload> ups;  // under g.mu
+    if (!override_data_take(ups)) return;
+    // After every read of the earlier frames' (the shader stages that read by
+    // address), before any of this recording's; then visible to them.
+    constexpr VkPipelineStageFlags kReaders = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+                                              VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT |
+                                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    VkMemoryBarrier before{};
+    before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    VkMemoryBarrier after{};
+    after.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bool began = false;
+    for (const OverrideUpload& u : ups) {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        {
+            std::lock_guard<std::mutex> lk(g_shader_data.mu);
+            if (const auto it = g_shader_data.by_owner.find(u.owner); it != g_shader_data.by_owner.end()) buffer = it->second;
+        }
+        if (!buffer || u.bytes.empty()) continue;
+        if (!began) rec().pipeline_barrier(kReaders, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+        began = true;
+        rec().update_buffer(buffer, u.offset, u.bytes.size(), u.bytes.data());
+        ++g_shader_data.uploads;
+        g_shader_data.bytes += u.bytes.size();
+    }
+    if (began) rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, kReaders, 0, 1, &after, 0, nullptr, 0, nullptr);
+}
+
 namespace {
 
 // The first time each program's lift for a native hull pipeline is decided.

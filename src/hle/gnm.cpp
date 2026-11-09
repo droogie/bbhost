@@ -432,6 +432,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                                           static_cast<unsigned long long>(tl_n), static_cast<double>(t - tl_call) / 1e6, tl_phase_ms(t));
                              }
                              if (draw_digest_on()) draw_digest_frame();  // BBHOST_DRAW_DIGEST: the frame's draws are all made
+                             host_gpu_frame_recorded();  // the frame's end in command order (plugins' shader data latched)
                              hle_video_finish_flip(handle, buffer, arg, true);  // the job's commands are recorded
                              post_gnm_eop();
                          },

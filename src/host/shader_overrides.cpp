@@ -731,10 +731,174 @@ bool override_read(const OverrideSource& s, std::string& text, std::string& why)
     return true;
 }
 
+namespace {
+// bbhost.hlsli (override_include_text).
+constexpr const char* kInclude = R"hlsl(// bbhost.hlsli - what bbhost gives an edited shader (plugin API 27). A
+// plugin's shader data (BbHostApi::shader_data), by byte offset: uint, int
+// and float at a multiple of 4, the two-element types at 8, the three- and
+// four-element ones and float4x4 (16 floats, rows first) at 16. An offset
+// stays inside the data (BBHOST_DATA_BYTES), never past it. Each frame's
+// draws read one copy of it. The player's own files have no data: every read
+// is 0.
+#ifndef BBHOST_HLSLI
+#define BBHOST_HLSLI
+#define BBHOST_DATA_BYTES 65536u
+#ifdef BBHOST_DATA
+uint  bb_data_uint (uint at) { return vk::RawBufferLoad<uint >(BBHOST_DATA + (at & 0xfffcu), 4); }
+uint2 bb_data_uint2(uint at) { return vk::RawBufferLoad<uint2>(BBHOST_DATA + (at & 0xfff8u), 8); }
+uint3 bb_data_uint3(uint at) { return vk::RawBufferLoad<uint3>(BBHOST_DATA + (at & 0xfff0u), 16); }
+uint4 bb_data_uint4(uint at) { return vk::RawBufferLoad<uint4>(BBHOST_DATA + (at & 0xfff0u), 16); }
+#else
+uint  bb_data_uint (uint at) { return 0u; }
+uint2 bb_data_uint2(uint at) { return 0u.xx; }
+uint3 bb_data_uint3(uint at) { return 0u.xxx; }
+uint4 bb_data_uint4(uint at) { return 0u.xxxx; }
+#endif
+int      bb_data_int   (uint at) { return asint(bb_data_uint(at)); }
+float    bb_data_float (uint at) { return asfloat(bb_data_uint(at)); }
+float2   bb_data_float2(uint at) { return asfloat(bb_data_uint2(at)); }
+float3   bb_data_float3(uint at) { return asfloat(bb_data_uint3(at)); }
+float4   bb_data_float4(uint at) { return asfloat(bb_data_uint4(at)); }
+float4x4 bb_data_float4x4(uint at) {
+    return float4x4(bb_data_float4(at), bb_data_float4(at + 16u), bb_data_float4(at + 32u), bb_data_float4(at + 48u));
+}
+#endif
+)hlsl";
+
+// Whether a line is `#include "bbhost.hlsli"` (or <bbhost.hlsli>), spaces aside.
+bool includes_ours(const std::string& line) {
+    std::size_t i = line.find_first_not_of(" \t");
+    if (i == std::string::npos || line[i] != '#') return false;
+    i = line.find_first_not_of(" \t", i + 1);
+    if (i == std::string::npos || line.compare(i, 7, "include") != 0) return false;
+    i = line.find_first_not_of(" \t", i + 7);
+    if (i == std::string::npos) return false;
+    const char close = line[i] == '"' ? '"' : line[i] == '<' ? '>' : 0;
+    if (!close || line.compare(i + 1, 12, "bbhost.hlsli") != 0 || line.size() <= i + 13 || line[i + 13] != close) return false;
+    const std::size_t rest = line.find_first_not_of(" \t\r\n", i + 14);
+    return rest == std::string::npos || line.compare(rest, 2, "//") == 0;
+}
+}  // namespace
+
+const char* override_include_text() { return kInclude; }
+
 std::string override_dxc_text(const OverrideSource& s, const std::string& text) {
     // A byte-order mark goes: past the #line it would be a character in the source.
     const std::size_t from = text.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
-    return "#line 1 \"" + s.name + ".hlsl\"\n" + text.substr(from);
+    const std::string file = "\"" + s.name + ".hlsl\"";
+    std::string out = "#line 1 " + file + "\n";
+    std::size_t line = 1;
+    for (std::size_t at = from; at < text.size(); ++line) {
+        const std::size_t nl = text.find('\n', at);
+        const std::size_t end = nl == std::string::npos ? text.size() : nl + 1;
+        const std::string one = text.substr(at, end - at);
+        if (includes_ours(one)) {
+            out += "#line 1 \"bbhost.hlsli\"\n" + std::string(kInclude) + "#line " + std::to_string(line + 1) + " " + file + "\n";
+        } else {
+            out += one;
+        }
+        at = end;
+    }
+    return out;
+}
+
+namespace {
+// The owners' shader data: each a shadow the owner writes, the range written
+// since the last latch, and its buffer's address once made.
+struct DataShadow {
+    std::vector<std::uint8_t> bytes;  // kOverrideDataBytes, from the first write or compile
+    std::uint32_t lo = 0, hi = 0;     // written since the last latch: [lo, hi)
+    std::uint64_t address = 0;        // its buffer's device address (0: not made)
+    bool tried = false;               // its buffer asked for
+};
+struct DataState {
+    std::mutex mu;
+    std::map<int, DataShadow> owners;     // under mu
+    std::vector<OverrideUpload> latched;  // under mu: for the next recording's start
+    std::uint64_t (*make)(int, const std::uint8_t*) = nullptr;
+    std::chrono::steady_clock::time_point last_latch{};  // under mu
+    std::atomic<bool> dirty{false}, ready{false};          // a range written; uploads latched
+};
+DataState& data() {
+    static DataState* const d = new DataState;
+    return *d;
+}
+// The written ranges of the owners with buffers, into the uploads. Under mu.
+void latch_locked(DataState& d) {
+    for (auto& [owner, sh] : d.owners) {
+        if (sh.hi > sh.lo && sh.address) {
+            OverrideUpload u;
+            u.owner = owner;
+            u.offset = sh.lo;
+            u.bytes.assign(sh.bytes.begin() + sh.lo, sh.bytes.begin() + sh.hi);
+            d.latched.push_back(std::move(u));
+        }
+        sh.lo = sh.hi = 0;  // (one without a buffer gets the whole shadow when it is made)
+    }
+    d.dirty.store(false, std::memory_order_relaxed);
+    d.ready.store(!d.latched.empty(), std::memory_order_release);
+    d.last_latch = std::chrono::steady_clock::now();
+}
+}  // namespace
+
+int overrides_data_write(int owner, std::uint32_t offset, const void* data_in, std::uint32_t size) {
+    if (owner == kOverridePlayer || offset > kOverrideDataBytes || size > kOverrideDataBytes - offset || (size && !data_in)) return 1;
+    DataState& d = data();
+    std::lock_guard<std::mutex> lk(d.mu);
+    DataShadow& sh = d.owners[owner];
+    if (sh.bytes.empty()) sh.bytes.assign(kOverrideDataBytes, 0);
+    if (!size) return 0;
+    std::memcpy(sh.bytes.data() + offset, data_in, size);
+    const std::uint32_t lo = offset & ~3u, hi = (offset + size + 3u) & ~3u;  // vkCmdUpdateBuffer's: a multiple of 4
+    if (sh.hi <= sh.lo) {
+        sh.lo = lo;
+        sh.hi = hi;
+    } else {
+        sh.lo = std::min(sh.lo, lo);
+        sh.hi = std::max(sh.hi, hi);
+    }
+    d.dirty.store(true, std::memory_order_release);
+    return 0;
+}
+
+std::uint64_t override_data_address(int owner) {
+    if (owner == kOverridePlayer) return 0;
+    DataState& d = data();
+    std::lock_guard<std::mutex> lk(d.mu);
+    DataShadow& sh = d.owners[owner];
+    if (sh.address || sh.tried || !d.make) return sh.address;
+    sh.tried = true;
+    if (sh.bytes.empty()) sh.bytes.assign(kOverrideDataBytes, 0);
+    sh.address = d.make(owner, sh.bytes.data());  // its first contents: the shadow as it is
+    sh.lo = sh.hi = 0;
+    if (!sh.address) host_log("render: HLSL overrides: no buffer for owner %d's shader data: its shaders read 0", owner);
+    return sh.address;
+}
+
+void overrides_set_data_maker(std::uint64_t (*make)(int owner, const std::uint8_t* bytes)) {
+    DataState& d = data();
+    std::lock_guard<std::mutex> lk(d.mu);
+    d.make = make;
+}
+
+void override_data_latch() {
+    DataState& d = data();
+    if (!d.dirty.load(std::memory_order_acquire)) return;  // (the cost of a frame without writes)
+    std::lock_guard<std::mutex> lk(d.mu);
+    latch_locked(d);
+}
+
+bool override_data_take(std::vector<OverrideUpload>& out) {
+    out.clear();
+    DataState& d = data();
+    if (!d.ready.load(std::memory_order_acquire) && !d.dirty.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> lk(d.mu);
+    // No frame's end latched them for 100 ms (a flip by another path, a loading screen's): now.
+    if (d.latched.empty() && d.dirty.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() - d.last_latch > std::chrono::milliseconds(100))
+        latch_locked(d);
+    out.swap(d.latched);
+    d.ready.store(false, std::memory_order_release);
+    return !out.empty();
 }
 
 void override_outcome(const OverrideSource& s, bool taken, const std::string& why) {
