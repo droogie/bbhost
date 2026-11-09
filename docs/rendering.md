@@ -839,10 +839,20 @@ unset).** The constant buffers' homes - and with them the segments, and the
 run batching (`BBHOST_RUN_BATCH`) and copy-back captures they take - are on by
 default only where the frame rate can gain from them: a graphics card with
 room, or one with small video memory that has 6,144 MiB or more free at the
-start (the homes' own rule below: not an integrated GPU, no tight memory), 16
-hardware threads or more that the process may run on (its CPU affinity, so a
-`taskset` counts), and a frame rate above 60 (a fixed rate above 60, or
-Display-Limited on a display above 60 Hz). On Linux at 60 and below the frame
+start (the homes' own rule below: not an integrated GPU, no tight memory), and
+a frame rate above 60 (a fixed rate above 60, or Display-Limited on a display
+above 60 Hz). The pool takes its threads from the CPUs the process may run on
+(its CPU affinity, so a `taskset` counts): two from 16 hardware threads, one
+from 8, none under 8, where the homes go on alone. With fewer threads the old
+path's command processor competes with the game's own, and the homes win
+more: with the game confined to 8, 6 and 4 hardware threads of an RTX 4070's
+Xeon (uncapped, alternating runs) they ran Old Yharnam 51%, 9.0% and 1.4%
+faster than the old path, Central Yharnam 5.1%, 5.5% and 2.8%, the sewer pit
+6.7%, 4.2% and 5.1%, the slowest frames no slower. Under
+Windows on an RTX 3070 Ti Laptop GPU with the game on 8 hardware threads
+(`start /affinity FF`) the default ran Old Yharnam 42% faster than the run
+commit and the other four places 3.2-6.3%, the process 19-51 points of CPU
+lower but at Old Yharnam. On Linux at 60 and below the frame
 waits for its limit anyway, and the command processor draws in order as it
 did before them. On Windows, where the run commit is on by default, the
 homes take its place at any frame rate: the run commit gives way to them and
@@ -871,7 +881,7 @@ segments without the run commit against the run commit:
 
 As shipped, the shared GPU memory stayed at 2.1 GB (whole imports, on the
 second row, pinned 4.95 GB). Where the rule does not hold - an integrated GPU,
-fewer threads, a card under 6,144 MiB free - the run commit
+a card under 6,144 MiB free - the run commit
 stays on by Windows' default, as before. The homes are made as
 their buffers are, so the choice is made once, with the device at start: a
 frame rate changed in play (it changes at once, 30 included) leaves the
@@ -1090,9 +1100,8 @@ version with its source at its batch.
 
 **Constant buffers in device-local homes made at their creation, bound by
 handle (`BBHOST_GXVK_HOMES`, on by default above 60 fps - on Windows at any
-rate - with 16 hardware threads or more and a card with room or 6,144 MiB
-free, the run commit giving way on Windows: "On by default above 60 fps, and
-on Windows at any rate" above).** A
+rate - with a card with room or 6,144 MiB free, the run commit giving way on
+Windows: "On by default above 60 fps, and on Windows at any rate" above).** A
 constant buffer's own memory is written only by GX's GPU copies: every
 UpdateSubresource of one, and every Map of a dynamic one, writes a renamed
 copy, and the map resolves copy the renames back. With `BBHOST_GXVK_HOMES=1`
