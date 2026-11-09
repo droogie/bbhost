@@ -352,6 +352,19 @@ if(Vulkan_FOUND)
                                 src/host/copy_census.cpp src/host/copy_compare.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
+  # The render probe (plugin API 27's frame info, render hooks and
+  # anti-aliasing claim checked on the GPU: tools/render_probe): a test aid,
+  # built beside bbhost, never into plugins/ - where every run would load it -
+  # and in no package (tools/package_plugins.sh names the official ones). A
+  # test kit copies it into its own plugins folder.
+  add_library(render_probe MODULE tools/render_probe/render_probe.cpp)
+  target_include_directories(render_probe PRIVATE include tools/render_probe)
+  target_compile_features(render_probe PRIVATE cxx_std_17)
+  target_link_libraries(render_probe PRIVATE Vulkan::Headers)
+  set_target_properties(render_probe PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+  if(WIN32)
+    target_link_options(render_probe PRIVATE -static -static-libgcc -static-libstdc++)
+  endif()
   # The SPIR-V validator: the HLSL path validates the modules DXC compiled
   # without its own validator (a sample's run-time offset; host/translation_cache.cpp).
   # Without it those keep the lift.
@@ -629,6 +642,16 @@ if(UNIX)
   target_link_libraries(boss_rush_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(boss_rush_test bb_plugin_boss_rush)
   add_test(NAME boss_rush_test COMMAND boss_rush_test $<TARGET_FILE:bb_plugin_boss_rush>)
+  # The render probe (tools/render_probe) on a pretend host and a pretend
+  # Vulkan device: what it asks of the device and records, and its own checks.
+  if(TARGET render_probe)
+    add_executable(render_probe_test tests/render_probe_test.cpp)
+    target_include_directories(render_probe_test PRIVATE src include)
+    target_compile_features(render_probe_test PRIVATE cxx_std_17)
+    target_link_libraries(render_probe_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    add_dependencies(render_probe_test render_probe)
+    add_test(NAME render_probe_test COMMAND render_probe_test $<TARGET_FILE:render_probe>)
+  endif()
   # The PS1 Look plugin on a pretend host (plugins/ps1): the look it asks the
   # host for at the start and as its options change, and none on an older host.
   add_executable(ps1_plugin_test tests/ps1_plugin_test.cpp)
