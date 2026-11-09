@@ -10,7 +10,8 @@
  *
  *   [plugins] shader_tint = true
  *   [shader_tint]
- *   shader = "ccbf44a6.ps"   # the shader, as BBHOST_HLSL_DUMP names its file (the scene's copy into the post chain)
+ *   # the shader, as BBHOST_HLSL_DUMP names its file: the scene's copy into the post chain
+ *   shader = "PointSampleColorClamp1.ppo@ccbf44a6.ps"
  *   toggle_seconds = 10      # on for this long, then off as long (0: on throughout)
  *   pulse_seconds = 4        # the strength from 0 to 1 and back over this long (0: 1 throughout)
  */
@@ -29,7 +30,7 @@
 #endif
 
 static const BbHostApi* g_api;
-static char g_shader[256] = "ccbf44a6.ps";
+static char g_shader[256] = "PointSampleColorClamp1.ppo@ccbf44a6.ps";
 static double g_toggle = 10.0, g_pulse = 4.0, g_start = -1.0;
 static char* g_text;   /* the patched source, once made ("" when it could not be) */
 static int g_on = -1;  /* the override as last set: 1 on, 0 off */
