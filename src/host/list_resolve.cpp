@@ -33,8 +33,8 @@ const int g_mode = [] {
 namespace {
 // BBHOST_RUN_COMMIT's default where it is unset: on (2) on Windows, where it
 // was measured to win, and off (0) on Linux, where it was measured to lose
-// (log_commit_default says why). On Windows it gives way where the constant
-// buffers' homes and the pool's segments are on by their rule
+// (log_commit_default says why). On Windows it gives way wherever the constant
+// buffers' homes are bound, by their rule or BBHOST_GXVK_HOMES=1
 // (host/gxvk_homes.h run_commit_gives_way, commit_give_way below).
 #if defined(_WIN32)
 constexpr int kRunCommitDefault = 2;
@@ -146,14 +146,14 @@ void log_commit_default() {
         const char* where = test_default_env() ? "by Windows' default (BBHOST_TEST_RUN_COMMIT_DEFAULT)" : "by default on Windows";
         if (g_gave_way.load(std::memory_order_relaxed))
             host_log("list-resolve: run commit off by default here - on %s, it gives way where the constant buffers' "
-                     "homes and the pool's segments are on (their lines say why): measured there at 1080p uncapped on an RTX 3070 Ti "
-                     "Laptop GPU, Old Yharnam ran 27%% faster with them than with the run commit and three other places 3.0-4.0%% "
-                     "(BBHOST_RUN_COMMIT=on turns it on)",
+                     "homes are bound (their lines say why): measured at 1080p on an RTX 3070 Ti Laptop GPU, uncapped Old Yharnam ran "
+                     "27%% faster with the homes and the pool's segments than with the run commit and three other places 3.0-4.0%%, "
+                     "and at 60 fps the homes took 9-34 points of CPU less (BBHOST_RUN_COMMIT=on turns it on)",
                      where);
         else if (run_commit_default())
             host_log("list-resolve: run commit on %s (BBHOST_RUN_COMMIT=0 turns it off): measured there at 1080p, "
                      "+12%% on a Radeon 8060S and +2%% on an RTX 3070 Ti Laptop GPU; it gives way only where the constant buffers' homes "
-                     "and the pool's segments are on by their rule (host/gxvk_homes.h), and BBHOST_GXVK_HOMES=0 keeps it",
+                     "are bound, by their rule or BBHOST_GXVK_HOMES=1 (host/gxvk_homes.h), and BBHOST_GXVK_HOMES=0 keeps it",
                      where);
         else if (test_default_env())
             host_log("list-resolve: run commit off by default here (BBHOST_TEST_RUN_COMMIT_DEFAULT: Linux's default) - every draw "

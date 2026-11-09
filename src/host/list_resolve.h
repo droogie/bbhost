@@ -59,8 +59,9 @@ void check_chunk(int ring, std::uint64_t recording, std::uint64_t lo, std::uint6
 // to do; 2 (`on`) the run's draws after its first committed in parts by the
 // workers and the command processor (render.cpp run_commit), spliced in their
 // order at the join - the default on Windows since 2026-10-29 (unset, or
-// `on`) but where the constant buffers' homes and the pool's segments are on
-// by their rule (commit_give_way, since 2026-11-04), and off by default on
+// `on`) but where the constant buffers' homes are bound - by their rule
+// (commit_give_way, since 2026-11-04) or by BBHOST_GXVK_HOMES=1 (since
+// 2026-11-09) - and off by default on
 // Linux since 2026-10-31; 3 (`compare`) as 2, and each forked run also committed in
 // order as before, the parts' packets compared with those and dropped. The
 // workers spin BBHOST_RUN_COMMIT_SPIN_US (50) after a part before they sleep
@@ -89,8 +90,8 @@ bool commit_by_setting();
 // =off Linux's, for a test of the give-way).
 bool commit_by_default();
 // The run commit on by the platform's default alone gives way, at the device's
-// choice before any draw (host/gxvk_homes.h run_commit_gives_way: where the
-// homes and the pool's segments are on by their rule): every draw committed
+// choice before any draw (host/gxvk_homes.h run_commit_gives_way: wherever the
+// homes are bound, by their rule or BBHOST_GXVK_HOMES=1): every draw committed
 // in order but for the pool's splices; log_commit_default says why. Nothing
 // where BBHOST_RUN_COMMIT is set.
 void commit_give_way();

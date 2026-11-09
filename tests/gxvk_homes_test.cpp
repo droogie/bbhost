@@ -8,8 +8,8 @@
 // The handle's packing is checked too (host/gxvk_homes.h), and the default's
 // rule (default_off: on only with a card with room or 6 GiB of small video
 // memory free, 16 hardware threads or more and a frame rate above 60;
-// small_refused; run_commit_gives_way: Windows' run commit gives way where
-// the rule holds).
+// small_refused; homes_bound and run_commit_gives_way: Windows' run commit
+// gives way wherever the homes are bound, by the rule or BBHOST_GXVK_HOMES=1).
 #include "host/gxvk_homes.h"
 #include "host/gxvk_homes_index.h"
 
@@ -85,21 +85,42 @@ int main() {
         check(default_off(false, false, small_refused(true, 7000, false), 16, 960, false) == 0 &&
                   default_off(false, false, small_refused(true, 4000, false), 16, 960, false) == kDefaultOffSmall,
               "on with 7,000 MiB free, off with 4,000", 7000, 4000);
-        // Windows' run commit (on by its default alone) gives way where the rule holds and the homes are the default or
-        // asked for; any reason off, a setting of the run commit's own, or BBHOST_GXVK_HOMES=0/compare/twins keeps it.
-        check(run_commit_gives_way(0, true, Mode::kAuto) && run_commit_gives_way(0, true, Mode::kHandle),
-              "the run commit gives way where the rule holds", 0, 1);
-        check(!run_commit_gives_way(0, false, Mode::kAuto) && !run_commit_gives_way(0, false, Mode::kHandle),
-              "nothing to give way without the platform's default (Linux, or BBHOST_RUN_COMMIT set)", 0, 0);
+        // The homes end bound by the default where nothing keeps them off, and by BBHOST_GXVK_HOMES=1 wherever the device
+        // takes them: the rule's threads, frame rate and run-commit reasons do not stop 1; the device's (an integrated GPU,
+        // tight memory, small video memory refused) do. 0, compare and twins bind none.
+        check(homes_bound(Mode::kAuto, 0, false, false, false), "the default binds where the rule holds", 0, 0);
         for (unsigned bit : {kDefaultOffIntegrated, kDefaultOffTight, kDefaultOffSmall, kDefaultOffThreads, kDefaultOffRate, kDefaultOffRunCommit})
-            check(!run_commit_gives_way(bit, true, Mode::kAuto) && !run_commit_gives_way(bit, true, Mode::kHandle),
-                  "the run commit kept where a reason keeps the homes off", bit, 1);
-        check(!run_commit_gives_way(default_off(false, false, false, 8, 960, false), true, Mode::kAuto) &&
-                  !run_commit_gives_way(default_off(false, false, false, 16, 60, false), true, Mode::kAuto) &&
-                  !run_commit_gives_way(default_off(true, false, false, 16, 960, false), true, Mode::kAuto),
-              "Windows keeps the run commit with 8 threads, at 60 fps, on an integrated GPU", 8, 60);
-        check(!run_commit_gives_way(0, true, Mode::kOff) && !run_commit_gives_way(0, true, Mode::kCompare) &&
-                  !run_commit_gives_way(0, true, Mode::kTwins),
+            check(!homes_bound(Mode::kAuto, bit, false, false, false), "the default binds none where a reason keeps it off", bit, 0);
+        check(homes_bound(Mode::kHandle, kDefaultOffRate, false, false, false) &&
+                  homes_bound(Mode::kHandle, kDefaultOffThreads | kDefaultOffRate, false, false, false) &&
+                  homes_bound(Mode::kHandle, kDefaultOffRunCommit, false, false, false),
+              "BBHOST_GXVK_HOMES=1 binds with 8 threads, at 60 fps, with the run commit set", 8, 60);
+        check(!homes_bound(Mode::kHandle, kDefaultOffIntegrated, true, false, false) &&
+                  !homes_bound(Mode::kHandle, kDefaultOffTight, false, true, false) &&
+                  !homes_bound(Mode::kHandle, kDefaultOffSmall, false, false, true),
+              "BBHOST_GXVK_HOMES=1 binds none on an integrated GPU, with tight memory or small video memory refused", 0, 1);
+        check(!homes_bound(Mode::kOff, 0, false, false, false) && !homes_bound(Mode::kCompare, 0, false, false, false) &&
+                  !homes_bound(Mode::kTwins, 0, false, false, false),
+              "BBHOST_GXVK_HOMES=0, compare and twins bind none", 0, 2);
+        // Windows' run commit (on by its default alone) gives way wherever the homes are bound - the default's rule or
+        // BBHOST_GXVK_HOMES=1 at 60 fps alike - and is kept where they are not, or where BBHOST_RUN_COMMIT is set.
+        check(run_commit_gives_way(homes_bound(Mode::kAuto, 0, false, false, false), true) &&
+                  run_commit_gives_way(homes_bound(Mode::kHandle, 0, false, false, false), true),
+              "the run commit gives way where the rule holds", 0, 1);
+        check(run_commit_gives_way(homes_bound(Mode::kHandle, default_off(false, false, false, 16, 60, false), false, false, false), true) &&
+                  run_commit_gives_way(homes_bound(Mode::kHandle, default_off(false, false, false, 8, 960, false), false, false, false), true),
+              "the run commit gives way to BBHOST_GXVK_HOMES=1 at 60 fps and with 8 threads", 8, 60);
+        check(!run_commit_gives_way(true, false) && !run_commit_gives_way(false, false),
+              "nothing to give way without the platform's default (Linux, or BBHOST_RUN_COMMIT set)", 0, 0);
+        check(!run_commit_gives_way(homes_bound(Mode::kAuto, default_off(false, false, false, 8, 960, false), false, false, false), true) &&
+                  !run_commit_gives_way(homes_bound(Mode::kAuto, default_off(false, false, false, 16, 60, false), false, false, false), true) &&
+                  !run_commit_gives_way(homes_bound(Mode::kAuto, default_off(true, false, false, 16, 960, false), true, false, false), true),
+              "Windows' default keeps the run commit with 8 threads, at 60 fps, on an integrated GPU", 8, 60);
+        check(!run_commit_gives_way(homes_bound(Mode::kHandle, kDefaultOffIntegrated, true, false, false), true),
+              "BBHOST_GXVK_HOMES=1 on an integrated GPU keeps the run commit", 0, 3);
+        check(!run_commit_gives_way(homes_bound(Mode::kOff, 0, false, false, false), true) &&
+                  !run_commit_gives_way(homes_bound(Mode::kCompare, 0, false, false, false), true) &&
+                  !run_commit_gives_way(homes_bound(Mode::kTwins, 0, false, false, false), true),
               "BBHOST_GXVK_HOMES=0, compare and twins keep the run commit", 0, 2);
     }
 

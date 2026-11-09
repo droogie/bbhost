@@ -873,8 +873,11 @@ choice as it was until the next start. Off, one line says why (`gxvk homes: off 
 default here (...)`); on, the homes' line says what decided it, and on
 Windows the run commit's line (`list-resolve: run commit ...`) says whether
 it gave way. `BBHOST_GXVK_HOMES=1` turns the homes on anywhere they can be
-made (where the rest of the rule holds, Windows' run commit gives way as with
-the default), `=0` keeps the path before them with the run commit as it was;
+made, and Windows' run commit gives way to them there as it does to the
+default - kept beside them at 60 fps, the pool committed 86% of the draws for
+nothing on the RTX 3070 Ti Laptop GPU, 106-152 points of CPU over the run
+commit alone, where the homes without it took 9-34 points less than the run
+commit at a true 60; `=0` keeps the path before them with the run commit as it was;
 `BBHOST_RUN_COMMIT` set decides the run commit either way, and
 `BBHOST_GXVK_LISTS` the segments alone.
 

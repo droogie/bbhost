@@ -92,8 +92,9 @@ Mode env_mode();
 // for its limit anyway, the pool's threads cost about a core more for nothing.
 // Nor with the run commit turned on by BBHOST_RUN_COMMIT: the pool's splices
 // give way to it, so its threads would commit ahead for nothing. Where the run
-// commit is on by the platform's default alone (Windows) and the rest holds,
-// the run commit gives way instead (run_commit_gives_way): under Windows on an
+// commit is on by the platform's default alone (Windows), it gives way instead
+// wherever the homes are bound - by this rule or by BBHOST_GXVK_HOMES=1
+// (run_commit_gives_way): under Windows on an
 // RTX 3070 Ti Laptop GPU with 16 hardware threads (1080p, uncapped) the homes
 // and the segments without the run commit ran Old Yharnam 27% faster than the
 // run commit, the Nightmare of Mensis, Cainhurst's courtyard and Central
@@ -127,14 +128,27 @@ constexpr unsigned default_off(bool integrated, bool tight, bool small_refused, 
            (threads < kDefaultThreads ? kDefaultOffThreads : 0u) | (fps <= kDefaultAboveFps ? kDefaultOffRate : 0u) |
            (run_commit_set ? kDefaultOffRunCommit : 0u);
 }
+// Whether the homes end bound by handle (homes_decide): the default where
+// nothing keeps them off by the rule above (`off` none), and
+// BBHOST_GXVK_HOMES=1 wherever the device takes them - not on an integrated
+// GPU or with tight memory, nor with small video memory under
+// kSmallHomesFreeMiB free unless a budget is given (small_refused); the rule's
+// other reasons (threads, the frame rate, the run commit's setting) do not
+// stop 1. BBHOST_GXVK_HOMES=0, compare and twins bind none.
+constexpr bool homes_bound(Mode homes, unsigned off, bool integrated, bool tight, bool small_refused) {
+    if (homes == Mode::kAuto) return off == 0;
+    return homes == Mode::kHandle && !integrated && !tight && !small_refused;
+}
 // Whether the run commit, on by the platform's default alone (BBHOST_RUN_COMMIT
-// unset: Windows, list_resolve::commit_by_default), gives way: where nothing
-// keeps the homes off by the rule above (`off` none) and they are the default
-// or asked for (BBHOST_GXVK_HOMES unset or 1), the draws are committed in
-// order but for the pool's splices. BBHOST_GXVK_HOMES=0 (or compare, twins)
-// keeps the run commit as it was.
-constexpr bool run_commit_gives_way(unsigned off, bool run_commit_by_default, Mode homes) {
-    return off == 0 && run_commit_by_default && (homes == Mode::kAuto || homes == Mode::kHandle);
+// unset: Windows, list_resolve::commit_by_default), gives way: wherever the
+// homes are bound (homes_bound), the draws are committed in order but for the
+// pool's splices. The run commit kept beside them - BBHOST_GXVK_HOMES=1 with
+// the game paced at 60 kept it until 2026-11-09 - had the pool commit 86% of
+// the draws for nothing on an RTX 3070 Ti Laptop GPU (1080p), 106-152 points of
+// CPU over the run commit alone; given way, the homes at a true 60 took 9-34
+// points less than the run commit. BBHOST_RUN_COMMIT set keeps its own answer.
+constexpr bool run_commit_gives_way(bool bound, bool run_commit_by_default) {
+    return bound && run_commit_by_default;
 }
 
 // The handle in a holder's +0x14: the tag, the entry's generation (8 bits) and
