@@ -61,12 +61,12 @@
 // checked against its mirror, a sample of homes read back from the GPU after
 // their copies; twins: stage 4b.3a(i) as it was (the homes as level-2 twins).
 // Off on an integrated GPU (its video memory is the system's) and with small
-// video memory (the pool's ~80 MiB pushed a 4 GB card's images into host
-// memory); elsewhere the pool has a budget (128 MiB, or
-// BBHOST_GXVK_HOMES_BUDGET_MB, which also turns the homes on with small video
-// memory): a buffer made past it gets no home and takes today's path for its
-// life - decided at its creation, so no home is ever taken from a buffer that
-// has one.
+// video memory under kSmallHomesFreeMiB free at the start (the pool's ~80 MiB
+// pushed a 4 GB card's images into host memory); elsewhere the pool has a
+// budget (128 MiB, or BBHOST_GXVK_HOMES_BUDGET_MB, which also turns the homes
+// on with less video memory free): a buffer made past it gets no home and
+// takes today's path for its life - decided at its creation, so no home is
+// ever taken from a buffer that has one.
 #pragma once
 
 #include <atomic>
@@ -82,33 +82,59 @@ Mode env_mode();
 // (homes_decide): the homes - and with them the draw segments stage 4b.2's pool
 // prepares on its own threads (host/gxvk_lists.h settle), the run batching and
 // the copy-back captures, as 1 turns them on - only where the frame rate can
-// gain from them: a graphics card with room (the device rule above: no
-// integrated GPU, no small video memory unless a budget is given, no tight
-// memory), 16 hardware threads or more for the process, and a frame rate above
-// 60 (a fixed rate above 60, or Display-Limited on a display above 60 Hz). On
-// an RTX 4070 uncapped they took the command processor's time a flip down
-// 27-31% and the frame rate up 6.5% where the command processor limited; at
-// 60 and below, where the frame waits for its limit anyway, the pool's threads
-// cost about a core more for nothing. Nor with the run commit on
-// (BBHOST_RUN_COMMIT, on by default on Windows): the pool's splices give way to
-// it, so its threads would commit ahead for nothing, and the homes beside the
-// run commit have not been measured. The homes are made as their buffers are,
-// so the choice holds for the run: a frame rate changed in play applies at the
-// next start. The reasons it is off, as bits (none: on).
+// gain from them: a graphics card with room, or with small video memory and
+// kSmallHomesFreeMiB or more free at the start (the device rule above: no
+// integrated GPU, no tight memory), 16 hardware threads or more for the
+// process, and a frame rate above 60 (a fixed rate above 60, or
+// Display-Limited on a display above 60 Hz). On an RTX 4070 uncapped they took
+// the command processor's time a flip down 27-31% and the frame rate up 6.5%
+// where the command processor limited; at 60 and below, where the frame waits
+// for its limit anyway, the pool's threads cost about a core more for nothing.
+// Nor with the run commit turned on by BBHOST_RUN_COMMIT: the pool's splices
+// give way to it, so its threads would commit ahead for nothing. Where the run
+// commit is on by the platform's default alone (Windows) and the rest holds,
+// the run commit gives way instead (run_commit_gives_way): under Windows on an
+// RTX 3070 Ti Laptop GPU with 16 hardware threads (1080p, uncapped) the homes
+// and the segments without the run commit ran Old Yharnam 27% faster than the
+// run commit, the Nightmare of Mensis, Cainhurst's courtyard and Central
+// Yharnam 3.0-4.0% faster, on the card's 8 GB as shipped (7,249 MiB free at
+// the start: small video memory, the pool's 128 MiB budget, the window imports
+// kept, the shared GPU memory unchanged at 2.1 GB); taken as a card with room,
+// 29% and 2.2-3.4%. The homes are made as their buffers are, so the choice
+// holds for the run: a frame rate changed in play applies at the next start.
+// The reasons it is off, as bits (none: on).
 enum DefaultOff : unsigned {
     kDefaultOffIntegrated = 1u << 0,  // an integrated GPU (its video memory is the system's)
     kDefaultOffTight = 1u << 1,       // tight memory (all heaps under 12 GiB)
-    kDefaultOffSmall = 1u << 2,       // small video memory, no BBHOST_GXVK_HOMES_BUDGET_MB
+    kDefaultOffSmall = 1u << 2,       // small video memory under kSmallHomesFreeMiB free, no BBHOST_GXVK_HOMES_BUDGET_MB (small_refused)
     kDefaultOffThreads = 1u << 3,     // fewer than kDefaultThreads hardware threads (host_cpu_threads)
     kDefaultOffRate = 1u << 4,        // a frame rate of kDefaultAboveFps or less (frame_rate_game_fps)
-    kDefaultOffRunCommit = 1u << 5,   // the run commit on (list_resolve::committing())
+    kDefaultOffRunCommit = 1u << 5,   // the run commit turned on by BBHOST_RUN_COMMIT (list_resolve::commit_by_setting)
 };
 constexpr unsigned kDefaultThreads = 16;
 constexpr int kDefaultAboveFps = 60;
-constexpr unsigned default_off(bool integrated, bool tight, bool small_vram_unbudgeted, unsigned threads, int fps, bool run_commit) {
-    return (integrated ? kDefaultOffIntegrated : 0u) | (tight ? kDefaultOffTight : 0u) | (small_vram_unbudgeted ? kDefaultOffSmall : 0u) |
+// Small video memory (gpu.cpp small_vram: a discrete GPU under 7,680 MiB free
+// at the start): the homes from this much free, with the pool's budget as on a
+// card with room (an 8 GB card's 7,249 MiB under Windows, above). Under it they
+// stay off unless BBHOST_GXVK_HOMES_BUDGET_MB gives a budget: a 4 GB card's
+// images went to host memory beside them.
+constexpr unsigned long long kSmallHomesFreeMiB = 6144;
+constexpr bool small_refused(bool small_vram, unsigned long long free_mib, bool budget_given) {
+    return small_vram && !budget_given && free_mib < kSmallHomesFreeMiB;
+}
+constexpr unsigned default_off(bool integrated, bool tight, bool small_refused, unsigned threads, int fps, bool run_commit_set) {
+    return (integrated ? kDefaultOffIntegrated : 0u) | (tight ? kDefaultOffTight : 0u) | (small_refused ? kDefaultOffSmall : 0u) |
            (threads < kDefaultThreads ? kDefaultOffThreads : 0u) | (fps <= kDefaultAboveFps ? kDefaultOffRate : 0u) |
-           (run_commit ? kDefaultOffRunCommit : 0u);
+           (run_commit_set ? kDefaultOffRunCommit : 0u);
+}
+// Whether the run commit, on by the platform's default alone (BBHOST_RUN_COMMIT
+// unset: Windows, list_resolve::commit_by_default), gives way: where nothing
+// keeps the homes off by the rule above (`off` none) and they are the default
+// or asked for (BBHOST_GXVK_HOMES unset or 1), the draws are committed in
+// order but for the pool's splices. BBHOST_GXVK_HOMES=0 (or compare, twins)
+// keeps the run commit as it was.
+constexpr bool run_commit_gives_way(unsigned off, bool run_commit_by_default, Mode homes) {
+    return off == 0 && run_commit_by_default && (homes == Mode::kAuto || homes == Mode::kHandle);
 }
 
 // The handle in a holder's +0x14: the tag, the entry's generation (8 bits) and

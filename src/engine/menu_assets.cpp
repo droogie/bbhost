@@ -22,11 +22,21 @@
 // Two edits. The movie: each PC section is a clone of the dump's
 // ControllSetting sprite under a new instance name and character id, with its
 // title retitled to the port's message id, its static text dropped, its
-// widget rows kept, dropped or added to fit the section, and its placement
-// put on the main timeline hidden (the game shows the section it opens); then
-// the System list gets the movie's own ScrollBarV, since nine rows scroll in
-// five lines. The messages: the port's ids added to the menu text (group 200)
-// and line help (201) FMGs of the dump's DCX-compressed BND4.
+// widget rows kept, dropped or added to fit the section and stacked so each
+// lies over the rows after it (a row's pick list opens over them), and its
+// placement put on the main timeline hidden (the game shows the section it
+// opens); then the System list gets the movie's own ScrollBarV, since nine
+// rows scroll in five lines. The messages: the port's ids added to the menu
+// text (group 200) and line help (201) FMGs of the dump's DCX-compressed BND4.
+
+// tests/menu_assets_test.cpp's mutants of the rows' stacking
+// (MENU_ASSETS_MUTANTS there only).
+#ifdef MENU_ASSETS_MUTANTS
+int g_menu_assets_mutant = 0;
+#define MENU_ASSETS_MUTANT(n) (g_menu_assets_mutant == (n))
+#else
+#define MENU_ASSETS_MUTANT(n) false
+#endif
 
 namespace {
 
@@ -34,7 +44,7 @@ using Bytes = std::vector<std::uint8_t>;
 
 // Bumped whenever a generator or the recipe changes, so installs remake their
 // assets instead of keeping the last generation.
-constexpr int kGeneratorVersion = 14;  // 14: PC Settings' Texture Quality row's text; 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
+constexpr int kGeneratorVersion = 20;  // 20: every PC section's rows stacked top-down, a row's pick list over the rows after it; 19: PC Upscaling's sixth row on Windows (five rows elsewhere); 18: PC Settings' seventh row on Windows alone; 17: PC Settings' seventh row, Stay Borderless; 16: PC Enhancements' sixth row, Auto-Replenish Items; 15: PC Enhancements' fifth row, Full Phantom HP; 14: PC Settings' Texture Quality row's text; 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
 
 const char kMessagesTsv[] =
 #include "pc_option_messages.inc"
@@ -83,7 +93,7 @@ void app(Bytes& b, const std::string& s) { b.insert(b.end(), s.begin(), s.end())
 
 // ---------------------------------------------------------------- the movie
 
-constexpr int kEnd = 0, kShowFrame = 1, kPlace2 = 26, kDefineSprite = 39, kPlace3 = 70, kSymbolClass = 76;
+constexpr int kEnd = 0, kShowFrame = 1, kRemove = 5, kPlace2 = 26, kRemove2 = 28, kDefineSprite = 39, kPlace3 = 70, kSymbolClass = 76;
 
 struct Tag {
     int code;
@@ -406,6 +416,51 @@ bool ends_with(const std::string& s, const char* p) {
     return s.size() >= n && s.compare(s.size() - n, n, p) == 0;
 }
 
+// A section's rows stacked top-down: each row (Item_<n>_0, the Defaults label
+// the last of them) at a depth above every row's after it, as the game's own
+// LanguageSetting has them (Item_0_0 at depth 74, Item_1_0 at 65, the label
+// Item_2_0 at 58). A row's pick list is the row's own child
+// (Widgets/DropdownList/ItemList), drawn at the row's depth, and it opens down
+// over the rows after it; the donor stacks its rows the other way - Item_0_0
+// lowest, the label on top - so the values of the rows under an open list, and
+// the label, were drawn over it. The depths the rows hold are dealt out again,
+// the highest to Item_0_0, and every tag of the sprite at one of them - the
+// placement, each frame's move, a removal - follows its row. `body` is a
+// DefineSprite's (character id, frame count, tags); only depth fields change.
+void stack_rows_down(Bytes& body) {
+    if (MENU_ASSETS_MUTANT(1)) return;
+    const std::vector<Tag> ts = tags(body, 4, body.size());
+    std::map<int, std::uint16_t> rows;  // Item_<n>_0's n -> its depth
+    for (const Tag& t : ts) {
+        if (t.code != kPlace2 || !(body.at(t.s) & 0x02)) continue;
+        const Place2 p = parse_place2(body, t.s, t.e);
+        if (p.name && starts_with(*p.name, "Item_") && ends_with(*p.name, "_0"))
+            rows[std::atoi(p.name->substr(5, p.name->size() - 7).c_str())] = p.depth;
+    }
+    if (MENU_ASSETS_MUTANT(3) && !rows.empty()) rows.erase(rows.rbegin()->first);
+    std::vector<std::uint16_t> depths;
+    for (const auto& [n, depth] : rows) depths.push_back(depth);
+    std::sort(depths.rbegin(), depths.rend());
+    if (std::adjacent_find(depths.begin(), depths.end()) != depths.end()) throw Fail{"two rows at one depth"};
+    std::map<std::uint16_t, std::uint16_t> to;  // a row's depth -> the one it is given
+    std::size_t k = 0;
+    for (const auto& [n, depth] : rows) to[depth] = depths[k++];
+    for (const Tag& t : ts) {
+        std::size_t at = 0;
+        if (t.code == kPlace2 || t.code == kPlace3) {
+            if (MENU_ASSETS_MUTANT(2) && !(body.at(t.s) & 0x02)) continue;  // a move
+            at = t.s + (t.code == kPlace3 ? 2 : 1);
+        } else if (t.code == kRemove) {
+            at = t.s + 2;
+        } else if (t.code == kRemove2) {
+            at = t.s;
+        } else {
+            continue;
+        }
+        if (const auto it = to.find(u16(body, at)); it != to.end()) put16(body, at, it->second);
+    }
+}
+
 // One PC section cloned from a donor section into the movie.
 Bytes add_option_section(const Bytes& b, const SectionArgs& a) {
     if (b.size() < 16 || std::memcmp(b.data(), "GFX", 3) != 0) throw Fail{"optionsetting.gfx is not an uncompressed GFX"};
@@ -562,6 +617,7 @@ Bytes add_option_section(const Bytes& b, const SectionArgs& a) {
         }
         app(new_body, b, t.head, t.e);
     }
+    stack_rows_down(new_body);
 
     if (!clone_p.mat) throw Fail{a.clone + " is placed without a matrix"};
     const Bytes new_section = tag_bytes(kPlace3, build_place3_hidden(new_cid, static_cast<std::uint16_t>(a.section_depth), *clone_p.mat, a.name));
@@ -783,15 +839,17 @@ Bytes build_option_movie(const Bytes& src) {
         for (auto& d : drops) a.drop.push_back(d);
         m = add_option_section(m, a);
     };
-    section("PCSetting", 116020, 383, 6, 0, {});
+    section("PCSetting", 116020, 383, kPcSettingSlots, kPcSettingSlots - 6, {});  // on Windows seven rows: one added, the Defaults label below it
     section("PCGraphics", 117020, 384, 7, 1, {});  // seven rows: one added, the Defaults label below it
     section("PCControls", 118020, 385, 6, 0, {});
     section("PCKeys", 119020, 386, std::nullopt, 2, {});
     section("PCEffects", 120020, 387, 6, 0, {});
     section("PCCamera", 121020, 388, 4, 0, {"Item_4_0", "Item_5_0"});
     section("PCDeck", 123020, 389, 2, 0, {"Item_2_0", "Item_3_0", "Item_4_0", "Item_5_0"});
-    section("PCEnhance", 124020, 390, 4, 0, {"Item_4_0", "Item_5_0"});
-    section("PCUpscale", 125020, 391, 5, 0, {"Item_5_0"});
+    section("PCEnhance", 124020, 390, 6, 0, {});
+    // On Windows the donor's six rows, the label below them; elsewhere five, the label in the sixth's place.
+    section("PCUpscale", 125020, 391, kPcUpscaleSlots, 0,
+            kPcUpscaleSlots < 6 ? std::vector<std::string>{"Item_5_0"} : std::vector<std::string>{});
     return add_scrollbar(m, "Top", 1290, 354.5);
 }
 

@@ -305,11 +305,14 @@ std::vector<u32> fragment_with_body(bool frag_coord) {
     return a.done();
 }
 
-void check_pixel_cut(const char* what, std::vector<u32> m) {
-    const PixelCut cut{960, 960, -540, 540, 0.55f, 0.31f, 14.0f, 0.819f, 0.574f, 4.0f, 0.35f, 1.2f, 1.0f, 1.0f, -9.999f, 10.0f};
+// `live`: the numbers read from a buffer (PixelCutLive) at this address, the
+// cut in its live form - the map's cone (distance 1) or the objects' (2).
+void check_pixel_cut(const char* what, std::vector<u32> m, std::uint64_t live = 0, float cone = 1.0f) {
+    PixelCut cut{960, 960, -540, 540, 0.55f, 0.31f, 14.0f, 0.819f, 0.574f, 4.0f, 0.35f, 1.2f, 1.0f, 1.0f, -9.999f, 10.0f};
+    if (live) cut = PixelCut{960, 960, -540, 540, 0, 0, cone, 0, 0, 0, 0, 1.2f, 1.0f, 1.0f, 0, 0};
     std::string why, msg;
     CHECK(valid(m, &msg));
-    const bool ok = pixel_cutaway(m, cut, &why);
+    const bool ok = pixel_cutaway(m, cut, &why, live);
     if (!ok) std::fprintf(stderr, "%s: pixel cutaway refused: %s\n", what, why.c_str());
     CHECK(ok);
     if (!ok) return;
@@ -321,6 +324,11 @@ void check_pixel_cut(const char* what, std::vector<u32> m) {
     for (std::size_t i = 5; i < m.size(); i += m[i] >> 16)
         if ((m[i] & 0xffff) == spv::OpExecutionMode && m[i + 2] == 9) ++early;
     CHECK(early == 0);
+    if (live) {
+        // Its numbers from the buffer: ten addresses, nine of them loaded.
+        CHECK(count(m, spv::OpConvertUToPtr) == 9);
+        CHECK(count(m, spv::OpLoad) >= 9);
+    }
 }
 
 }  // namespace
@@ -328,6 +336,17 @@ void check_pixel_cut(const char* what, std::vector<u32> m) {
 int main() {
     check_pixel_cut("pixel cutaway: no FragCoord", fragment_with_body(false));
     check_pixel_cut("pixel cutaway: its own FragCoord", fragment_with_body(true));
+    check_pixel_cut("pixel cutaway: live, the map's", fragment_with_body(false), 0x7f0012345600ull, 1.0f);
+    check_pixel_cut("pixel cutaway: live, the objects'", fragment_with_body(true), 0x7f0012345600ull, 2.0f);
+    {
+        const PixelCut cut{960, 960, -540, 540, 0, 0, 1.0f, 0, 0, 0, 0, 1.2f, 1.0f, 1.0f, 0, 0};
+        const std::vector<u32> only = pixel_cutaway_only(cut, 0x7f0012345600ull);
+        std::string msg;
+        CHECK(!only.empty());
+        const bool v = valid(only, &msg);
+        if (!v) std::fprintf(stderr, "cutaway alone, live: invalid: %s", msg.c_str());
+        CHECK(v);
+    }
     {
         const PixelCut cut{960, 960, -540, 540, 0.55f, 0.31f, 14.0f, 0.819f, 0.574f, 4.0f, 0.35f, 1.2f, 1.0f, 1.0f, -9.999f, 10.0f};
         const std::vector<u32> only = pixel_cutaway_only(cut);

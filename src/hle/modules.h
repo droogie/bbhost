@@ -53,8 +53,9 @@ void* hle_kernel_dmem_mirror();
 // The image slide (0 before the eboot is bound), for diagnostics that print
 // ELF addresses.
 std::uint64_t hle_image_slide();
-// Windows: reserves the guest's fixed address windows as placeholders; call
-// first thing in main, before anything else can take them. Linux: no-op.
+// Reserves the guest's fixed address windows (Windows: placeholders, Linux:
+// PROT_NONE ranges, core/linux_vm.h); call first thing in main, before
+// anything else can take them.
 bool hle_kernel_reserve_guest_windows();
 std::uint64_t hle_kernel_dmem_high();  // highest allocated physical end
 // Live guest mappings, for the GPU page table.
@@ -91,6 +92,9 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
 void hle_gnm_explain_table(std::uint64_t va, std::size_t bytes);
 void hle_gnm_cp_drain();
 std::uint64_t hle_gnm_cp_backlog();
+// The game's flips (sceGnmSubmitAndFlip) so far: the next one is `stall:`'s
+// "flip #N" with this N.
+std::uint64_t hle_gnm_flip_calls();
 // Command buffers submitted by the game and retired by the command processor,
 // summed over the queues: work submitted before `submitted` is done once
 // `retired` reaches it.

@@ -5,7 +5,8 @@
 // Transform, the Blood Vial, the quick item) stay out of the menus; a menu
 // action and a play-only one may share a key, anything else gives it up; an
 // options file from before the menu actions keeps a key the player gave an
-// action that works in menus too.
+// action that works in menus too; and a controller's menu OK and Back follow
+// the buttons Interact and Dodge are moved to.
 #include "core/config.h"
 #include "host/bindings.h"
 #include "host/window.h"
@@ -25,8 +26,10 @@ const HostConfig& config() {
     return c;
 }
 bool debug_menu_active() { return false; }
-std::uint32_t menu_confirm_button() { return 0x4000u; }
-std::uint32_t menu_back_button() { return 0x2000u; }
+// The US disc's by default; a case below plays the Japanese region's.
+std::uint32_t g_confirm = 0x4000u;
+std::uint32_t menu_confirm_button() { return g_confirm; }
+std::uint32_t menu_back_button() { return g_confirm == 0x2000u ? 0x4000u : 0x2000u; }
 
 namespace {
 
@@ -137,6 +140,55 @@ int main() {
         bind_key(kBindConfirm, 50);
         bind_key(kBindMenuPageL, 50);
         CHECK(host_binding_key(kBindMenuPageL) == 50 && host_binding_key(kBindConfirm) == 0);
+    }
+    // The controller: every button itself in a menu until Interact or Dodge
+    // moves.
+    {
+        host_bindings_reset_all();
+        for (int i = 0; i < kPadInputs; ++i) CHECK(host_pad_menu_bit(i) == host_pad_input_bit(i));
+        CHECK(host_pad_menu_input(kBindBack) == kPadCircle && host_pad_menu_input(kBindConfirm) == kPadCross);
+    }
+    // The player's report: Dodge and Transform swapped, L1 and Circle. L1
+    // dodges in play and backs out of a menu; Circle transforms in play and is
+    // a menu's previous page; nothing else moves.
+    {
+        host_bindings_reset_all();
+        CHECK(host_pad_parse("roll", "L1"));
+        CHECK(host_pad_input_of(kBindRoll) == kPadL1 && host_pad_input_of(kBindTransform) == kPadCircle);
+        CHECK(host_pad_play_bit(kPadL1) == kCircle && host_pad_menu_bit(kPadL1) == kCircle);
+        CHECK(host_pad_play_bit(kPadCircle) == kL1 && host_pad_menu_bit(kPadCircle) == kL1);
+        for (int i = 0; i < kPadInputs; ++i)
+            if (i != kPadL1 && i != kPadCircle) CHECK(host_pad_menu_bit(i) == host_pad_input_bit(i));
+        CHECK(host_pad_menu_input(kBindBack) == kPadL1);
+        CHECK(host_pad_menu_input(kBindMenuPageL) == kPadCircle);
+        CHECK(host_pad_menu_input(kBindConfirm) == kPadCross);
+    }
+    // Dodge moved to Square, a menu's Toggle Display, then Interact to Circle:
+    // the menu's Back on Square, its OK on Circle, Cross the Toggle Display.
+    {
+        host_bindings_reset_all();
+        CHECK(host_pad_parse("roll", "Square"));
+        CHECK(host_pad_parse("interact", "Circle"));
+        CHECK(host_pad_menu_bit(kPadSquare) == kCircle);
+        CHECK(host_pad_menu_bit(kPadCircle) == kCross);
+        CHECK(host_pad_menu_bit(kPadCross) == kSquare);
+        // Still one button for each bit.
+        std::uint32_t all = 0;
+        for (int i = 0; i < kPadInputs; ++i) {
+            CHECK(!(all & host_pad_menu_bit(i)));
+            all |= host_pad_menu_bit(i);
+        }
+    }
+    // The Japanese region, OK on Circle and Back on Cross: they follow the
+    // buttons whose press those are in play all the same.
+    {
+        g_confirm = kCircle;
+        host_bindings_reset_all();
+        CHECK(host_pad_parse("roll", "L1"));
+        CHECK(host_pad_menu_bit(kPadL1) == kCircle && host_pad_menu_input(kBindConfirm) == kPadL1);
+        CHECK(host_pad_menu_input(kBindBack) == kPadCross);
+        g_confirm = kCross;
+        host_bindings_reset_all();
     }
 #if defined(BBHOST_HAVE_SDL3)
     // The defaults: the pages on Page Up and Page Down, the shortcuts on Home

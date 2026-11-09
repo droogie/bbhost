@@ -14,6 +14,7 @@
 #include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/options.h"
+#include "host/window.h"
 #include "log.h"
 
 #include <algorithm>
@@ -77,7 +78,7 @@ constexpr std::uint64_t kSwfPlayerCtor = 0x2358360, kSwfPlayerDtor = 0x2358670, 
 
 // The largest entries of the Resolution setting, wide and tall: 11520x2160
 // (three 16:9 screens) and 7680x4320 (8K) - the display buffers fit any size
-// up to the largest display's, within these. With no display to go by, the
+// up to the window's display's, within these. With no display to go by, the
 // widest and tallest of the entries up to 5120x2160 (21:9), as before the
 // list grew past it.
 constexpr std::uint32_t kMaxW = 11520, kMaxH = 4320;
@@ -797,6 +798,203 @@ bool remake_default_depth(std::uint64_t out, std::uint32_t w, std::uint32_t h) {
     return true;
 }
 
+// ---- The back buffer at the window's display's size ----------------------------
+//
+// The GX init's swap chain (sub_2ad5a80, its object at the output entry's +0)
+// makes two layers at the descriptor's size: three VideoOut scan-out buffers
+// in one block, registered with VideoOut, and one ordinary GX 2D texture, the
+// back buffer (CreateTexture sub_2565f90 at 0x2ad66d2, kept at the swap
+// chain's +0x33d0), which GetBuffer (sub_2ad5d00) puts at the entry's +0x58
+// with no reference of its own. The GX init wraps it in an RTV (sub_25667a0,
+// the entry's +0x60; it takes a reference on the texture) and DefRenderTarget
+// (0x80 bytes, vtable 0x57b6940, the texture set by its slot +0x98; the
+// entry's +0x68). Each present copies the back buffer into the next scan-out
+// buffer with a rect pass (sub_2ab6cb0) whose viewport is the scan-out
+// header's size (the swap chain's +0x374/+0x376). Nothing in the shipped game
+// resizes either: sub_2ad5d60, a ResizeBuffers, is `xor eax, eax; ret`.
+//
+// Only the back buffer's size decides whether a scene context renders
+// straight into the output entry's targets (both sides alike,
+// install_scene_both_sides) or into a target of its own copied in. So the
+// scan-out buffers are made once at the largest size any display can ask for
+// (g_reserved: the widest and the tallest display, each side apart) and the
+// back buffer at the size of the display the window is on (g_display), made
+// again here when the window moves to a display of another size or a
+// display's mode changes - at the frame end's quiet point, as a new texture,
+// RTV and DefRenderTarget, the way the GX init makes them, put in the old
+// ones' places. The copy's header takes the back buffer's size, so the copy
+// is 1:1 into the scan-out buffer's top left and the host's image there is
+// the back buffer's size (render.cpp keeps one image per address and makes
+// it again when its size changes); the presenter shows its top-left picture
+// as before. The old three are let go three flips later, as DefDepthStencil
+// is: the RTV's reference on the texture and the swap chain's own (the RTV's
+// 0x50 bytes are left, its allocator not being kept in it), DefRenderTarget
+// by its count. BBHOST_BACK_BUFFER_FOLLOWS=0 keeps the back buffer at the
+// scan-out buffers' size, as before.
+constexpr std::uint64_t kCreateTexture = 0x2565f90, kCreateRtv = 0x25667a0;
+constexpr std::uint64_t kRenderTargetVtable = 0x57b6940;
+constexpr std::uint64_t kDefRenderTargetName = 0x4dc2e22;  // u"DefRenderTarget"
+constexpr std::uint64_t kScAllocator = 0x2c0, kScGpuAllocator = 0x2c8, kScDesc = 0x300, kScCopyW = 0x374, kScBackBuffer = 0x33d0;
+std::uint32_t g_reserved[2] = {0, 0};  // the scan-out buffers' size
+std::uint64_t g_back_start = 0;        // the back buffer's size for the GX init's hook to make, 0 to keep it
+std::uint64_t g_back_failed = 0;       // a size remake_back_buffer could not make: not tried again
+const bool g_back_follows = [] {
+    const char* e = std::getenv("BBHOST_BACK_BUFFER_FOLLOWS");
+    return !(e && e[0] == '0');
+}();
+struct OldBack {
+    std::uint64_t tex, rtv, rt, flip;
+};
+std::vector<OldBack> g_old_back;  // main thread: the GX init, the frame end
+
+// One reference on a GX texture let go, as the swap chain's destroy does
+// (sub_2ad5c80): the count at +0x10, then at none its destructor and its
+// allocator's (+8) free.
+void release_texture(std::uint64_t tex) {
+    if (!tex) return;
+    auto* refs = reinterpret_cast<std::int32_t*>(static_cast<std::uintptr_t>(tex + 0x10));
+    if (__atomic_fetch_sub(refs, 1, __ATOMIC_ACQ_REL) != 1) return;
+    const std::uint64_t alloc = at_<std::uint64_t>(tex + 8);
+    call_slot(tex, 0);
+    if (alloc) call_slot(alloc, 0x70, static_cast<std::int64_t>(tex));
+}
+
+void release_old_back(std::uint64_t flip) {
+    std::size_t kept = 0;
+    for (const OldBack& o : g_old_back) {
+        if (flip < o.flip + 3) {
+            g_old_back[kept++] = o;
+            continue;
+        }
+        if (o.rt) release_ref(o.rt);
+        if (o.rtv) {
+            const std::uint64_t t = at_<std::uint64_t>(o.rtv + 8);
+            at_<std::uint64_t>(o.rtv + 8) = 0;
+            release_texture(t);
+        }
+        const std::int32_t left = at_<std::int32_t>(o.tex + 0x10);
+        release_texture(o.tex);
+        host_log("resolution: the old back buffer 0x%llx let go (%d references before the swap chain's, %s)",
+                 static_cast<unsigned long long>(o.tex), left, left == 1 ? "freed" : "still held elsewhere");
+    }
+    g_old_back.resize(kept);
+}
+
+// The back buffer, its RTV and DefRenderTarget made again at w x h. False,
+// with the old ones kept, when anything is not as the GX init left it or the
+// heap lacks the room.
+bool remake_back_buffer(std::uint64_t dev, std::uint32_t w, std::uint32_t h) {
+    const std::uint64_t out = at_<std::uint64_t>(dev + 0x90);
+    const std::uint64_t sc = out ? at_<std::uint64_t>(out) : 0;
+    const std::uint64_t ctx = at_<std::uint64_t>(dev);
+    const std::uint64_t alloc = at_<std::uint64_t>(dev + 0xc0);
+    if (!sc || !ctx || !alloc) return false;
+    const std::uint64_t old_tex = at_<std::uint64_t>(sc + kScBackBuffer), old_rtv = at_<std::uint64_t>(out + 0x60),
+                        old_rt = at_<std::uint64_t>(out + 0x68);
+    if (!old_tex || old_tex != at_<std::uint64_t>(out + 0x58) || !old_rt || at_<std::uint64_t>(old_rt) != guest(kRenderTargetVtable) ||
+        (old_rtv && at_<std::uint64_t>(old_rtv + 8) != old_tex) || at_<std::uint64_t>(out + 0x78)) {
+        static bool told = false;
+        if (!told) host_log("resolution: the back buffer is not as the GX init left it; it keeps its size");
+        told = true;
+        return false;
+    }
+    if (at_<std::uint16_t>(old_tex + 0x44) == w && at_<std::uint16_t>(old_tex + 0x46) == h) return true;
+    std::uint64_t largest = 0;
+    target_heap_free_mib(dev, &largest);
+    const std::uint64_t need_mib = (static_cast<std::uint64_t>(w) * h * 4 >> 20) + 2;
+    if (largest < need_mib) {
+        host_log("resolution: no room for a %ux%u back buffer (%llu MiB needed, the largest free block %llu); it stays %ux%u", w, h,
+                 (unsigned long long)need_mib, (unsigned long long)largest, at_<std::uint16_t>(old_tex + 0x44), at_<std::uint16_t>(old_tex + 0x46));
+        return false;
+    }
+    // The texture, described as the swap chain does from its descriptor
+    // (0x2ad660a..0x2ad66d2).
+    const std::uint64_t d = sc + kScDesc;
+    const std::uint32_t bind = at_<std::uint32_t>(d + 0x24);
+    struct {
+        std::uint32_t w, h, mips, layers, format, samples, z0, z1, flags, z2, misc, z3;
+    } desc = {w, h, 1, 1, at_<std::uint32_t>(d + 0x3c) ? at_<std::uint32_t>(d + 0x3c) : at_<std::uint32_t>(d + 0x10), 1, 0, 0,
+              (bind << 5 & 0x80) | (bind << 5 & 0x20) | (bind << 2 & 8), 0, at_<std::uint32_t>(d + 0x40), 0};
+    std::uint64_t tex = 0;
+    GuestCallRegs r{};
+    r.fn = guest_fn(kCreateTexture);
+    r.ints[0] = ctx;
+    r.ints[1] = reinterpret_cast<std::uintptr_t>(&tex);
+    r.ints[2] = reinterpret_cast<std::uintptr_t>(&desc);
+    r.ints[3] = 0;
+    r.ints[4] = at_<std::uint64_t>(sc + kScAllocator);
+    r.ints[5] = at_<std::uint64_t>(sc + kScGpuAllocator);
+    r.stack[0] = 0;
+    hle_call_guest_regs(&r);
+    if (static_cast<std::int32_t>(r.ret) != 0 || !tex) {
+        host_log("resolution: a %ux%u back buffer was not made (error %d); it keeps its size", w, h, static_cast<int>(r.ret));
+        return false;
+    }
+    // Its RTV (0x2594f97..0x2594fee).
+    struct {
+        std::uint32_t format, dim, z0, z1, one;
+    } rtv_desc = {at_<std::uint8_t>(tex + 0x4b), at_<std::uint16_t>(tex + 0x4c) > 1 ? 6u : 4u, 0, 0, 1};
+    std::uint64_t rtv = 0;
+    hle_call_guest6(guest_fn(kCreateRtv), static_cast<std::int64_t>(ctx), static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(&rtv)),
+                    static_cast<std::int64_t>(tex), static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(&rtv_desc)),
+                    static_cast<std::int64_t>(alloc), 0);
+    // DefRenderTarget (0x2595124..0x25951c7).
+    const auto rt = static_cast<std::uint64_t>(hle_call_guest6(
+        reinterpret_cast<void*>(static_cast<std::uintptr_t>(at_<std::uint64_t>(at_<std::uint64_t>(alloc) + 0x58))), static_cast<std::int64_t>(alloc),
+        0x80, 0x10, 0, 0, 0));
+    if (!rtv || !rt) {
+        host_log("resolution: the %ux%u back buffer's %s was not made; it keeps its size", w, h, rtv ? "DefRenderTarget" : "RTV");
+        if (rtv) {
+            at_<std::uint64_t>(rtv + 8) = 0;
+            release_texture(tex);
+        }
+        release_texture(tex);
+        return false;
+    }
+    std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(rt)), 0, 0x80);
+    at_<std::uint64_t>(rt) = guest(kRenderTargetVtable);
+    at_<float>(rt + 0x10) = 1.0f;
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(rt + 0x20)), guest_ptr(g_image->mem, guest(kDepthStencilDefaults)), 16);
+    at_<std::uint64_t>(rt + 0x68) = ~0ull;
+    at_<std::uint32_t>(rt + 0x70) = ~0u;
+    call_slot(rt, 0x98, static_cast<std::int64_t>(tex), 0);
+    at_<std::int32_t>(rt + 8) += 1;
+    call_slot(rt, 0x80, static_cast<std::int64_t>(guest(kDefRenderTargetName)));
+    // In the old ones' places, and every copy of the size.
+    at_<std::uint64_t>(sc + kScBackBuffer) = tex;
+    at_<std::uint64_t>(out + 0x58) = tex;
+    at_<std::uint64_t>(out + 0x60) = rtv;
+    at_<std::uint64_t>(out + 0x68) = rt;
+    at_<std::uint32_t>(out + 0x10) = w;
+    at_<std::uint32_t>(out + 0x14) = h;
+    at_<std::uint32_t>(out + 0xa4) = w;
+    at_<std::uint32_t>(out + 0xa8) = h;
+    at_<std::uint32_t>(sc + kScDesc) = w;
+    at_<std::uint32_t>(sc + kScDesc + 4) = h;
+    at_<std::uint16_t>(sc + kScCopyW) = static_cast<std::uint16_t>(w);
+    at_<std::uint16_t>(sc + kScCopyW + 2) = static_cast<std::uint16_t>(h);
+    if (g_rect_resource) g_rect_resource->store(tex);
+    g_old_back.push_back({old_tex, old_rtv, old_rt, hle_video_flip_count()});
+    host_log("resolution: back buffer %ux%u -> %ux%u (0x%llx; the scan-out buffers stay %ux%u)", at_<std::uint16_t>(old_tex + 0x44),
+             at_<std::uint16_t>(old_tex + 0x46), w, h, static_cast<unsigned long long>(tex), g_reserved[0], g_reserved[1]);
+    g_display[0] = w;
+    g_display[1] = h;
+    return true;
+}
+
+// The back buffer's size for the window's display now: that display's size,
+// never below the render size `cw` x `ch` (a Resolution above the display's)
+// nor above the scan-out buffers. 0 when it should stay as it is.
+std::uint64_t back_buffer_wanted(std::uint32_t cw, std::uint32_t ch) {
+    if (!g_back_follows || !g_reserved[0]) return 0;
+    int dw = 0, dh = 0;
+    if (!host_window_display_now(&dw, &dh) || dw <= 0 || dh <= 0) return 0;
+    const std::uint32_t w = std::min(std::max(static_cast<std::uint32_t>(dw), cw), g_reserved[0]);
+    const std::uint32_t h = std::min(std::max(static_cast<std::uint32_t>(dh), ch), g_reserved[1]);
+    const std::uint64_t want = pack(w, h);
+    return (w == g_display[0] && h == g_display[1]) || want == g_back_failed ? 0 : want;
+}
+
 // The output entry's render size and viewport (x, y, w, h floats at +0x88;
 // GX init's aspect fit inside the display buffer), which the scene contexts
 // rebuild from, DefDepthStencil and the rectangle binding the display buffers
@@ -844,6 +1042,10 @@ bool resize(std::uint32_t w, std::uint32_t h) {
     const std::uint64_t failed = gx_resources_create_failures();
     RenderScale rs_was, rs_now;
     const bool scaled = render_scale_retarget(w, h, g_display[0], g_display[1], hle_video_flip_count(), &rs_was, &rs_now);
+    // The resources that die from here to the end of the broadcasts are the
+    // old size's: their targets go at the end (host_gpu_targets_rebuild),
+    // before the next frame makes the new size's.
+    host_gpu_targets_rebuild(true);
     int ctxs = scaled ? broadcast_size(dev, gm, was_w, was_h, w, h, &rs_was, &rs_now) : broadcast_size(dev, gm, was_w, was_h, w, h);
     bool fitted = true;
     const std::uint64_t unfit = unfit_scene_ctx();
@@ -861,6 +1063,7 @@ bool resize(std::uint32_t w, std::uint32_t h) {
         h = was_h;
         fitted = false;
     }
+    host_gpu_targets_rebuild(false);
     // The window size SprjInitStuff derives from the res words at the start
     // (0x59404d8/dc), which sub_212c630 divides the res words by; the Sprj
     // listener sets only the res words and the UI scale. Booted at this size
@@ -1096,6 +1299,43 @@ void apply_shadow_sizes(std::uint64_t dev, std::uint64_t gm) {
              (unsigned long long)free_mib, (unsigned long long)free_after, (unsigned long long)largest_after);
 }
 
+// The GX play thread's done event. sub_25b6620 makes the play object (the
+// device's +0x348) with GXRenderThread and three events; the thread
+// (sub_25b6910) sets +0x68 once it has played the queue the frame end handed
+// it (sub_2599af0) and made the frame's flip (0x25b6a68), and the frame end
+// (sub_2598fd0) waits on it before it hands over the next queue (0x25998db,
+// no time limit) and resets it. A Dantelion2 event (vtable 0x56b97a0, the
+// created flag bit 0 of +0x18): slot +0x20 polls it (0 once set), slot +0x18
+// waits for it - one condition wait of a number of microseconds, so it is
+// polled again after.
+constexpr std::uint64_t kPlayObject = 0x348, kPlayDone = 0x68, kEventVtable = 0x56b97a0;
+constexpr int kEventWait = 0x18, kEventPoll = 0x20;
+// How long the change waits for that play: longer than any frame plays -
+// lavapipe takes up to 14 s over a 2560x1440 frame at the Nightmare of
+// Mensis, and by its pixels more than twice that over a 3840x2160 one - so
+// that only a play that is not ending meets it, and the change then waits for
+// a later frame instead.
+constexpr auto kPlayDoneLimit = std::chrono::seconds(60);
+
+// 1: the frame the frame end handed over has been played and flipped; 0: not
+// within the limit; -1: no play object this knows at the device's +0x348.
+int wait_play_done(std::uint64_t dev) {
+    const std::uint64_t play = at_<std::uint64_t>(dev + kPlayObject);
+    const std::uint64_t ev = play ? play + kPlayDone : 0;
+    if (!ev || at_<std::uint64_t>(ev) != guest(kEventVtable) || !(at_<std::uint32_t>(ev + 0x18) & 1)) return -1;
+    const auto poll = [ev] {
+        const auto set = hle_call_guest6(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at_<std::uint64_t>(at_<std::uint64_t>(ev) + kEventPoll))),
+                                         static_cast<std::int64_t>(ev), 0, 0, 0, 0, 0);
+        return static_cast<std::int32_t>(set) == 0;
+    };
+    const auto until = std::chrono::steady_clock::now() + kPlayDoneLimit;
+    while (!poll()) {
+        if (std::chrono::steady_clock::now() >= until) return 0;
+        call_slot(ev, kEventWait, 100000);  // a tenth of a second at a time
+    }
+    return 1;
+}
+
 // The quiet point. The present step (sub_21976e0, main thread) queues the
 // frame's command context (sub_2594340) and calls the GX device's frame end,
 // sub_2598fd0 (0x2197853). In the device's queued mode (+0x84) that swaps
@@ -1104,10 +1344,25 @@ void apply_shadow_sizes(std::uint64_t dev, std::uint64_t gm) {
 // while the main loop goes on and the workers record the next frame. So the
 // change goes right after that call returns, before the main loop moves on:
 // the call is sent through a stub whose host side makes it itself, then
-// waits for the frame it ended to be shown (two flips: the queue runs a
-// frame behind), for the command processor and the host GPU to finish, and
+// waits for the GX thread to have played the frame it ended (its done event,
+// wait_play_done), for the command processor and the host GPU to finish, and
 // resizes. Nothing records meanwhile (the main thread is here) and nothing
-// recorded is still to be played.
+// recorded is still to be played. It waited for two flips, at most 500 ms:
+// a frame that played longer (lavapipe's at 1440p, 7 to 14 s) was still in
+// YEBIS's flip pass (sub_25d5f80) when the change's broadcast shut YEBIS
+// down (sub_25d2830 releases the post effect's constant buffer at +0x70 and
+// stores 0), and the pass's update of it (sub_2568a20) read the null
+// resource's bind flags. A play that does not end within the limit leaves
+// the change for a later frame rather than shutting YEBIS down under it.
+// Shadow resolution's change (apply_shadow_sizes), which releases maps the
+// play may still read, waits the same way and is kept for later with it.
+//
+// The wait cannot hold the play up: the main thread waits holding no lock of
+// the game's (the present step takes none around the frame end, which has
+// returned) nor of the host's (the hook keeps only atomics; the event's own
+// mutex is let go by its condition wait), and the play and its flip need
+// nothing of the main thread - the game's own frame end waits on the same
+// event, with no limit, every frame.
 GUEST_ABI std::int64_t present_frame_end_hook(std::uint64_t, const std::uint64_t* saved) {
     const std::uint64_t dev = saved[5];  // rdi
     const std::uint64_t f0 = hle_video_flip_count();
@@ -1117,27 +1372,84 @@ GUEST_ABI std::int64_t present_frame_end_hook(std::uint64_t, const std::uint64_t
     const bool shadows = g_shadow_request.exchange(false);
     hle_call_guest6(guest_fn(kFrameEnd), static_cast<std::int64_t>(dev), 0, 0, 0, 0, 0);
     if (!g_old_depth.empty()) release_old_depth(f0);
+    if (!g_old_back.empty()) release_old_back(f0);
     render_scale_flip(f0);
     confirm_tick();
-    if (req && req == g_current.load() && !g_rebuild.exchange(false)) {
-        g_request_confirm.store(false);
-        req = 0;
+    // A request at the size the game has is made only as a rebuild there
+    // (live_resolution_rebuild); else it is dropped.
+    bool rebuild = false;
+    if (req && req == g_current.load()) {
+        rebuild = g_rebuild.exchange(false);
+        if (!rebuild) {
+            g_request_confirm.store(false);
+            req = 0;
+        }
     }
-    if (!req && !shadows) return 1;  // the frame end ran; back to the caller
+    // The back buffer for the window's display (a move to another display,
+    // a display's mode changed), or for a requested size past it.
+    const std::uint64_t sized = req ? req : g_current.load();
+    const std::uint64_t back = sized ? back_buffer_wanted(static_cast<std::uint32_t>(sized >> 32), static_cast<std::uint32_t>(sized)) : 0;
+    if (!req && !shadows && !back) return 1;  // the frame end ran; back to the caller
     const auto w = static_cast<std::uint32_t>(req >> 32), h = static_cast<std::uint32_t>(req);
-    const auto start = std::chrono::steady_clock::now();
-    while (hle_video_flip_count() < f0 + 2 && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500))
-        host_sleep_us(200);
+    const int played = wait_play_done(dev);
+    if (played == 0) {
+        // Kept for a later frame (a request made meanwhile stands instead),
+        // and the shadow maps' change with it.
+        std::uint64_t none = 0;
+        if (req && g_request.compare_exchange_strong(none, req) && rebuild) g_rebuild.store(true);
+        if (shadows) g_shadow_request.store(true);
+        static bool logged = false;  // main thread
+        if (!logged) {
+            logged = true;
+            if (req)
+                host_log("resolution: the frame before the change to %ux%u was still being played after %lld s; the change waits for a "
+                         "later frame",
+                         w, h, static_cast<long long>(kPlayDoneLimit.count()));
+            else
+                host_log("resolution: the frame before the shadow maps' change was still being played after %lld s; the change waits "
+                         "for a later frame",
+                         static_cast<long long>(kPlayDoneLimit.count()));
+        }
+        return 1;
+    }
+    if (played < 0) {
+        static bool logged = false;  // main thread
+        if (!logged) {
+            logged = true;
+            host_log("resolution: no GX play thread's done event at the device's +0x%llx; the change waits for two flips instead",
+                     static_cast<unsigned long long>(kPlayObject));
+        }
+        const auto start = std::chrono::steady_clock::now();
+        while (hle_video_flip_count() < f0 + 2 && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500))
+            host_sleep_us(200);
+    }
     hle_gnm_cp_drain();  // the command processor has run everything submitted
     host_gpu_flush();    // and the host GPU has finished it
     if (shadows) {
         std::uint64_t d = 0, gm = 0;
         if (device_ready(&d, &gm)) apply_shadow_sizes(d, gm);
     }
+    if (back) {
+        // Made again, then everything that took the old one rebuilt by the
+        // change's broadcast - at the size asked for, or else at the size it
+        // has (a rebuild there).
+        const auto bw = static_cast<std::uint32_t>(back >> 32), bh = static_cast<std::uint32_t>(back);
+        if (remake_back_buffer(dev, bw, bh)) {
+            if (!req) req = g_current.load();
+        } else {
+            g_back_failed = back;
+            if (req && (w > g_display[0] || h > g_display[1])) {
+                host_log("resolution: %ux%u is past the back buffer (%ux%u); it applies at the next start", w, h, g_display[0], g_display[1]);
+                if (g_request_confirm.exchange(false)) g_answer.store(2);
+                req = 0;
+            }
+        }
+    }
     if (!req) return 1;
+    const auto rw = static_cast<std::uint32_t>(req >> 32), rh = static_cast<std::uint32_t>(req);
     const bool confirm = g_request_confirm.exchange(false);
     const std::uint64_t before = g_current.load();
-    if (resize(w, h)) {
+    if (resize(rw, rh)) {
         if (confirm) {
             g_before_asked.store(before);
             g_confirm = Confirm::ToOpen;
@@ -1159,16 +1471,21 @@ GUEST_ABI std::int64_t present_frame_end_hook(std::uint64_t, const std::uint64_t
 // chosen one.
 GUEST_ABI std::int64_t gx_init_call_hook(std::uint64_t, const std::uint64_t* saved) {
     const std::int64_t ok = hle_call_guest6(guest_fn(kGxInit), static_cast<std::int64_t>(saved[5]), 0, 0, 0, 0, 0);
+    std::uint64_t dev = 0, gm = 0;
+    device_ready(&dev, &gm);
+    // The back buffer at the window's display's size (remake_back_buffer),
+    // before anything has taken the one the init made at the scan-out
+    // buffers' size.
+    if (dev && g_back_start && !remake_back_buffer(dev, static_cast<std::uint32_t>(g_back_start >> 32), static_cast<std::uint32_t>(g_back_start)))
+        g_back_failed = g_back_start;
     // The init made the GPU device and with it the upscaler; the graphics
     // manager is built after it: its size, or the full one with no upscaler.
     render_scale_gx_init(g_display[0], g_display[1], hle_video_flip_count());
-    std::uint64_t dev = 0, gm = 0;
-    device_ready(&dev, &gm);
     const std::uint64_t out = dev ? at_<std::uint64_t>(dev + 0x90) : 0;
     if (out) {
         const std::uint32_t w = g_res_words[0], h = g_res_words[1];
-        host_log("resolution: display buffers %ux%u, rendering %ux%u; the scene renders %s", at_<std::uint32_t>(out + 0x80),
-                 at_<std::uint32_t>(out + 0x84), w, h, scene_target_path(w, h));
+        host_log("resolution: back buffer %ux%u (scan-out buffers %ux%u), rendering %ux%u; the scene renders %s", g_display[0], g_display[1],
+                 g_reserved[0], g_reserved[1], w, h, scene_target_path(w, h));
         at_<std::uint32_t>(out + 0x80) = w;
         at_<std::uint32_t>(out + 0x84) = h;
         at_<float>(out + 0x88) = 0.0f;
@@ -1320,14 +1637,19 @@ bool live_resolution_install(ElfImage* image) {
     }();
     const std::uint64_t start_px = static_cast<std::uint64_t>(w) * static_cast<std::uint32_t>(h);
     const bool tight = live && host_gpu_memory_tight();
-    // How large a live change may go: the largest display's size (a picture
-    // larger than every screen only scales down), or the starting size when
-    // that is larger. The display buffers and the render-target heap are made
-    // for it at the start and cost memory pinned for the GPU for the whole
-    // run whether a change ever comes or not - made at 5120x2160 they were
-    // 4 x 42.5 MiB of display buffers, a 5120x2160 depth target, whole-image
-    // clears of them every frame and +1,088 MiB of heap on a 1080p screen.
-    // A larger entry applies at the next start (live_resolution_can).
+    // How large a live change may go: the largest display's size, the widest
+    // and the tallest apart (a picture larger than every screen only scales
+    // down), or the starting size when that is larger - the scan-out buffers'
+    // size (g_reserved), which the back buffer may grow to while the game runs
+    // (remake_back_buffer). The back buffer itself starts at the size of the
+    // display the window is on - before the window is made, the primary
+    // display's, where it opens (as options' output_for). The scan-out buffers
+    // and the render-target heap are made for the largest at the start and
+    // cost memory pinned for the GPU for the whole run whether a change ever
+    // comes or not - made at 5120x2160 they were 4 x 42.5 MiB of display
+    // buffers, a 5120x2160 depth target, whole-image clears of them every
+    // frame and +1,088 MiB of heap on a 1080p screen. A larger entry applies
+    // at the next start (live_resolution_can).
     // BBHOST_LIVE_MAX=<w>x<h> sets the size, =max the Resolution setting's
     // largest entries (11520 wide, 4320 tall).
     std::uint32_t max_w = kNoDisplayW, max_h = kNoDisplayH;
@@ -1381,10 +1703,16 @@ bool live_resolution_install(ElfImage* image) {
     g_manager_slot = static_cast<const std::uint64_t*>(guest_ptr(image->mem, guest(kGraphicsManagerSlot)));
     g_res_words = static_cast<const std::uint32_t*>(guest_ptr(image->mem, guest(kResWidth)));
     // The widest and tallest entry a live change can reach (above), or the
-    // starting size when larger.
-    g_display[0] = std::max<std::uint32_t>(max_w, static_cast<std::uint32_t>(w));
-    g_display[1] = std::max<std::uint32_t>(max_h, static_cast<std::uint32_t>(h));
+    // starting size when larger: the scan-out buffers, and the back buffer
+    // until the GX init's hook makes it at the window's display's size.
+    g_reserved[0] = g_display[0] = std::max<std::uint32_t>(max_w, static_cast<std::uint32_t>(w));
+    g_reserved[1] = g_display[1] = std::max<std::uint32_t>(max_h, static_cast<std::uint32_t>(h));
     host_log("resolution: live changes up to %ux%u (%s); larger sizes apply at the next start", g_display[0], g_display[1], max_why);
+    if (g_back_follows && (host_window_display_now(&desk_w, &desk_h) || host_desktop_primary_size(&desk_w, &desk_h))) {
+        g_back_start = pack(std::min(std::max(static_cast<std::uint32_t>(desk_w), static_cast<std::uint32_t>(w)), g_reserved[0]),
+                            std::min(std::max(static_cast<std::uint32_t>(desk_h), static_cast<std::uint32_t>(h)), g_reserved[1]));
+        if (g_back_start == pack(g_reserved[0], g_reserved[1])) g_back_start = 0;
+    }
 
     // Every edit is checked before any is made, so a mismatch leaves the
     // image as it was. The call sites and prologues are checked by the hooks
@@ -1485,7 +1813,9 @@ bool live_resolution_available() {
 }
 
 bool live_resolution_can(unsigned w, unsigned h) {
-    return g_installed && w && h && w <= g_display[0] && h <= g_display[1] && static_cast<std::uint64_t>(w) * h <= g_live_max_px;
+    // Past the back buffer, up to the scan-out buffers: it grows first (back_buffer_wanted).
+    const std::uint32_t* most = g_back_follows ? g_reserved : g_display;
+    return g_installed && w && h && w <= most[0] && h <= most[1] && static_cast<std::uint64_t>(w) * h <= g_live_max_px;
 }
 
 bool live_resolution_request(unsigned w, unsigned h, bool confirm) {

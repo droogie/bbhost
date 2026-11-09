@@ -13,6 +13,7 @@
 #include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
 #include "engine/live_resolution.h"
+#include "engine/mouse_camera.h"
 #include "engine/patch_manifest.h"
 #include "hle/modules.h"
 #include "hle/np.h"
@@ -90,6 +91,7 @@ struct Setting {
 
 enum SettingId {
     kWindowMode,
+    kStayBorderless,
     kVsync,
     kFrameCap,
     kFrameCapCustom,
@@ -153,6 +155,8 @@ enum SettingId {
     kRebirth,
     kFivePlayers,
     kSkillIssue,
+    kFullPhantomHp,
+    kAutoReplenish,
     kMenuTextSize,
     kMenuHue,
     kMenuVibrance,
@@ -192,9 +196,27 @@ Setting g_set[kSettingCount] = {
     // Borderless was this setting's Fullscreen until 2026-11-04 (an older
     // file's Fullscreen reads as Borderless: host_options_load).
     {"window_mode", "Window mode", {"Windowed", "Borderless", "Fullscreen"}, 0,
+#if defined(_WIN32)
+     "Windowed is a window you can move and resize. Borderless fills the screen at the desktop's resolution and "
+     "switches away at once; the graphics driver may still make it exclusive fullscreen (Stay borderless keeps it a "
+     "window). Fullscreen takes the display over at the mode nearest the Resolution, which can change the screen's "
+     "resolution. AMD cards: use Borderless or Fullscreen - in a window the game has to draw hidden objects too and "
+     "runs slower.",
+#else
      "Borderless fills the screen at the desktop's resolution and switches away at once. Fullscreen takes the display "
      "over at the mode nearest the Resolution, which can change the screen's resolution.",
+#endif
      false},
+    // Windows: Borderless's swapchain tells the driver it may not make the
+    // window exclusive fullscreen (host/window.cpp, exclusive_policy). Live: a
+    // change makes the swapchain again. Shown while Window mode is Borderless
+    // (row_hidden). Elsewhere it does nothing and has no row; a value in the
+    // file is kept.
+    {"stay_borderless", "Stay borderless", {"Off", "On"}, 0,
+     "On: Borderless stays a window - the graphics driver never switches it to exclusive fullscreen. Try it if the "
+     "picture freezes for a few seconds while the game keeps running, for example while another window has focus. AMD "
+     "cards: leave it off unless you need it - it may make the game draw hidden objects too, which lowers the frame "
+     "rate.", false},
     {"vsync", "V-Sync", {"Off", "On"}, 1,
      "Off presents as soon as a frame is ready, and can tear.", false},
     // The game's own pace (engine/frame_rate.h), the same eleven the game's
@@ -203,13 +225,15 @@ Setting g_set[kSettingCount] = {
     // holds a cap on presentation, whose 90, 120, 144 and Off ran the game at
     // 60, and reads as 60 (host_options_load).
     // Read as the game starts (engine/frame_rate.cpp), and with it the
-    // default for the draw work the pool prepares (host/gxvk_homes.h
-    // default_off). From one rate above 30 to another it changes while the
-    // game runs (frame_rate_request); 30 on either side needs the next start
-    // - the "next start" pill shows for those alone (setting_row).
+    // defaults for the draw work the pool prepares and, on Windows, the run
+    // commit's (host/gxvk_homes.h default_off, run_commit_gives_way), which
+    // keep what that start decided until the next one. Every change of the
+    // rate itself applies while the game runs (frame_rate_request): from the
+    // game's own 30 the game is converted then, and a converted game taken to
+    // 30 stays converted.
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "150", "180", "240", "360", "480", "960", "Display-Limited"}, 0,
      "30 is the game's own pace; the others run its logic at that rate. Display-Limited runs it at your monitor's refresh "
-     "rate (180 on a 180 Hz monitor). Changes at once between the rates above 30; to or from 30 needs a restart.",
+     "rate (180 on a 180 Hz monitor). Changes at once.",
      true},
     // Frame rate's Custom limit, its tick box and its number, drawn in Frame
     // rate's row (frame_rate_control) and not rows of their own: ticked, the
@@ -277,11 +301,13 @@ Setting g_set[kSettingCount] = {
     // does and what a PC player expects. Off hands the camera back to the pad.
     {"mouse_camera", "Mouse camera", {"Off", "On"}, 1,
      "The mouse turns the camera outside menus. Off leaves it to the pad.", false},
-    // 0..10, the range of the game's own Camera Sensitivity slider, which is
-    // the widget the PC Controls screen draws it with, and DS3's: the same
-    // angle a count at each step (engine/mouse_camera.h), 5 its default.
+    // 0-100: the 0..10 of the game's own Camera Sensitivity slider, the widget
+    // the PC Controls screen draws it with, in tenths - an angle a count from
+    // 0.005 to 0.4 degrees, each step about 4.5% further, 50 (0.045) its
+    // default (engine/mouse_camera_step.h).
     {"mouse_sens", "Mouse sensitivity", hundred(), 50,
-     "How far a given mouse movement turns the camera.", false},
+     "How far a mouse movement turns the camera, each step about 4.5% further than the one below. 50 suits most mice at "
+     "800 to 1600 DPI.", false},
     {"mouse_invert_x", "Reverse mouse X-axis", {"Off", "On"}, 0,
      "Reverses the mouse's horizontal camera movement.", false},
     {"mouse_invert_y", "Reverse mouse Y-axis", {"Off", "On"}, 0,
@@ -455,10 +481,17 @@ Setting g_set[kSettingCount] = {
     // no bridge and never draws the 3D smaller. One choice of the row, so TAA
     // and FSR or DLSS are never on together.
     {"upscaler", "Upscaling", {"Off", "TAA", "FSR 3", "FSR 4", "DLSS"}, 0,
+#if defined(_WIN32)
      "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 "
      "(any GPU) or DLSS (NVIDIA RTX) in place of the game's own anti-aliasing. FSR and DLSS need upscaler_bridge.dll and "
      "AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; without them they stay off. FSR 4 runs as "
      "FSR 3 where it cannot run. Changes at once.",
+#else
+     // (host/upscaler.h upscaler_offered: FSR is Windows' alone, DLSS where it runs.)
+     "TAA (bbhost's own temporal anti-aliasing, any GPU) or DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of "
+     "the game's own anti-aliasing. DLSS needs libbbhost_ngx_bridge.so and NVIDIA's libnvidia-ngx-dlss.so beside bbhost, "
+     "as the Linux package has them; FSR runs on Windows only. Changes at once.",
+#endif
      false},
     // TAA's blend (host/upscale_pass.cpp record_taa): how much of each new
     // frame goes into the picture, the rest the history - 0% a fifth, 50% a
@@ -492,8 +525,8 @@ Setting g_set[kSettingCount] = {
     // through the bridge and DLSS do no sharpening of their own. 0% none, the
     // default (the picture as the upscaler leaves it); 100% AMD's most.
     {"sharpness", "Sharpness", signed_steps(0, 100, "%", false), 0,
-     "Sharpens the upscaled 3D (FSR or DLSS) before the post effects and the HUD, which it never touches. 0% leaves the "
-     "upscaler's picture as it is; higher brings out more detail, at 100% with some ringing on hard edges. Needs Upscaling on.",
+     "Sharpens the 3D after TAA, FSR or DLSS, before the post effects and the HUD, which it never touches. 0% leaves the "
+     "picture as it is; higher brings out more detail, at 100% with some ringing on hard edges. Needs Upscaling on.",
      false},
     // AMD's frame generation (host/framegen.h): its swapchain in the
     // presenter's place; a frame it makes from the 3D between two of the
@@ -580,7 +613,7 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. Hold Interact (E) and press L3 (Left Ctrl) to cycle the free camera's modes.", true},
     // The PC enhancements: additions to the game itself, each read once at
     // start (main.cpp hands them to config_set_enhancements), all on unless
-    // bbhost.toml's [world] says otherwise. Off, all three, is the game as it
+    // bbhost.toml's [world] says otherwise. Off, all of them, is the game as it
     // shipped. (The Old Hunters, a fourth in v0.2.9, is always on: engine/patch_manifest.cpp.)
     {"change_appearance", "Hunter's Dream mirror", {"Off", "On"}, 1,
      "Requires a restart. The Dream's mirror opens the appearance editor (the unused \"Put on Disguise\").", true},
@@ -590,6 +623,11 @@ Setting g_set[kSettingCount] = {
      "Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier and the DLC; all players need it.", true},
     // Off unless bbhost.toml's [world] turns it on: a joke, not an addition.
     {"skill_issue", "SKILL ISSUE", {"Off", "On"}, 1, "Requires a restart. The death message says SKILL ISSUE instead of YOU DIED.",
+     true},
+    {"full_phantom_hp", "Full Phantom HP", {"Off", "On"}, 1,
+     "Requires a restart. Your full HP when summoned to another world; each visitor's own setting decides.", true},
+    {"auto_replenish", "Auto-Replenish Items", {"Off", "On"}, 1,
+     "Requires a restart. Molotovs, knives and more refill from storage on a death in your world or in the Dream.",
      true},
     // bbhost's own menus - the setup window, F9 and F10 - and everything in
     // them grow with it (launcher_ui set_scale). 100% is their usual size: the
@@ -617,11 +655,16 @@ Setting g_set[kSettingCount] = {
 const Row g_rows[] = {
     {Row::Header, "GAME"},
     {Row::Option, nullptr, kWindowMode},
+#if defined(_WIN32)
+    {Row::Option, nullptr, kStayBorderless},  // it does nothing elsewhere
+#endif
     {Row::Option, nullptr, kVsync},
     {Row::Option, nullptr, kFrameCap},
     {Row::Option, nullptr, kFrameClock},
     {Row::Option, nullptr, kEffectTiming},
-    {Row::Option, nullptr, kFrameGeneration},
+#if defined(_WIN32)
+    {Row::Option, nullptr, kFrameGeneration},  // AMD's FidelityFX, Windows' alone: no row elsewhere
+#endif
     {Row::Option, nullptr, kSkipLogos},
     {Row::Option, nullptr, kPerformanceMode},
     {Row::Option, nullptr, kFpsCounter},
@@ -674,8 +717,11 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kDynamicShadows},
     {Row::Option, nullptr, kShadowResolution},
     // Frame generation on Graphics too, beside the upscaler (Kyo: on both
-    // pages); the same setting as the Game page's row.
+    // pages); the same setting as the Game page's row, and like it Windows'
+    // alone.
+#if defined(_WIN32)
     {Row::Option, nullptr, kFrameGeneration},
+#endif
     {Row::Option, nullptr, kResolution},
     {Row::Option, nullptr, kUpscaler},
     {Row::Option, nullptr, kTaaStrength},  // (shown with TAA only: row_hidden)
@@ -696,6 +742,8 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kRebirth},
     {Row::Option, nullptr, kFivePlayers},
     {Row::Option, nullptr, kSkillIssue},
+    {Row::Option, nullptr, kFullPhantomHp},
+    {Row::Option, nullptr, kAutoReplenish},
     {Row::Header, "SETTINGS"},
     {Row::Option, nullptr, kMenuTextSize},
     {Row::Option, nullptr, kMenuHue},
@@ -772,11 +820,15 @@ void set_account_lines(const std::string& status, const std::string& detail) {
     g_acct_detail = detail;
 }
 
+// The server no longer takes this PC's sign-in (net::account_refused): what
+// F10's account section (the Game page) and the setup window say about it.
+constexpr const char kRefusedStatus[] = "Sign-in expired";
+constexpr const char kRefusedText[] = "Your sign-in has expired, or this PC was signed out. Online play needs a new sign-in.";
+
 std::string signed_in_line() {
     // The game read its NpId when it went online, so a sign-in after that
     // names the account to the server but not to the game until the next run.
-    if (net::account_refused())
-        return "Signed in as " + net::account_name() + " - the server refused it (expired or replaced): link this PC again";
+    if (net::account_refused()) return std::string(kRefusedStatus) + " (" + net::account_name() + ")";
     return "Signed in as " + net::account_name() +
            (hle_np_context_started() ? " (in full on the next launch)" : "");
 }
@@ -828,6 +880,8 @@ void update_action(int which) {
 }
 
 bool action_idle(int which) {
+    // A website code needs a sign-in the server still takes.
+    if (which == 3 && net::account_refused()) return false;
     if (which < 10) return !g_acct_busy.load();
     if (updater::busy()) return false;
     if (which == 11) return updater::update_available();
@@ -897,7 +951,11 @@ void account_action(int which, const std::string& name, const std::string& code)
 
 std::string account_status() {
     std::lock_guard<std::mutex> lk(g_acct_mu);
-    if (!g_acct_status.empty()) return g_acct_status;
+    // A refusal outranks an older "Signed in as" from the last action.
+    const bool refused = net::account_logged_in() && net::account_refused();
+    if (!g_acct_status.empty() && !(refused && !g_acct_busy.load() && g_acct_status.rfind("Signed in as ", 0) == 0))
+        return g_acct_status;
+    if (refused) return std::string(kRefusedStatus) + " (" + net::account_name() + ")";
     return net::account_logged_in() ? "Signed in as " + net::account_name() : "Not signed in";
 }
 
@@ -1042,12 +1100,15 @@ void targets_follow_settings(const char* what, bool ssr_on) {
     host_log("graphics: %s changed: %s", what, rebuild ? "the scene's targets made again" : "no target changes");
 }
 
-// The primary display's refresh rate, the one frame generation's limit is
-// half of (engine/frame_rate.cpp fg_cap_target reads host_desktop_refresh_hz:
-// the same display). host_desktop_refresh_hz brings SDL's video up and down,
-// which the presenter's thread must not, so on Windows the display's settings
-// are asked directly, at most every 2 s; elsewhere SDL's answer once.
+// The refresh rate of the display the window is on, the one frame
+// generation's limit is half of (engine/frame_rate.cpp fg_cap_target reads
+// host_window_refresh_hz: the same display). Before there is a window, the
+// primary display's, where it opens: host_desktop_refresh_hz brings SDL's
+// video up and down, which the presenter's thread must not, so on Windows the
+// display's settings are asked directly, at most every 2 s; elsewhere SDL's
+// answer once.
 float refresh_hz_now() {
+    if (const float w = host_window_refresh_hz(); w > 0.0f) return w;
 #if defined(_WIN32)
     static std::atomic<float> hz{0.0f};
     static std::atomic<std::int64_t> asked{0};
@@ -1117,6 +1178,7 @@ void apply(int id) {
             if (live_resolution_available() && w && h && cw && ch && (cw != w || ch != h)) live_resolution_request(w, h, false);
             break;
         }
+        case kStayBorderless: host_window_set_stay_borderless(reads_on(s, s.index)); break;
         case kVsync: host_window_set_vsync(reads_on(s, s.index)); break;
         case kFrameGeneration: {
             // AMD's swapchain made or dropped at the presenter's next frame
@@ -1186,6 +1248,14 @@ void apply(int id) {
             }
             if (was[id] >= 0 && was[id] != s.index && live_resolution_available()) targets_follow_settings(s.label, id == kSsr && s.index == 1);
             was[id] = s.index;
+            // An upscaler chosen or not moves the game's size (the window's
+            // with one and a smaller Resolution): Fullscreen's display mode
+            // follows it, as it follows the Resolution - chosen in the setup
+            // window, it stayed the Resolution's.
+            if (id == kUpscaler && g_set[kWindowMode].index == 2) {
+                unsigned w = 0, h = 0;
+                if (output_of(&w, &h)) host_window_set_mode(2, static_cast<int>(w), static_cast<int>(h));
+            }
             break;
         }
         case kFrameCap:
@@ -1289,6 +1359,8 @@ void apply(int id) {
         case kRebirth:
         case kFivePlayers:
         case kSkillIssue:
+        case kFullPhantomHp:
+        case kAutoReplenish:
             break;  // read by the loader before any of this exists
         case kMenuTextSize:
         case kMenuHue:
@@ -1313,8 +1385,9 @@ void apply(int id) {
 // the wheel and the middle button); an older file's Transform on the middle
 // button, its default until then, gives it to Camera Zoom Reset. 7: Window
 // mode's Borderless and an exclusive Fullscreen; an older file's Fullscreen
-// was the borderless one.
-constexpr int kOptionsVersion = 7;
+// was the borderless one. 8: Mouse sensitivity from 0.005 to 0.4 degrees a
+// count; an older file saved Dark Souls III's scale, 0.1 to 0.4.
+constexpr int kOptionsVersion = 8;
 
 void save() {
     if (!g_dirty) {
@@ -1369,6 +1442,7 @@ int index_of(int id) { return g_set[id].index; }
 void rebuild_settings() {
     HostSettings h;
     h.fullscreen = index_of(kWindowMode) != 0;  // Borderless or Fullscreen
+    h.stay_borderless = on_of(kStayBorderless);
     h.vsync = on_of(kVsync);
     h.frame_cap = frame_rate_now();
     h.frame_clock = on_of(kFrameClock);
@@ -1404,8 +1478,8 @@ void rebuild_settings() {
     }
     h.mouse_menu = on_of(kMouseMenu);
     h.mouse_camera = on_of(kMouseCamera);
-    // DS3's mouse sensitivity (engine/mouse_camera.h): its 0..10 and its
-    // default, a tenth a step (0-100).
+    // Mouse sensitivity's 0..10 (engine/mouse_camera_step.h), a tenth a step
+    // (0-100).
     h.mouse_sens = index_of(kMouseSens) < 0 ? 5.0f : static_cast<float>(index_of(kMouseSens)) / 10.0f;
     h.mouse_invert_x = on_of(kMouseInvertX);
     h.mouse_invert_y = on_of(kMouseInvertY);
@@ -1460,6 +1534,8 @@ void rebuild_settings() {
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
     h.skill_issue = on_of(kSkillIssue);
+    h.full_phantom_hp = on_of(kFullPhantomHp);
+    h.auto_replenish = on_of(kAutoReplenish);
     settings_store().publish(h);
 }
 
@@ -1547,6 +1623,8 @@ void host_options_load() {
     g_set[kRebirth].index = config().rebirth ? 1 : 0;
     g_set[kFivePlayers].index = config().five_players ? 1 : 0;
     g_set[kSkillIssue].index = config().skill_issue ? 1 : 0;
+    g_set[kFullPhantomHp].index = config().full_phantom_hp ? 1 : 0;
+    g_set[kAutoReplenish].index = config().auto_replenish ? 1 : 0;
     // video.fps_cap is the frame rate's default: one of the setting's rates or
     // 0 (Display-Limited); another number takes the nearest rate below it.
     {
@@ -1590,7 +1668,7 @@ void host_options_load() {
                          static_cast<int>(kEffectTiming), static_cast<int>(kResolution), static_cast<int>(kWindowMode),
                          static_cast<int>(kModelDetail), static_cast<int>(kTextureQuality), static_cast<int>(kShaders),
                          static_cast<int>(kChangeAppearance), static_cast<int>(kRebirth), static_cast<int>(kFivePlayers),
-                         static_cast<int>(kSkillIssue)})
+                         static_cast<int>(kSkillIssue), static_cast<int>(kFullPhantomHp), static_cast<int>(kAutoReplenish)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
     FILE* f = std::fopen(path.c_str(), "r");
@@ -1697,6 +1775,19 @@ void host_options_load() {
                 if (g_saved[static_cast<std::size_t>(id)]) g_set[id].index = std::min(g_set[id].index, 10) * 10;
             }
         }
+        // Before version 8 Mouse sensitivity was Dark Souls III's scale, 0.1 to
+        // 0.4 degrees a count: a value the player set turns as far as before on
+        // today's 0.005 to 0.4, and the old default (50) is today's - DS3's
+        // slowest was faster than most mice want (engine/mouse_camera_step.h).
+        if (file_version < 8 && g_saved[static_cast<std::size_t>(kMouseSens)]) {
+            const int was = g_set[kMouseSens].index;
+            if (was != 50) {
+                g_set[kMouseSens].index = mouse_camera_setting_from_ds3(was);
+                host_log("options: Mouse sensitivity %d on the old scale reads as %d, the same turn for a count", was,
+                         g_set[kMouseSens].index);
+            }
+            g_dirty = true;
+        }
         // Before version 7 Window mode's Fullscreen was borderless: it is
         // Borderless now, and Fullscreen the exclusive mode.
         if (file_version < 7 && window_mode_val == "Fullscreen") {
@@ -1760,6 +1851,12 @@ void host_options_load() {
     }
     // BBHOST_FRAMEGEN=1 or 0: Frame generation on or off over the file.
     if (const char* e = std::getenv("BBHOST_FRAMEGEN"); e && e[0]) g_set[kFrameGeneration].index = e[0] == '0' ? 0 : 1;
+#if !defined(_WIN32)
+    // Frame generation is AMD's FidelityFX on Windows alone (host/framegen.cpp)
+    // and has no row elsewhere: off here whatever a file from Windows says, so
+    // nothing that cannot be turned off holds the frame rate to its limit.
+    g_set[kFrameGeneration].index = 0;
+#endif
     if (const char* e = std::getenv("BBHOST_MOUSE_CAMERA"); e && e[0]) {
         g_set[kMouseCamera].index = e[0] == '0' ? 0 : 1;
     }
@@ -1770,6 +1867,11 @@ void host_options_load() {
     if (const char* e = std::getenv("BBHOST_MOUSE_CURSOR"); e && e[0]) {
         g_set[kDrawCursor].index = e[0] == '0' ? 0 : 1;
     }
+    // Published before they are applied: the applies read them (Window mode's
+    // the upscaler's, through the game's size - read from the defaults it gave
+    // Fullscreen the Resolution's display mode while the game was the screen's
+    // size).
+    rebuild_settings();
     host_options_apply();
     rebuild_settings();
 }
@@ -1912,7 +2014,7 @@ const char* const* value_tips(int id, bool dlss) {
     static const char* const kUpscalerTips[] = {
         "The game's own anti-aliasing; the 3D at the Resolution.",
         "TAA: bbhost's own temporal anti-aliasing - steadier edges and less shimmer, a little softer. Any GPU, the 3D at the "
-        "Resolution. The fastest of these.",
+        "Resolution; one below the window keeps the HUD at the window's size. The fastest of these.",
         "AMD FSR 3: any GPU.",
         "AMD FSR 4: AMD's newest, where the GPU and driver run it; FSR 3 where they do not.",
         "NVIDIA DLSS: RTX cards only.",
@@ -2136,13 +2238,30 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
         // FSR 4, DLSS - a slider once TAA made five) as buttons too, as wide as
         // a slider so their names fit.
         const char* const* tips = id == kShaders ? kHostShaderModeTips : value_tips(id, names != nullptr);
+        const char* const* labels = names ? names : s.values.data();
+        // Upscaling: the choices this platform offers, and the one made (host/upscaler.h upscaler_offered).
+        const char* up_labels[5];
+        const char* up_tips[5];
+        int up_of[5], m = n, pick = want;
+        if (id == kUpscaler) {
+            m = 0;
+            for (int v = 0; v < n && m < 5; ++v) {
+                if (v != cur && !upscaler_offered(v)) continue;
+                if (v == cur) pick = m;
+                up_labels[m] = labels[v];
+                up_tips[m] = tips ? tips[v] : nullptr;
+                up_of[m++] = v;
+            }
+            labels = up_labels;
+            if (tips) tips = up_tips;
+        }
         float bw = cw;
-        if (n > 4) {
+        if (m > 4) {
             bw = std::min(std::round(520 * sc), w * 0.62f);
             ImGui::SetCursorScreenPos(ImVec2(p.x + w - bw, p.y));
         }
-        ui::segmented("##v", &want, names ? names : s.values.data(), n, bw, tips,
-                      id == kShaders ? "Applies at the next start." : nullptr);
+        ui::segmented("##v", &pick, labels, m, bw, tips, id == kShaders ? "Applies at the next start." : nullptr);
+        want = id == kUpscaler ? up_of[std::clamp(pick, 0, m - 1)] : pick;
     } else {
         // A scale: the slider shows the step's own name (+10%, x1.4, 5).
         std::string shown;
@@ -2234,6 +2353,11 @@ void account_page() {
     if (const std::string d = account_detail(); !d.empty()) {
         ImGui::Spacing();
         ui::banner(ui::Icon::Info, ui::kIce, d);
+    }
+    if (net::account_logged_in() && net::account_refused() && !g_acct_busy.load()) {
+        ImGui::Spacing();
+        ui::banner(ui::Icon::Warning, ui::kWarn,
+                   std::string(kRefusedText) + " Link with Discord again, or recover an account this PC holds with its recovery code below.");
     }
     ImGui::Spacing();
     action_button("Link with Discord", 0, true);
@@ -2328,6 +2452,20 @@ const char* upscaler_note() {
     const UpscalerCaps caps = upscaler_caps();
     static std::string note;
     const bool dlss = u == 4;
+#if !defined(_WIN32)
+    // Linux: DLSS through the NGX bridge, and no FSR.
+    if (!dlss) {
+        note = "FSR runs on Windows only: the game's own anti-aliasing runs instead.";
+    } else if (!caps.loaded) {
+        note = "Not running: libbbhost_ngx_bridge.so did not load (it and NVIDIA's libnvidia-ngx-dlss.so belong beside "
+               "bbhost, as the Linux package has them). The game's own anti-aliasing runs instead.";
+    } else if (!caps.dlss) {
+        note = "DLSS is not available here" + (caps.dlss_reason.empty() ? std::string() : " (" + caps.dlss_reason + ")") +
+               ": the game's own anti-aliasing runs instead.";
+    } else {
+        return g_set[kUpscaler].note;
+    }
+#else
     if (!caps.loaded) {
         note = "Not running: upscaler_bridge.dll did not load (it and AMD's FidelityFX files belong beside bbhost.exe). The "
                "game's own anti-aliasing runs instead; Frame generation works without it.";
@@ -2339,6 +2477,7 @@ const char* upscaler_note() {
     } else {
         return g_set[kUpscaler].note;
     }
+#endif
     return note.c_str();
 }
 
@@ -2351,6 +2490,7 @@ bool row_hidden(int id) {
     if (id == kDlssPreset) return shown_index(kUpscaler) <= 1;  // (Off, TAA: no preset)
     if (id == kTaaStrength) return shown_index(kUpscaler) != 1;  // (TAA's alone)
     if (id == kMotionVectors) return shown_index(kUpscaler) == 0 && !reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration));
+    if (id == kStayBorderless) return shown_index(kWindowMode) != 1;  // (Borderless's alone)
     return false;
 }
 
@@ -2526,11 +2666,12 @@ bool host_opt_upscaler_chosen() {
     static const int env = [] {
         const char* e = std::getenv("BBHOST_UPSCALE");
         if (!e || !*e) return -1;
-        return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0 ? 1 : 0;
+        return std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr") == 0 || std::strcmp(e, "fsr3") == 0 || std::strcmp(e, "taa") == 0 ? 1 : 0;
     }();
-    // (TAA, 4, keeps the 3D and the game at the Resolution.)
+    // TAA (4) too: a Resolution below the window draws the 3D at it and
+    // keeps the game and its HUD at the window's size, as FSR and DLSS do.
     const int u = host_settings_ref().upscaler;
-    return env >= 0 ? env != 0 : u != 0 && u != 4;
+    return env >= 0 ? env != 0 : u != 0;
 }
 
 // (TAA wants the motion too, though it is no upscaler that sizes the 3D.)
@@ -2563,7 +2704,14 @@ void output_for(int* w, int* h) {
     if (g_set[kWindowMode].index == 0) {
         ww = config().width;
         wh = config().height;
-    } else if (!host_desktop_max_size(&ww, &wh)) {
+    } else if (!host_window_desktop_size(&ww, &wh) && !host_desktop_primary_size(&ww, &wh)) {
+        // The screen the window fills: once the window is made, its display's
+        // desktop mode (not Fullscreen's exclusive mode while it is up);
+        // before that the primary display's, where the window opens. Not the
+        // largest width and height of all displays: with a second display of
+        // another shape (a portrait one beside a 2560x1440, 2560x1920) the
+        // game was made that shape and shown with bars at the sides, its UI
+        // shrunk.
         return;
     }
     if (ww <= 0 || wh <= 0) return;

@@ -52,8 +52,10 @@
 // The choice is made when the game starts: the game's fixed 1/30 s steps are
 // constants in its code, and a rate needs them all changed together. From
 // one converted rate to another the same code sites serve, so a change while
-// the game runs rewrites the rate's values alone (frame_rate_request); 30 on
-// either side needs the next start.
+// the game runs rewrites the rate's values alone (frame_rate_request). A game
+// started at its own 30 is converted when another rate is chosen while it
+// runs, and a converted game taken to 30 stays converted: every change of
+// rate applies at once.
 
 // The frame time and the camera's flag code on the game's side reads:
 // engine/frame_rate_step.h.
@@ -67,16 +69,20 @@ void frame_rate_install(ElfImage* image);
 // start after all (frame_rate.cpp, kHandedOver).
 void frame_rate_install_late(ElfImage* image);
 
-// The pace the game was started at: 30, or the rate it was converted to (one
-// of the option's, or Uncapped's refresh rate).
+// The pace the game runs at: 30, or the rate it was converted to (one of the
+// option's, or Uncapped's refresh rate).
 int frame_rate_game_fps();
+// Whether the game's steps are converted: a rate other than the game's own 30
+// chosen at the start or since (a converted 30 among them).
+bool frame_rate_converted();
 
 // A Frame rate chosen while the game runs (a rate of the option's, 0 for
 // Display-Limited): taken at the next frame - the rated constants and counts
 // written again at its values, the cloth's caves put in above 60, the pace,
-// the flips and the effect timing with it - when the game started at a
-// converted rate and this is one too. False (nothing done) when the change
-// needs the next start: 30 on either side, or the cloth's caves refused.
+// the flips and the effect timing with it; from the game's own 30, the whole
+// conversion the start makes. False (nothing done) when the change needs the
+// next start: the cloth's caves refused, or the game's own update running
+// (BBHOST_FRAME_SOURCE).
 bool frame_rate_request(int fps);
 // Whether frame_rate_request takes `fps` while the game runs (the menus'
 // "next start" pill).

@@ -257,7 +257,23 @@ void camera_install(ElfImage* image) {
     host_settings_listen(&settings_changed);
 }
 
+// A plugin's zoom (camera_zoom_take): the presses since it last took them.
+std::atomic<bool> g_zoom_taken{false};
+std::atomic<int> g_taken_steps{0};
+std::atomic<bool> g_taken_reset{false};
+
+int camera_zoom_take(bool* reset) {
+    g_zoom_taken.store(true, std::memory_order_relaxed);
+    *reset = g_taken_reset.exchange(false);
+    return g_taken_steps.exchange(0);
+}
+
 void camera_zoom(int steps, bool reset) {
+    if (g_zoom_taken.load(std::memory_order_relaxed)) {
+        if (reset) g_taken_reset.store(true);
+        g_taken_steps.fetch_add(reset ? 0 : steps);
+        return;
+    }
     std::lock_guard<std::mutex> lock(g_want_mu);
     const float was = g_zoom;
     if (reset) {

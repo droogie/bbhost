@@ -1,0 +1,42 @@
+MIT License
+
+Copyright (c) 2026 the bbhost authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---------------------------------------------------------------------------
+This folder is bbhost's NGX bridge: NVIDIA DLSS on Linux, behind the C API of
+Numity1504's upscaler bridge. The licence above covers the source in this
+folder only, which is not under bbhost's GPL: the bridge links NVIDIA's NGX
+SDK, and bbhost loads it at run time beside its executable
+(src/host/upscaler.cpp) as the Windows build loads Numity1504's
+upscaler_bridge.dll.
+
+The API it implements is Numity1504's (BBsuite): upscaler_bridge.h in
+third_party/upscaler_bridge, MIT, Copyright (c) 2026 Numity1504 - the table of
+functions ub_get_api returns, the order of the calls and the rules of each.
+The credit for that API stays with him. This is a separate implementation of
+it for Linux, written for bbhost, not his code; his own Linux build of the
+bridge, should there be one, takes this one's place unchanged.
+
+NVIDIA's code is not in this folder or in the repository. The built library,
+libbbhost_ngx_bridge.so, contains NVIDIA's NGX SDK library (libnvsdk_ngx.a,
+fetched pinned by tools/fetch_ngx.sh) and so is also under NVIDIA's terms
+(third_party/dlss/LICENSE.txt), as is the DLSS runtime it uses,
+libnvidia-ngx-dlss.so. bbhost is not sponsored or endorsed by NVIDIA.

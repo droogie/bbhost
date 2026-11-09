@@ -5,6 +5,7 @@
 // come straight from the imported guest memory.
 #include "core/image_file.h"
 #include "core/portable.h"
+#include "core/host_clock.h"
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "engine/loading.h"
@@ -28,6 +29,7 @@
 #include "host/list_resolve.h"
 #include "host/lvp_split.h"
 #include "host/masked_blend.h"
+#include "host/rt_extent.h"
 #include "host/shader_bundles.h"
 #include "host/vertex_clamp.h"
 #include "host/shader_patch.h"
@@ -1966,12 +1968,28 @@ bool rt_image_memory(VkImage image, ImageMemory& out) {
 // target sampled as a texture is addressed in normalized coordinates over the
 // image's height: a 1080-row target padded to 1088 makes every v 1080/1088 too
 // small. That is what squashed the movie and left an 8-row band of the clear
-// colour along the bottom of the screen. The scissor carries the real height.
-// Remember it per target so a later pass with a smaller scissor cannot resize
-// the image - rt_image() recreates on a size change, and that costs a flush and
-// a vkDeviceWaitIdle.
-std::unordered_map<std::uint64_t, std::uint32_t> g_rt_real_height;
-std::unordered_map<std::uint64_t, std::uint32_t> g_rt_real_width;
+// colour along the bottom of the screen. The scissor carries the real height
+// (and CB_COLOR_PITCH pads the width the same way). Remember it per target so a
+// later pass with a smaller scissor cannot resize the image - rt_image()
+// recreates on a size change, and that costs a flush and a vkDeviceWaitIdle.
+// Per target is by its geometry: its base, pitch and padded height
+// (host/rt_extent.h). By the base alone, a size YEBIS's other glare pyramid
+// left at an address (523 wide at 2560x1440) stayed on the 640-wide glare
+// level YEBIS later drew there, which glared to the right of the sky and of
+// bright highlights. BBHOST_RT_LEARN_BY_GEOMETRY=0: by the base alone, as
+// before; =2: by the geometry, with the base alone's answers worked out beside
+// them, and where the two differ counted and each logged once.
+const int g_rt_learn_mode = [] {
+    const char* e = std::getenv("BBHOST_RT_LEARN_BY_GEOMETRY");
+    return e && *e ? std::atoi(e) : 1;
+}();
+rt_extent::Table g_rt_extents{g_rt_learn_mode != 0};  // under g.mu
+rt_extent::Table g_rt_extents_by_base{false};         // under g.mu: =2's comparison
+// Under g.mu: lookups where a scissor the padded size met a smaller size
+// learned for the same geometry, which stays (width, height) - the case the
+// geometry does not tell apart; =2's lookups where the base alone would have
+// answered another size.
+std::uint64_t g_rt_padded_over[2] = {0, 0}, g_rt_learn_differ = 0;
 
 // Fill shaders run before the first draw that creates the image (and again
 // after a size/format recreate). The translated compute writes guest memory
@@ -2034,19 +2052,6 @@ bool take_pending_htile(std::uint64_t key, RtImage& r) {
     return true;
 }
 std::atomic<std::uint64_t> g_fill_pending{0}, g_fill_applied{0};
-
-// True when `v` rounded up to a tiling granularity is exactly `padded`: that is
-// what makes a scissor edge believable as the target's real extent rather than
-// a pass drawing into part of a larger one. Colour pitch pads to 128 or 256
-// pixels (392 -> 512, 960 -> 1024, 1176 -> 1280) and height to 64 rows
-// (1080 -> 1088).
-bool plausible_extent(std::uint32_t v, std::uint32_t padded) {
-    if (!v || v > padded) return false;
-    for (std::uint32_t g : {64u, 128u, 256u}) {
-        if (((v + g - 1) & ~(g - 1)) == padded) return true;
-    }
-    return false;
-}
 
 // Bumped whenever what rt_image() would answer for the same registers can
 // change: a target or snapshot made, dropped or replaced, or an unpadded
@@ -2120,38 +2125,94 @@ std::uint64_t reuse_idle_ms() {
     return ms;
 }
 
-std::uint32_t unpadded(std::unordered_map<std::uint64_t, std::uint32_t>& seen, std::uint64_t base, std::uint32_t padded,
-                       std::uint32_t scissor_edge) {
-    if (auto it = seen.find(base); it != seen.end() && plausible_extent(it->second, padded)) {
-        // A pass cannot draw past its target: a scissor wider or taller than
-        // what was learned says the memory holds another target now (the
-        // cutscenes' glare pyramid leaves its sizes on addresses the game's
-        // reuses at others).
-        if (scissor_edge > it->second && scissor_edge != padded && plausible_extent(scissor_edge, padded)) {
-            ++g_rt_gen;
-            it->second = scissor_edge;
+// What asks for a target (target_image), as target_gen counts draws whose
+// view was not seen made: a GX draw (the wrapper's), YEBIS's draws,
+// Scaleform's, packet draws, clear tokens.
+enum TargetAsker { kAskGx, kAskYebis, kAskScaleform, kAskPacket, kAskClear, kAskers };
+// Why a colour target was sized from its scissors rather than by a texture:
+// no live texture of the registry's begins at its base; a YEBIS texture
+// there that is not the surface the draw's registers describe; a
+// GX texture there larger than the padded size; YEBIS's textures not asked
+// (BBHOST_RT_EXTENT_FROM_YEBIS=0).
+enum LearnedWhy { kLearnedNoTexture, kLearnedOtherTarget, kLearnedNoFit, kLearnedOff, kLearnedWhys };
+// Under g.mu: target lookups sized from their scissors, by asker and colour /
+// depth; YEBIS's colour ones by why; targets sized by YEBIS's textures, and
+// YEBIS textures at a target's base that were not its surface.
+std::uint64_t g_learned_by[kAskers][2] = {}, g_learned_yebis_why[kLearnedWhys] = {};
+std::uint64_t g_extent_from_yebis = 0, g_extent_yebis_refused = 0;
+
+// Each target and its sizes logged once, the first 48 of a kind (0: the base
+// alone's answers, 1: YEBIS's targets sized from their scissors): a chain's
+// targets miss target_image's memo every frame.
+bool log_once_locked(int kind, std::uint64_t base, std::uint32_t a, std::uint32_t b, std::uint32_t c, std::uint32_t d) {
+    static std::set<std::array<std::uint64_t, 3>> seen[2];
+    if (seen[kind].size() >= 48) return false;
+    return seen[kind].insert({base, (static_cast<std::uint64_t>(a) << 32) | b, (static_cast<std::uint64_t>(c) << 32) | d}).second;
+}
+
+void learn_differ_locked(std::uint64_t base, std::uint32_t pitch, std::uint32_t padded_h, std::uint32_t scissor_right,
+                         std::uint32_t scissor_bottom, bool depth, std::uint32_t w, std::uint32_t h, const rt_extent::Answer& b, const char* by) {
+    ++g_rt_learn_differ;
+    if (log_once_locked(0, base, w, h, b.w, b.h)) {
+        host_log("render: %s target 0x%llx (pitch %u, %u rows, scissor %ux%u): %ux%u by %s, %ux%u by its base alone (flip %llu)",
+                 depth ? "depth" : "colour", static_cast<unsigned long long>(base), pitch, padded_h, scissor_right, scissor_bottom, w, h, by, b.w,
+                 b.h, static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+}
+
+// The size to make the image of the target at `base` whose registers pad it to
+// `pitch` x `padded_h`, from a draw's scissor edges (0 for a clear), learning
+// from them (host/rt_extent.h). CB_COLOR_PITCH pads the same way
+// CB_COLOR_SLICE does, and a target sampled as a texture is addressed in
+// normalized coordinates over the image's width: a 392-wide target held in a
+// 512-wide image makes every u 392/512 too small. Down a bloom pyramid that
+// compounds, which is why the composited frame was a smear along its left edge.
+// `compare`: =2's answer by the base alone worked out beside this one.
+rt_extent::Answer learned_extent_locked(std::uint64_t base, std::uint32_t pitch, std::uint32_t padded_h, std::uint32_t scissor_right,
+                                        std::uint32_t scissor_bottom, bool depth, bool compare = true) {
+    const rt_extent::Answer a = g_rt_extents.draw(base, pitch, padded_h, scissor_right, scissor_bottom);
+    if (a.changed) ++g_rt_gen;
+    if (a.padded_over_w || a.padded_over_h) {
+        // A scissor the padded size over a smaller size learned for the same
+        // geometry: a pass over the whole surface of the smaller target, or a
+        // larger target of that geometry at the address now. Nothing in the
+        // registers tells the two apart, and the size stays; counted, to see
+        // whether play meets it.
+        g_rt_padded_over[0] += a.padded_over_w;
+        g_rt_padded_over[1] += a.padded_over_h;
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 8) {
+            host_log("render: %s target 0x%llx (pitch %u, %u rows): a scissor of %ux%u, its padded size, met a smaller size learned for "
+                     "its geometry; its image stays %ux%u (flip %llu)",
+                     depth ? "depth" : "colour", static_cast<unsigned long long>(base), pitch, padded_h, scissor_right, scissor_bottom, a.w,
+                     a.h, static_cast<unsigned long long>(hle_video_flip_count()));
         }
-        return it->second;
     }
-    if (plausible_extent(scissor_edge, padded) && scissor_edge != padded) {
-        ++g_rt_gen;
-        seen[base] = scissor_edge;
-        return scissor_edge;
+    if (g_rt_learn_mode == 2 && compare) {
+        const rt_extent::Answer b = g_rt_extents_by_base.draw(base, pitch, padded_h, scissor_right, scissor_bottom);
+        if (b.changed) ++g_rt_gen;  // (so the memo asks both again)
+        if (b.w != a.w || b.h != a.h) learn_differ_locked(base, pitch, padded_h, scissor_right, scissor_bottom, depth, a.w, a.h, b, "its geometry");
     }
-    return padded;
+    return a;
 }
 
-std::uint32_t unpadded_height(std::uint64_t base, std::uint32_t padded, std::uint32_t scissor_bottom) {
-    return unpadded(g_rt_real_height, base, padded, scissor_bottom);
-}
-
-// CB_COLOR_PITCH pads the same way CB_COLOR_SLICE does, and a target sampled as
-// a texture is addressed in normalized coordinates over the image's width: a
-// 392-wide target held in a 512-wide image makes every u 392/512 too small.
-// Down a bloom pyramid that compounds, which is why the composited frame was a
-// smear along its left edge.
-std::uint32_t unpadded_width(std::uint64_t base, std::uint32_t padded, std::uint32_t scissor_right) {
-    return unpadded(g_rt_real_width, base, padded, scissor_right);
+// A target sized from its scissors, counted by what asked; YEBIS's colour
+// ones by why, each logged once - the targets the registry does not size yet.
+void learned_census_locked(int asker, bool depth, int why, std::uint64_t base, std::uint32_t pitch, std::uint32_t padded_h,
+                           std::uint32_t scissor_right, std::uint32_t scissor_bottom, const GxTextureExtent& te) {
+    ++g_learned_by[asker][depth ? 1 : 0];
+    if (asker != kAskYebis || depth || why < 0) return;
+    ++g_learned_yebis_why[why];
+    if (log_once_locked(1, base, static_cast<std::uint32_t>(why), pitch, padded_h, (scissor_right << 16) | scissor_bottom)) {
+        static const char* const kWhy[kLearnedWhys] = {"no live texture of the registry's begins there", "a YEBIS texture there is another surface",
+                                                       "a GX texture there is larger", "YEBIS's textures not asked"};
+        host_log("render: YEBIS's colour target 0x%llx (pitch %u, %u rows, scissor %ux%u) sized from its scissors: %s%s (flip %llu)",
+                 static_cast<unsigned long long>(base), pitch, padded_h, scissor_right, scissor_bottom, kWhy[why],
+                 why == kLearnedOtherTarget ? (" (" + std::to_string(te.width) + "x" + std::to_string(te.height) + " in a pitch of " +
+                                               std::to_string(te.pitch) + ")").c_str()
+                                            : "",
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
 }
 
 void copy_layers_locked(RtImage& from, RtImage& to);
@@ -2543,7 +2604,7 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
 // rt_image() applies on every use: the pending clears.
 // A GX target's real extent from its view's texture
 // (GpuDrawInputs::color_extent) instead of guessing it from the scissor
-// (unpadded_width/height). BBHOST_GX_VIEW_EXTENTS=0 guesses as before; =2
+// (learned_extent_locked). BBHOST_GX_VIEW_EXTENTS=0 guesses as before; =2
 // guesses, and counts and logs where the guess and the texture disagree.
 const int g_view_extents = [] {
     const char* e = std::getenv("BBHOST_GX_VIEW_EXTENTS");
@@ -2551,6 +2612,7 @@ const int g_view_extents = [] {
 }();
 std::uint64_t g_extent_used = 0, g_extent_guessed = 0, g_extent_checked = 0, g_extent_disagree = 0;  // under g.mu
 std::uint64_t g_extent_from_gx = 0;  // under g.mu: extents for view-less draws from the GX texture at the target
+std::uint64_t g_extent_disagree_yebis = 0;  // under g.mu: =2's disagreements where the texture was YEBIS's
 bool g_target_memo_hit = false;  // whether target_image's last answer came from its slot's memo (stage 2's census)
 
 // What a target's lookup applies whenever it answers from its memo: the
@@ -2564,59 +2626,115 @@ void target_hit(RtImage& rt, std::uint32_t res_gen) {
     g_target_memo_hit = true;
 }
 
+// What a draw is, as a target lookup counts it (TargetAsker).
+int target_asker(const GpuDraw& d) {
+    const char* kind = d.gx_token ? d.gx_token_kind : nullptr;
+    return !d.gx_token ? kAskPacket : kind && std::strcmp(kind, "yebis") == 0 ? kAskYebis : kind && std::strcmp(kind, "scaleform") == 0 ? kAskScaleform : kAskGx;
+}
+
+// `asker`: what asks (TargetAsker), or the draw it is worked out from when a
+// lookup is counted (learned_census_locked) - only then, not for every target
+// of every draw (two string compares each).
 RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32_t padded_w, std::uint32_t padded_h,
                       std::uint32_t scissor_right, std::uint32_t scissor_bottom, bool depth, std::uint32_t layers,
-                      std::uint64_t slice_bytes, std::uint32_t extent = 0, std::uint32_t res_gen = 0) {
+                      std::uint64_t slice_bytes, std::uint32_t extent = 0, std::uint32_t res_gen = 0, int asker = kAskGx,
+                      const GpuDraw* draw = nullptr) {
     struct Memo {
         std::uint64_t gen = 0, base = 0, slice_bytes = 0;
         VkFormat format = VK_FORMAT_UNDEFINED;
         std::uint32_t padded_w = 0, padded_h = 0, right = 0, bottom = 0, layers = 0, extent = 0, res_gen = 0;
+        std::uint32_t registered = 0;  // the size of the registry's texture that sized it ((w << 16) | h; 0: none)
+        bool yebis = false;            // that texture YEBIS's
         RtImage* rt = nullptr;
     };
     static Memo memo[10];  // 0-7 colour, 8 depth, 9 clear tokens (render_clear_view_locked)
     Memo& m = memo[slot];
+    // The memo is keyed by the extent asked (a view's), not the one the
+    // registry answered with: keyed by that, every lookup of a target a texture
+    // of the registry's sized missed it - every one of YEBIS's draws a whole
+    // lookup. Such an answer stands while the registry still gives that
+    // texture at the base (a texture made or destroyed there since, or one
+    // YEBIS's object no longer is, asks again).
+    const auto still_registered = [&] {
+        GxTextureExtent t;
+        return gx_texture_extent(base, &t) && t.yebis == m.yebis && ((t.width << 16) | t.height) == m.registered &&
+               rt_extent::registered_fits(rt_extent::Registered{t.width, t.height, t.yebis, t.pitch}, padded_w, padded_h);
+    };
     if (m.rt && m.gen == g_rt_gen && m.base == base && m.format == format && m.padded_w == padded_w && m.padded_h == padded_h &&
         m.right == scissor_right && m.bottom == scissor_bottom && m.layers == layers && m.slice_bytes == slice_bytes && m.extent == extent &&
-        m.res_gen == res_gen) {
+        m.res_gen == res_gen && (!m.registered || still_registered())) {
         target_hit(*m.rt, res_gen);
         return m.rt;
     }
     g_target_memo_hit = false;
     std::uint32_t w = 0, h = 0;
+    const std::uint32_t asked_extent = extent;  // the view's (the registry's below)
     // No view to take it from (YEBIS's draws, the wrapper's): the live GX
     // texture that begins at the target's memory says its size - the game's
-    // own description of what is there now. The learned sizes below are per
+    // own description of what is there now. The learned sizes below were per
     // address, and an address the game reuses for a target of another size
     // kept the old one: the new-character cutscenes' glare pyramid (392x331
     // at its base) left sizes the game's (314x265) then drew into the corner
     // of, and the glare sampled the stale rest - magenta, until a reload.
-    // BBHOST_RT_EXTENT_FROM_GX=0: the learned sizes only.
+    // They are kept per geometry now (learned_extent_locked); two targets
+    // their registers pad to one size at one address still share them.
+    // The registry knows YEBIS's textures too (BBHOST_RES_YEBIS) but gave no
+    // size for them, so every YEBIS target took its size from its scissors -
+    // which at 2560x1440 left the glare's 640-wide level 523 wide. A YEBIS
+    // target takes the size of the texture YEBIS made at its base now, when
+    // that texture is the surface the draw's registers describe
+    // (rt_extent::registered_fits).
+    // BBHOST_RT_EXTENT_FROM_GX=0: the learned sizes only;
+    // BBHOST_RT_EXTENT_FROM_YEBIS=0: GX's textures only, YEBIS's targets from
+    // their scissors as before.
     static const bool extent_from_gx = [] {
         const char* e = std::getenv("BBHOST_RT_EXTENT_FROM_GX");
         return !(e && e[0] == '0');
     }();
+    static const bool extent_from_yebis = [] {
+        const char* e = std::getenv("BBHOST_RT_EXTENT_FROM_YEBIS");
+        return !(e && e[0] == '0');
+    }();
+    bool from_yebis = false;
+    int fallback = -1;  // why a YEBIS draw's colour target was not sized by the registry (kLearnedWhy)
+    GxTextureExtent te;
     if (!extent && extent_from_gx && !depth) {
-        std::uint32_t t[8];
-        if (gx_resource_tsharp(base, t)) {
-            const std::uint32_t tw = (t[2] & 0x3fff) + 1, th = ((t[2] >> 14) & 0x3fff) + 1;
-            if (tw <= padded_w && th <= padded_h) {
-                extent = (tw << 16) | th;
-                ++g_extent_from_gx;
+        if (gx_texture_extent(base, &te)) {
+            const rt_extent::Registered r{te.width, te.height, te.yebis, te.pitch};
+            if (te.yebis && !extent_from_yebis) {
+                fallback = kLearnedOff;
+            } else if (rt_extent::registered_fits(r, padded_w, padded_h)) {
+                extent = (te.width << 16) | te.height;
+                from_yebis = te.yebis;
+                ++(te.yebis ? g_extent_from_yebis : g_extent_from_gx);
+            } else {
+                fallback = te.yebis ? kLearnedOtherTarget : kLearnedNoFit;
+                if (te.yebis) ++g_extent_yebis_refused;
             }
+        } else {
+            fallback = kLearnedNoTexture;
         }
     }
     const std::uint32_t ew = extent >> 16, eh = extent & 0xffff;
     // The texture's extent stands when it fits the padded one it came padded to.
     const bool use_extent = g_view_extents && extent && ew <= padded_w && eh <= padded_h;
     if (!use_extent || g_view_extents == 2) {
-        w = unpadded_width(base, padded_w, scissor_right);
-        h = unpadded_height(base, padded_h, scissor_bottom);
+        // (BBHOST_RT_LEARN_BY_GEOMETRY=2 compares a target YEBIS's texture
+        // sized below, with the guess by the base alone it had before.)
+        const rt_extent::Answer a =
+            learned_extent_locked(base, padded_w, padded_h, scissor_right, scissor_bottom, depth, !(use_extent && from_yebis));
+        w = a.w;
+        h = a.h;
     }
+    if (!use_extent)
+        learned_census_locked(draw ? target_asker(*draw) : asker, depth, fallback, base, padded_w, padded_h, scissor_right, scissor_bottom, te);
     if (use_extent && g_view_extents == 2) ++g_extent_checked;
     if (use_extent && g_view_extents == 2 && (w != ew || h != eh)) {
+        if (from_yebis) ++g_extent_disagree_yebis;
         if (g_extent_disagree++ < 24) {
-            host_log("render: %s target 0x%llx: the scissor makes it %ux%u (padded %ux%u), its view's texture %ux%u",
-                     depth ? "depth" : "colour", static_cast<unsigned long long>(base), w, h, padded_w, padded_h, ew, eh);
+            host_log("render: %s target 0x%llx: the scissor makes it %ux%u (padded %ux%u), its %s texture %ux%u",
+                     depth ? "depth" : "colour", static_cast<unsigned long long>(base), w, h, padded_w, padded_h,
+                     from_yebis ? "YEBIS" : asked_extent ? "view's" : "GX", ew, eh);
         }
     }
     if (use_extent && g_view_extents == 1) {
@@ -2626,18 +2744,26 @@ RtImage* target_image(int slot, std::uint64_t base, VkFormat format, std::uint32
         // What the scissor would have to teach is known now: draws with no
         // view (the wrapper's, YEBIS's) and the texture cache size this
         // target the same way instead of making it again at another size.
-        std::uint32_t& known_w = g_rt_real_width[base];
-        std::uint32_t& known_h = g_rt_real_height[base];
-        if (known_w != ew || known_h != eh) {
-            known_w = ew;
-            known_h = eh;
+        // Not a YEBIS texture's size: YEBIS's draws ask the registry while
+        // the texture lives, and a size kept past its death would size
+        // whatever the memory holds next.
+        if (!from_yebis && g_rt_extents.view(base, padded_w, padded_h, ew, eh)) ++g_rt_gen;
+        if (g_rt_learn_mode == 2 && from_yebis) {
+            // Before, YEBIS's targets were guessed from their scissors by the
+            // base alone: what that would have made this one.
+            const rt_extent::Answer b = g_rt_extents_by_base.draw(base, padded_w, padded_h, scissor_right, scissor_bottom);
+            if (b.changed) ++g_rt_gen;
+            if (b.w != ew || b.h != eh) learn_differ_locked(base, padded_w, padded_h, scissor_right, scissor_bottom, depth, ew, eh, b, "YEBIS's texture");
+        } else if (g_rt_learn_mode == 2 && g_rt_extents_by_base.view(base, padded_w, padded_h, ew, eh)) {
             ++g_rt_gen;
         }
     } else {
         ++g_extent_guessed;
     }
     RtImage* rt = rt_image(base, format, w, h, depth, layers, slice_bytes, res_gen);
-    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, extent, res_gen, rt};
+    const std::uint32_t registered = use_extent && g_view_extents == 1 && !asked_extent ? extent : 0;
+    m = Memo{g_rt_gen, base, slice_bytes, format, padded_w, padded_h, scissor_right, scissor_bottom, layers, asked_extent, res_gen,
+             registered, from_yebis, rt};
     return rt;
 }
 
@@ -2873,9 +2999,24 @@ CachedProgram* program_for_impl(std::uint32_t id, std::uint64_t va);
 // Stage 4b.1a's compare (BBHOST_GXVK_LISTS=2): the command processor's answer noted for the pool's.
 CachedProgram* program_for(std::uint32_t id, std::uint64_t va) {
     if (list_draw()) [[unlikely]] {  // stage 4b.1b: by address, through the reader path (out of line)
-        return [va]() __attribute__((noinline)) {
+        return [id, va]() __attribute__((noinline)) {
+            // A pool thread's own answers by the program object's id, as the command processor's by-id entries
+            // (a GX program object's code stays at its address while it lives): good while no program was made or
+            // updated since (the cache's writes, under the readers' lock this commit holds shared).
+            struct PoolById {
+                std::uint32_t id = 0;
+                std::uint64_t va = 0, gen = 0;
+                const CachedProgram* cp = nullptr;
+            };
+            static thread_local PoolById by_id[kById];
+            const std::uint64_t gen = cache_rw::gen(cache_rw::kPrograms);
+            PoolById* const e = id && g_program_ids == 1 ? &by_id[id & (kById - 1)] : nullptr;
+            if (e && e->id == id && e->va == va && e->gen == gen && e->cp &&
+                (e->cp->patch_mask < 0 || e->cp->patch_mask == shader_patch_mask()))
+                return const_cast<CachedProgram*>(e->cp);
             const CachedProgram* const found = program_find(va);
             if (!found) run_part_stop(kRunStopProgram);
+            else if (e) *e = {id, va, gen, found};
             return const_cast<CachedProgram*>(found);
         }();
     }
@@ -3180,6 +3321,11 @@ struct DrawState {
     // numbers with this draw's viewport; salted into the key like the snap.
     bool pixel_cut_on = false;
     PixelCut pixel_cut{};
+    // pixel_cut is the live form (host/pixel_cutaway.h PixelCutLive): its
+    // numbers in the live buffer, the key the same however the view moves.
+    // Not recorded: a recipe's twin with distance a cone but none of the
+    // rest is the live form (recipe_file::read).
+    bool pixel_cut_live = false;
     // A plugin's draw into the G-buffer (kGxDrawGbuffer): the host's pixel
     // shader in place of the draw's (build_gfx_pipeline), targets 0-5 written
     // whole and the rest masked (fixed_state). Salted into the key like the
@@ -4038,6 +4184,18 @@ TableMaskWorkers& table_mask_workers() {
                     }
                     std::uint32_t mask = ~0u, any = ~0u;
                     table_slots_read(*job.meta, mask, &any);
+                    // BBHOST_TABLE_MASK_LOG=1: each answer by its module's hash, for comparing builds and platforms.
+                    static const bool mask_log = [] {
+                        const char* e = std::getenv("BBHOST_TABLE_MASK_LOG");
+                        return e && e[0] == '1';
+                    }();
+                    if (mask_log) {
+                        const std::vector<std::uint32_t>& sv = job.meta->spirv;
+                        host_log("render: table read mask: module %016llx (%zu words, %zu buffers), stage %d: tables 0x%08x, user data 0x%08x; "
+                                 "pipeline %s",
+                                 static_cast<unsigned long long>(fnv1a(sv.data(), sv.size() * 4)), sv.size(), job.meta->buffers.size(),
+                                 job.stage, mask, any, job.pipeline->name.c_str());
+                    }
                     std::lock_guard<std::mutex> lk(w->mu);
                     w->results.push_back({job.pipeline, job.stage, mask, any});
                     g_table_masks_ready.store(true, std::memory_order_relaxed);
@@ -6735,6 +6893,43 @@ VkBuffer addressed_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryP
     return buffer;
 }
 
+// The cutaway per pixel's live numbers (host/pixel_cutaway.h PixelCutLive):
+// one small mapped buffer for the run, at an address the twins bake in, so a
+// zoom or a field of view change writes it and builds nothing. 0 when it
+// could not be made: the twins bake every number in, as before.
+struct PixelCutLiveBuffer {
+    std::once_flag once;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceAddress address = 0;
+    std::uint8_t* map = nullptr;
+    std::mutex mu;
+    PixelCutLive last{};
+} g_cut_live;
+std::uint64_t pixel_cut_live_address() {
+    std::call_once(g_cut_live.once, [] {
+        g_cut_live.buffer = addressed_buffer(sizeof(PixelCutLive), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, g_cut_live.memory,
+                                             g_cut_live.address, &g_cut_live.map, "cutaway live numbers");
+        if (!g_cut_live.buffer) {
+            g_cut_live.address = 0;
+            host_log("render: cutaway: no buffer for its live numbers - each zoom builds the twins again");
+        } else {
+            std::memset(g_cut_live.map, 0, sizeof(PixelCutLive));
+        }
+    });
+    return g_cut_live.address;
+}
+// The frame's numbers into the buffer. A frame still on the GPU reads the
+// newer ones: a frame's worth of a zoom early, nothing worse.
+void pixel_cut_live_write(const PixelCutLive& n) {
+    std::lock_guard<std::mutex> lk(g_cut_live.mu);
+    if (!std::memcmp(&n, &g_cut_live.last, sizeof(n))) return;
+    g_cut_live.last = n;
+    std::memcpy(g_cut_live.map, &n, sizeof(n));
+}
+
 bool particle_args_ready_locked() {
     ParticleArgs& a = g_pargs;
     if (a.tried) return a.pipeline != VK_NULL_HANDLE;
@@ -7619,7 +7814,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // A camera draw with no pixel stage (the map's depth-only passes): one
         // of the cutaway alone, so the cut surfaces leave no depth behind.
         gcn::TranslateResult only{};
-        only.spirv = pixel_cutaway_only(s.pixel_cut);
+        only.spirv = pixel_cutaway_only(s.pixel_cut, s.pixel_cut_live ? pixel_cut_live_address() : 0);
         VkShaderModule module = VK_NULL_HANDLE;
         if (!only.spirv.empty() && make_module(only.spirv, module)) {
             pl.ps.fresh() = std::move(only);
@@ -7635,7 +7830,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             std::string why;
             VkShaderModule module = VK_NULL_HANDLE;
             const PixelCut cut = s.pixel_cut;
-            if (pixel_cutaway(twin.spirv, cut, &why) && make_module(twin.spirv, module)) {
+            if (pixel_cutaway(twin.spirv, cut, &why, s.pixel_cut_live ? pixel_cut_live_address() : 0) && make_module(twin.spirv, module)) {
                 const bool lifted = pl.ps.lifted;
                 pl.ps.fresh() = std::move(twin);
                 pl.ps.lifted = lifted;
@@ -10582,6 +10777,9 @@ bool read(Reader& in, PipelineRecipe& rc) {
         pod(r, s.snap_cells);
         s.pixel_cut_on = r.u32() != 0;
         if (s.pixel_cut_on) pod(r, s.pixel_cut);
+        // The live form: which cone for its distance and none of the numbers
+        // the live buffer holds.
+        s.pixel_cut_live = s.pixel_cut_on && s.pixel_cut.tan_x == 0.0f && s.pixel_cut.radius == 0.0f && s.pixel_cut.distance > 0.0f;
     }
     // The addresses the build tests for a program are the run's that recorded
     // it; the recipe's build takes the copies (tess_program).
@@ -14195,7 +14393,31 @@ void render_report() {
                  "guessed from the scissor %llu%s",
                  static_cast<unsigned long long>(g_extent_used), static_cast<unsigned long long>(g_extent_from_gx),
                  static_cast<unsigned long long>(g_extent_guessed),
-                 g_view_extents == 2 ? ("; compared " + std::to_string(g_extent_checked) + ", disagreeing " + std::to_string(g_extent_disagree)).c_str() : "");
+                 g_view_extents == 2 ? ("; compared " + std::to_string(g_extent_checked) + ", disagreeing " + std::to_string(g_extent_disagree) +
+                                        " (YEBIS's textures " + std::to_string(g_extent_disagree_yebis) + ")").c_str()
+                                     : "");
+    }
+    {
+        std::lock_guard<GpuMutex> lk(g.mu);
+        const std::string differ = g_rt_learn_mode == 2 ? "; by the base alone " + std::to_string(g_rt_extents_by_base.size()) +
+                                                              " targets, another size in " + std::to_string(g_rt_learn_differ) + " lookups"
+                                                        : std::string();
+        host_log("render: target sizes learned from scissors and views: %zu %s; a scissor the padded size over a smaller size learned "
+                 "for its geometry, the size kept, in %llu lookups of a width and %llu of a height%s",
+                 g_rt_extents.size(), g_rt_learn_mode ? "geometries (base, pitch, padded height)" : "targets by the base alone (BBHOST_RT_LEARN_BY_GEOMETRY=0)",
+                 static_cast<unsigned long long>(g_rt_padded_over[0]), static_cast<unsigned long long>(g_rt_padded_over[1]), differ.c_str());
+        using ull = unsigned long long;
+        const auto& l = g_learned_by;
+        host_log("render: targets sized by YEBIS's textures %llu (a YEBIS texture at the base another surface %llu); sized from "
+                 "their scissors (colour/depth): GX draws %llu/%llu, YEBIS's %llu/%llu, Scaleform's %llu/%llu, packet draws %llu/%llu, clear "
+                 "tokens %llu/%llu; YEBIS's colour ones: no texture of the registry's at the base %llu, another surface %llu, a larger GX "
+                 "texture %llu, not asked %llu",
+                 static_cast<ull>(g_extent_from_yebis), static_cast<ull>(g_extent_yebis_refused), static_cast<ull>(l[kAskGx][0]),
+                 static_cast<ull>(l[kAskGx][1]), static_cast<ull>(l[kAskYebis][0]), static_cast<ull>(l[kAskYebis][1]),
+                 static_cast<ull>(l[kAskScaleform][0]), static_cast<ull>(l[kAskScaleform][1]), static_cast<ull>(l[kAskPacket][0]),
+                 static_cast<ull>(l[kAskPacket][1]), static_cast<ull>(l[kAskClear][0]), static_cast<ull>(l[kAskClear][1]),
+                 static_cast<ull>(g_learned_yebis_why[kLearnedNoTexture]), static_cast<ull>(g_learned_yebis_why[kLearnedOtherTarget]),
+                 static_cast<ull>(g_learned_yebis_why[kLearnedNoFit]), static_cast<ull>(g_learned_yebis_why[kLearnedOff]));
     }
     if (g_view_by_id) {
         host_log("render: %s%s", texture_view_by_id_report().c_str(),
@@ -16064,7 +16286,8 @@ void bind_stage_images(VkDescriptorSet set, const gcn::TranslateResult& meta, co
 }
 
 bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, VkImage dst, VkRect2D area, VkExtent2D src,
-                                std::uint32_t src_x, std::uint32_t src_y, VkImageView dst_view) {
+                                std::uint32_t src_x, std::uint32_t src_y, VkImageView dst_view, bool* by_fsr) {
+    if (by_fsr) *by_fsr = false;
     auto it = g_rts.find(display_va);
     if (it == g_rts.end() || !it->second.initialised) return false;
     RtImage& r = it->second;
@@ -16076,8 +16299,10 @@ bool render_blit_display_locked(VkCommandBuffer cmd, std::uint64_t display_va, V
     // Smaller than the window (a lower render size, the Deck's 960x600): FSR 1
     // rather than a bilinear stretch (host/fsr.cpp).
     if (sw <= area.extent.width && sh <= area.extent.height && (sw < area.extent.width || sh < area.extent.height) &&
-        fsr_upscale_locked(cmd, r.image, r.format, r.width, r.height, x0, y0, sw, sh, dst, area, dst_view))
+        fsr_upscale_locked(cmd, r.image, r.format, r.width, r.height, x0, y0, sw, sh, dst, area, dst_view)) {
+        if (by_fsr) *by_fsr = true;
         return true;
+    }
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[0] = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), 0};
@@ -16137,6 +16362,7 @@ bool render_target_newer_overlapping_locked(std::uint64_t va, std::size_t bytes,
 std::uint64_t g_gen_retired_targets = 0, g_gen_retired_bytes = 0, g_gen_kept_written = 0, g_gen_adopted = 0;  // under g.mu
 std::uint64_t g_gen_dead_marked = 0;  // under g.mu: targets and snapshots whose resource died, waiting out the idle time
 std::uint64_t g_gen_taken_next = 0;   // under g.mu: taken by the texture made over their memory without data (gx_successor_gen)
+std::uint64_t g_gen_rebuild_n = 0, g_gen_rebuild_bytes = 0;  // under g.mu: of the retired, at once at a size change's rebuild
 
 // A target or snapshot whose GX resource died goes once it has been idle for
 // the reuse idle time, unless the memory's next resource takes it first: at
@@ -16170,30 +16396,71 @@ void retire_target_locked(std::map<std::uint64_t, RtImage>::iterator it, bool sn
     destroy_rt_image(r);
 }
 
-void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted) {
-    (void)bytes;
+// A resolution or render-size change (host_gpu_targets_rebuild) is not an
+// area load: the game lets go of its targets and makes the new size's in the
+// same call, laid out again over the render-target heap, so by the time the
+// old ones' retirements run, their memory's next resources are all made. An
+// old image stays only with the resource made next at its own address - a
+// draw there finds it, and makes it again if the shape changed - or with the
+// dead resource made again whole (its images at their offsets mean the same).
+// One a new resource covers from elsewhere is nothing's to draw into, yet
+// went on from layout to layout with each covering resource's generation;
+// and the old size's images waited out the reuse idle time beside the new
+// ones - at 2560x1600, 200-360 MiB of them for ten seconds after each change,
+// while the new size's targets took a new image heap block: a 6 GB card that
+// had 400 MiB to spare went past the driver's budget at the first change.
+std::uint64_t rebuild_successor_gen(std::uint64_t dead_memory, std::size_t dead_bytes, std::uint64_t image_base) {
+    GxResourceInfo live;
+    if (gx_resource_at(image_base, 1, &live) && live.memory == image_base && live.type >= 2 && !live.initial_data) return live.gen;
+    if (gx_resource_at(dead_memory, 1, &live) && live.memory == dead_memory && live.bytes == dead_bytes && live.type >= 2 && !live.initial_data)
+        return live.gen;
+    return 0;
+}
+
+void render_retire_generation_locked(std::uint64_t base, std::size_t bytes, std::uint64_t gen, std::uint64_t after_submitted, bool rebuild) {
+    bool gone = false;
     for (int k = 0; k < 2; ++k) {
         std::map<std::uint64_t, RtImage>& m = k ? g_snapshots : g_rts;
-        for (auto it = m.lower_bound(base); it != m.end() && it->first < base + bytes; ++it) {
+        for (auto it = m.lower_bound(base); it != m.end() && it->first < base + bytes;) {
             RtImage& r = it->second;
-            if (r.gx_gen != gen) continue;
+            if (r.gx_gen != gen) {
+                ++it;
+                continue;
+            }
             if (r.written_seq > after_submitted) {
                 // Drawn into by a submission made after its resource died: the
                 // memory's newer resource took it over (same base and shape).
                 r.gx_gen = rt_resource_gen(r.base, rt_size_bytes(r));
                 ++g_gen_kept_written;
+                ++it;
                 continue;
             }
-            if (const std::uint64_t next = gx_successor_gen(base, r.base, rt_size_bytes(r))) {
+            if (const std::uint64_t next = rebuild ? rebuild_successor_gen(base, bytes, r.base) : gx_successor_gen(base, r.base, rt_size_bytes(r))) {
                 r.gx_gen = next;
                 ++g_gen_taken_next;
+                ++it;
+                continue;
+            }
+            if (rebuild) {
+                // The old size's alone: it goes now (destroyed once the work in
+                // flight has run), not after the idle time.
+                ++g_gen_rebuild_n;
+                g_gen_rebuild_bytes += r.memory.size;
+                retire_target_locked(it, k == 1);
+                it = m.erase(it);
+                gone = true;
                 continue;
             }
             r.dead_ms = steady_ms();
             r.dead_after = after_submitted;
             r.dead_memory = base;
             ++g_gen_dead_marked;
+            ++it;
         }
+    }
+    if (gone) {
+        ++g_rt_gen;
+        bump_view_epoch();
     }
 }
 
@@ -16367,14 +16634,16 @@ std::string draw_gen_report_locked() {
 }
 
 std::string image_reuse_report_locked() {
-    char buf[640];
+    char buf[768];
     std::snprintf(buf, sizeof(buf),
-                  "targets and snapshots retired with their GX resource once idle %llu (%llu MiB), kept as drawn after it died %llu (by the "
+                  "targets and snapshots retired with their GX resource %llu (%llu MiB; %llu of them, %llu MiB, at once at a resolution or "
+                  "render-size change, the rest once idle), kept as drawn after it died %llu (by the "
                   "time it died %llu, later %llu), taken by a texture made over their memory without data %llu, waiting %llu, targets made "
                   "again there within the idle time %llu; "
                   "images retired as their memory went to newer objects: targets and snapshots %llu (%llu MiB), shader-written textures %llu "
                   "(%llu MiB); targets made again within the idle time %llu; %llu sweeps, %llu us on average, the longest %llu us",
                   static_cast<unsigned long long>(g_gen_retired_targets), static_cast<unsigned long long>(g_gen_retired_bytes >> 20),
+                  static_cast<unsigned long long>(g_gen_rebuild_n), static_cast<unsigned long long>(g_gen_rebuild_bytes >> 20),
                   static_cast<unsigned long long>(g_gen_kept_written + g_gen_adopted), static_cast<unsigned long long>(g_gen_kept_written),
                   static_cast<unsigned long long>(g_gen_adopted), static_cast<unsigned long long>(g_gen_taken_next),
                   static_cast<unsigned long long>(dead_targets_waiting_locked()),
@@ -16707,7 +16976,9 @@ struct ListCbArena {
     VkDeviceSize base = 0;      // where the arena begins in it
     std::atomic<bool> made{false};
     std::mutex mu;                                        // the pool threads' segment takes
-    std::uint64_t last_flip[kSegments] = {};              // its last commit's flip (under mu)
+    // Its last commit's flip: stored by the thread that copies into it (once a flip, no lock), read under mu by a
+    // take looking for a segment old enough to take again.
+    std::atomic<std::uint64_t> last_flip[kSegments] = {};
     std::atomic<std::uint64_t> max_serial[kSegments] = {};  // the newest recording a commit of it was spliced into
     std::atomic<std::uint64_t> lap[kSegments] = {};         // its takes so far
     std::uint32_t next = 0;                               // where the next take looks first (under mu)
@@ -16718,18 +16989,24 @@ struct ListCbCursor {  // a pool thread's segment
     std::uint32_t seg = ~0u;
     std::uint64_t lap = 0;
     VkDeviceSize next = 0;
+    std::uint64_t flip = 0;  // the flip it last stored as its segment's
 };
 thread_local ListCbCursor t_list_cb;
+// Segment `seg` used at `flip` by this thread: its last flip stored when it moved (a take sees a segment in use as
+// recent, and leaves it).
+inline void list_cb_used(std::uint32_t seg, std::uint64_t flip) {
+    std::atomic<std::uint64_t>& f = g_list_arena.last_flip[seg];
+    if (f.load(std::memory_order_relaxed) != flip) f.store(flip, std::memory_order_relaxed);
+}
 // A copy an earlier commit of this thread made in segment `seg` (lap `lap`)
 // bound again: the segment kept from being taken again meanwhile and noted for
-// the splice. False when it was taken again since.
+// the splice. False when it was taken again since. (No lock: the copy is of
+// this flip's call, so its segment was used within the flip and no take finds
+// it old.)
 bool list_cb_keep(std::uint32_t seg, std::uint64_t lap, ListNotes& notes) {
     ListCbArena& a = g_list_arena;
-    {
-        std::lock_guard<std::mutex> lk(a.mu);
-        if (a.lap[seg].load(std::memory_order_relaxed) != lap) return false;
-        a.last_flip[seg] = hle_video_flip_count();
-    }
+    if (a.lap[seg].load(std::memory_order_acquire) != lap) return false;
+    list_cb_used(seg, hle_video_flip_count());
     for (std::uint32_t k = 0; k < notes.nsegs; ++k) {
         if (notes.seg[k] == seg && notes.seg_lap[k] == lap) return true;
     }
@@ -16751,15 +17028,18 @@ bool list_cb_take(VkDeviceSize bytes, VkDeviceSize& at, ListNotes& notes) {
     ListCbCursor& c = t_list_cb;
     const std::uint64_t flip = hle_video_flip_count();
     VkDeviceSize off = (c.next + 255) & ~VkDeviceSize{255};
-    if (c.seg == ~0u || off + bytes > ListCbArena::kSegment) {
+    // (A segment of this thread's taken again by another meanwhile - this thread left it unused long enough to look
+    // old - is this thread's no more: a new one.)
+    if (c.seg == ~0u || off + bytes > ListCbArena::kSegment || a.lap[c.seg].load(std::memory_order_acquire) != c.lap) {
         std::lock_guard<std::mutex> lk(a.mu);
         const std::uint64_t completed = g_completed_submits_seen.load(std::memory_order_acquire);
         std::uint32_t found = ~0u;
         for (std::uint32_t k = 0; k < ListCbArena::kSegments; ++k) {
             const std::uint32_t s = (a.next + k) % ListCbArena::kSegments;
             if (s == c.seg) continue;
-            const bool old = !a.last_flip[s] || a.last_flip[s] + kListMaxAge + 2 < flip;
-            if (old && a.max_serial[s].load(std::memory_order_acquire) < completed + (a.last_flip[s] ? 0 : 1)) {
+            const std::uint64_t last = a.last_flip[s].load(std::memory_order_relaxed);
+            const bool old = !last || last + kListMaxAge + 2 < flip;
+            if (old && a.max_serial[s].load(std::memory_order_acquire) < completed + (last ? 0 : 1)) {
                 found = s;
                 break;
             }
@@ -16769,15 +17049,16 @@ bool list_cb_take(VkDeviceSize bytes, VkDeviceSize& at, ListNotes& notes) {
             return false;
         }
         a.next = (found + 1) % ListCbArena::kSegments;
-        a.last_flip[found] = flip;
+        a.last_flip[found].store(flip, std::memory_order_relaxed);
         a.max_serial[found].store(0, std::memory_order_relaxed);
         c.seg = found;
         c.lap = a.lap[found].fetch_add(1, std::memory_order_acq_rel) + 1;
+        c.flip = flip;
         a.takes.fetch_add(1, std::memory_order_relaxed);
         off = 0;
-    } else {
-        std::lock_guard<std::mutex> lk(a.mu);
-        a.last_flip[c.seg] = flip;
+    } else if (c.flip != flip) {
+        c.flip = flip;
+        list_cb_used(c.seg, flip);
     }
     c.next = off + bytes;
     at = static_cast<VkDeviceSize>(c.seg) * ListCbArena::kSegment + off;
@@ -16792,6 +17073,25 @@ bool list_cb_take(VkDeviceSize bytes, VkDeviceSize& at, ListNotes& notes) {
         }
     }
     return true;
+}
+
+// BBHOST_GXVK_LISTS_TIMES: a list-mode draw's constant buffer that stopped it for its lookups ('a constant
+// buffer's lookups'), by why it took no home: no GX records, no binding plan, a pointer pair, a binding that is no
+// constant-buffer record, no buffer object in its slot, a record naming no home (a renamed copy outside GX's upload
+// heap), a home not taken (stored to, empty, unaligned, a byte table, Scaleform's snapshots), a home not bound. The
+// first few logged.
+enum CbLookupsWhy : int { kClNoRecords, kClNoPlan, kClPointer, kClNotRecord, kClNoObject, kClNoHome, kClNotTaken, kClNotBound, kCbLookupsWhys };
+const char* const kCbLookupsWhyName[kCbLookupsWhys] = {"no records", "no binding plan", "a pointer", "not a buffer record", "no buffer in the slot",
+                                                       "no home (a renamed copy outside the heap)", "a home not taken", "a home not bound"};
+std::atomic<std::uint64_t> g_cb_lookups_why[kCbLookupsWhys] = {};
+std::atomic<int> g_cb_lookups_said{0};
+__attribute__((noinline)) void note_cb_lookups(int why, std::uint64_t base, VkDeviceSize bytes, int source, int slot, int plan_why) {
+    g_cb_lookups_why[why].fetch_add(1, std::memory_order_relaxed);
+    if (g_cb_lookups_said.fetch_add(1, std::memory_order_relaxed) < 12)
+        host_log("gxvk-lists: times: a constant buffer's lookups stopped a commit: %s - 0x%llx, %llu bytes; plan source %d slot %d why %d; "
+                 "pipeline %s",
+                 kCbLookupsWhyName[why], static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), source, slot, plan_why,
+                 t_draw_pipeline ? t_draw_pipeline : "?");
 }
 
 void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t* user, gcn::StageParams& params,
@@ -16961,7 +17261,21 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         // Stage 4b.1b's list mode: a range neither a home nor GX's upload heap
         // holds is answered by the copy versions, the GPU writes and the twins
         // as they stand at its splice's place, not this one's: in order.
-        if (t_run_draw && t_run_draw->list && !in_heap && outcome == kUnmapped && !known && base && run_part_stop(kRunStopBuffers)) return;
+        if (t_run_draw && t_run_draw->list && !in_heap && outcome == kUnmapped && !known && base) {
+            if (gxvk_lists::times() && t_run_draw->stop < 0) {  // (BBHOST_GXVK_LISTS_TIMES: why it took no home)
+                const GxBindingPlan* const bp = plan && i < plan->buffers.size() ? &plan->buffers[i] : nullptr;
+                const int why = !gx                                           ? kClNoRecords
+                                : !plan                                       ? kClNoPlan
+                                : b.pointer                                   ? kClPointer
+                                : !bp || bp->source != GxBindingPlan::kCb     ? kClNotRecord
+                                : !((gx->obj_cb_set >> bp->slot) & 1)         ? kClNoObject
+                                : !home_handle                                ? kClNoHome
+                                : !gxvk_homes::bind_on() || b.written || !bytes || (base & 3) || !shape || t_snapshot_cbs ? kClNotTaken
+                                                                              : kClNotBound;
+                note_cb_lookups(why, base, bytes, bp ? bp->source : -1, bp ? bp->slot : -1, bp ? bp->why : -1);
+            }
+            if (run_part_stop_buffers(kBsCbLookups)) return;
+        }
         if (!in_heap && outcome == kUnmapped && b.written) {
             if (copy_version_lookup_locked(base, bytes, &loc) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvWalks);
             loc = Located{};
@@ -17275,7 +17589,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     // list arena (list_cb_take), bound as the ring is; false: the draw stops.
                     const bool bound = [&]() __attribute__((noinline)) {
                         if (!snapshot && !known) {
-                            run_part_stop(kRunStopBuffers);
+                            run_part_stop_buffers(kBsCbArena);
                             return false;
                         }
                         VkDeviceSize copy_bytes = bytes;
@@ -17300,7 +17614,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         if (am.base == copy_from && am.bytes >= copy_bytes && am.flip == ln.call_flip &&
                             g_list_arena.lap[am.seg].load(std::memory_order_acquire) == am.lap && list_cb_keep(am.seg, am.lap, ln)) {
                             at = am.at;
-                            g_list_arena.shared.fetch_add(1, std::memory_order_relaxed);
+                            bump(g_list_arena.shared);  // (into the commit's sink: one locked add per draw no more)
                         } else {
                             if (!list_cb_take(copy_bytes, at, ln)) {
                                 run_part_stop(kRunStopRing);
@@ -17478,7 +17792,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 if (b.written && !twin_holds_live_locked(base, bytes)) shadow_written_locked(base, bytes, true);
             }
         }
-        if (outcome != kBound && base && run_part_stop(kRunStopBuffers)) return;  // its windows imported in order
+        if (outcome != kBound && base && run_part_stop_buffers(kBsCbPageTable)) return;  // its windows imported in order
         if (outcome != kBound) {
             // The shader walks the page table over the V#'s range: its windows
             // imported, and any copy-back still in its copy put in place first.
@@ -18367,7 +18681,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                 fb = had->whole;
                 how = had->snapped ? import_fallback::kCopy : import_fallback::kMirror;
             } else if (rec_bytes >= fe.offset + bytes) {
-                if (run_part_stop(kRunStopBuffers)) return false;  // a record in no import: copied in order
+                if (run_part_stop_buffers(kBsVertexNoImport)) return false;  // a record in no import: copied in order
                 how = shadow_import_fallback_locked(rec_va, rec_bytes, draw_read_bytes(w, stride, rec_bytes), fb);
             }
             if (how == import_fallback::kMirror && fb.avail > fe.offset) {
@@ -19195,7 +19509,7 @@ RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint3
             return r && !r->depth ? r : nullptr;
         }
         return target_image(9, base, fmt, pitch, padded_h, 0, 0, false, layers,
-                            static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), c.extent, clear_gen(c));
+                            static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), c.extent, clear_gen(c), kAskClear);
     }
     const VkFormat df = db_format(c.z_info, c.stencil_info);
     if (df == VK_FORMAT_UNDEFINED || !c.z_read_base) return nullptr;
@@ -19211,7 +19525,7 @@ RtImage* clear_view_target_locked(const GpuClearView& c, bool create, std::uint3
         return it != g_rts.end() && it->second.depth ? &it->second : nullptr;
     }
     const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
-    RtImage* r = target_image(9, dbase, df, w, h, 0, 0, true, layers, static_cast<std::uint64_t>(w) * h * bpp, c.extent, clear_gen(c));
+    RtImage* r = target_image(9, dbase, df, w, h, 0, 0, true, layers, static_cast<std::uint64_t>(w) * h * bpp, c.extent, clear_gen(c), kAskClear);
     if (r) {
         // What a draw binding the view learns about its HTILE, so fills of
         // that HTILE from anywhere else still find the target.
@@ -22072,8 +22386,7 @@ bool host_gpu_draw(const GpuDraw& d) {
 // counted by what the draw is when not known.
 std::uint32_t target_gen(const GpuDraw& d, std::uint32_t gen) {
     if (gen) return gen;
-    const char* kind = d.gx_token ? d.gx_token_kind : nullptr;
-    ++g_draw_gen_none[!d.gx_token ? 3 : kind && std::strcmp(kind, "yebis") == 0 ? 1 : kind && std::strcmp(kind, "scaleform") == 0 ? 2 : 0];
+    ++g_draw_gen_none[target_asker(d)];
     return 0;
 }
 
@@ -22166,7 +22479,7 @@ void draw_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, DrawT
                  {static_cast<std::uint32_t>(draw_rect.x1 - draw_rect.x0), static_cast<std::uint32_t>(draw_rect.y1 - draw_rect.y0)}};
 
     // The screen and generic scissors' bottom edge is the target's real
-    // height (see unpadded_height); the CB registers only give the padded
+    // height (see learned_extent_locked); the CB registers only give the padded
     // one. The viewport scissor is per draw, so it does not size targets.
     const int x1 = target_rect.x1, y1 = target_rect.y1;
     const std::uint32_t scissor_bottom = y1 > 0 && y1 < 16384 ? static_cast<std::uint32_t>(y1) : 0u;
@@ -22199,7 +22512,7 @@ void draw_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, DrawT
         const std::uint32_t slice_start = linear_general ? 0 : std::min(c[3] & 0x7ff, layers - 1);
         s.color[t] = target_image(t, base, fmt, pitch, padded_h, scissor_right, scissor_bottom, false, layers,
                                   static_cast<std::uint64_t>(pitch) * padded_h * format_bytes_per_pixel(fmt), in.color_extent[t],
-                                  target_gen(d, in.color_gen[t]));
+                                  target_gen(d, in.color_gen[t]), kAskGx, &d);
         out.looked[t] = s.color[t];
         out.reached |= 1u << t;
         textures_census_target(0, in.color_gen[t] != 0, g_target_memo_hit);
@@ -22279,7 +22592,7 @@ void draw_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, DrawT
                 const std::uint32_t layers = ((in.depth_view >> 13) & 0x7ff) + 1;
                 const std::size_t bpp = df == VK_FORMAT_D16_UNORM ? 2 : 4;
                 s.depth = target_image(8, dbase, df, w, h, scissor_right, scissor_bottom, true, layers,
-                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent, target_gen(d, in.depth_gen));
+                                       static_cast<std::uint64_t>(w) * h * bpp, in.depth_extent, target_gen(d, in.depth_gen), kAskGx, &d);
                 out.looked[8] = s.depth;
                 out.reached |= 1u << 8;
                 textures_census_target(1, in.depth_gen != 0, g_target_memo_hit);
@@ -22649,11 +22962,14 @@ thread_local std::uint32_t t_list_names[kTargetNames];
 void run_targets_part(const GpuDrawInputs& in, DrawState& s) {
     const bool list = t_run_draw && t_run_draw->list;
     const RunTargets& m = list ? *t_list_targets : *g_run_shared_targets;
-    std::uint32_t now[kTargetNames];
-    target_names(in, now);
-    if (std::memcmp(now, list ? t_list_names : g_run_first_names, sizeof(now)) != 0) {
-        run_part_stop(kRunStopTargets);
-        return;
+    // (A list-mode draw's names are those its commit looked its targets up by, from these very inputs.)
+    if (!list) {
+        std::uint32_t now[kTargetNames];
+        target_names(in, now);
+        if (std::memcmp(now, g_run_first_names, sizeof(now)) != 0) {
+            run_part_stop(kRunStopTargets);
+            return;
+        }
     }
     const DrawScissor target_rect = draw_scissor(in, false);
     DrawScissor draw_rect = target_rect;
@@ -23118,7 +23434,8 @@ void publish_run_targets_locked(const RunTargets& m);  // stage 4b.1b (below)
 static bool draw_impl(const GpuDraw& d) {
     g_draw_dummies = 0;  // the draw record takes the count of this draw's
     t_draw_pipeline = nullptr;
-    g.draw_calls.fetch_add(1, std::memory_order_relaxed);
+    if (list_draw()) bump(g.draw_calls);  // (a pool thread's: into its commit's sink, not a locked add on the command processor's line)
+    else g.draw_calls.fetch_add(1, std::memory_order_relaxed);
     // BBHOST_PASS_BREAK=<n>: end the render pass before every n-th draw, the
     // way a tessellated draw's compute pass has to. A check on whether that
     // churn is what washes a frame out.
@@ -23844,6 +24161,7 @@ static bool draw_impl(const GpuDraw& d) {
     // The cutaway per pixel: the camera draws' pixel stages, with the draw's
     // viewport to take each pixel back to view space.
     s.pixel_cut_on = false;
+    s.pixel_cut_live = false;
     // The G-buffer's stencil marks what a draw is: the map's own pieces 9;
     // the characters (players, enemies, their parts) and the map's objects
     // (furniture, crates, lamps) alike 8, and a few of either 12 - neither
@@ -23875,17 +24193,49 @@ static bool draw_impl(const GpuDraw& d) {
         s.pixel_cut.offset_x = s.vport[1];
         s.pixel_cut.scale_y = s.vport[2];
         s.pixel_cut.offset_y = s.vport[3];
-        s.pixel_cut.tan_x = std::round(view_tan[0] * 1024.0f) / 1024.0f;
-        s.pixel_cut.tan_y = std::round(view_tan[1] * 1024.0f) / 1024.0f;
-        s.pixel_cut.depth_z = bits12(view_depth[0]);
-        s.pixel_cut.depth_w = bits12(view_depth[1]);
-        if (chr_or_obj) s.pixel_cut.distance = std::round(s.pixel_cut.distance * (1.0f - object_start) * 4.0f) / 4.0f;
+        s.pixel_cut_live = pixel_cut_live_address() != 0;
+        if (s.pixel_cut_live) {
+            // The numbers into the live buffer; the key keeps the viewport,
+            // the fixed height, margin and feather, and which cone it is.
+            PixelCutLive n{};
+            n.tan_x = view_tan[0];
+            n.tan_y = view_tan[1];
+            n.distance = s.pixel_cut.distance;
+            n.sin_pitch = s.pixel_cut.sin_pitch;
+            n.cos_pitch = s.pixel_cut.cos_pitch;
+            n.radius = s.pixel_cut.radius;
+            n.widen = s.pixel_cut.widen;
+            n.depth_z = view_depth[0];
+            n.depth_w = view_depth[1];
+            const float objects = scene_look_object_cut();
+            n.object_distance = objects >= 0.0f ? s.pixel_cut.distance * (1.0f - objects) : s.pixel_cut.distance;
+            pixel_cut_live_write(n);
+            const PixelCut c = s.pixel_cut;
+            s.pixel_cut = PixelCut{};
+            s.pixel_cut.scale_x = c.scale_x;
+            s.pixel_cut.offset_x = c.offset_x;
+            s.pixel_cut.scale_y = c.scale_y;
+            s.pixel_cut.offset_y = c.offset_y;
+            s.pixel_cut.height = c.height;
+            s.pixel_cut.margin = c.margin;
+            s.pixel_cut.feather = c.feather;
+            s.pixel_cut.distance = chr_or_obj ? 2.0f : 1.0f;
+        } else {
+            s.pixel_cut.tan_x = std::round(view_tan[0] * 1024.0f) / 1024.0f;
+            s.pixel_cut.tan_y = std::round(view_tan[1] * 1024.0f) / 1024.0f;
+            s.pixel_cut.depth_z = bits12(view_depth[0]);
+            s.pixel_cut.depth_w = bits12(view_depth[1]);
+            // Rounded: each new set is a new twin of every camera draw's pixel stage.
+            s.pixel_cut.distance = std::round(s.pixel_cut.distance * (chr_or_obj ? 1.0f - object_start : 1.0f) * 4.0f) / 4.0f;
+            s.pixel_cut.radius = std::round(s.pixel_cut.radius * 4.0f) / 4.0f;
+        }
         s.pixel_cut_on = true;
         key = fnv1a(&s.pixel_cut, sizeof(s.pixel_cut), key ^ kPixelCutSalt);
         static std::atomic<int> said{0};
         if (said.fetch_add(1, std::memory_order_relaxed) == 0)
-            host_log("render: cutaway: the view's tangents %.3f %.3f, depth 1 / (%g z + %g)", static_cast<double>(s.pixel_cut.tan_x),
-                     static_cast<double>(s.pixel_cut.tan_y), static_cast<double>(s.pixel_cut.depth_z), static_cast<double>(s.pixel_cut.depth_w));
+            host_log("render: cutaway: the view's tangents %.3f %.3f, depth 1 / (%g z + %g)%s", static_cast<double>(view_tan[0]),
+                     static_cast<double>(view_tan[1]), static_cast<double>(view_depth[0]), static_cast<double>(view_depth[1]),
+                     s.pixel_cut_live ? ", read live" : "");
     }
     draw_stamp.to(kRenderCostKey);
     GpuPhaseTimer pipeline_timer(kPhasePipeline, phase_weight);
@@ -24572,7 +24922,9 @@ static bool draw_impl(const GpuDraw& d) {
             // pre-execution CPU state.
             flush_locked();
             {
+                static constexpr slow_calls::Site kDetailIdle{slow_calls::kQueueIdle, "a draw's detail"};
                 QueueGuard queue;
+                slow_calls::Scope timed(kDetailIdle);
                 vkQueueWaitIdle(g.queue);  // not the device: the presenter's queue is not ours to wait on
             }
             host_log("render: detail for %s: index_va=0x%llx type=%u count=%u", pl.name.c_str(),
@@ -26214,6 +26566,19 @@ static bool draw_impl(const GpuDraw& d) {
                 for (const StageImages::Image& im : stage_images[st].images) reads |= im.resolved && image_base(im) == scene_base;
             }
             RtImage* scene = reads ? find_render_target(scene_base) : nullptr;
+            // The scene is a float target. After a rebuild of the targets (a
+            // render size back to native: FSR -> TAA) its old address can be
+            // another target's, an 8-bit one, until YEBIS's copy names the
+            // new scene: the upscaler ran on it and blitted its picture back
+            // into it - other surfaces' colours broken. Forgotten instead.
+            if (scene && scene->format != VK_FORMAT_R16G16B16A16_SFLOAT && scene->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
+                scene->format != VK_FORMAT_R32G32B32A32_SFLOAT) {
+                host_log("upscaler: 0x%llx is format %d now, not the scene; waiting for YEBIS's copy to name it",
+                         static_cast<unsigned long long>(scene_base), static_cast<int>(scene->format));
+                scene_base = 0;
+                depth_base = 0;
+                scene = nullptr;
+            }
             RtImage* depth = scene ? find_render_target(depth_base) : nullptr;
             if (scene && depth && depth->depth && scene->last_write != u.done_write) {
                 if (part) {
@@ -26262,13 +26627,16 @@ static bool draw_impl(const GpuDraw& d) {
     // drawn into the display buffer: a rect pass copies a target of the same
     // size into it (89cda9e4+38d65b32, with a table), and the HUD is drawn
     // into that target first. So the target is learned from that pass, copied
-    // before its first triangle-list draw (the HUD's) once the post chain's
-    // last passes have written it, and the copy handed over with the display
-    // buffer the pass then writes. A plugin's dither (scene_dither) goes over
-    // the target at the same point, before the copy.
+    // before its first triangle-list draw (the HUD's) once the frame's picture
+    // is in it, and the copy handed over with the display buffer the pass then
+    // writes. A plugin's dither (scene_dither) goes over the target at the
+    // same point, before the copy.
     const std::uint32_t dither = scene_look_dither();
     if ((upscale_pass_hudless_due_locked() || dither) && s.color[0]) {
         static std::uint64_t hud_target = 0;
+        // The target's last write (RtImage::last_write) as the display
+        // buffer's pass read it: a write since is the next frame's.
+        static std::uint64_t shown_write = 0;
         static bool target_written = false, hud_begun = false;
         const std::uint64_t dst = s.color[0]->base;
         if (hle_video_is_display_buffer(dst)) {
@@ -26279,6 +26647,7 @@ static bool draw_impl(const GpuDraw& d) {
                     if (t && t->width == s.color[0]->width && t->height == s.color[0]->height) {
                         if (hud_target != t->base) host_log("framegen: the HUD's target is 0x%llx", static_cast<unsigned long long>(t->base));
                         hud_target = t->base;
+                        shown_write = t->last_write;
                         break;
                     }
                 }
@@ -26287,11 +26656,17 @@ static bool draw_impl(const GpuDraw& d) {
             target_written = false;
             hud_begun = false;
         } else if (dst == hud_target) {
-            // The post chain's last passes write it as strips (prim 6) or
-            // rects; the HUD's first draw is a triangle list (prim 4).
-            if (s.prim != 4) {
-                target_written = true;
-            } else if (target_written && !hud_begun) {
+            // At the display buffers' size the post chain's last passes write
+            // it, as strips (prim 6) or rects; the HUD's first draw is a
+            // triangle list (prim 4). At another size - a Resolution other
+            // than the screen's with Upscaling off or TAA, the scene in a
+            // target of its own (engine/live_resolution.cpp) - the post chain
+            // ends in that target and the picture comes into this one by a
+            // copy, which no draw here sees: only the HUD's triangles were,
+            // so no HUD-less picture was ever taken and frame generation never
+            // generated. So any write since the display buffer's pass counts.
+            if (s.prim != 4 || s.color[0]->last_write != shown_write) target_written = true;
+            if (s.prim == 4 && target_written && !hud_begun) {
                 if (part) {
                     run_part_stop(kRunStopOrder);
                     return false;
@@ -27807,13 +28182,15 @@ enum SpliceWhy : int {
     kSwOther,         // windows given, a run commit or a diagnostic at the walk
     kSwCompare,       // splice-compare: drawn in order by design
     kSwSegment,       // stage 4b.2: a segment's builder holds it (its segment not spliced here)
+    kSwRested,        // stored while the pool rested at a frame cap (gxvk_lists::resting): never fed
     kSpliceWhys
 };
 const char* const kSpliceWhyName[kSpliceWhys] = {"not committed", "not committed yet", "a run's first draw", "a split since its run's first",
                                                  "its run's targets remade or owed work", "other target objects",
                                                  "another pass",  "too old",           "a hazard",           "an owed clear",
                                                  "a view",        "a set",             "a home",             "its copies' segment",
-                                                 "occlusion",     "other",             "compare",           "held by a segment"};
+                                                 "occlusion",     "other",             "compare",           "held by a segment",
+                                                 "the pool resting"};
 
 struct Segment;
 struct ListCommit {
@@ -27835,8 +28212,56 @@ struct ListCommit {
     // ready (written by the builder before the draw's state says segment).
     Segment* seg = nullptr;
     std::uint64_t seg_word = 0;
+    // BBHOST_GXVK_LISTS_TIMES: when the commit began and ended (rdtsc).
+    std::atomic<std::uint64_t> t0{0}, t1{0};
 };
 constexpr std::uint64_t kListCommits = 16384;  // as the token slots: token `id`'s record is id's slot index
+static_assert(kListCommits == gxvk_lists::detail::kTimeSlots, "a draw's times are kept by its commit's index");
+
+// BBHOST_GXVK_LISTS_TIMES (host/gxvk_lists.h times): the commit's time by
+// part, kept per pool thread and added to the totals every 128 commits.
+enum CommitPart : int { kCpBegin, kCpPin, kCpKind, kCpLock, kCpDraw, kCpEnd, kCommitParts };
+const char* const kCommitPartName[kCommitParts] = {"begin", "pin", "kind and targets", "lock and config", "draw", "end"};
+// And the refusals' finer reasons: a kind refused by what made it so (tessellated, a geometry shader, indirect, other
+// stages, no count, no geometry), a draw with no published targets by why (none published under its names' slot,
+// another run's names there, the slot being written).
+enum KindWhy : int { kKwTess, kKwGs, kKwIndirect, kKwStages, kKwCount, kKwGeometry, kKindWhys };
+const char* const kKindWhyName[kKindWhys] = {"tessellated", "a geometry shader", "indirect", "other stages", "no count", "no geometry"};
+enum TargetsWhy : int { kTwNone, kTwOther, kTwBusy, kTargetsWhys };
+const char* const kTargetsWhyName[kTargetsWhys] = {"none published", "another run's names", "being written"};
+thread_local int t_find_why = kTwNone;  // find_run_targets' why, when it finds none
+struct CommitTimes {
+    std::uint64_t part[kCommitParts] = {};
+    std::uint64_t ok = 0, ok_ticks = 0, refused = 0, refused_ticks = 0, n = 0;
+    std::uint64_t kind_why[kKindWhys] = {}, targets_why[kTargetsWhys] = {}, buffers_why[kBuffersStops] = {};
+};
+thread_local CommitTimes t_commit_times;
+std::atomic<std::uint64_t> g_commit_part[kCommitParts] = {}, g_commit_ok{0}, g_commit_ok_ticks{0}, g_commit_refused{0},
+    g_commit_refused_ticks{0}, g_kind_why[kKindWhys] = {}, g_targets_why[kTargetsWhys] = {}, g_buffers_why[kBuffersStops] = {};
+const char* const kBuffersStopName[kBuffersStops] = {"a constant buffer's lookups", "a constant buffer for the arena", "a page-table read",
+                                                     "a vertex record in no import", "a twin candidate", "the vertex copies' ring in host memory"};
+// The per-draw splice's finer in-order reasons (the command processor's, with the times): a run's first draw with no
+// run open at all / another run open; a split since its run's first by the split's kind (list_resolve::Split).
+struct SpliceCensus {
+    std::atomic<std::uint64_t> first[2] = {};
+    std::atomic<std::uint64_t> split[list_resolve::kSplits + 1] = {};
+};
+SpliceCensus g_splice_census;
+const char* const kSplitName[list_resolve::kSplits + 1] = {"targets", "wait",  "label",      "copy",     "dispatch",  "query",      "other draw",
+                                                           "cp write", "predication", "constant engine", "call", "packet draw", "submission", "none"};
+// A count only the command processor adds to.
+void arr_bump(std::atomic<std::uint64_t>& a) { a.store(a.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+void commit_times_flush(CommitTimes& t) {
+    for (int k = 0; k < kBuffersStops; ++k) g_buffers_why[k].fetch_add(t.buffers_why[k], std::memory_order_relaxed);
+    for (int k = 0; k < kKindWhys; ++k) g_kind_why[k].fetch_add(t.kind_why[k], std::memory_order_relaxed);
+    for (int k = 0; k < kTargetsWhys; ++k) g_targets_why[k].fetch_add(t.targets_why[k], std::memory_order_relaxed);
+    for (int k = 0; k < kCommitParts; ++k) g_commit_part[k].fetch_add(t.part[k], std::memory_order_relaxed);
+    g_commit_ok.fetch_add(t.ok, std::memory_order_relaxed);
+    g_commit_ok_ticks.fetch_add(t.ok_ticks, std::memory_order_relaxed);
+    g_commit_refused.fetch_add(t.refused, std::memory_order_relaxed);
+    g_commit_refused_ticks.fetch_add(t.refused_ticks, std::memory_order_relaxed);
+    t = CommitTimes{};
+}
 ListCommit* g_list_commits = nullptr;
 std::once_flag g_list_commits_made;
 ListCommit* list_commits() {
@@ -27856,11 +28281,14 @@ struct PubTargets {
     std::uint64_t erase_gen = 0;  // g_rt_erase_gen when published
     std::uint64_t flip = 0;       // and the flip (a publication older than kRtPubAge flips is not taken)
 };
-constexpr std::uint32_t kPubTargets = 2048;  // (direct-mapped: ~80 runs a flip)
-PubTargets g_pub_targets[kPubTargets];
+// Two ways a set, by the names' hash (~80 runs a flip): direct-mapped, a run
+// whose names shared a slot with another's lost its publication whenever the
+// other published, and its draws were refused ('targets').
+constexpr std::uint32_t kPubSets = 2048, kPubWays = 2;
+PubTargets g_pub_targets[kPubSets * kPubWays];
 std::atomic<std::uint64_t> g_pub_writes{0};
-std::uint32_t pub_slot(const std::uint32_t* names) {
-    return static_cast<std::uint32_t>(fnv1a(names, sizeof(std::uint32_t) * kTargetNames)) & (kPubTargets - 1);
+std::uint32_t pub_set(const std::uint32_t* names) {
+    return (static_cast<std::uint32_t>(fnv1a(names, sizeof(std::uint32_t) * kTargetNames)) & (kPubSets - 1)) * kPubWays;
 }
 void names_of(const RunTargets& m, std::uint32_t (&n)[kTargetNames]) {
     GpuDrawInputs f{};
@@ -27908,7 +28336,22 @@ void publish_run_targets_locked(const RunTargets& m) {
     if (!m.valid) return;
     std::uint32_t n[kTargetNames];
     names_of(m, n);
-    PubTargets& p = g_pub_targets[pub_slot(n)];
+    // The way that holds these names, else the one published longer ago (an empty one first). (The command
+    // processor alone writes the slots: their names and flips are read here without the seqlock.)
+    PubTargets* const set = &g_pub_targets[pub_set(n)];
+    PubTargets* way = nullptr;
+    for (std::uint32_t k = 0; k < kPubWays && !way; ++k) {
+        if (set[k].seq.load(std::memory_order_relaxed) && std::memcmp(set[k].names, n, sizeof(n)) == 0) way = &set[k];
+    }
+    if (!way) {
+        way = &set[0];
+        for (std::uint32_t k = 1; k < kPubWays; ++k) {
+            const bool empty = !set[k].seq.load(std::memory_order_relaxed);
+            if (empty || (way->seq.load(std::memory_order_relaxed) && set[k].flip < way->flip)) way = &set[k];
+            if (empty) break;
+        }
+    }
+    PubTargets& p = *way;
     const std::uint64_t erase_gen = g_rt_erase_gen.load(std::memory_order_acquire);
     if (p.seq.load(std::memory_order_relaxed) && p.erase_gen == erase_gen && p.flip + kRtPubAge / 2 >= hle_video_flip_count() &&
         std::memcmp(p.names, n, sizeof(n)) == 0 &&
@@ -27928,41 +28371,56 @@ void publish_run_targets_locked(const RunTargets& m) {
 namespace {
 
 bool find_run_targets(const std::uint32_t (&n)[kTargetNames], RunTargets& out, std::uint64_t& erase_gen, std::uint64_t& flip) {
-    PubTargets& p = g_pub_targets[pub_slot(n)];
     // The thread's last copy, when it is this slot's publication still (the
-    // draws of a run commit one after another): not copied again. `out` is the
-    // caller's own (lists_commit's thread-local).
+    // draws of a run commit one after another): not copied again - told by its
+    // names before the slot's hash is worked out. `out` is the caller's own
+    // (lists_commit's thread-local).
     static thread_local const PubTargets* last = nullptr;
     static thread_local std::uint64_t last_seq = 0, last_erase = 0, last_flip = 0;
     static thread_local const RunTargets* last_out = nullptr;
-    if (last == &p && last_out == &out && p.seq.load(std::memory_order_acquire) == last_seq && std::memcmp(p.names, n, sizeof(n)) == 0) {
-        if (p.seq.load(std::memory_order_acquire) == last_seq) {
+    static thread_local std::uint32_t last_names[kTargetNames] = {};
+    if (last && last_out == &out && std::memcmp(last_names, n, sizeof(n)) == 0 && last->seq.load(std::memory_order_acquire) == last_seq &&
+        std::memcmp(last->names, n, sizeof(n)) == 0) {
+        if (last->seq.load(std::memory_order_acquire) == last_seq) {
             erase_gen = last_erase;
             flip = last_flip;
             return true;
         }
     }
-    for (int tries = 0; tries < 4; ++tries) {
-        const std::uint64_t s0 = p.seq.load(std::memory_order_acquire);
-        if (!s0 || (s0 & 1)) continue;
-        const bool same = std::memcmp(p.names, n, sizeof(n)) == 0;
-        if (same) {
-            out = p.m;
-            erase_gen = p.erase_gen;
-            flip = p.flip;
-        }
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (p.seq.load(std::memory_order_relaxed) == s0) {
+    // Each way of the names' set, its publication read under its seqlock: one that holds these names.
+    PubTargets* const set = &g_pub_targets[pub_set(n)];
+    int why = kTwNone;  // (none published in the set, another run's names there, or a way being written throughout)
+    for (std::uint32_t k = 0; k < kPubWays; ++k) {
+        PubTargets& p = set[k];
+        for (int tries = 0; tries < 4; ++tries) {
+            const std::uint64_t s0 = p.seq.load(std::memory_order_acquire);
+            if (!s0) break;
+            if (s0 & 1) {
+                if (tries == 3 && why == kTwNone) why = kTwBusy;
+                continue;
+            }
+            const bool same = std::memcmp(p.names, n, sizeof(n)) == 0;
+            if (same) {
+                out = p.m;
+                erase_gen = p.erase_gen;
+                flip = p.flip;
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (p.seq.load(std::memory_order_relaxed) != s0) continue;
             if (same) {
                 last = &p;
                 last_seq = s0;
                 last_erase = erase_gen;
                 last_flip = flip;
                 last_out = &out;
+                std::memcpy(last_names, n, sizeof(last_names));
+                return true;
             }
-            return same;
+            why = kTwOther;
+            break;
         }
     }
+    t_find_why = why;
     return false;
 }
 
@@ -27990,23 +28448,63 @@ bool list_config_ok_locked() {
 
 }  // namespace
 
+namespace {
+// A pool thread's statistics - those its commits' draws bump (bump: into the sink) and the commits' own counts - added to
+// the totals every 64 commits (each a locked add on a line the other pool thread or the command processor writes too).
+thread_local BumpSink t_commit_sink;
+struct CommitCounts {
+    std::uint64_t looked = 0, committed = 0, ns = 0, why[kListWhys] = {};
+    std::uint32_t n = 0;
+};
+thread_local CommitCounts t_commit_counts;
+void commit_counts_flush() {
+    CommitCounts& k = t_commit_counts;
+    t_commit_sink.merge_atomic();
+    if (k.looked) g_lc_looked.fetch_add(k.looked, std::memory_order_relaxed);
+    if (k.committed) g_lc_committed.fetch_add(k.committed, std::memory_order_relaxed);
+    if (k.ns) g_lc_ns.fetch_add(k.ns, std::memory_order_relaxed);
+    for (int w = 0; w < kListWhys; ++w) {
+        if (k.why[w]) g_lc_why[w].fetch_add(k.why[w], std::memory_order_relaxed);
+    }
+    k = CommitCounts{};
+}
+}  // namespace
+
 namespace gpu {
+// A pool thread ending (gxvk_lists_pool.cpp): what its commits counted, added.
+void lists_thread_end() {
+    commit_counts_flush();
+    commit_times_flush(t_commit_times);
+}
+
 void lists_commit(std::uint64_t id) {
     ListCommit* const all = list_commits();
     ListCommit& c = all[id & (kListCommits - 1)];
     const auto t0 = std::chrono::steady_clock::now();
-    g_lc_looked.fetch_add(1, std::memory_order_relaxed);
+    CommitCounts& counts = t_commit_counts;
+    ++counts.looked;
     // (A record a segment's builder is recording from is not taken: it reads its packet.)
     std::uint64_t w = c.word.load(std::memory_order_acquire);
     if (lc_state(w) == kLcCommitting || lc_state(w) == kLcBuilding ||
         !c.word.compare_exchange_strong(w, lc_word(id, kLcCommitting), std::memory_order_acq_rel)) {
-        g_lc_why[kLwBusy].fetch_add(1, std::memory_order_relaxed);
+        ++counts.why[kLwBusy];
         return;
     }
     c.id = id;
     c.seg = nullptr;
     c.why = -1;
     c.flip = hle_video_flip_count();
+    // BBHOST_GXVK_LISTS_TIMES: the commit's parts, timed.
+    const bool timed = gxvk_lists::times();
+    const std::uint64_t tsc0 = timed ? __builtin_ia32_rdtsc() : 0;
+    std::uint64_t mark = tsc0;
+    const auto lap = [&](int part) {
+        if (!timed) return;
+        const std::uint64_t now = __builtin_ia32_rdtsc();
+        t_commit_times.part[part] += now - mark;
+        mark = now;
+    };
+    if (timed) c.t0.store(tsc0, std::memory_order_relaxed);
     bool pinned = false;
     const auto finish = [&](int why) {
         // The slot given back first: a committed record says the pool reads
@@ -28014,17 +28512,28 @@ void lists_commit(std::uint64_t id) {
         if (pinned) hle_gx_native_unpin(id);
         pinned = false;
         c.why = why;
-        if (why < 0) g_lc_committed.fetch_add(1, std::memory_order_relaxed);
-        else g_lc_why[why].fetch_add(1, std::memory_order_relaxed);
-        g_lc_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()),
-                          std::memory_order_relaxed);
+        if (why < 0) ++counts.committed;
+        else ++counts.why[why];
+        counts.ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        if (++counts.n >= 64 || t_commit_sink.nused >= BumpSink::kSlots / 2) commit_counts_flush();
+        if (timed) {
+            lap(kCpEnd);
+            CommitTimes& t = t_commit_times;
+            if (why == kRunStopBuffers && t_buffers_stop >= 0 && t_buffers_stop < kBuffersStops) ++t.buffers_why[t_buffers_stop];
+            (why < 0 ? t.ok : t.refused) += 1;
+            (why < 0 ? t.ok_ticks : t.refused_ticks) += mark - tsc0;
+            c.t1.store(mark, std::memory_order_relaxed);
+            if (++t.n == 128) commit_times_flush(t);
+        }
         c.word.store(lc_word(id, why < 0 ? kLcCommitted : kLcNot), std::memory_order_release);
     };
     if (!recorder_list_packet_free(id)) return finish(kLwBusy);
     static thread_local GpuDrawInputs in;
     static thread_local GxDrawObjects o;
     bool own_records = false;
+    lap(kCpBegin);
     if (!hle_gx_native_pin_copy(id, in, o, &own_records)) return finish(kLwLate);
+    lap(kCpPin);
     pinned = true;
     // (Its records copied for this thread: the slot given back now, so the command processor's take never waits for
     // the commit - a draw it reaches first is drawn in order.)
@@ -28032,7 +28541,13 @@ void lists_commit(std::uint64_t id) {
         hle_gx_native_unpin(id);
         pinned = false;
     }
-    if (!o.geometry || !o.count || o.indirect_va || (in.stages & 0x7) || in.gs || in.tess) return finish(kLwKind);
+    if (!o.geometry || !o.count || o.indirect_va || (in.stages & 0x7) || in.gs || in.tess) {
+        if (timed) {
+            ++t_commit_times.kind_why[in.tess ? kKwTess : in.gs ? kKwGs : o.indirect_va ? kKwIndirect : (in.stages & 0x7) ? kKwStages
+                                      : !o.count ? kKwCount : kKwGeometry];
+        }
+        return finish(kLwKind);
+    }
     // The draw as the walk's take of its token gives it (gnm_exec.cpp native_draw).
     static const std::uint32_t no_registers[0x1000] = {};
     GpuDraw d;
@@ -28052,13 +28567,17 @@ void lists_commit(std::uint64_t id) {
     target_names(in, c.names);
     static thread_local RunTargets targets;
     std::uint64_t erase_gen = 0, pub_flip = 0;
-    if (!find_run_targets(c.names, targets, erase_gen, pub_flip)) return finish(kLwTargets);
+    if (!find_run_targets(c.names, targets, erase_gen, pub_flip)) {
+        if (timed) ++t_commit_times.targets_why[t_find_why];
+        return finish(kLwTargets);
+    }
     // Its targets stay allocated while it may use them - let go, they lie in
     // the graveyard (rt_bury_locked) - if the publication is recent enough.
     if (pub_flip + kRtPubAge < c.flip) return finish(kLwRemade);
     c.erase_gen = erase_gen;
     std::memcpy(c.looked, targets.out.looked, sizeof(c.looked));
     c.reached = targets.out.reached;
+    lap(kCpKind);
     // Beside the command processor: the caches and maps it reads under the
     // readers' lock (host/cache_rw.h), which every change they could see takes
     // exclusive - a target let go, a pipeline, set, program or view made.
@@ -28071,26 +28590,42 @@ void lists_commit(std::uint64_t id) {
     if (locked) lock.lock();
     cache_rw::Read rd;
     if (!list_config_ok_locked()) return finish(kLwConfig);
+    lap(kCpLock);
     // (A target let go since it was published is still allocated - the graveyard - with its format and size as
     // published; the splice binds the commit only to a run whose targets are these very objects.)
     c.notes.clear();
     c.notes.packet_index = id & (kListCommits - 1);
     c.notes.call_flip = o.call_flip;
-    RunDraw r;
+    // The thread's own, its fields set for each draw - all but the run commit's compare digest (2 KiB), which a
+    // list-mode draw never writes or reads: one constructed for each draw spent ~0.25 us zeroing it.
+    static thread_local RunDraw r;
+    r.params_next = r.params_end = 0;
+    r.packet = r.record = 0;
     r.part = true;
+    r.started = false;
+    r.stop = -1;
+    r.part_index = 0;
+    r.effects = 0;
+    r.fresh_packet = false;
+    r.drew = nullptr;
+    r.drew_gx = false;
+    r.vs_other = nullptr;
+    r.vs_other_why = 0;
     r.list = &c.notes;
     t_part_recorded = RecordedState{};  // its packet binds everything it draws with
-    static thread_local BumpSink sink;
+    BumpSink& sink = t_commit_sink;
     t_bump_sink = &sink;
     t_list_targets = &targets;
     std::memcpy(t_list_names, c.names, sizeof(c.names));
     t_run_draw = &r;
     const bool ok = draw_impl(d);
+    lap(kCpDraw);
     t_run_draw = nullptr;
     t_list_targets = nullptr;
     t_bump_sink = nullptr;
+    // The statistics its draws bumped go to the counters with the commits' own (finish: every 64 commits - a locked add
+    // a counter at every commit took ~0.25 us of it - and when the thread ends, lists_thread_end); under g.mu at once.
     if (locked) sink.merge();
-    else sink.merge_atomic();
     if (run_digest_on()) c.digest = t_run_digest;
     __builtin_ia32_sfence();  // its copies into write-combined memory leave this core first
     if (r.stop >= 0) return finish(r.stop);
@@ -28150,6 +28685,10 @@ void splice_compare_locked(const ListCommit& c) {
 
 }  // namespace
 
+namespace {
+bool segment_release_member(std::uint64_t id);  // (stage 4b.2, below)
+}  // namespace
+
 // The command processor at GX-native draw token `id` (gnm_exec.cpp), its slot
 // taken: true when the pool's commit of its draw was spliced into the stream -
 // the draw is done; false when it is to be drawn in order (counted by why).
@@ -28165,14 +28704,16 @@ bool host_gpu_splice(std::uint64_t id) {
     const std::uint64_t cw = c.word.load(std::memory_order_acquire);
     const std::uint32_t st = lc_state(cw);
     if (lc_id(cw) != id || st == kLcCommitting || st == kLcFree) {
-        g_sp_why[kSwPending].fetch_add(1, std::memory_order_relaxed);
+        g_sp_why[lc_id(cw) != id && gxvk_lists::resting() ? kSwRested : kSwPending].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    if (st == kLcBuilding || st == kLcSegment) {
+    std::uint64_t cw_now = cw;
+    if (st == kLcSegment && segment_release_member(id)) cw_now = c.word.load(std::memory_order_acquire);  // (its segment given up)
+    if (lc_id(cw_now) != id || lc_state(cw_now) == kLcBuilding || lc_state(cw_now) == kLcSegment) {
         g_sp_why[kSwSegment].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    if (st != kLcCommitted) {
+    if (lc_state(cw_now) != kLcCommitted) {
         g_sp_why[kSwNotCommitted].fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -28193,11 +28734,20 @@ bool host_gpu_splice(std::uint64_t id) {
     // The run open on this thread: its first draw drawn in order with these
     // names, nothing done in order since, no target made, no fill or clear.
     const RunTargets& m = t_run_targets;
-    if (!m.valid) return fall(kSwRunFirst);
-    if (std::memcmp(run_names_of(m), c.names, sizeof(c.names)) != 0) return fall(kSwRunFirst);
+    if (!m.valid) {
+        if (gxvk_lists::times()) arr_bump(g_splice_census.first[0]);
+        return fall(kSwRunFirst);
+    }
+    if (std::memcmp(run_names_of(m), c.names, sizeof(c.names)) != 0) {
+        if (gxvk_lists::times()) arr_bump(g_splice_census.first[1]);
+        return fall(kSwRunFirst);
+    }
     // The run open: its first draw's lookups still stand (as batching shares
     // them) - and its targets are the very objects the commit drew with.
-    if (m.serial != list_resolve::run_serial()) return fall(kSwChanged);
+    if (m.serial != list_resolve::run_serial()) {
+        if (gxvk_lists::times()) arr_bump(g_splice_census.split[std::min(list_resolve::last_split(), static_cast<int>(list_resolve::kSplits))]);
+        return fall(kSwChanged);
+    }
     if (g_rt_gen != m.rt_gen || g_pending_htile_gen != m.htile_gen || g_pending_gen != m.pending_gen ||
         (m.depth && m.depth->htile_clear_pending))
         return fall(kSwRunGens);
@@ -28254,7 +28804,7 @@ bool host_gpu_splice(std::uint64_t id) {
     }
     // Spliced: its params into this recording's slots, its packet into the stream. Taken from a segment's builder
     // (stage 4b.2), which may want it too.
-    if (std::uint64_t want = cw; !c.word.compare_exchange_strong(want, lc_word(id, kLcTaken), std::memory_order_acq_rel)) return fall(kSwSegment);
+    if (std::uint64_t want = cw_now; !c.word.compare_exchange_strong(want, lc_word(id, kLcTaken), std::memory_order_acq_rel)) return fall(kSwSegment);
     if (!occlusion_draw_entry()) return fall(kSwOcclusion);  // (issued: plain, so no predicate skips it)
     begin_recording_locked();
     // (Stage 4b.2 without maintenance7: a pass begun for segments holds no inline draw - begun again for it.)
@@ -28304,6 +28854,160 @@ bool host_gpu_list_committed(std::uint64_t id) {
     const std::uint64_t w = c.word.load(std::memory_order_acquire);
     const std::uint32_t st = lc_state(w);
     return lc_id(w) == id && (st == kLcCommitted || st == kLcBuilding || st == kLcSegment || st == kLcTaken);
+}
+
+// BBHOST_GXVK_LISTS_TIMES: the command processor's arrival at GX-native draw
+// token `id` (gnm_exec.cpp, before anything takes it), by where the pool was:
+// its feed's entry not taken yet (with how far behind the pool's next entry
+// it lay), committing, done (committed or refused), held or built into a
+// segment, taken (a spliced segment's member) - each with the time since the
+// draw was stored; and for a done commit the time since it ended, for a draw
+// whose list had closed the time since then. All the command processor's
+// (one writer): plain loads and stores. Ticks are rdtsc's, turned into
+// microseconds at the first 100 ms (then fixed).
+namespace {
+enum Arrival : int { kArQueued, kArCommitting, kArCommitted, kArRefused, kArBuilding, kArSegment, kArTaken, kArOther, kArrivals };
+const char* const kArrivalName[kArrivals] = {"queued", "committing", "committed", "refused", "building", "segment", "taken", "other"};
+constexpr int kLeadBuckets = 12;  // < 25, 50, 100, 200, 500 us, 1, 2, 3, 5, 10, 20 ms, more
+constexpr double kLeadEdge[kLeadBuckets - 1] = {25, 50, 100, 200, 500, 1000, 2000, 3000, 5000, 10000, 20000};
+constexpr int kBehindBuckets = 6;  // feed entries behind: < 16, 64, 256, 1024, 4096, more
+struct ArrivalCounts {
+    std::atomic<std::uint64_t> n[kArrivals] = {};
+    std::atomic<std::uint64_t> lead[kArrivals][kLeadBuckets] = {};
+    std::atomic<std::uint64_t> behind[kBehindBuckets] = {};
+    std::atomic<std::uint64_t> slack[kLeadBuckets] = {};      // committed: since its commit ended
+    std::atomic<std::uint64_t> list_lead[kLeadBuckets] = {};  // since its list closed
+    std::atomic<std::uint64_t> list_open = 0, no_time = 0;
+};
+ArrivalCounts g_arr;
+std::atomic<double> g_tsc_per_us{0.0};
+std::atomic<std::uint64_t> g_seg_wait_ticks{0};  // a list's segment builder waiting for its draws' commits (lists_segment)
+int lead_bucket(std::uint64_t ticks, double per_us) {
+    const double us = static_cast<double>(ticks) / per_us;
+    int b = 0;
+    while (b < kLeadBuckets - 1 && us >= kLeadEdge[b]) ++b;
+    return b;
+}
+}  // namespace
+
+void host_gpu_lists_arrival(std::uint64_t id) {
+    const std::uint64_t now = __builtin_ia32_rdtsc();
+    double per_us = g_tsc_per_us.load(std::memory_order_relaxed);
+    if (per_us == 0.0) {
+        static std::uint64_t tsc0 = 0, ns0 = 0;
+        const std::uint64_t ns = host_clock_monotonic_ns();
+        if (!tsc0) {
+            tsc0 = now;
+            ns0 = ns;
+            return;
+        }
+        if (ns - ns0 < 100'000'000) return;
+        per_us = static_cast<double>(now - tsc0) * 1000.0 / static_cast<double>(ns - ns0);
+        g_tsc_per_us.store(per_us, std::memory_order_relaxed);
+    }
+    const gxvk_lists::detail::DrawTime& t = gxvk_lists::detail::g_draw_times[id & (gxvk_lists::detail::kTimeSlots - 1)];
+    const ListCommit* const all = g_list_commits;
+    if (!all || t.id.load(std::memory_order_relaxed) != id) {
+        arr_bump(g_arr.no_time);
+        return;
+    }
+    const std::uint64_t stored = t.stored.load(std::memory_order_relaxed);
+    const ListCommit& c = all[id & (kListCommits - 1)];
+    const std::uint64_t w = c.word.load(std::memory_order_acquire);
+    int a = kArOther;
+    if (lc_id(w) != id) {
+        a = kArQueued;
+        const std::uint64_t pos = t.feed.load(std::memory_order_relaxed);
+        const std::uint64_t next = gxvk_lists::detail::g_feed_next.load(std::memory_order_relaxed);
+        const std::uint64_t behind = pos >= next ? pos - next : 0;
+        int b = 0;
+        for (std::uint64_t edge = 16; b < kBehindBuckets - 1 && behind >= edge; edge *= 4) ++b;
+        arr_bump(g_arr.behind[b]);
+    } else {
+        switch (lc_state(w)) {
+        case kLcCommitting: a = kArCommitting; break;
+        case kLcCommitted: a = kArCommitted; break;
+        case kLcNot: a = kArRefused; break;
+        case kLcBuilding: a = kArBuilding; break;
+        case kLcSegment: a = kArSegment; break;
+        case kLcTaken: a = kArTaken; break;
+        default: break;
+        }
+        if (a == kArCommitted || a == kArSegment) {
+            const std::uint64_t t1 = c.t1.load(std::memory_order_relaxed);
+            if (t1 && t1 <= now) arr_bump(g_arr.slack[lead_bucket(now - t1, per_us)]);
+        }
+    }
+    arr_bump(g_arr.n[a]);
+    if (stored && stored <= now) arr_bump(g_arr.lead[a][lead_bucket(now - stored, per_us)]);
+    const std::uint64_t closed = t.closed.load(std::memory_order_relaxed);
+    if (closed >= stored && closed <= now) arr_bump(g_arr.list_lead[lead_bucket(now - closed, per_us)]);
+    else arr_bump(g_arr.list_open);
+}
+
+// The line (cumulative, the pool's report): the arrivals by class with their
+// leads, the queued draws' places behind, the committed ones' slack, the
+// lists' leads, then the commit's parts and the pool's parking and waits.
+std::string host_gpu_lists_times_report(int part, std::uint64_t parked_ticks, std::uint64_t parks) {
+    const double per_us = g_tsc_per_us.load(std::memory_order_relaxed);
+    const auto hist = [](const std::atomic<std::uint64_t>* h, int n) {
+        std::string out;
+        for (int k = 0; k < n; ++k) out += (k ? "/" : "") + std::to_string(h[k].load(std::memory_order_relaxed));
+        return out;
+    };
+    std::string out = "times (rdtsc " + std::to_string(per_us) + " a us; leads < 25/50/100/200/500 us, 1/2/3/5/10/20 ms, more): arrivals";
+    for (int a = 0; a < kArrivals; ++a) {
+        out += " " + std::string(kArrivalName[a]) + " " + std::to_string(g_arr.n[a].load(std::memory_order_relaxed)) + " [" +
+               hist(g_arr.lead[a], kLeadBuckets) + "];";
+    }
+    out += " no time " + std::to_string(g_arr.no_time.load(std::memory_order_relaxed));
+    if (part == 0) return out;  // (each part under a log line's 1 KiB)
+    if (part == 3) {
+        out = "times (4): a constant buffer's lookups, by why it took no home:";
+        for (int k = 0; k < kCbLookupsWhys; ++k)
+            out += " " + std::string(kCbLookupsWhyName[k]) + " " + std::to_string(g_cb_lookups_why[k].load(std::memory_order_relaxed)) + ";";
+        return out;
+    }
+    if (part == 2) {
+        out = "times (3): refused kinds:";
+        for (int k = 0; k < kKindWhys; ++k) out += " " + std::string(kKindWhyName[k]) + " " + std::to_string(g_kind_why[k].load(std::memory_order_relaxed)) + ";";
+        out += " no targets:";
+        for (int k = 0; k < kTargetsWhys; ++k)
+            out += " " + std::string(kTargetsWhyName[k]) + " " + std::to_string(g_targets_why[k].load(std::memory_order_relaxed)) + ";";
+        out += " buffers stops:";
+        for (int k = 0; k < kBuffersStops; ++k)
+            out += " " + std::string(kBuffersStopName[k]) + " " + std::to_string(g_buffers_why[k].load(std::memory_order_relaxed)) + ";";
+        out += " views by id not found: none in the slot " + std::to_string(g_list_view_stop_why[0].load(std::memory_order_relaxed)) +
+               "; another view " + std::to_string(g_list_view_stop_why[1].load(std::memory_order_relaxed)) + "; other flags " +
+               std::to_string(g_list_view_stop_why[2].load(std::memory_order_relaxed)) + "; elision " +
+               std::to_string(g_list_view_stop_why[3].load(std::memory_order_relaxed)) + ";";
+        out += " | in order, a run's first: no run open " + std::to_string(g_splice_census.first[0].load(std::memory_order_relaxed)) +
+               "; another run open " + std::to_string(g_splice_census.first[1].load(std::memory_order_relaxed)) + "; split since, by kind:";
+        for (int k = 0; k <= list_resolve::kSplits; ++k) {
+            const std::uint64_t v = g_splice_census.split[k].load(std::memory_order_relaxed);
+            if (v) out += " " + std::string(kSplitName[k]) + " " + std::to_string(v) + ";";
+        }
+        return out;
+    }
+    out = "times (2):";
+    out += " queued behind (< 16/64/256/1024/4096, more) [" + hist(g_arr.behind, kBehindBuckets) + "]";
+    out += "; committed slack [" + hist(g_arr.slack, kLeadBuckets) + "]";
+    out += "; list lead [" + hist(g_arr.list_lead, kLeadBuckets) + "], list open " + std::to_string(g_arr.list_open.load(std::memory_order_relaxed));
+    char buf[160];
+    const auto us = [&](std::uint64_t ticks) { return per_us > 0.0 ? static_cast<double>(ticks) / per_us : 0.0; };
+    const std::uint64_t ok = g_commit_ok.load(std::memory_order_relaxed), refused = g_commit_refused.load(std::memory_order_relaxed);
+    std::snprintf(buf, sizeof(buf), " | commits %llu ok (%.0f us in all), %llu refused (%.0f us); parts (us in all):", static_cast<unsigned long long>(ok),
+                  us(g_commit_ok_ticks.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refused),
+                  us(g_commit_refused_ticks.load(std::memory_order_relaxed)));
+    out += buf;
+    for (int k = 0; k < kCommitParts; ++k) {
+        std::snprintf(buf, sizeof(buf), " %s %.0f;", kCommitPartName[k], us(g_commit_part[k].load(std::memory_order_relaxed)));
+        out += buf;
+    }
+    std::snprintf(buf, sizeof(buf), " parked %.0f us in all (%llu parks); segment waits %.0f us", us(parked_ticks), static_cast<unsigned long long>(parks),
+                  us(g_seg_wait_ticks.load(std::memory_order_relaxed)));
+    out += buf;
+    return out;
 }
 
 // splice-compare: after the draw of token `id` drawn in order (its digest in
@@ -28628,11 +29332,13 @@ enum SegFall : int {
     kSfOther,        // windows given, a run commit, a diagnostic, the configuration
     kSfCompare,      // segments-compare: drawn in order by design
     kSfOff,          // BBHOST_GXVK_SEGMENTS_SPLICE=0
+    kSfPassed,       // ready only once the walk had passed its first member: given back at a later one, spliced per draw
     kSegFalls
 };
 const char* const kSegFallName[kSegFalls] = {"stream",  "record lost", "too old",  "a run's first", "a split",   "run generations",
                                              "other targets", "another pass", "a hazard", "an owed clear", "a view", "a set",
-                                             "a home",  "an arena",     "occlusion", "other",        "compare",  "off"};
+                                             "a home",  "an arena",     "occlusion", "other",        "compare",  "off",
+                                             "met past its first"};
 
 std::atomic<std::uint64_t> g_sg_lists{0}, g_sg_draws{0}, g_sg_not[kSegNots] = {};
 std::atomic<std::uint64_t> g_sg_made{0}, g_sg_members{0}, g_sg_record_ns{0}, g_sg_by_len[8] = {};
@@ -28866,11 +29572,14 @@ void build_segment(const gxvk_lists::detail::ListRec& r, const std::uint64_t* wo
             if (!found) sg.vs_other.push_back({c.vs_other, c.vs_other_why, 1});
         }
     }
-    // Ready: the first member names it, its members held for it.
-    ListCommit& c0 = all[sg.ids[0] & (kListCommits - 1)];
+    // Ready: its members name it (the first, for the splice at its token; the others, for a splice that meets them
+    // past it), its members held for it.
     const std::uint64_t ready = sg_word(sg.gen, kSgReady);
-    c0.seg = &sg;
-    c0.seg_word = ready;
+    for (std::uint32_t k = 0; k < n; ++k) {
+        ListCommit& cm = all[sg.ids[k] & (kListCommits - 1)];
+        cm.seg = &sg;
+        cm.seg_word = ready;
+    }
     sg.ready_flip = hle_video_flip_count();
     for (std::uint32_t k = 0; k < n; ++k) {
         all[sg.ids[k] & (kListCommits - 1)].word.store(lc_word(sg.ids[k], kLcSegment), std::memory_order_release);
@@ -28930,6 +29639,25 @@ void segment_drop(Segment& sg, bool members_back) {
     sg.word.store(sg_word(sg.gen, kSgDropped), std::memory_order_release);
 }
 
+// The command processor at token `id`, a member of a ready segment it did not
+// splice at its first token (made ready after the walk passed it, or passed
+// over at it): the segment given up, its members back to their own splices -
+// this one's first - rather than all of them drawn in order. False when the
+// segment is not ready (being built, or taken).
+bool segment_release_member(std::uint64_t id) {
+    ListCommit* const all = g_list_commits;
+    if (!all) return false;
+    const ListCommit& c = all[id & (kListCommits - 1)];
+    Segment* const sg = c.seg;
+    if (!sg) return false;
+    std::uint64_t want = c.seg_word;
+    if (sg_state(want) != kSgReady || !sg->word.compare_exchange_strong(want, sg_word(sg->gen, kSgTaken), std::memory_order_acq_rel)) return false;
+    g_sg_fall[kSfPassed].fetch_add(1, std::memory_order_relaxed);
+    g_sg_fall_draws.fetch_add(sg->count, std::memory_order_relaxed);
+    segment_drop(*sg, true);
+    return true;
+}
+
 }  // namespace
 
 namespace gpu {
@@ -28949,11 +29677,15 @@ void lists_segment(std::uint32_t rec) {
     for (std::uint32_t k = 0; k < n; ++k) {
         ListCommit& c = all[r.id[k] & (kListCommits - 1)];
         std::uint64_t w = c.word.load(std::memory_order_acquire);
-        for (unsigned spins = 0; lc_state(w) == kLcCommitting && lc_id(w) == r.id[k] && spins < 20000; ++spins) {
+        if (lc_state(w) == kLcCommitting && lc_id(w) == r.id[k]) {
+            const std::uint64_t w0 = gxvk_lists::times() ? __builtin_ia32_rdtsc() : 0;
+            for (unsigned spins = 0; lc_state(w) == kLcCommitting && lc_id(w) == r.id[k] && spins < 20000; ++spins) {
 #if defined(__x86_64__)
-            __builtin_ia32_pause();
+                __builtin_ia32_pause();
 #endif
-            w = c.word.load(std::memory_order_acquire);
+                w = c.word.load(std::memory_order_acquire);
+            }
+            if (w0) g_seg_wait_ticks.fetch_add(__builtin_ia32_rdtsc() - w0, std::memory_order_relaxed);
         }
         words[k] = w;
     }
@@ -29277,10 +30009,20 @@ std::string host_gpu_segment_report_spliced() {
 
 bool host_gpu_blit_display(void* cmd, std::uint64_t display_va, void* dst_image, std::int32_t dst_x, std::int32_t dst_y,
                            std::uint32_t dst_w, std::uint32_t dst_h, std::uint32_t src_width, std::uint32_t src_height, std::uint32_t src_x,
-                           std::uint32_t src_y, void* dst_storage_view) {
+                           std::uint32_t src_y, void* dst_storage_view, bool* by_fsr) {
     return render_blit_display_locked(static_cast<VkCommandBuffer>(cmd), display_va, static_cast<VkImage>(dst_image),
                                       {{dst_x, dst_y}, {dst_w, dst_h}}, {src_width, src_height}, src_x, src_y,
-                                      static_cast<VkImageView>(dst_storage_view));
+                                      static_cast<VkImageView>(dst_storage_view), by_fsr);
+}
+
+bool host_gpu_fsr_upscale(void* cmd, void* src_image, std::uint32_t src_format, std::uint32_t src_w, std::uint32_t src_h,
+                          std::uint32_t src_x, std::uint32_t src_y, std::uint32_t sw, std::uint32_t sh, void* dst_image, std::int32_t dst_x,
+                          std::int32_t dst_y, std::uint32_t dst_w, std::uint32_t dst_h) {
+    // FSR 1's second use (host/fsr.cpp): its own sets and targets beside the
+    // display buffer's, which the same command buffer has just upscaled.
+    return fsr_upscale_locked(static_cast<VkCommandBuffer>(cmd), static_cast<VkImage>(src_image), static_cast<VkFormat>(src_format), src_w,
+                              src_h, src_x, src_y, sw, sh, static_cast<VkImage>(dst_image), {{dst_x, dst_y}, {dst_w, dst_h}},
+                              VK_NULL_HANDLE, 1);
 }
 
 bool host_gpu_display_image(std::uint64_t display_va, void** image, std::uint32_t* format, std::uint32_t* width,
@@ -29354,6 +30096,8 @@ void host_gpu_hang_report() {
         const char* const step = host_present_step(present_for);
         host_log("hang: %s; the presenting thread is %s (%.1f s); the renderer's lock is held by %s", submit_thread_report().c_str(), step,
                  present_for, GpuMutex::name_of(g.mu.holder()).c_str());
+        // Every thread in a timed driver call now, and for how long (host/slow_calls.h).
+        if (const std::string calls = slow_calls::in_calls_now(); !calls.empty()) host_log("hang: in calls now: %s", calls.c_str());
         // Where the command stream's recorder is (recorder.cpp).
         if (const std::string s = stream_last_op(); !s.empty()) host_log("hang: %s", s.c_str());
     }
@@ -30053,7 +30797,9 @@ void host_gpu_watch_display(std::uint64_t display_va) {
     // frame it named had already rotated out and nothing was written at all.
     flush_locked();
     if (sync_frame) {
+        static constexpr slow_calls::Site kSyncFrameIdle{slow_calls::kQueueIdle, "BBHOST_SYNC_FRAME"};
         QueueGuard queue;
+        slow_calls::Scope timed(kSyncFrameIdle);
         vkQueueWaitIdle(g.queue);
     }
 }
@@ -30187,6 +30933,16 @@ bool host_gpu_dump_display(std::uint64_t display_va, const char* path, bool all_
                     std::fprintf(f, "    render target vkformat %d %ux%u x%u layers%s%s\n", static_cast<int>(rt->format),
                                  rt->width, rt->height, rt->layers, rt->initialised ? "" : " (never drawn)",
                                  rt->depth ? " depth" : "");
+                }
+                // The registry's live texture there: the size the target takes from it (target_image).
+                if (GxTextureExtent te; gx_texture_extent(kv.first, &te)) {
+                    if (te.yebis) {
+                        std::fprintf(f, "    registered: YEBIS texture %ux%u, pitch %u (generation %llu)\n", te.width, te.height, te.pitch,
+                                     static_cast<unsigned long long>(te.gen));
+                    } else {
+                        std::fprintf(f, "    registered: GX texture %ux%u (generation %llu)\n", te.width, te.height,
+                                     static_cast<unsigned long long>(te.gen));
+                    }
                 }
                 const std::string d = texture_describe_locked(kv.first);
                 if (!d.empty()) {

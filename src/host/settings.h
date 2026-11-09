@@ -21,6 +21,9 @@ struct HostSettings {
 
     // Display
     bool fullscreen = false;
+    // Stay borderless (Windows): Borderless is never made exclusive by the
+    // driver (host/window.cpp); elsewhere it does nothing.
+    bool stay_borderless = false;
     bool vsync = true;
     int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 10 to 960; 0 is Display-Limited (the display's rate)
     // The Native frame clock (experimental, off): read once as the game starts
@@ -47,7 +50,7 @@ struct HostSettings {
     // Controls
     bool mouse_menu = true;     // the pointer drives the menus through the pad
     bool mouse_camera = true;   // the mouse turns the camera outside menus
-    float mouse_sens = 5.0f;    // 0..10 in tenths, DS3's: 0.2 * (s * 0.15 + 0.5) degrees a count (engine/mouse_camera.h)
+    float mouse_sens = 5.0f;    // 0..10 in tenths: 0.005 to 0.4 degrees a count (engine/mouse_camera_step.h)
     bool mouse_invert_x = false, mouse_invert_y = false;
     // While the mouse turns the camera (the keyboard and mouse used last): off
     // holds the camera's own turns as the character moves (engine/mouse_camera.h).
@@ -135,6 +138,8 @@ struct HostSettings {
     bool rebirth = true;
     bool five_players = true;
     bool skill_issue = false;
+    bool full_phantom_hp = true;
+    bool auto_replenish = true;
 };
 
 // A copy of the current settings (no lock: the snapshot published last).

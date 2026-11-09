@@ -2,6 +2,7 @@
 
 #include "core/config.h"
 #include "engine/loading.h"
+#include "host/gpu.h"
 #include "host/settings.h"
 #include "log.h"
 
@@ -54,7 +55,14 @@ std::mutex g_hudless_mu;
 // the renderer's, the configure on the presenter's - where AMD's sample uses
 // it from one: one at a time.
 std::mutex g_ctx_mu;
-std::atomic<float> g_shown_per_frame{1.0f};
+// Frames AMD's swapchain presented for each of ours over the last 60 of ours:
+// 0 until this swapchain has been measured once (framegen_present).
+std::atomic<float> g_shown_per_frame{0.0f};
+// Its counts, this swapchain's (framegen_present; reset as one is made).
+std::uint64_t g_count_ours = 0, g_count_base = 0, g_count_base60 = 0;
+// The frames that went without generation and why, this swapchain's too
+// (framegen_frame; reset with the counts above).
+std::uint64_t g_skip_frames = 0, g_skip_none = 0, g_skip_again = 0;
 Hudless g_hudless[4];  // under g_hudless_mu
 
 // The presenter's side: the HUD-less picture at the swapchain's size, and the
@@ -214,6 +222,11 @@ bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkS
         g_fg_ctx = nullptr;
     }
     g_max_render = {fg.maxRenderSize.width, fg.maxRenderSize.height};
+    // The counts start again with this swapchain: the last one's factor shown
+    // for its first ticks was the FPS counter's bracket after a toggle.
+    g_shown_per_frame.store(0.0f, std::memory_order_relaxed);
+    g_count_ours = g_count_base = g_count_base60 = 0;
+    g_skip_frames = g_skip_none = g_skip_again = 0;
     g_swapchain = made;
     g_device = device;
     g_phys = phys;
@@ -233,7 +246,7 @@ bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkS
 
 bool framegen_active() { return g_swap_ctx != nullptr; }
 
-float framegen_shown_per_frame() { return g_swap_ctx ? g_shown_per_frame.load(std::memory_order_relaxed) : 1.0f; }
+float framegen_shown_per_frame() { return g_swap_ctx ? g_shown_per_frame.load(std::memory_order_relaxed) : 1.0f; }  // 0: not measured yet
 
 VkResult framegen_get_images(VkDevice device, VkSwapchainKHR swapchain, std::uint32_t* count, VkImage* images) {
     return g_fns.pOutGetSwapchainImagesKHR(device, swapchain, count, images);
@@ -298,18 +311,19 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
     }
     // What reaches the screen, real and generated, against the game's frames:
     // the FPS counter's factor every 60, the log's line every 600.
-    static std::uint64_t frames = 0, base = 0, base60 = 0;
-    if (g_fns.pOutGetLastPresentCountFFXAPI && (frames + 1) % 60 == 0) {
+    // (AMD's count of its presents, real and generated - what it handed the
+    // display, not a measure of what the display showed - against ours; this
+    // swapchain's alone: the counts start again as one is made.)
+    if (g_fns.pOutGetLastPresentCountFFXAPI && (g_count_ours + 1) % 60 == 0) {
         const std::uint64_t shown = g_fns.pOutGetLastPresentCountFFXAPI(g_swapchain);
-        if (shown < base60) base60 = 0, base = shown;  // a new swapchain counts from 0
-        if (base60 && shown > base60) g_shown_per_frame.store(static_cast<float>(shown - base60) / 60.0f, std::memory_order_relaxed);
-        base60 = shown;
+        if (g_count_base60 && shown > g_count_base60)
+            g_shown_per_frame.store(static_cast<float>(shown - g_count_base60) / 60.0f, std::memory_order_relaxed);
+        g_count_base60 = shown ? shown : 1;
     }
-    if (g_fns.pOutGetLastPresentCountFFXAPI && ++frames % 600 == 0) {
+    if (g_fns.pOutGetLastPresentCountFFXAPI && ++g_count_ours % 600 == 0) {
         const std::uint64_t shown = g_fns.pOutGetLastPresentCountFFXAPI(g_swapchain);
-        if (shown < base) base = 0;
-        host_log("framegen: %llu frames shown for the last 600 of the game's", static_cast<unsigned long long>(shown - base));
-        base = shown;
+        host_log("framegen: AMD presented %llu frames for the last 600 of ours", static_cast<unsigned long long>(shown - g_count_base));
+        g_count_base = shown;
     }
     return r;
 }
@@ -388,7 +402,7 @@ void framegen_note_hudless(std::uint64_t display_va, std::uint64_t id, VkImage i
 }
 
 void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D dst, VkExtent2D dst_size, std::int32_t src_x,
-                    std::int32_t src_y, std::uint32_t src_w, std::uint32_t src_h) {
+                    std::int32_t src_y, std::uint32_t src_w, std::uint32_t src_h, bool fsr) {
     g_present_ready = false;
     if (!g_fg_ctx || !g_sc_hudless) return;
     Hudless h;
@@ -398,8 +412,17 @@ void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D ds
             if (s.display_va == display_va) h = s;
         }
     }
+    // Why frames go without generation, every 600 presents (beside the log's
+    // "AMD presented" line, over this swapchain's frames as it is).
+    if (++g_skip_frames % 600 == 0 && (g_skip_none || g_skip_again)) {
+        host_log("framegen: of the last 600 frames %llu had no HUD-less copy, %llu were shown before (last prepared %llu, presented %llu)",
+                 static_cast<unsigned long long>(g_skip_none), static_cast<unsigned long long>(g_skip_again),
+                 static_cast<unsigned long long>(h.id), static_cast<unsigned long long>(g_present_id));
+        g_skip_none = g_skip_again = 0;
+    }
     // A frame seen before (the same buffer shown again) is not one to generate after.
     if (!h.image || h.id <= g_present_id) {
+        ++(h.image ? g_skip_again : g_skip_none);
         static std::atomic<int> told{0};
         if (told.fetch_add(1) < 3)
             host_log("framegen: no HUD-less copy to present display buffer 0x%llx with (%s)", static_cast<unsigned long long>(display_va),
@@ -434,8 +457,34 @@ void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D ds
     r.dstOffsets[1] = {dst.x + static_cast<std::int32_t>(dst_size.width), dst.y + static_cast<std::int32_t>(dst_size.height), 1};
     const bool same = r.srcOffsets[1].x - r.srcOffsets[0].x == static_cast<std::int32_t>(dst_size.width) &&
                       r.srcOffsets[1].y - r.srcOffsets[0].y == static_cast<std::int32_t>(dst_size.height);
-    vkCmdBlitImage(cmd, h.image, VK_IMAGE_LAYOUT_GENERAL, g_sc_hudless, VK_IMAGE_LAYOUT_GENERAL, 1, &r,
-                   same ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+    // A frame FSR 1 upscaled (a picture smaller than its rectangle: Upscaling
+    // Off or TAA at a Resolution below the window's): its HUD-less picture by
+    // FSR 1 too, from the same rectangle into the same one. AMD takes whatever
+    // differs between the frame and this picture for the UI and puts it back
+    // as it is over the generated frames; stretched by a blit, the picture
+    // differed at every edge EASU drew and every detail RCAS sharpened - most
+    // of the 3D, which so moved at the real frames' rate (the generated frames
+    // presented, the screen as smooth as without them).
+    bool by_fsr = false;
+    if (fsr && !same) {
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        by_fsr = host_gpu_fsr_upscale(cmd, h.image, static_cast<std::uint32_t>(h.format), h.w, h.h,
+                                      static_cast<std::uint32_t>(r.srcOffsets[0].x), static_cast<std::uint32_t>(r.srcOffsets[0].y),
+                                      static_cast<std::uint32_t>(r.srcOffsets[1].x - r.srcOffsets[0].x),
+                                      static_cast<std::uint32_t>(r.srcOffsets[1].y - r.srcOffsets[0].y), g_sc_hudless, dst.x, dst.y,
+                                      dst_size.width, dst_size.height);
+        static bool told = false;
+        if (!told)
+            host_log("framegen: the frame is upscaled by FSR 1, and its HUD-less picture %s (%dx%d to %ux%u)",
+                     by_fsr ? "too" : "could not be: stretched", r.srcOffsets[1].x - r.srcOffsets[0].x,
+                     r.srcOffsets[1].y - r.srcOffsets[0].y, dst_size.width, dst_size.height);
+        told = true;
+    }
+    if (!by_fsr)
+        vkCmdBlitImage(cmd, h.image, VK_IMAGE_LAYOUT_GENERAL, g_sc_hudless, b.oldLayout, 1, &r, same ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);

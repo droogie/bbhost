@@ -13,8 +13,11 @@ Per log:
                since C11), 0x1d17ecd / 0x1d18285 the character jobs
   CP stalls    `stall:` lines by cause: shader/pipeline (translations and
                pipeline creation on the command processor), texture work,
-               lock waits, the command processor busy with draws, or idle
-               (the main loop or the game was the slow one)
+               lock waits, driver calls (the command processor in a timed
+               driver call, or waiting for the queue: host/slow_calls.h), the
+               command processor busy with draws, or idle (the main loop or
+               the game was the slow one)
+  slow calls   `slow call:` lines by call, and the longest
   settle       with BBHOST_GX_RATE=1: seconds from each warp until GX
                resources stop being made (20 or more a second) - how long
                what a warp brings in takes to arrive
@@ -33,7 +36,7 @@ def window(lines):
 def summary(path):
     lines = open(path, errors='replace').read().splitlines()
     seg = window(lines)
-    secs, longs, stalls = [], [], []
+    secs, longs, stalls, slow = [], [], [], []
     for l in seg:
         if l.startswith('[bbhost] frames:'):
             m = re.search(r'\(([0-9.]+)/s\).*max ([0-9.]+) ms, \d+ over 16.7, (\d+) over 33.3', l)
@@ -43,6 +46,10 @@ def summary(path):
             m = re.search(r'a ([0-9.]+) ms frame before flip (\d+), ([0-9.]+) ms of it waiting(.*)', l)
             if m:
                 longs.append((float(m.group(1)), float(m.group(3)), m.group(4)))
+        elif l.startswith('[bbhost] slow call:'):
+            m = re.search(r'slow call: (\S+) ([0-9.]+) ms on (\S+)', l)
+            if m:
+                slow.append((m.group(1), float(m.group(2)), m.group(3).rsplit(':', 1)[0]))
         elif l.startswith('[bbhost] stall:'):
             d = {k: int(v) for k, v in re.findall(r'(\w[\w-]*)=(\d+)', l)}
             d['gap'] = int(re.search(r'came (\d+) ms', l).group(1))
@@ -74,10 +81,17 @@ def summary(path):
             c.append('texture')
         if d.get('lock-wait', 0) >= 10:
             c.append('lock-wait')
+        if d.get('driver', 0) >= 10:
+            c.append('driver')
         if not c:
             c.append('cp-busy' if d.get('exec', 0) >= d['gap'] * 0.6 else 'cp-idle')
         causes.update(c)
     print(f'  CP stalls: {len(stalls)}' + (' (' + ', '.join(f'{k} {v}' for k, v in causes.most_common()) + ')' if stalls else ''))
+    if slow:
+        calls = Counter(f'{call} on {thread}' for call, _, thread in slow)
+        worst = max(slow, key=lambda x: x[1])
+        print(f'  slow calls: {len(slow)} lines (' + ', '.join(f'{k} {v}' for k, v in calls.most_common(6)) +
+              f'), the longest {worst[0]} {worst[1]:.0f} ms on {worst[2]}')
     warps = [float(m.group(1)) for l in lines for m in [re.search(r'mapval step \d+ warp \S+ ([0-9.]+)', l)] if m]
     done = [float(m.group(1)) for l in lines for m in [re.search(r'mapval tour-done ([0-9.]+)', l)] if m]
     rates = [(int(m.group(2)), int(m.group(1))) for l in lines for m in [re.search(r'gx-resources: rate: (\d+) made \(\d+ KiB\) in second (\d+)', l)] if m]

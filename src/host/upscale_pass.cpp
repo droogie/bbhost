@@ -116,8 +116,9 @@ OwnImage g_embers;                  // the picture with the embers put back, the
 VkImageView g_picture_view = VK_NULL_HANDLE;  // this frame's final picture (render scale: YEBIS's copy samples it)
 OwnImage g_sharp;                   // the picture sharpened (Sharpness), the output size; made at the first use
 OwnImage g_taa_hist[2];             // TAA's two histories (record_taa): one read, one written, changing places each frame
+OwnImage g_taa_small;               // TAA's picture at the scene's size while the 3D is smaller than the output (record_taa)
 int g_taa_read = 0;                 // the one this frame's TAA reads
-int g_last_method = 0;              // the last call's method (another one's history is not this one's)
+int g_last_method = 0;              // the last call's method, FSR 3's flag in (another one's history and LOD bias are not this one's)
 // Frame generation (host/framegen.h): the frames prepared so far - each
 // frame's number - and the one this frame was prepared as (0: not), which its
 // HUD-less copy is then of.
@@ -989,6 +990,15 @@ bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkI
             return false;
         }
     }
+    // The 3D smaller than the output (a Resolution below the window): TAA at
+    // the scene's size into an image of that size, brought up to the output
+    // after it (a linear blit into g_output), as an upscaler's picture is.
+    if (g_scaled && !g_taa_small.image &&
+        !make(g_taa_small, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_w, g_h)) {
+        drop(g_taa_small);
+        return false;
+    }
+    OwnImage& out = g_scaled ? g_taa_small : g_output;
     const VkDescriptorSet set = alloc_set_locked(g_taa_set_layout);
     if (!set) return false;
     OwnImage &read = g_taa_hist[g_taa_read], &write = g_taa_hist[g_taa_read ^ 1];
@@ -1006,7 +1016,7 @@ bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkI
         {VK_NULL_HANDLE, velo ? velo : scene.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, depth, depth_layout},
         {g_taa_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED},
-        {VK_NULL_HANDLE, g_output.view, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, write.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, glow ? glow->view : scene.view, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, g_cap_map_view ? g_cap_map_view : scene.view,
@@ -1042,7 +1052,7 @@ bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkI
     }
     for (int k = 0; k < 9; ++k) pc.weights[k] /= std::max(sum, 1e-6f);
     pc.weights[11] = taa_share();
-    barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, g_output.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+    barrier(cb, out.image, VK_IMAGE_ASPECT_COLOR_BIT, out.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     barrier(cb, write.image, VK_IMAGE_ASPECT_COLOR_BIT, write.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
@@ -1067,10 +1077,26 @@ bool record_taa(VkCommandBuffer cb, const RtImage& scene, VkImageView depth, VkI
     }
     write.initialised = true;
     g_taa_read ^= 1;
+    if (g_scaled) {
+        out.initialised = true;
+        barrier(cb, out.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT);
+        barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, g_output.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkImageBlit r{};
+        r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.srcOffsets[1] = {static_cast<std::int32_t>(g_w), static_cast<std::int32_t>(g_h), 1};
+        r.dstOffsets[1] = {static_cast<std::int32_t>(g_ow), static_cast<std::int32_t>(g_oh), 1};
+        vkCmdBlitImage(cb, out.image, VK_IMAGE_LAYOUT_GENERAL, g_output.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r, VK_FILTER_LINEAR);
+        // (As the pass's own write would be: the caller's barrier after it
+        // names a shader write.)
+        barrier(cb, g_output.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
     static bool told = false;
     if (!told)
-        host_log("upscaler: TAA at %ux%u (the scene's size, Numity1504's step 9), the ember mask %s", g_w, g_h,
-                 glow ? "from the glow" : "off until a glow is found");
+        host_log("upscaler: TAA at %ux%u (the scene's size, Numity1504's step 9)%s, the ember mask %s", g_w, g_h,
+                 g_scaled ? ", brought up to the output after it" : "", glow ? "from the glow" : "off until a glow is found");
     told = true;
     return true;
 }
@@ -1557,7 +1583,12 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
     // GPU cannot run): the motion and its prepare at the scene's size, and the
     // scene left as the game drew it.
     const bool motion_only = !method && framegen_active();
-    if (!method && !motion_only) return false;
+    if (!method && !motion_only) {
+        // Upscaling off: a method chosen again later starts over - its history
+        // and its LOD bias are its own, not the ones kept from before.
+        g_last_method = 0;
+        return false;
+    }
     // The output size: render scale's when the scene is its render size,
     // else the scene's own (DLAA, FSR native AA).
     RenderScale rs;
@@ -1586,7 +1617,8 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         return false;
     }
     const std::uint32_t ow = scaled ? rs.output_w : scene.width, oh = scaled ? rs.output_h : scene.height;
-    if (scene.width != g_w || scene.height != g_h || ow != g_ow || oh != g_oh || motion_only != !g_output.image) {
+    const bool remade = scene.width != g_w || scene.height != g_h || ow != g_ow || oh != g_oh || motion_only != !g_output.image;
+    if (remade) {
         drop(g_output);
         drop(g_motion);
         drop(g_depth_r32);
@@ -1595,6 +1627,7 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         drop(g_embers);
         drop(g_taa_hist[0]);
         drop(g_taa_hist[1]);
+        drop(g_taa_small);
         drop(g_prev_scene);
         g_prev_scene_valid = false;
         g_w = scene.width;
@@ -1606,7 +1639,9 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         g_reset = true;
         // The upscaler's picture only with an upscaler.
         if ((!motion_only && !make(g_output, VK_FORMAT_R16G16B16A16_SFLOAT,
-                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, g_ow, g_oh)) ||
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                       VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                   g_ow, g_oh)) ||
             !make(g_motion, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                   g_w, g_h) ||
             !make(g_depth_r32, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, g_w, g_h)) {
@@ -1621,21 +1656,10 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         if (motion_only)
             host_log("framegen: the motion at %ux%u (the scene's size, no upscaler running), scene format %d, depth format %d", g_w, g_h,
                      static_cast<int>(scene.format), static_cast<int>(depth.format));
-        // The materials' textures sampled as at the output size: the
-        // bridge's mip bias (BBHOST_UPSCALE_MIP_BIAS=0: none, a test).
-        static const bool mip_bias_on = [] {
-            const char* e = std::getenv("BBHOST_UPSCALE_MIP_BIAS");
-            return !(e && e[0] == '0');
-        }();
-        g_mip_bias = !mip_bias_on || motion_only ? 0.0f
-                     : g_scaled               ? upscaler_mip_bias_sized(method, g_w, g_ow)
-                                              : upscaler_mip_bias(method, 0, g_ow, g_oh);
         if (!motion_only) {
-            host_log("upscaler: the camera's draws sample their textures with a LOD bias of %.3f%s", static_cast<double>(g_mip_bias),
-                     mip_bias_on ? "" : " (BBHOST_UPSCALE_MIP_BIAS=0)");
             if (g_scaled)
                 host_log("upscaler: %s from %ux%u to %ux%u (Upscaling quality %d), scene format %d, depth format %d; YEBIS's copy reads the picture",
-                         method == 1 ? "DLSS" : "FSR", g_w, g_h, g_ow, g_oh, rs.quality, static_cast<int>(scene.format),
+                         method == 1 ? "DLSS" : method == kUpscaleTaa ? "TAA" : "FSR", g_w, g_h, g_ow, g_oh, rs.quality, static_cast<int>(scene.format),
                          static_cast<int>(depth.format));
             else
                 host_log("upscaler: %s at %ux%u (native, the scene's size), scene format %d, depth format %d",
@@ -1658,9 +1682,29 @@ bool upscale_pass_run_locked(RtImage& scene, RtImage& depth, float jitter_x, flo
         }
     }
 
-    if (method != g_last_method) {
-        g_last_method = method;
-        g_reset = true;
+    // The method as the bridge runs it: FSR 4 and FSR 3 are one method with
+    // a flag (upscaler_fsr3_override), and a change between them is a change
+    // of upscaler like any other.
+    const int method_key = method == 2 && upscaler_fsr3_override() ? 2 | 0x100 : method;
+    if (method_key != g_last_method || remade) {
+        // The materials' textures sampled as at the output size: the method's
+        // own mip bias at these sizes (BBHOST_UPSCALE_MIP_BIAS=0: none, a
+        // test) - worked out whenever the method or the images change. Kept
+        // from whichever method made the images, TAA after DLSS, FSR 3 or FSR 4
+        // at Native AA (the same sizes) sampled with their bias of -1.
+        static const bool mip_bias_on = [] {
+            const char* e = std::getenv("BBHOST_UPSCALE_MIP_BIAS");
+            return !(e && e[0] == '0');
+        }();
+        const float bias = !mip_bias_on || motion_only ? 0.0f
+                           : g_scaled               ? upscaler_mip_bias_sized(method, g_w, g_ow)
+                                                    : upscaler_mip_bias(method, 0, g_ow, g_oh);
+        if (!motion_only && (bias != g_mip_bias || remade))
+            host_log("upscaler: the camera's draws sample their textures with a LOD bias of %.3f%s", static_cast<double>(bias),
+                     mip_bias_on ? "" : " (BBHOST_UPSCALE_MIP_BIAS=0)");
+        g_mip_bias = bias;
+        if (method_key != g_last_method) g_reset = true;
+        g_last_method = method_key;
     }
     begin_recording_locked();
     if (scene.view_clear) view_clear_apply_locked(scene);

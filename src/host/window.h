@@ -197,7 +197,7 @@ std::uint64_t host_input_serial();
 // position they map to, as one line for a log.
 void host_mouse_describe(char* out, std::size_t n);
 
-// Live display settings, driven by the options screen (host/options.h). Both
+// Live display settings, driven by the options screen (host/options.h). All
 // are safe before the window exists: they record the wish and the presenter
 // picks it up when it comes up. V-Sync off rebuilds the swapchain on the next
 // present with whichever no-wait mode the surface supports.
@@ -206,6 +206,11 @@ void host_mouse_describe(char* out, std::size_t n);
 // to the mode nearest width x height - the resolution - at the desktop's
 // refresh rate). A width and height of 0 keep the last ones.
 void host_window_set_mode(int mode, int width = 0, int height = 0);
+// Stay borderless (Windows) makes Borderless's swapchain tell the
+// driver it may not take the window as exclusive fullscreen; a change of it,
+// or of the window mode to or from Borderless while it is on, rebuilds the
+// swapchain the same way. Elsewhere it is recorded and does nothing.
+void host_window_set_stay_borderless(bool on);
 // The presenter's swapchain made again at its next frame (frame generation
 // switched: AMD's swapchain or its own).
 void host_window_recreate_swapchain();
@@ -218,6 +223,15 @@ void host_window_set_vsync(bool on);
 // The presented image's size in pixels (the swapchain: the window, or the
 // display in fullscreen); false before there is one (headless). Any thread.
 bool host_window_pixels(int* w, int* h);
+// The desktop mode of the display the window is on, in pixels - the desktop's
+// own, unchanged by Fullscreen's exclusive mode while it is up - for the game's
+// size with an upscaler (host/options.cpp). False before the window is made.
+bool host_window_desktop_size(int* w, int* h);
+// The same, as the window's thread last saw it - updated when the window is
+// made, moves to another display, or a display's mode changes - for any
+// thread (the game's frame end: engine/live_resolution.cpp). False before the
+// window is made, and with no window (headless).
+bool host_window_display_now(int* w, int* h);
 // `fn` is told the window's pixel size now (if there is a window) and each
 // time it changes - a resize, a fullscreen toggle, a display change - on the
 // window's thread. One listener (the light grid, engine/graphics_patch.cpp).
@@ -226,6 +240,12 @@ void host_window_on_pixels(void (*fn)(int, int));
 // when there is no window (headless) or the display does not say. The flip
 // clock runs at this rate instead of assuming 59.94 Hz.
 float host_window_refresh_hz();
+// The refresh rate of the display the game is on: the window's
+// (host_window_refresh_hz) once there is one, before that the primary
+// display's, where the window opens (host_desktop_refresh_hz) - Display-Limited
+// and frame generation's limit take it, so a window on a 144 Hz second screen
+// beside a 60 Hz primary runs at 144, not 60.
+float host_display_refresh_hz();
 // The steady-clock time, in nanoseconds, at which the presenting thread last
 // finished a present, and a counter of finished presents. With V-Sync on the
 // present returns on the display's own vblank, which is the phase the flip

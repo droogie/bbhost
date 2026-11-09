@@ -53,8 +53,10 @@ to run on a PC - it needs a place to live. bbhost provides that place:
 - **PC enhancements** that can be switched off for the game as it shipped: the
   Hunter's Dream mirror opens the character appearance editor (a feature cut
   from the release), "Rebirth in the Nightmare" at the Altar of
-  Despair lets you redistribute your levels, and the late areas allow two
-  invaders, as the chalice dungeons do.
+  Despair lets you redistribute your levels, the late areas allow two
+  invaders, as the chalice dungeons do, a hunter summoned into another's
+  world keeps their full HP, and Molotovs, knives, pebbles and more refill
+  from storage as Blood Vials do.
 - **Online play** through a private server: co-op, invasions, messages,
   bloodstains and summon signs between bbhost players.
 - **Mods** without touching the game files: replacement files, param tables
@@ -190,10 +192,13 @@ third_party/     LibAtrac9, Dear ImGui, Monocypher, and the licences of the DXC 
 ## License
 
 bbhost is free software, licensed under the GNU General Public License,
-version 3 or later (see [LICENSE](LICENSE)). The third-party code in
-`third_party/` and `src/host/shaders/fsr1/` keeps its own licenses. The debug
-menu's glyphs (`plugins/debug_menu/font14.bin`) come from the X11 fonts k14
-and 7x14, which are in the public domain.
+version 3 or later (see [LICENSE](LICENSE)). It carries an additional
+permission under the license's section 7 to combine it with GPU vendors'
+upscaling and frame generation runtimes, such as NVIDIA DLSS, AMD FidelityFX
+and Intel XeSS (see [LICENSE-EXCEPTION](LICENSE-EXCEPTION)). The third-party
+code in `third_party/` and `src/host/shaders/fsr1/` keeps its own licenses.
+The debug menu's glyphs (`plugins/debug_menu/font14.bin`) come from the X11
+fonts k14 and 7x14, which are in the public domain.
 
 Bloodborne is a trademark of Sony Interactive Entertainment. bbhost is not
 affiliated with or endorsed by Sony or FromSoftware, and contains none of the

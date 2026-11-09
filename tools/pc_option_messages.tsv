@@ -35,10 +35,11 @@
 110010	PC Effects	Post-processing: blur, bloom, vignette and lens effects.
 110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
-110013	PC Enhancements	Additions to the game: the mirror, rebirth, five players, SKILL ISSUE. Each needs a restart.
+110013	PC Enhancements	Additions to the game, each for the next start: the mirror, rebirth, five players and more.
 110014	PC Upscaling	TAA, FSR, DLSS and frame generation: the upscaler, its quality and sharpness, and reflection quality.
 116000	Vertical Sync	Wait for the display. Off can tear.
 116001	Fullscreen	Fill the screen: Borderless, or Fullscreen where Window mode (F10) says so.
+116009	Stay Borderless	Borderless never turns into exclusive fullscreen. AMD cards: may lower the frame rate.
 116002	Mouse in Menus	Move and click to select.
 116003	Draw the Pointer	Show the mouse pointer.
 116004	Skip Company Logos	Skips the logos and the Exit Game warning at startup. Applies on the next run.
@@ -139,7 +140,7 @@
 117077	10320x1440 (43:6, three 21:9 screens)
 118000	Mouse Camera	The mouse turns the camera outside menus.
 118004	Field of View	How wide the camera sees. 0 is the game's own; each step widens it 5%.
-118001	Camera Sensitivity	How fast the mouse turns the camera.
+118001	Mouse Sensitivity	How far the mouse turns the camera. Each step turns it about half again as far.
 118002	Mouse X-Axis	The mouse's horizontal camera direction.
 118003	Mouse Y-Axis	The mouse's vertical camera direction.
 118020	PC Controls
@@ -170,6 +171,8 @@
 124002	Rebirth at the Altar	Requires a restart. With the Yharnam Stone, the Altar of Despair resets level and attributes.
 124003	Five Players	Requires a restart. Two invaders in Mensis, Mergo's Loft, the Frontier, the DLC; all need it.
 124004	SKILL ISSUE	Requires a restart. The death message says SKILL ISSUE instead of YOU DIED.
+124005	Full Phantom HP	Requires a restart. Your full HP when summoned to another world; each visitor's setting decides.
+124006	Auto-Replenish Items	Requires a restart. Molotovs, knives and more refill from storage on a death or in the Dream.
 920000	Keep this resolution?\nIt goes back in 10 seconds unless you choose YES.	
 920001	Quit the game and return to the desktop?	
 14000332	Rebirth in the Nightmare	
@@ -178,12 +181,12 @@
 14000335	Accept Rebirth	
 14000336	Undo Rebirth	
 125020	PC Upscaling	
-125000	Frame Generation	A frame made between each two of the game's, from the 3D alone. The game then runs at most half your refresh rate.
-125001	Sharpness	Sharpens the anti-aliased or upscaled 3D (TAA, FSR or DLSS). 0 leaves the upscaler's picture as it is. Needs Upscaling on.
-125002	Reflection Quality	The reflections' resolution. Quarter is about four times cheaper; Half is the game's own, sharper.
-125003	Upscaling	TAA (bbhost's own, any GPU), FSR 3 (any GPU), FSR 4 (AMD, where offered) or DLSS (NVIDIA RTX) in place of the game's anti-aliasing.
-125004	Upscaling Quality	How much smaller the 3D is drawn: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
-125005	TAA Strength	How much TAA smooths: higher is steadier and smoother, with more risk of a faint trail; lower is crisper. 5 is the default. TAA only.
+125000	Frame Generation	A frame made between each two of the game's. The game then runs at most half your refresh rate.
+125001	Sharpness	Sharpens the 3D after TAA, FSR or DLSS; 0 leaves it as it is. Needs Upscaling on.
+125002	Reflection Quality	Reflection resolution: Quarter is about four times cheaper; Half is the game's own, sharper.
+125003	Upscaling	Replaces the game's AA: TAA or FSR 3 (any GPU), FSR 4 (AMD, where offered) or DLSS (NVIDIA RTX).
+125004	Upscaling Quality	The 3D's drawn size: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
+125005	TAA Strength	How much TAA smooths: higher is steadier but may leave a faint trail, lower crisper. Default 5.
 125030	Quarter	
 125031	Half	
 125032	Off	

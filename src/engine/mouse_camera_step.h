@@ -10,6 +10,7 @@
 // of its update and turns by them after the stick.
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -41,11 +42,34 @@ inline void add(std::atomic<std::uint64_t>& to, float x, float y) {
     }
 }
 
-// DS3's degrees a count at a sensitivity of 0..10: 0.2 * (s * 0.15 + 0.5),
-// as its pad object computes it.
+// The degrees a count at a sensitivity of 0..10 (the 0-100 setting's tenth):
+// 0.005 at 0 to 0.4 at 10, each step of the setting about 4.5% further than
+// the one below it - each whole number about half again as far - and 0.045 at
+// the default 5. DS3's own scale (ds3_degrees_per_count) ran from 0.1 to 0.4:
+// its slowest turned the camera 80 to 160 degrees for an inch of a mouse at
+// 800 to 1600 counts an inch, and its two ends were only four times apart.
+inline constexpr float kSlowestDegrees = 0.005f, kFastestDegrees = 0.4f;
 inline float degrees_per_count(float sensitivity) {
     const float s = sensitivity < 0.0f ? 0.0f : sensitivity > 10.0f ? 10.0f : sensitivity;
+    return kSlowestDegrees * std::pow(kFastestDegrees / kSlowestDegrees, s * 0.1f);
+}
+// The sensitivity (0..10) that turns `degrees` a count.
+inline float sensitivity_for_degrees(float degrees) {
+    if (!(degrees > kSlowestDegrees)) return 0.0f;
+    const float s = 10.0f * std::log(degrees / kSlowestDegrees) / std::log(kFastestDegrees / kSlowestDegrees);
+    return s < 10.0f ? s : 10.0f;
+}
+// DS3's degrees a count at its sensitivity of 0..10, 0.2 * (s * 0.15 + 0.5) as
+// its pad object computes it: the scale an options file before version 8 saved.
+inline float ds3_degrees_per_count(float sensitivity) {
+    const float s = sensitivity < 0.0f ? 0.0f : sensitivity > 10.0f ? 10.0f : sensitivity;
     return ((s * 0.1f) * 1.5f + 0.5f) * 0.2f;
+}
+// A 0-100 setting saved on DS3's scale, on today's: the same degrees a count.
+inline int setting_from_ds3(int setting) {
+    const float s = sensitivity_for_degrees(ds3_degrees_per_count(static_cast<float>(setting) * 0.1f));
+    const long i = std::lround(s * 10.0f);
+    return i < 0 ? 0 : i > 100 ? 100 : static_cast<int>(i);
 }
 
 // The window's relative motion while the mouse turns the camera, since the
@@ -54,7 +78,7 @@ inline float degrees_per_count(float sensitivity) {
 // camera mode began is not in it (host/window.cpp).
 inline std::atomic<std::uint64_t> g_counts{0};
 
-// What the pad read publishes on every read: DS3's degrees a count at the
+// What the pad read publishes on every read: the degrees a count at the
 // sensitivity set (float bits), and these flags.
 enum : std::uint32_t {
     kInvertX = 1,

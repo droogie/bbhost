@@ -248,23 +248,31 @@ gives the Binary Ninja address.
   point and more than `margin` in front of it, faded over `feather` metres at
   those edges by a screen-door dither (the G-buffer has no blending). `pitch`
   and `distance` place the point; the field of view and the depth's decode
-  come from the drawn view's own block. Set it as the distance changes, not
-  every frame: each new set makes the map's pipelines again. NULL or radius 0
-  turns it off. The Isometric plugin's Cutaway; it costs a third of a
+  come from the drawn view's own block. Turning it on makes the map's
+  pipelines again once; since v26 the numbers (and the view's field of view
+  and depth) are read live from a small buffer, so a new set each frame - a
+  zoom easing in - builds nothing (before, each new set made them all again:
+  the Isometric's zoom stutter). NULL or radius 0 turns it off. The Isometric plugin's Cutaway; it costs a third of a
   millisecond of GPU time a frame at 1080p.
 - `view_cutaway_objects(float start)` (v24): `view_cutaway2`'s cone for the
   draws the stencil marks 8 and 12 too, its tip `start` of the way from the
-  point looked at toward the camera (0.5 halfway). Those marks hold the
-  characters and the map's objects alike - neither the stencil, the vertex
-  shader nor what moves tells them apart - so a character high between the
-  view and the point looked at is cut with the objects; nothing standing near
-  that point is. Below 0, the default, they are never cut. The Isometric
-  plugin's Cut objects; no GPU time to measure beyond the map's cut.
+  point looked at toward the camera (0.5 halfway); read live since v26, so it
+  may change each frame. Those marks hold the characters and the map's
+  objects alike - neither the stencil, the vertex shader nor what moves tells
+  them apart - so a character standing into the cone above its tip is cut
+  with the objects. Below 0, the default, they are never cut. The Isometric
+  plugin's Cut objects (its tip 1.4 m over the hunter's feet); no GPU time to
+  measure beyond the map's cut.
 - `scene_dither(bits)` (v25): the finished picture - the 3D and its post
   effects, before the HUD and the menus are drawn over it - rounded to `bits`
   a channel through the PS1 GPU's 4x4 ordered dither, a cell of the pattern a
   pixel of the 3D (`scene_scale`'s lines). 5 is the PS1's 15-bit colour; 0,
   the default, off. The Bloodborne PS1's Dithering.
+- `camera_zoom(int* steps, int* reset)` (v26): the player's Camera Zoom
+  presses since the last call - the wheel and the middle button by default,
+  as bound, in the world only: `steps` notches out (in when negative), `reset`
+  1 for Camera Zoom Reset. From the first call they are the plugin's and the
+  game's camera no longer zooms. The Isometric's zoom.
 - The 3D's look (v18): how the camera's draws - the world, its characters, the
   sky and the effects, the draws with the scene's depth that are not
   full-screen rect lists - are drawn; the shadow maps, the post-processing and

@@ -40,6 +40,12 @@ std::uint32_t host_thread_id();
 // (comm, 15 characters) on Linux; on Windows winpthreads' copy and
 // SetThreadDescription, which the sampler and debuggers read.
 void host_thread_set_name(const char* name);
+// The calling thread's name as host_thread_set_name last gave it (whole: a
+// longer one than Linux keeps too); else, on Linux, its comm - what it took
+// from the thread that made it. False when it has none. Kept here because
+// winpthreads keeps no name for a detached thread (its pthread_setname_np
+// refuses one whose handle is closed), and most of ours are.
+bool host_thread_name(char* out, std::size_t n);
 // Puts the calling thread at the lowest priority there is (idle on Windows,
 // nice 19 on Linux), for good: work that must never take a core the game wants.
 void host_thread_background();
@@ -50,6 +56,10 @@ unsigned host_cpu_threads();
 // pixels (each display's current mode). False when the platform does not say:
 // a headless run (host_set_headless), or a build without SDL off Windows.
 bool host_desktop_max_size(int* w, int* h);
+// The primary display's size in physical pixels (its current mode): where a
+// window opens when it is given no position, so the screen Borderless and
+// Fullscreen fill. False as host_desktop_max_size.
+bool host_desktop_primary_size(int* w, int* h);
 // The refresh rate of the display the window opens on (the primary one), as
 // the display gives it (59.94, 143.998), asked before the window shell starts:
 // the Uncapped frame rate's (engine/frame_rate.cpp). 0 when nothing says: a

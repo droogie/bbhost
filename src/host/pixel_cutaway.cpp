@@ -60,14 +60,15 @@ bool preamble(u32 op) {
 
 }  // namespace
 
-bool pixel_cutaway(std::vector<u32>& spirv, const PixelCut& cut, std::string* why) {
+bool pixel_cutaway(std::vector<u32>& spirv, const PixelCut& cut, std::string* why, std::uint64_t live) {
     const auto fail = [&](const char* w) {
         if (why) *why = w;
         return false;
     };
     const std::vector<u32>& w = spirv;
     if (w.size() < 5 || w[0] != 0x07230203u) return fail("not a SPIR-V module");
-    if (!(cut.scale_x != 0.0f) || !(cut.scale_y != 0.0f) || !(cut.tan_x > 0.0f) || !(cut.tan_y > 0.0f) || !(cut.radius > 0.0f))
+    if (!(cut.scale_x != 0.0f) || !(cut.scale_y != 0.0f) ||
+        (live ? !(cut.distance > 0.0f) || (live & 3) : !(cut.tan_x > 0.0f) || !(cut.tan_y > 0.0f) || !(cut.radius > 0.0f)))
         return fail("no cutaway");
     std::vector<Ins> ins;
     for (std::size_t i = 5; i < w.size();) {
@@ -76,13 +77,15 @@ bool pixel_cutaway(std::vector<u32>& spirv, const PixelCut& cut, std::string* wh
         ins.push_back({i, w[i] & 0xffff, n});
         i += n;
     }
-    u32 model = ~0u, entry = 0, glsl = 0, t_f32 = 0, t_bool = 0, entries = 0;
+    u32 model = ~0u, entry = 0, glsl = 0, t_f32 = 0, t_bool = 0, t_u64 = 0, entries = 0;
+    bool has_psb = false, has_int64 = false, has_psb_ext = false;
     std::size_t entry_ins = ins.size();
     std::map<u32, u32> builtin;
     std::map<u32, std::pair<u32, u32>> vec, ptr;
     std::map<u32, u32> in_var;  // Input variable -> its pointer type
     std::vector<std::size_t> early;  // EarlyFragmentTests modes, left out
-    std::size_t first_fn = ins.size(), last_annot = ins.size(), first_global = ins.size(), last_import = ins.size(), memory_model = ins.size();
+    std::size_t first_fn = ins.size(), last_annot = ins.size(), first_global = ins.size(), last_import = ins.size(), memory_model = ins.size(),
+                first_import = ins.size();
     for (std::size_t k = 0; k < ins.size(); ++k) {
         const Ins& x = ins[k];
         const u32* a = &w[x.at];
@@ -101,7 +104,15 @@ bool pixel_cutaway(std::vector<u32>& spirv, const PixelCut& cut, std::string* wh
         case spv::OpExecutionMode:
             if (x.n >= 3 && a[2] == kExEarlyFragmentTests) early.push_back(k);
             break;
+        case spv::OpCapability:
+            if (x.n >= 2 && a[1] == spv::CapPhysicalStorageBufferAddresses) has_psb = true;
+            if (x.n >= 2 && a[1] == spv::CapInt64) has_int64 = true;
+            break;
+        case spv::OpExtension:
+            if (word_str(w, x.at + 1, x.at + x.n) == "SPV_KHR_physical_storage_buffer") has_psb_ext = true;
+            break;
         case spv::OpExtInstImport:
+            if (first_import == ins.size()) first_import = k;
             last_import = k;
             if (word_str(w, x.at + 2, x.at + x.n) == "GLSL.std.450") glsl = a[1];
             break;
@@ -113,6 +124,9 @@ bool pixel_cutaway(std::vector<u32>& spirv, const PixelCut& cut, std::string* wh
             if (x.n >= 3 && a[2] == 32 && !t_f32) t_f32 = a[1];
             break;
         case spv::OpTypeBool: t_bool = a[1]; break;
+        case spv::OpTypeInt:
+            if (x.n >= 4 && a[2] == 64 && a[3] == 0) t_u64 = a[1];
+            break;
         case spv::OpTypeVector:
             if (x.n >= 4) vec[a[1]] = {a[2], a[3]};
             break;
@@ -195,13 +209,37 @@ bool pixel_cutaway(std::vector<u32>& spirv, const PixelCut& cut, std::string* wh
         return id;
     };
     const u32 c_sx = constant(1.0f / cut.scale_x), c_ox = constant(cut.offset_x), c_sy = constant(1.0f / cut.scale_y),
-              c_oy = constant(cut.offset_y), c_tx = constant(cut.tan_x), c_ty = constant(cut.tan_y), c_dist = constant(cut.distance),
-              c_sp = constant(cut.sin_pitch), c_cp = constant(cut.cos_pitch), c_radius = constant(cut.radius), c_widen = constant(cut.widen),
-              c_height = constant(cut.height), c_front = constant(cut.distance - cut.margin),
+              c_oy = constant(cut.offset_y), c_height = constant(cut.height), c_margin = constant(cut.margin),
               c_feather = constant(1.0f / (cut.feather > 0.01f ? cut.feather : 0.01f)),
               c_zero = constant(0.0f), c_one = constant(1.0f), c_n1 = constant(0.06711056f), c_n2 = constant(0.00583715f),
-              c_dz = constant(cut.depth_z), c_dw = constant(cut.depth_w),
               c_n3 = constant(52.9829189f);
+    // The numbers a zoom or a field of view changes: constants, or (live)
+    // loads from the buffer at the head of the test.
+    std::vector<u32> caps, exts;
+    u32 p_psb_f32 = 0;
+    u32 c_addr[10] = {};
+    if (live) {
+        if (!has_psb) add(caps, mk(spv::OpCapability, {spv::CapPhysicalStorageBufferAddresses}));
+        if (!has_int64) add(caps, mk(spv::OpCapability, {spv::CapInt64}));
+        if (!has_psb_ext) {
+            const char* e = "SPV_KHR_physical_storage_buffer";
+            std::vector<u32> name((std::strlen(e) + 4) / 4, 0);
+            for (std::size_t k = 0; e[k]; ++k) name[k / 4] |= static_cast<u32>(static_cast<unsigned char>(e[k])) << (8 * (k % 4));
+            exts.push_back(static_cast<u32>(1 + name.size()) << 16 | spv::OpExtension);
+            exts.insert(exts.end(), name.begin(), name.end());
+        }
+        if (!t_u64) {
+            t_u64 = bound++;
+            add(globals, mk(spv::OpTypeInt, {t_u64, 64, 0}));
+        }
+        p_psb_f32 = bound++;
+        add(globals, mk(spv::OpTypePointer, {p_psb_f32, spv::ScPhysicalStorageBuffer, t_f32}));
+        for (u32 k = 0; k < 10; ++k) {
+            const std::uint64_t at = live + 4ull * k;
+            c_addr[k] = bound++;
+            add(globals, mk(spv::OpConstant, {t_u64, c_addr[k], static_cast<u32>(at), static_cast<u32>(at >> 32)}));
+        }
+    }
     if (!glsl) {
         glsl = bound++;
         std::vector<u32> name = {0, 0, 0, 0};
@@ -237,6 +275,18 @@ bool pixel_cutaway(std::vector<u32>& spirv, const PixelCut& cut, std::string* wh
     add(head, mk(spv::OpCompositeExtract, {t_f32, fx, fc, 0}));
     add(head, mk(spv::OpCompositeExtract, {t_f32, fy, fc, 1}));
     add(head, mk(spv::OpCompositeExtract, {t_f32, fz, fc, 2}));
+    // The numbers: PixelCutLive's fields in order, or the cut's own.
+    const auto number = [&](u32 field, float baked) {
+        if (!live) return constant(baked);
+        const u32 p = bound++, v = bound++;
+        add(head, mk(spv::OpConvertUToPtr, {p_psb_f32, p, c_addr[field]}));
+        add(head, mk(spv::OpLoad, {t_f32, v, p, 2 /* Aligned */, 4}));
+        return v;
+    };
+    const u32 c_tx = number(0, cut.tan_x), c_ty = number(1, cut.tan_y), c_sp = number(3, cut.sin_pitch), c_cp = number(4, cut.cos_pitch),
+              c_radius = number(5, cut.radius), c_widen = number(6, cut.widen), c_dz = number(7, cut.depth_z), c_dw = number(8, cut.depth_w);
+    const u32 c_dist = number(live && cut.distance >= 2.0f ? 9 : 2, cut.distance);
+    const u32 c_front = op2(spv::OpFSub, c_dist, c_margin);
     // view depth: the game's decode of its depth
     const u32 wv = op2(spv::OpFDiv, c_one, op2(spv::OpFAdd, op2(spv::OpFMul, fz, c_dz), c_dw));
     // Only a pixel in front of the point looked at can be cut: the rest (the
@@ -271,9 +321,11 @@ bool pixel_cutaway(std::vector<u32>& spirv, const PixelCut& cut, std::string* wh
 
     std::vector<u32> out(w.begin(), w.begin() + 5);
     out[3] = bound;
-    out.reserve(w.size() + globals.size() + imports.size() + decorations.size() + head.size() + 1);
+    out.reserve(w.size() + caps.size() + exts.size() + globals.size() + imports.size() + decorations.size() + head.size() + 1);
     for (std::size_t k = 0; k < ins.size(); ++k) {
         const Ins& x = ins[k];
+        if (k == 0) out.insert(out.end(), caps.begin(), caps.end());
+        if (k == (first_import != ins.size() ? first_import : memory_model)) out.insert(out.end(), exts.begin(), exts.end());
         if (last_import == ins.size() && k == memory_model) out.insert(out.end(), imports.begin(), imports.end());
         if (last_annot == ins.size() && k == first_global) out.insert(out.end(), decorations.begin(), decorations.end());
         if (k == first_fn) out.insert(out.end(), globals.begin(), globals.end());
@@ -282,7 +334,11 @@ bool pixel_cutaway(std::vector<u32>& spirv, const PixelCut& cut, std::string* wh
         if (k > label_at && k < vars_end) skip = true;  // moved into the new first block
         if (k == label_at) out.insert(out.end(), head.begin(), head.end());
         if (skip) continue;
-        if (k == entry_ins && new_frag) {
+        if (k == memory_model && live) {
+            out.push_back(w[x.at]);
+            out.push_back(5348);  // PhysicalStorageBuffer64: the live numbers' pointers
+            out.insert(out.end(), w.begin() + static_cast<std::ptrdiff_t>(x.at + 2), w.begin() + static_cast<std::ptrdiff_t>(x.at + x.n));
+        } else if (k == entry_ins && new_frag) {
             out.push_back(static_cast<u32>(x.n + 1) << 16 | x.op);
             out.insert(out.end(), w.begin() + static_cast<std::ptrdiff_t>(x.at + 1), w.begin() + static_cast<std::ptrdiff_t>(x.at + x.n));
             out.push_back(frag);
@@ -297,7 +353,7 @@ bool pixel_cutaway(std::vector<u32>& spirv, const PixelCut& cut, std::string* wh
 }
 
 std::string g_only_why;  // why the last pixel_cutaway_only came back empty (a test reads it)
-std::vector<u32> pixel_cutaway_only(const PixelCut& cut) {
+std::vector<u32> pixel_cutaway_only(const PixelCut& cut, std::uint64_t live) {
     // main(): an empty fragment stage, then the cutaway's test in front of it.
     const u32 main = 1, t_void = 2, t_fn = 3, label = 4;
     std::vector<u32> m = {0x07230203u, 0x00010000u, 0, 7, 0};
@@ -319,7 +375,7 @@ std::vector<u32> pixel_cutaway_only(const PixelCut& cut) {
     add(mk(spv::OpReturn, {}));
     add(mk(spv::OpFunctionEnd, {}));
     std::string why;
-    if (!pixel_cutaway(m, cut, &why)) {
+    if (!pixel_cutaway(m, cut, &why, live)) {
         g_only_why = why;
         return {};
     }

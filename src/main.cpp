@@ -3,6 +3,7 @@
 #include "decomp/decomp.h"
 #include "engine/mouse_camera.h"
 #include "core/config.h"
+#include "core/config_move.h"
 #include "core/host_clock.h"
 #include "core/portable.h"
 #include "core/thunk.h"
@@ -399,24 +400,35 @@ namespace {
 // is no window, and a console made for an earlier decision (the setup window
 // can change the setting) is let go.
 bool g_log_console = false;  // the console is one this process attached or made
+// A file or a pipe a standard stream was started with is that stream's
+// already; anything else - none, or a handle of a console this process is
+// not attached to - is not.
+bool std_handle_is_file_or_pipe(DWORD which) {
+    const HANDLE h = GetStdHandle(which);
+    const DWORD type = h && h != INVALID_HANDLE_VALUE ? GetFileType(h) : FILE_TYPE_UNKNOWN;
+    return type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE;
+}
 void log_console(bool on) {
+    // stdout goes to the console only when it was started with nowhere of
+    // its own. The setup window's "Compile shaders now" child prints its
+    // progress to a pipe the window reads (host/shader_compile.h): reopening
+    // stdout closed that pipe, and the window heard nothing more of the
+    // compile. Decided once, before a console's handles can replace the
+    // standard ones; a stdout kept is never reopened, so it stays right.
+    static const bool stdout_own = std_handle_is_file_or_pipe(STD_OUTPUT_HANDLE);
     if (on) {
         if (g_log_console) return;
-        // A file or a pipe is the log's already; anything else - none, or a
-        // handle of a console this process is not attached to - is not.
-        const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
-        const DWORD type = h && h != INVALID_HANDLE_VALUE ? GetFileType(h) : FILE_TYPE_UNKNOWN;
-        if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE) return;
+        if (std_handle_is_file_or_pipe(STD_ERROR_HANDLE)) return;
         if (!AttachConsole(ATTACH_PARENT_PROCESS) && !AllocConsole()) return;
         g_log_console = true;
         std::FILE* f = nullptr;
         freopen_s(&f, "CONOUT$", "w", stderr);
-        freopen_s(&f, "CONOUT$", "w", stdout);  // (on_console_ctrl, set at the start, takes this console's close too)
+        if (!stdout_own) freopen_s(&f, "CONOUT$", "w", stdout);  // (on_console_ctrl, set at the start, takes this console's close too)
     } else if (g_log_console) {
         std::fflush(nullptr);
         std::FILE* f = nullptr;
         freopen_s(&f, "NUL", "w", stderr);
-        freopen_s(&f, "NUL", "w", stdout);
+        if (!stdout_own) freopen_s(&f, "NUL", "w", stdout);
         FreeConsole();
         g_log_console = false;
     }
@@ -953,6 +965,7 @@ int main(int argc, char** argv) {
         }
     }
 #else
+    hle_kernel_reserve_guest_windows();  // before anything else can take those addresses (Vulkan's drivers, NGX)
     host_log("bbhost %s (%s, Linux x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
     log_cpu();
     std::signal(SIGTERM, on_term);
@@ -992,6 +1005,15 @@ int main(int argc, char** argv) {
     // --compile-shaders (host/shader_compile.h): no window, no game.
     const bool compile_session = shader_compile_take_flag(argc, argv);
     shader_compile_set_args(argc, argv);
+    // --compile-selftest DIR (host/shader_compile.h): the window's side of
+    // that button end to end, with the log on as the setup window has it by
+    // default (on Windows, its console).
+    if (const std::string dir = shader_compile_selftest_dir(argc, argv); !dir.empty()) {
+        decide_log(true);
+        const int rc = shader_compile_selftest(dir);
+        std::fflush(nullptr);
+        std::_Exit(rc);
+    }
 #else
     const bool compile_session = false;
 #endif
@@ -1017,7 +1039,14 @@ int main(int argc, char** argv) {
         // seen yet (or plugins.show_settings): it opens on the Plugins tab.
         const std::string help = config_setup_help(cfg);
         const bool plugins_tab = !cfg.headless && help.empty() && !cfg.setup_requested && plugin_ui_wants_attention();
-        if (!compile_session && !cfg.headless && !cfg.setup_skip && (cfg.setup_requested || cfg.setup_always || !help.empty() || plugins_tab)) {
+        // The settings moved to their new folder (core/config_move.h): the
+        // window opens to say so until it is dismissed - not for a harness,
+        // which keeps it shut (BBHOST_SETUP_WINDOW=0), nor for the game the
+        // window starts while it stays open (--no-setup).
+        const char* setup_env = std::getenv("BBHOST_SETUP_WINDOW");
+        const bool moved = !(setup_env && std::strcmp(setup_env, "0") == 0) && !config_moves_to_show().empty();
+        if (!compile_session && !cfg.headless && !cfg.setup_skip &&
+            (cfg.setup_requested || cfg.setup_always || !help.empty() || plugins_tab || moved)) {
             std::string reason = help.substr(0, help.find('\n'));
             if (reason.rfind("bbhost: ", 0) == 0) reason = reason.substr(8);
             if (launcher_run(cfg, reason, plugins_tab) == LauncherResult::Quit) return help.empty() ? 0 : 2;
@@ -1064,10 +1093,13 @@ int main(int argc, char** argv) {
     // next start.
     {
         const HostSettings h = host_settings();
-        config_set_enhancements(h.change_appearance, h.rebirth, h.five_players, h.skill_issue);
+        config_set_enhancements(h.change_appearance, h.rebirth, h.five_players, h.skill_issue, h.full_phantom_hp,
+                                h.auto_replenish);
         const HostConfig& c = config();
-        host_log("pc enhancements: mirror %s, rebirth %s, five players %s, skill issue %s", c.change_appearance ? "on" : "off",
-                 c.rebirth ? "on" : "off", c.five_players ? "on" : "off", c.skill_issue ? "on" : "off");
+        host_log("pc enhancements: mirror %s, rebirth %s, five players %s, skill issue %s, Full Phantom HP %s, "
+                 "Auto-Replenish Items %s",
+                 c.change_appearance ? "on" : "off", c.rebirth ? "on" : "off", c.five_players ? "on" : "off",
+                 c.skill_issue ? "on" : "off", c.full_phantom_hp ? "on" : "off", c.auto_replenish ? "on" : "off");
         // The debug menu was a PC Settings switch before the Debug Menu plugin
         // took its place: a player who had it on gets the plugin turned on,
         // once, and the old switch goes off.
