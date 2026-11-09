@@ -79,7 +79,7 @@ log line. Everything a plugin logs is prefixed with `plugin:`.
 
 The API only ever grows. A plugin checks that `api->version` is at least the
 version whose calls it makes, and `api->size` for fields a newer host
-appended. The current version is 21 (`BB_PLUGIN_API_VERSION`).
+appended. The current version is 27 (`BB_PLUGIN_API_VERSION`).
 
 ## Addresses
 
@@ -309,6 +309,13 @@ gives the Binary Ninja address.
   functions by their Japanese names, and with those names in English every
   character died at load.
 
+**Rendering effects** (v27)
+
+- `frame_info`, `on_render` and `aa_claim`: the frame as bbhost draws it,
+  compute work of the plugin's own recorded into it before and after the
+  upscale, and who does the anti-aliasing. See
+  [Rendering effects](#rendering-effects-v27).
+
 **Online rules** (v10)
 
 A gameplay plugin is announced to the server with every request
@@ -317,6 +324,199 @@ only meet others with the same rules. `set_rules` updates the plugin's entry
 (for example when its seed changes); `on_world_rules` and `visitor` let a
 plugin flagged `BB_PLUGIN_ADOPTS_RULES` play by a host's rules when summoned
 into another player's modded world.
+
+## Rendering effects (v27)
+
+A plugin can draw effects of its own into the frame - ambient occlusion,
+fog, a colour pass - from the frame bbhost describes and the images it hands
+over, in the Vulkan command buffer the frame is recorded into. It needs only
+Vulkan's headers (`#define VK_NO_PROTOTYPES` before `vulkan/vulkan.h`): every
+function comes from the device it is given, so it never links the Vulkan
+loader. `tools/render_probe` is a working example: it registers both hooks,
+writes a marker into each, and checks everything below on the GPU.
+
+### The frame: `frame_info`
+
+`frame_info(&info)` fills a `BbFrameInfo` with the last 3D frame described -
+inside a hook, the one being recorded - from any thread. Set `info.size` to
+`sizeof(info)` first: the host fills as much as both of you know and sets
+`size` to that, and a newer host only ever appends fields. From the first call
+on (or the first `on_render`) the host describes every 3D frame; before that
+it costs nothing, and the first call returns 1.
+
+- `frame` counts the 3D frames from 1 (a loading screen is none); `flip` is
+  the host's flip count, as its log has it.
+- `render_width` x `render_height` is the 3D's size - the scene's, the depth's,
+  the motion's and the glow's; `output_width` x `output_height` the picture's,
+  larger than the render size when an upscaler draws the 3D smaller (an
+  Upscaling quality below Native AA, or a Resolution below the window's).
+- `method` is what takes the 3D to the picture this frame: `BB_UPSCALE_NONE`
+  (Upscaling Off, an upscaler this machine cannot run, or a plugin's own
+  anti-aliasing), `BB_UPSCALE_DLSS`, `BB_UPSCALE_FSR` or `BB_UPSCALE_TAA`, and
+  `quality` the Upscaling quality the upscaler is told (`BB_QUALITY_*`; work
+  from the sizes, which are exact).
+- `jitter_x`, `jitter_y`: the render pixels this frame's camera draws were
+  moved by - +x right, +y down - exactly what the upscaler is told; 0 when none
+  runs.
+- `now` and `prev`: this frame's camera and the last frame's, as drawn (an
+  `on_view` plugin's change included) and without the jitter. Each is a
+  `BbFrameCamera`: a `BbCamera` - the basis (right, up, forward) and the eye,
+  which in a row are the view-to-world matrix column by column, the vertical
+  field of view, the aspect, and `near_z`/`far_z`, the view distances the
+  depth's 0 and 1 stand for - and the matrices `view` (world to view), `proj`
+  (view to clip), `view_proj` and `inv_view_proj` (clip to world).
+- `reset` is 1 when there is nothing to blend with: the first frame, a new
+  render or output size or method, no camera this frame or the last, a cut
+  (`BB_FRAME_CUT`: the eye moved more than 4 m, the view turned more than 75
+  degrees or its field of view changed by more than 10), or more than a
+  quarter of a second since the last frame.
+- `flags`: `BB_FRAME_CAMERA` (`now` is this frame's), `BB_FRAME_PREV` (`prev`
+  is the last frame's; else it repeats `now`), `BB_FRAME_CUT`,
+  `BB_FRAME_DEPTH_REVERSED` and `BB_FRAME_AA_PLUGIN` (a plugin does the
+  anti-aliasing).
+
+The conventions:
+
+- Matrices are 16 floats, column-major (`m[column * 4 + row]`: GLSL's `mat4`
+  and GLM's layout; HLSL's `column_major`), applied to column vectors:
+  `clip = proj * view * (x, y, z, 1)`.
+- The world is the game's, in metres, y up - `player_position`'s and
+  `BbCamera`'s. The view: x right, y up, z the way the camera looks.
+- Clip space is Vulkan's over the 3D's images: after the divide by w (the
+  view's z) x runs from -1 at their left edge to +1 at their right, y from -1
+  at their top to +1 at their bottom, and z is the value the depth image holds
+  there: 0 at the near plane and 1 at the far one as the game draws (the other
+  way round with `BB_FRAME_DEPTH_REVERSED`). The pixel (px, py) of a w x h
+  image is centred at `((px + 0.5) / w * 2 - 1, (py + 0.5) / h * 2 - 1)`; the
+  picture at the output size covers the same view.
+- The frame's draws were moved by the jitter: their projection is `proj` with
+  `m[8] = 2 * jitter_x / render_width` and `m[9] = 2 * jitter_y / render_height`.
+- Angles are radians, sizes pixels, times seconds.
+
+### The hooks: `on_render`
+
+`on_render(name, points, fn, user)` has `fn(call, user)` called at each of
+`points` of every 3D frame:
+
+- `BB_RENDER_BEFORE_UPSCALE`: the 3D is drawn - lit, its transparency on it -
+  and nothing has read it yet: the upscaler, TAA, the embers, the sharpening
+  and frame generation come after. With Upscaling Off it is called all the
+  same.
+- `BB_RENDER_AFTER_UPSCALE`: the final picture, after all of them, before the
+  post-processing (exposure, bloom, depth of field, tone mapping, grading) and
+  the HUD. With no upscaler the picture is the scene itself.
+- `| BB_RENDER_MOTION` asks for the frame's motion, made for the hooks whether
+  or not an upscaler or frame generation needs it.
+
+A later call with the same `fn` and `user` replaces its points; no points take
+it away. `name` is the plugin's `BbPluginInfo` name: its hooks are not called
+while it is off, and go if it is unloaded. Several plugins' hooks run in the
+order they were registered.
+
+`call` (a `BbRenderCall`, size first) holds the command buffer, the frame's
+`BbFrameInfo`, the device (`BbRenderDevice`: the instance, physical device and
+device, `get_instance_proc_addr` and `get_device_proc_addr`, the queue family
+and `frames_in_flight`), and the images, each as its `VkImage`, view,
+generation, format, layout, usage, size and `BB_IMAGE_WRITE` when the hook may
+write it:
+
+| Image | What it is | Size | Layout | Written |
+|---|---|---|---|---|
+| `scene` | the lit 3D in linear light: RGBA16F, or B10G11R11 with the Performance patch | render | `GENERAL` | before the upscale |
+| `depth` | the G-buffer's depth, through a view of its depth aspect; jittered as the scene | render | read-only optimal, or `GENERAL` | never |
+| `motion` | with `BB_RENDER_MOTION`: R16G16_SFLOAT, render pixels from each pixel to where its surface was in the last frame, x right, y down, without the jitter | render | `GENERAL` | never |
+| `glow` | the scene's second target, the effects' glow the bloom reads, when the frame has one | render | `GENERAL` | never |
+| `picture` | after the upscale: the final picture - the upscaler's RGBA16F image (a storage image), or the scene when no upscaler runs | output | `GENERAL` | after the upscale |
+
+The scene is a render target: it can be sampled, copied and blitted, never
+bound as a storage image - write your result into an image of your own and
+copy or blit it in. Every writable image takes copies; check `usage` for
+storage.
+
+The contract:
+
+- Record compute and transfer work only: dispatches, copies, blits, clears,
+  and the barriers between your own steps. No render pass, draw, graphics
+  pipeline or dynamic state.
+- Leave every image in the layout the call gives (change one only to put it
+  back before you return).
+- Never submit, end the command buffer or wait for the GPU: no queue, fence,
+  semaphore or query-wait calls. The host submits the frame.
+- The host puts the barriers around each hook - what the frame wrote is
+  visible to your compute and transfer, what you wrote is visible to
+  everything after - and binds all of its own state again afterwards.
+- Hooks run on the thread that records the frame, not the game's main thread,
+  with the renderer's lock held: the host's GPU work waits while one runs. Keep
+  it to recording; build pipelines once. From a hook, call nothing of the
+  host's but `log`, `frame_info` and `on_render`.
+
+How long things last:
+
+- The command buffer and the frame info: for the call.
+- The device: for the whole run (bbhost makes one).
+- An image's handle and view: in every call while its `generation` stays the
+  same - so views and descriptors of your own can be kept by generation. A new
+  generation (a Resolution change makes one) is a new image.
+- What a hook records may still be read by the GPU `frames_in_flight` frames
+  later: free or reuse a resource your commands used no sooner.
+
+### Who does the anti-aliasing: `aa_claim`
+
+`aa_claim(name, claim)` says whether your plugin leaves the anti-aliasing to
+bbhost or does its own; `BB_PLUGIN_AA_LEAVE` or `BB_PLUGIN_AA_TAKE` in
+`BbPluginInfo.flags` is the claim it starts with, which the setup window can
+read before the plugin runs.
+
+- `BB_AA_LEAVE`: your plugin does none and moves no draws. bbhost's runs as
+  the settings say - also beside a Vulkan layer that would otherwise keep its
+  TAA off.
+- `BB_AA_TAKE`: your plugin does it. While it is on, bbhost moves no draws (no
+  jitter) and runs no TAA, FSR or DLSS, nor the game's own anti-aliasing pass,
+  and draws the 3D at the Resolution, as with Upscaling Off. The Upscaling and
+  Anti-aliasing rows name your plugin, in bbhost's menus and the game's; the
+  player's settings are kept for when it is off.
+
+Of the plugins that are on, the strongest claim holds: TAKE before LEAVE. If
+two plugins take it over, both run their own, and the menus name the first
+loaded. Claim from `bb_plugin_init` for the start, or once the game runs from
+the main thread (`on_frame`, `on_option`): the 3D's size follows at the next
+quiet point, as at a Resolution change.
+
+### What it costs
+
+With no hook registered and `frame_info` never called, nothing runs. A hook
+costs a frame description, a barrier on each side, and with Upscaling Off one
+camera read a frame. `BB_RENDER_MOTION` with no upscaler makes the motion as
+frame generation does - the motion pass, the characters' capture - and beside
+TAA one motion pass more. Each hook's GPU time shows in `BBHOST_GPU_PROFILE`
+as `plugin <name> before` and `plugin <name> after`.
+
+## From a Vulkan layer to a plugin
+
+A mod that sits beside `bbhost.exe` as `vulkan-1.dll` and finds the camera,
+the scene and the depth by watching draws breaks whenever bbhost's rendering
+changes. As a bbhost plugin it gets them from bbhost, on Windows and Linux:
+
+1. Export `bb_plugin_info` - opt-in, and `BB_PLUGIN_LIVE_SWITCH` so the
+   player turns it on and off in game - and register from `bb_plugin_init`.
+2. Take the device from the first hook's `call->device`, and every Vulkan
+   function from its `get_device_proc_addr` and `get_instance_proc_addr`.
+3. Read the camera from `frame_info`'s `now` and `prev` instead of finding it
+   in the draws.
+4. Take the scene, the depth, the motion and the glow from the call; keep
+   your views of them by `generation` instead of finding them again.
+5. Move your passes to `BB_RENDER_BEFORE_UPSCALE` (they are then upscaled and
+   anti-aliased with the scene) or `BB_RENDER_AFTER_UPSCALE` (on the final
+   picture).
+6. Never jitter the camera: claim `BB_AA_LEAVE` and bbhost's TAA, FSR or DLSS
+   runs as the player chose, or `BB_AA_TAKE` to do the anti-aliasing yourself.
+7. Remove the `vulkan-1.dll` from beside `bbhost.exe`. As a plugin nothing
+   needs it there, and while a `vulkan-1.dll` that is not the Vulkan loader
+   sits there the upscaler bridge keeps DLSS and FSR off, and bbhost's TAA
+   stays off unless a plugin leaves the anti-aliasing to bbhost.
+8. Check your plugin with `BBHOST_VK_VALIDATE=1`: the Vulkan validation layer
+   reports any layout or barrier it gets wrong.
+9. Build the same source as a `.so` for Linux.
 
 ## The C++ SDK
 

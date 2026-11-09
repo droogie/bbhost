@@ -729,6 +729,10 @@ anti-aliasing:
 Frame generation (AMD FidelityFX) also runs on Windows only. Sharpness
 sharpens what TAA, FSR or DLSS gives.
 
+A plugin can take the anti-aliasing over (plugin API 27, see
+[plugins.md](plugins.md)): while it is on, TAA, FSR and DLSS stay off, the
+Upscaling row names it, and your choice applies again once the plugin is off.
+
 On Windows the package carries the upscalers' files beside `bbhost.exe`:
 Numity1504's Upscaler Bridge (`upscaler_bridge.dll`), which bbhost calls them
 through, NVIDIA's `nvngx_dlss.dll` and AMD's FidelityFX DLLs.
