@@ -1,0 +1,37 @@
+MIT License
+
+Copyright (c) 2026 the bbhost authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---------------------------------------------------------------------------
+This folder holds bbhost's files for its Linux build of AMD's FidelityFX
+library, libbbhost_fidelityfx_vk.so: FSR 3 upscaling on Vulkan, which bbhost
+loads at run time beside its executable (src/host/upscaler_ffx.cpp) as the
+Windows build uses AMD's signed amd_fidelityfx_*_vk.dll. The licence above
+covers the files in this folder.
+
+The library is built from AMD FidelityFX SDK v2.4.0's own source - the
+FidelityFX API, its Vulkan backend and the FSR 3 upscaler - fetched pinned by
+tools/fetch_fidelityfx.sh, MIT, Copyright (C) Advanced Micro Devices, Inc.
+(the SDK's Kits/FidelityFX/docs/license.md, also third_party/fidelityfx/
+LICENSE-signedbin.md), with its shaders compiled by tools/ffx_permutations.py
+and the changes in third_party/fidelityfx/patches. AMD's code is not in this
+repository. The built library is under those MIT terms; bbhost is not
+sponsored or endorsed by AMD.

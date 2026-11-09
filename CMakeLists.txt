@@ -510,6 +510,93 @@ if(UNIX AND NOT APPLE AND Vulkan_FOUND)
   endif()
 endif()
 
+# AMD FSR 3 on Linux: bbhost's build of AMD's FidelityFX library (src/ffx_vk,
+# MIT), libbbhost_fidelityfx_vk.so beside bbhost, which bbhost loads at run
+# time (host/upscaler_ffx.cpp) as the Windows build uses AMD's signed DLLs.
+# AMD's sources - the FidelityFX API, its Vulkan backend and FSR 3 - come from
+# its repository at a pinned tag, each file checked by SHA-256 and patched by
+# third_party/fidelityfx/patches (tools/fetch_fidelityfx.sh, kept in FFX_CACHE,
+# build/fidelityfx by default); never in the repository. Their compute shaders
+# are compiled here into the permutation headers the sources include
+# (tools/ffx_permutations.py, with the command-line DXC of tools/fetch_dxc.sh
+# linux-cli, kept in DXC_CACHE, every blob checked by spirv-val). BBHOST_FFX=OFF,
+# or anything of it missing (offline, no spirv-val): no library, and FSR stays
+# off on Linux.
+if(UNIX AND NOT APPLE AND Vulkan_FOUND)
+  option(BBHOST_FFX "build bbhost's FidelityFX library (FSR 3 on Linux) from AMD's SDK, fetched pinned by tools/fetch_fidelityfx.sh" ON)
+  if(BBHOST_FFX)
+    find_package(Python3 COMPONENTS Interpreter)
+    find_package(Threads REQUIRED)
+    find_program(BBHOST_SPIRV_VAL spirv-val)
+    set(BBHOST_FFX_SDK ${CMAKE_BINARY_DIR}/fidelityfx-sdk)
+    set(BBHOST_FFX_DXC ${CMAKE_BINARY_DIR}/dxc-cli)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_fidelityfx.sh sdk ${BBHOST_FFX_SDK}
+      RESULT_VARIABLE ffx_rc OUTPUT_VARIABLE ffx_out ERROR_VARIABLE ffx_err TIMEOUT 900)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_dxc.sh linux-cli ${BBHOST_FFX_DXC}
+      RESULT_VARIABLE dxc_rc OUTPUT_VARIABLE dxc_out ERROR_VARIABLE dxc_err TIMEOUT 900)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_fidelityfx.sh --tag OUTPUT_VARIABLE ffx_tag OUTPUT_STRIP_TRAILING_WHITESPACE)
+    set(ffx_kit ${BBHOST_FFX_SDK}/Kits/FidelityFX)
+    if(NOT ffx_rc EQUAL 0)
+      string(STRIP "${ffx_err}" ffx_why)
+    elseif(NOT dxc_rc EQUAL 0)
+      string(STRIP "DXC's command-line compiler: ${dxc_err}" ffx_why)
+    elseif(NOT Python3_FOUND OR NOT BBHOST_SPIRV_VAL)
+      set(ffx_why "python3 and spirv-val are needed to make its shaders")
+    else()
+      set(ffx_why "")
+    endif()
+    if(ffx_why STREQUAL "")
+      # The shaders: the headers the SDK's *_shaderblobs.cpp includes, made
+      # together by one run of the generator, which rewrites only what changed.
+      set(ffx_blobs_cpp ${ffx_kit}/upscalers/fsr3/internal/ffx_fsr3upscaler_shaderblobs.cpp)
+      set(ffx_gen ${CMAKE_BINARY_DIR}/ffx-permutations)
+      file(STRINGS ${ffx_blobs_cpp} ffx_includes REGEX "^#include <.*_permutations\\.h>")
+      set(ffx_headers "")
+      foreach(line ${ffx_includes})
+        string(REGEX REPLACE "^#include <(.*)>.*$" "${ffx_gen}/\\1" header "${line}")
+        list(APPEND ffx_headers ${header})
+      endforeach()
+      file(GLOB_RECURSE ffx_shader_sources ${ffx_kit}/upscalers/fsr3/internal/shaders/*.hlsl ${ffx_kit}/upscalers/fsr3/include/gpu/*.h
+        ${ffx_kit}/api/internal/gpu/*.h ${ffx_kit}/framegeneration/*.h)
+      add_custom_command(OUTPUT ${ffx_gen}/ffx_permutations.stamp ${ffx_headers}
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/ffx_permutations.py --sdk ${ffx_kit} --dxc ${BBHOST_FFX_DXC}/bin/dxc
+          --out ${ffx_gen} --spirv-val ${BBHOST_SPIRV_VAL} --compress --stamp ${ffx_gen}/ffx_permutations.stamp
+        DEPENDS ${CMAKE_SOURCE_DIR}/tools/ffx_permutations.py ${ffx_blobs_cpp} ${ffx_kit}/upscalers/fsr3/internal/ffx_fsr3upscaler.cpp
+          ${ffx_shader_sources} ${BBHOST_FFX_DXC}/bin/dxc
+        COMMENT "FidelityFX: FSR 3's shader permutations (DXC, spirv-val)" VERBATIM)
+      set(ffx_sources ${ffx_kit}/api/internal/ffx_api.cpp ${ffx_kit}/api/internal/ffx_assert.cpp ${ffx_kit}/api/internal/ffx_message.cpp
+        ${ffx_kit}/api/internal/ffx_object_management.cpp ${ffx_kit}/api/internal/ffx_query_fallback.cpp ${ffx_kit}/backend/vk/ffx_backends_vk.cpp
+        ${ffx_kit}/backend/vk/ffx_vk.cpp ${ffx_kit}/upscalers/fsr3/internal/ffx_fsr3upscaler.cpp ${ffx_blobs_cpp}
+        ${ffx_kit}/upscalers/fsr3/internal/ffx_provider_fsr3upscale.cpp)
+      add_library(bbhost_fidelityfx_vk MODULE ${ffx_sources} src/ffx_vk/ffx_providers_vk.cpp ${ffx_gen}/ffx_permutations.stamp)
+      set_source_files_properties(${ffx_blobs_cpp} PROPERTIES OBJECT_DEPENDS "${ffx_headers}")
+      target_include_directories(bbhost_fidelityfx_vk PRIVATE src/ffx_vk/include ${ffx_gen} ${ffx_kit} ${ffx_kit}/api/internal ${ffx_kit}/api/include)
+      target_compile_definitions(bbhost_fidelityfx_vk PRIVATE FFX_BACKEND_VK FFX_UPSCALER)
+      # AMD's sources as they are: MSVC's literal suffixes (ui64) take
+      # -fms-extensions, src/ffx_vk/ffx_linux.h the rest; its MSVC pragmas and
+      # deprecations are AMD's. A float handed to int abs() fails the build
+      # (ffx_linux.h says why).
+      target_compile_options(bbhost_fidelityfx_vk PRIVATE -fms-extensions -include ${CMAKE_SOURCE_DIR}/src/ffx_vk/ffx_linux.h
+        -Wno-unknown-pragmas -Wno-unknown-warning-option -Wno-deprecated-declarations -Werror=absolute-value)
+      target_link_libraries(bbhost_fidelityfx_vk PRIVATE Vulkan::Vulkan ZLIB::ZLIB Threads::Threads m)
+      # The five API functions out, libstdc++ and libgcc inside, nothing left
+      # unresolved: the library needs only the Vulkan loader, zlib and glibc.
+      target_link_options(bbhost_fidelityfx_vk PRIVATE -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL
+        -Wl,--version-script=${CMAKE_SOURCE_DIR}/src/ffx_vk/exports.map -Wl,-z,defs)
+      set_target_properties(bbhost_fidelityfx_vk PROPERTIES OUTPUT_NAME bbhost_fidelityfx_vk PREFIX lib
+        CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+        LINK_DEPENDS ${CMAKE_SOURCE_DIR}/src/ffx_vk/exports.map)
+      add_dependencies(bbhost bbhost_fidelityfx_vk)
+      message(STATUS "bbhost: AMD's FidelityFX SDK ${ffx_tag}; building the FidelityFX library (FSR 3 on Linux), ${CMAKE_BINARY_DIR}/libbbhost_fidelityfx_vk.so")
+    else()
+      string(REPLACE "\n" "; " ffx_why "${ffx_why}")
+      message(STATUS "bbhost: no FidelityFX library (${ffx_why}): FSR stays off on Linux")
+    endif()
+  else()
+    message(STATUS "bbhost: BBHOST_FFX=OFF; no FidelityFX library: FSR stays off on Linux")
+  endif()
+endif()
+
 # The game's functions as ours (src/decomp, docs/decomp.md), one folder per
 # engine area. A leaf runs on the game's thread state, where FS may be the
 # game's, so no decomp file reads the stack protector's canary through it; and
@@ -705,6 +792,18 @@ if(UNIX)
       add_test(NAME upscaler_load_order COMMAND upscaler_load_test order $<TARGET_FILE:bbhost_ngx_bridge>)
     else()
       add_test(NAME ngx_bridge_test COMMAND ngx_bridge_test)
+    endif()
+    # bbhost's FidelityFX library (src/ffx_vk) on a real device - lavapipe in
+    # the tests: FSR 3 upscales a jittered synthetic picture, accumulated and
+    # with the jitter read as the host means it. Exit 77 without a device.
+    if(TARGET bbhost_fidelityfx_vk)
+      add_executable(ffx_fsr3_test tests/ffx_fsr3_test.cpp)
+      target_include_directories(ffx_fsr3_test PRIVATE third_party/fidelityfx)
+      target_link_libraries(ffx_fsr3_test PRIVATE Vulkan::Vulkan ${CMAKE_DL_LIBS})
+      target_compile_options(ffx_fsr3_test PRIVATE -Wno-missing-field-initializers)
+      add_dependencies(ffx_fsr3_test bbhost_fidelityfx_vk)
+      add_test(NAME ffx_fsr3_test COMMAND ffx_fsr3_test $<TARGET_FILE:bbhost_fidelityfx_vk>)
+      set_tests_properties(ffx_fsr3_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
   endif()
   add_executable(thunk_args tests/thunk_args.cpp src/core/thunk.cpp src/core/tls_rewrite.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
