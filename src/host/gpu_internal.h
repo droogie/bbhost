@@ -2919,6 +2919,9 @@ public:
     void end_rendering(bool barrier);   // record_end_rendering
     void begin_rendering(const VkRenderingInfo& ri);
     void fill_buffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, std::uint32_t data);
+    // vkCmdUpdateBuffer: `size` bytes of `data` (a multiple of 4, at most
+    // 64 KiB), copied into the stream at once.
+    void update_buffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void* data);
     void copy_buffer(VkBuffer src, VkBuffer dst, std::uint32_t n, const VkBufferCopy* regions);
     void copy_buffer_to_image(VkBuffer buffer, VkImage image, VkImageLayout layout, std::uint32_t n, const VkBufferImageCopy* regions);
     void copy_image_to_buffer(VkImage image, VkImageLayout layout, VkBuffer buffer, std::uint32_t n, const VkBufferImageCopy* regions);
