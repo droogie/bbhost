@@ -716,8 +716,9 @@ std::string hlsl_stable_name(const std::string& gx) {
     }
     return name;
 }
-// "ps", "vs", "hs", "ds", "cs": the lift's stage, from its entry point's
-// execution model.
+// "ps", "vs", "hs", "ds", "gs", "cs": the lift's stage, from its entry
+// point's execution model - the dump's file names' (its profile's first two
+// letters), so an edited file finds its stage.
 std::string lift_stage_tag(const std::vector<std::uint32_t>& spirv) {
     for (std::size_t i = 5; i < spirv.size();) {
         const std::uint32_t len = spirv[i] >> 16, op = spirv[i] & 0xffff;
@@ -727,6 +728,7 @@ std::string lift_stage_tag(const std::vector<std::uint32_t>& spirv) {
                 case 0: return "vs";
                 case 1: return "hs";
                 case 2: return "ds";
+                case 3: return "gs";
                 case 4: return "ps";
                 case 5: return "cs";
                 default: return "xx";
