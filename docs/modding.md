@@ -126,13 +126,21 @@ reads.
 Things to know:
 
 - **Names survive updates; hashes don't.** A file named after the shader
-  (`<name>.<stage>.hlsl`) keeps working after a bbhost update and on another
+  (`<name>.<stage>.hlsl`) keeps matching after a bbhost update and on another
   machine: both parts come from the game's own files. A lift hash
   identifies the shader as translated for your GPU and this bbhost version:
   the device's features (half-precision rounding, run-time sample offsets)
   and the translator are part of it. So `~<hash>` variant files and
   `<hash>` fallback files stop matching after an update; write out a fresh
   set then. A file that no shader matches does nothing.
+- **A dump is printed for the GPU that wrote it.** The device's features
+  change the HLSL, not only the hash: half-precision values are `float16_t2`
+  on a Steam Deck and are packed with `PackHalf2x16` on NVIDIA cards and
+  lavapipe. So a file edited from one GPU's dump can be refused on another
+  (DXC: `unknown type name 'float16_t2'`). A mod meant for every player should
+  patch, from a plugin, the text `shader_source` gives on the player's own
+  machine ([plugins.md](plugins.md), "Shaders") rather than ship whole files;
+  one that ships files needs one for each GPU family it has tested.
 - **An update can change the shader's interface.** If the update changes the
   inputs or outputs the game's own version declares, your file is refused,
   the log says why, and the game uses its own until you edit it again.

@@ -357,7 +357,10 @@ runs.
   instead of shipping whole copies, which an update that changes the shader's
   interface would refuse. It returns 1 until the game has built a stage of
   that shader in this run (ask again from `on_frame`), and 2 when overrides do
-  not apply.
+  not apply. The text is printed for the player's GPU, whose features change
+  it (half-precision values among them), so a file made from another GPU's
+  dump can be refused there: patch what `shader_source` gives on the player's
+  machine.
 - `shader_data(name, offset, data, size)`: numbers of the plugin's own that
   its shaders read with no binding: `BB_SHADER_DATA_BYTES` (64 KiB), zero at
   the start, written from any thread. A shader includes `bbhost.hlsli` - the
