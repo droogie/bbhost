@@ -207,12 +207,14 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
 
 void plugin_ui_refresh(PluginUi& ui) {
     ui.plugins = plugins_scan();
-    // In the game, which of them are running.
+    // In the game, which of them are running, and the anti-aliasing claim each
+    // holds now - one made by aa_claim as well as one its flags declare.
     for (const PluginEntry& loaded : plugins_catalog()) {
         for (PluginEntry& p : ui.plugins) {
             if (p.name != loaded.name) continue;
             p.loaded = !loaded.visitor;  // a visitor is not the player's plugin running
             p.visitor = loaded.visitor;
+            if (!loaded.visitor) p.aa = loaded.aa;
         }
     }
     std::sort(ui.plugins.begin(), ui.plugins.end(), [](const PluginEntry& a, const PluginEntry& b) {
