@@ -350,7 +350,8 @@ if(Vulkan_FOUND)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
   target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/gxvk_homes_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/vertex_snap.cpp src/host/vertex_cutaway.cpp src/host/pixel_cutaway.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/upscaler.cpp src/host/upscale_pass.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/copy_census.cpp src/host/copy_compare.cpp
-                                src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
+                                src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/shader_overrides.cpp src/host/dxc.cpp
+                                src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # The render probe (plugin API 27's frame info, render hooks and
   # anti-aliasing claim checked on the GPU: tools/render_probe): a test aid,
@@ -1167,7 +1168,7 @@ if(UNIX)
   set_tests_properties(gcn_decode_test PROPERTIES SKIP_RETURN_CODE 77)
   # The translation cache (src/host/translation_cache.cpp, which it includes)
   # against the shipped shader bundles.
-  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp src/host/dxc.cpp)
+  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp src/host/dxc.cpp src/host/shader_overrides.cpp)
   target_include_directories(translation_cache_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
   add_dependencies(translation_cache_test bbhost_translator_fingerprint)
@@ -1176,12 +1177,21 @@ if(UNIX)
   # The HLSL default (translation_cache.cpp, which it includes): compiles
   # behind the game, their lanes, the dump and edited HLSL; synthetic shaders,
   # skipped without DXC.
-  add_executable(hlsl_default_test tests/hlsl_default_test.cpp src/core/paced_file.cpp src/host/dxc.cpp)
+  add_executable(hlsl_default_test tests/hlsl_default_test.cpp src/core/paced_file.cpp src/host/dxc.cpp src/host/shader_overrides.cpp)
   target_include_directories(hlsl_default_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(hlsl_default_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
   add_dependencies(hlsl_default_test bbhost_translator_fingerprint)
   add_test(NAME hlsl_default_test COMMAND hlsl_default_test)
   set_tests_properties(hlsl_default_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  # Edited shaders as variants (host/shader_overrides.h, with translation_cache.cpp
+  # included): salts, owners, sources compiled once, names; synthetic shaders,
+  # skipped without DXC.
+  add_executable(shader_overrides_test tests/shader_overrides_test.cpp src/core/paced_file.cpp src/host/dxc.cpp src/host/shader_overrides.cpp)
+  target_include_directories(shader_overrides_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(shader_overrides_test PRIVATE gcn ZLIB::ZLIB ${CMAKE_DL_LIBS})
+  add_dependencies(shader_overrides_test bbhost_translator_fingerprint)
+  add_test(NAME shader_overrides_test COMMAND shader_overrides_test)
+  set_tests_properties(shader_overrides_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # The PC options' generated menu assets (engine/menu_assets.cpp, which it
   # includes) against the game's option movie and message bundles. The
   # config is menu_assets_ensure's (SKILL ISSUE in the bundle's stamp): clang

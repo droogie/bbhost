@@ -33,6 +33,7 @@
 #include "host/rt_extent.h"
 #include "host/shader_bundles.h"
 #include "host/vertex_clamp.h"
+#include "host/shader_overrides.h"
 #include "host/shader_patch.h"
 #include "host/tess_lds.h"
 #include "host/translation_cache.h"
@@ -476,6 +477,10 @@ struct GfxPipeline {
     // The stage cache's keys of its vertex and pixel stages (build_gfx_pipeline),
     // which the pipeline manifest knows a pipeline by.
     std::uint64_t vs_key = 0, ps_key = 0;
+    // A lifted stage of it keyed with an edited shader's salt (DrawState::
+    // hlsl_salt): the pipeline and its libraries are the run's own, made with
+    // the run's pipeline cache (PipelineCacheUse), never kept in its file.
+    bool hlsl_salted = false;
     // A plugin's vertex snap and cutaway (DrawState::snap_cells): the grid its
     // last stage before the rasterizer snaps to, 0 none, then the cutaway's
     // tan_x, tan_y, near and radius (host/vertex_cutaway.h), radius 0 none.
@@ -2823,6 +2828,10 @@ struct CachedProgram {
     // A program a setting patches (host/shader_patch.h) is read again when the
     // settings change what it should be; -1 for every other program.
     std::int64_t patch_mask = -1;
+    // Its edited shaders (host/shader_overrides.h): their salt as of the
+    // overrides' generation `hlsl_gen` - made again on the command processor
+    // once the generation moves (program_salt), never by stage 4's readers.
+    std::uint64_t hlsl_gen = 0, hlsl_salt = 0;
 };
 std::unordered_map<std::uint64_t, CachedProgram> g_programs;
 
@@ -2885,7 +2894,21 @@ const CachedProgram* program_find(std::uint64_t va) {
     const CachedProgram& cp = it->second;
     if (std::memcmp(cp.head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va)), 64) != 0) return nullptr;
     if (cp.patch_mask >= 0 && cp.patch_mask != shader_patch_mask()) return nullptr;
+    if (cp.hlsl_gen != override_gen()) return nullptr;  // its edited shaders' salt to make again (program_salt)
     return &cp;
+}
+
+// A program's edited shaders' salt (host/shader_overrides.h) as the overrides
+// stand at generation `gen`, made again when it moved: the command
+// processor's, under the programs' write lock (stage 4's readers find a stale
+// one in program_find and stop).
+std::uint64_t program_salt(CachedProgram& cp, std::uint64_t gen) {
+    if (cp.hlsl_gen == gen) return cp.hlsl_salt;
+    const std::uint64_t salt = override_salt(cp.name);
+    cache_rw::Write cw(cache_rw::kPrograms);
+    cp.hlsl_salt = salt;
+    cp.hlsl_gen = gen;
+    return salt;
 }
 
 // The fetch shader ends with s_setpc_b64.
@@ -3013,7 +3036,7 @@ CachedProgram* program_for(std::uint32_t id, std::uint64_t va) {
             const std::uint64_t gen = cache_rw::gen(cache_rw::kPrograms);
             PoolById* const e = id && g_program_ids == 1 ? &by_id[id & (kById - 1)] : nullptr;
             if (e && e->id == id && e->va == va && e->gen == gen && e->cp &&
-                (e->cp->patch_mask < 0 || e->cp->patch_mask == shader_patch_mask()))
+                (e->cp->patch_mask < 0 || e->cp->patch_mask == shader_patch_mask()) && e->cp->hlsl_gen == override_gen())
                 return const_cast<CachedProgram*>(e->cp);
             const CachedProgram* const found = program_find(va);
             if (!found) run_part_stop(kRunStopProgram);
@@ -3336,7 +3359,20 @@ struct DrawState {
     // Which bound target each of its outputs 0-5 goes to, 3 bits each
     // (gbuffer_targets): the G-buffer is not always bound in one order.
     std::uint32_t gbuffer_slots = kGbufferSlotsAsBound;
+    // Edited shaders (host/shader_overrides.h): the salt of each program the
+    // pipeline is built from - the vertex slot's, the pixel shader's, the
+    // LS's, the hull's, the ES's (kSaltVs...) - which names the sources its
+    // lifted stages compile with; 0 for one without. Salted into the key in
+    // draw_impl, like the snap, and into each lifted stage's key in
+    // build_gfx_pipeline; such a pipeline is never recorded.
+    std::uint64_t hlsl_salt[5] = {};
 };
+enum : int { kSaltVs = 0, kSaltPs, kSaltLs, kSaltHs, kSaltEs };
+// Any of the draw's programs has edited shaders (DrawState::hlsl_salt).
+bool hlsl_salted(const DrawState& s) { return (s.hlsl_salt[0] | s.hlsl_salt[1] | s.hlsl_salt[2] | s.hlsl_salt[3] | s.hlsl_salt[4]) != 0; }
+// A lifted stage's key with its program's salt (0: as it is).
+constexpr std::uint64_t kHlslOverrideSalt = 0x0ed17edc0de5a17ull;
+std::uint64_t salted_key(std::uint64_t key, std::uint64_t salt) { return salt ? fnv1a(&salt, sizeof(salt), key ^ kHlslOverrideSalt) : key; }
 
 // BBHOST_CLIP_CONTROL (host/clip_control.h), on unless 0: PA_CL_CLIP_CNTL's
 // CLIP_DISABLE, ZCLIP_NEAR_DISABLE and ZCLIP_FAR_DISABLE as depth clamp on the
@@ -5655,6 +5691,7 @@ bool recipe_recordable(const DrawState& s) {
     // every effect's first sight compiled its twin on the command processor -
     // the plugins' hitches as fire, blood and smoke first appeared each start.
     if (s.host_gbuffer) return false;  // its host pixel shader: not kept
+    if (hlsl_salted(s)) return false;  // its edited shaders' stages: the run's own (DrawState::hlsl_salt)
     if (s.gs) return !t_pipeline_worker || (t_gs_programs[0] && t_gs_programs[1]);  // its ES and copy shader, as tessellation's programs
     if (!recipe_tessellated(s)) return true;
     return !t_pipeline_worker || t_tess_native_programs[0] || t_tess_native_programs[1];
@@ -6336,7 +6373,8 @@ bool build_gs_es_stage(GfxPipeline& pl, const DrawState& s, const VertexInputPla
     }
     gcn::TranslateOptions eo = o;
     eo.gs_role = gcn::TranslateOptions::GsRole::EsVertex;
-    hlsl_name_next(es->name);
+    if (s.hlsl_salt[kSaltEs]) pl.hlsl_salted = true;
+    hlsl_name_next(es->name, s.hlsl_salt[kSaltEs]);
     gcn::LiftResult lifted = lift_gs_cached(TranslationUse::kLiftEs, prog, eo, ref, gl);
     if (!lifted.ok()) {
         why = "ES " + es->name + " not lifted: " + lifted.rejections[0];
@@ -7172,7 +7210,8 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
         tl.attr_vec4s = s.tess_constants[0] / 16;
         tl.own_params = true;
         tl.params_binding = kTessNativeLsParams;
-        hlsl_name_next(ls->name);
+        if (s.hlsl_salt[kSaltLs]) pl.hlsl_salted = true;
+        hlsl_name_next(ls->name, s.hlsl_salt[kSaltLs]);
         gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftLs, prog, o, ref, tl);
         const bool first = tess_native_first(ls->name);
         if (!lifted.ok()) {
@@ -7230,7 +7269,8 @@ bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexI
         gcn::TessLift tl = tess_native_lift(s, s.tess_cb[1]);
         tl.own_params = true;
         tl.params_binding = kTessNativeHsParams;
-        hlsl_name_next(hs->name);
+        if (s.hlsl_salt[kSaltHs]) pl.hlsl_salted = true;
+        hlsl_name_next(hs->name, s.hlsl_salt[kSaltHs]);
         gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftHull, prog, o, ref, tl);
         const bool first = tess_native_first(hs->name);
         if (!lifted.ok()) {
@@ -7403,6 +7443,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                 bool cb_no_fallback, const VertexInputPlan* vertex_input, bool create = true, bool layout_only = false) {
     pl.name = vs_name + "+" + ps_name;
     pl.lean = cb_no_fallback;
+    pl.hlsl_salted = false;  // set by each lifted stage keyed with its edited shaders' salt
     const PipelineBuildScope build_scope(pl, create ? "built" : "laid out");
     // A fallback laid out from its no-fallback stages is built again in place
     // (BBHOST_LAYOUT_FROM_LEAN): what the tessellation stages were lifted to
@@ -7466,6 +7507,12 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         std::uint64_t ps_key = lift_key(ps_stage_key(ps_in), ps_lift);
         // Its lift rewritten for rebuilt motion vectors: one per setting (velo_variant).
         if (const std::uint32_t v = ps_lift ? velo_variant(ps_name) : 0) ps_key = fnv1a(&v, sizeof(v), ps_key);
+        // Its lift with the program's edited shaders: a stage per set of their
+        // sources, which nothing records (DrawState::hlsl_salt).
+        const std::uint64_t ps_salt = ps_lift ? s.hlsl_salt[kSaltPs] : 0;
+        ps_key = salted_key(ps_key, ps_salt);
+        if (ps_salt) pl.hlsl_salted = true;
+        const bool ps_noted = !t_replaying && !ps_salt;  // the manifest's and the precompile's and the sweep's notes
         pl.ps_key = ps_key;
         const bool ps_cacheable = g_stage_cache_on;
         const std::shared_ptr<const CachedStage> ps_hit = ps_cacheable ? cached_stage(ps_key) : nullptr;
@@ -7475,7 +7522,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
             if (!t_replaying) manifest_note_hit(ps_key);
             if (!t_replaying && !t_pipeline_worker && ps_hit->lifted) hlsl_note_drawn(ps_key);
-            if (!t_replaying && note_precompile_hit(ps_key) && g_precompile_check && !ps_lift) {
+            if (ps_noted && note_precompile_hit(ps_key) && g_precompile_check && !ps_lift) {
                 const gcn::Program p = gcn::decode(ps_words.data(), ps_words.size());
                 check_precompiled_stage("PS", ps_name, ps_hit->meta, gcn::translate(p, ps_translate_options(ps_in)));
             }
@@ -7485,14 +7532,14 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             const gcn::TranslateOptions po = ps_translate_options(ps_in);
             pl.ps.fresh() = translate_cached(ps_prog, po);
             note_ps_early_tests(ps_words, pl.ps.meta().spirv);
-            if (!t_replaying) note_sweep_hit(ps_key);
-            if (!t_replaying) {
+            if (ps_noted) note_sweep_hit(ps_key);
+            if (ps_noted) {
                 note_stage_translation(1, ps_words, ps_key, stage_lean);
                 note_precompile_miss(ps_name, ps_in);
                 note_image_dims(1, ps_name, ps_prog, pl.ps.meta(), ps_dims);
                 note_first_translation(1, ps_name);
             }
-            if (!t_replaying) {
+            if (ps_noted) {
                 bool all_2d = true, modes_default = true, map_identity = true;
                 for (const auto& d : ps_dims) all_2d &= (d.first & 0xff) == 1 && !d.second;
                 for (bool m : ps_sampler_modes) modes_default &= !m;
@@ -7510,14 +7557,14 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                 g_pl_stage_translations.fetch_add(1, std::memory_order_relaxed);
             }
             ++t_stage_translations;
-            if (!g_stage_cache_on) note_stage_key(ps_key);
+            if (!g_stage_cache_on && !ps_salt) note_stage_key(ps_key);
             if (!pl.ps.meta().ok()) return fail("PS: " + pl.ps.meta().errors[0]);
-            if (!t_replaying) manifest_note_ps(ps_key, ps_name, ps_in, ps_lift);
+            if (ps_noted) manifest_note_ps(ps_key, ps_name, ps_in, ps_lift);
             // BBHOST_DECOMP: the no-fallback variant of a selected pixel shader runs
             // its typed lift. The lift declares the translation's bindings, so the
             // descriptor sets are unchanged; a rejection keeps the translation.
             if (ps_lift) {
-                hlsl_name_next(ps_name);
+                hlsl_name_next(ps_name, ps_salt);
                 gcn::LiftResult lifted = lift_cached(false, ps_prog, po, pl.ps.meta());
                 // BBHOST_LIFT_LISTING=<PS>[,<PS>...]: its lift's listing (the
                 // program with each write's typed value, regions marked) in
@@ -7652,6 +7699,17 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         vs_key = fnv1a(shape, sizeof(shape), vs_key ^ 0x65111f7ull);
         vs_key = fnv1a(copy ? &copy->hash : &s.gs_copy_va, sizeof(std::uint64_t), vs_key);
     }
+    // Its lift with the program's edited shaders (DrawState::hlsl_salt), and a
+    // native hull pipeline's LS's and hull's, a geometry-shader pipeline's
+    // ES's: lifted with this stage, they keep no key of their own, and this
+    // one is what the pipeline's content key knows them by.
+    const std::uint64_t vs_salt = vs_decomp || ds_lift || ds_native || gs_lift ? s.hlsl_salt[kSaltVs] : 0;
+    vs_key = salted_key(vs_key, vs_salt);
+    if (ds_native) vs_key = salted_key(salted_key(vs_key, s.hlsl_salt[kSaltLs]), s.hlsl_salt[kSaltHs]);
+    if (gs_lift) vs_key = salted_key(vs_key, s.hlsl_salt[kSaltEs]);
+    const bool vs_salted = vs_salt || (ds_native && (s.hlsl_salt[kSaltLs] | s.hlsl_salt[kSaltHs])) || (gs_lift && s.hlsl_salt[kSaltEs]);
+    if (vs_salted) pl.hlsl_salted = true;
+    const bool vs_noted = !t_replaying && !vs_salted;
     pl.vs_key = vs_key;
     const bool vs_cacheable = g_stage_cache_on;
     const std::shared_ptr<const CachedStage> vs_hit = vs_cacheable ? cached_stage(vs_key) : nullptr;
@@ -7661,7 +7719,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
         if (!t_replaying) manifest_note_hit(vs_key);
         if (!t_replaying && !t_pipeline_worker && vs_hit->lifted) hlsl_note_drawn(vs_key);
-        if (!t_replaying && note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native && !gs_lift) {
+        if (vs_noted && note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native && !gs_lift) {
             const gcn::Program p = gcn::decode(vs_words.data(), vs_words.size());
             check_precompiled_stage("VS", vs_name, vs_hit->meta, gcn::translate(p, vs_translate_options(vs_in, nullptr)));
         }
@@ -7675,15 +7733,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         }
         const gcn::TranslateOptions vo = vs_translate_options(vs_in, fetch_words.empty() ? nullptr : &fetch_prog);
         pl.vs.fresh() = translate_cached(vs_prog, vo);
-        if (!t_replaying) note_sweep_hit(vs_key);
-        if (!t_replaying) {
+        if (vs_noted) note_sweep_hit(vs_key);
+        if (vs_noted) {
             note_stage_translation(0, vs_words, vs_key, stage_lean);
             note_vs_precompile_miss(vs_name, vs_in);
             note_image_dims(0, vs_name, vs_prog, pl.vs.meta(), vs_dims);
             note_first_translation(0, vs_name);
             if (!gs_lift) note_vs_dependencies(vs_name, vs_words, vs_input, output_links, stage_lean, s, vs_dims, vs_sampler_modes);
         }
-        if (!t_replaying) {
+        if (vs_noted) {
             std::lock_guard<std::mutex> lk(g_stage_variants.mu);
             if (vo.fetch) g_stage_variants.vs_with_fetch += 1;
             if (vs_input) g_stage_variants.vs_with_vertex_input += 1;
@@ -7693,14 +7751,14 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             g_pl_stage_translations.fetch_add(1, std::memory_order_relaxed);
         }
         ++t_stage_translations;
-        if (!g_stage_cache_on) note_stage_key(vs_key);
+        if (!g_stage_cache_on && !vs_salted) note_stage_key(vs_key);
         if (!pl.vs.meta().ok()) return fail("VS: " + pl.vs.meta().errors[0]);
-        if (!vs_in.tess_window && !gs_lift && !t_replaying) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
+        if (!vs_in.tess_window && !gs_lift && vs_noted) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
         // The lift declares the translation's bindings and outputs (lift.cpp
         // checks the outputs), so layouts and linkage are unchanged; a rejection
         // keeps the translation.
         if (vs_decomp) {
-            hlsl_name_next(vs_name);
+            hlsl_name_next(vs_name, vs_salt);
             gcn::LiftResult lifted = lift_cached(true, vs_prog, vo, pl.vs.meta());
             name_stage(lifted, pl.vs.meta(), vs_name);
             static std::mutex logged_mu;  // no-fallback variants build on the pipeline workers
@@ -7723,7 +7781,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (ds_lift) {
             gcn::TessLift tl;
             tl.attr_vec4s = s.tess_attr_vec4s;
-            hlsl_name_next(vs_name);
+            hlsl_name_next(vs_name, vs_salt);
             gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftDomain, vs_prog, vo, pl.vs.meta(), tl);
             name_stage(lifted, pl.vs.meta(), vs_name);
             static std::mutex logged_mu;
@@ -7747,7 +7805,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         if (ds_native) {
             // The window's control points and patch constants as the control
             // stage's outputs (gcn::lift_domain_shader, TessLift::window).
-            hlsl_name_next(vs_name);
+            hlsl_name_next(vs_name, vs_salt);
             gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftDomain, vs_prog, vo, pl.vs.meta(), tess_native_lift(s, s.tess_cb[0]));
             if (!lifted.ok()) return fail("native hull pipeline: domain shader " + vs_name + " not lifted: " + lifted.rejections[0]);
             name_stage(lifted, pl.vs.meta(), vs_name);
@@ -7773,7 +7831,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             if (!gs_lift_for(s, gl, why)) return fail("geometry shader " + vs_name + ": " + why);
             gcn::TranslateOptions go = vo;
             go.gs_role = gcn::TranslateOptions::GsRole::Geometry;
-            hlsl_name_next(vs_name);
+            hlsl_name_next(vs_name, vs_salt);
             gcn::LiftResult lifted = lift_gs_cached(TranslationUse::kLiftGs, vs_prog, go, pl.vs.meta(), gl);
             if (!lifted.ok()) return fail("geometry shader " + vs_name + " not lifted: " + lifted.rejections[0]);
             name_stage(lifted, pl.vs.meta(), vs_name);
@@ -7884,10 +7942,13 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // of its own, which holds the elements and their formats.
         const bool ls_lift = stage_lean && vertex_input && (g_lift_tess & kLiftTessLs) && decomp_selects(ls->name);
         std::uint64_t ls_key = tess_ls_key(ls->words, fetch ? &fetch->words : nullptr, s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s);
+        // Lifted, with the program's edited shaders (DrawState::hlsl_salt).
+        const std::uint64_t ls_salt = ls_lift ? s.hlsl_salt[kSaltLs] : 0;
         if (ls_lift) {
             ls_key = fnv1a(vertex_input->elements.data(), vertex_input->elements.size() * sizeof(gcn::VertexElement), ls_key ^ 0x1515f7ull);
-            ls_key = lift_key(ls_key, true);
+            ls_key = salted_key(lift_key(ls_key, true), ls_salt);
         }
+        if (ls_salt) pl.hlsl_salted = true;
         const std::shared_ptr<const CachedStage> ls_hit = g_stage_cache_on ? cached_stage(ls_key) : nullptr;
         gcn::Program prog;
         if (ls_hit) {
@@ -7908,7 +7969,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                 const gcn::TranslateResult ref = translate_cached(prog, vo);
                 gcn::TessLift tl;
                 tl.attr_vec4s = s.tess_attr_vec4s;
-                hlsl_name_next(ls->name);
+                hlsl_name_next(ls->name, ls_salt);
                 gcn::LiftResult lifted = ref.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo, ref, tl) : gcn::LiftResult{};
                 static std::mutex logged_mu;
                 static std::set<std::string> logged;
@@ -7940,7 +8001,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                     vo4.cb_binding_base = kTessNativeLsBuffers;
                     vo4.cb_bias_zero = true;
                     const gcn::TranslateResult ref4 = translate_cached(prog, vo4);
-                    hlsl_name_next(ls->name);
+                    hlsl_name_next(ls->name, ls_salt);
                     gcn::LiftResult lifted4 = ref4.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo4, ref4, tl) : gcn::LiftResult{};
                     if (lifted4.ok() && ref4.images.empty() && ref4.samplers.empty()) {
                         name_stage(lifted4, ref4, ls->name);
@@ -8948,6 +9009,7 @@ VkPipeline relink_build(Precompiler& w, const PrecompileJob& job) {
     // The pipeline's stages and layouts are fixed once it is linked, and
     // graphics shader modules are never destroyed.
     const GfxPipeline& pl = *job.relink;
+    const RunOnlyCache run_only(pl.hlsl_salted);
     if (job.specialize_formats || job.w3_mask[0]) {
         std::uint32_t words[48] = {};
         if (job.specialize_formats) std::copy(job.vertex_formats, job.vertex_formats + 16, words);
@@ -11097,6 +11159,7 @@ int hlsl_stages_from_lifts(GfxPipeline& pl, bool make) {
     for (ShaderStage* st : {&pl.vs, &pl.ps, &pl.tess_ls}) {
         if (!st->module || !st->lifted) continue;  // a translation's module is never DXC's
         if (const std::shared_ptr<const CachedStage> lift = hlsl_lift_stage(st->meta(), make)) {
+            if (make) hlsl_note_override_refused(st->meta().spirv);  // an edited shader's: its state says so
             st->take(lift);
             st->module = lift->module;
             ++swapped;
@@ -11141,6 +11204,7 @@ bool hlsl_test_refused(const GfxPipeline& pl) {
 // state with its key (the key covers the fixed state and vertex input).
 bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::size_t fetch_dwords) {
     const PipelineBuildScope build_scope(pl, "created");
+    const RunOnlyCache run_only(pl.hlsl_salted);  // an edited shader's: its libraries and pipeline the run's own
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -23823,6 +23887,21 @@ static bool draw_impl(const GpuDraw& d) {
         draw_failed(kFailPsProgram);
         return false;
     }
+    // Edited shaders (host/shader_overrides.h): each program's salt - the
+    // vertex slot's, the pixel shader's, and the LS's, the native hull's and
+    // the ES's where the pipeline has them - made again in order once the
+    // overrides change (a run part's draw stops for it). Nothing while there
+    // are none.
+    if (const std::uint64_t gen = override_gen()) [[unlikely]] {
+        CachedProgram* const progs[5] = {vs_cp, ps_cp, s.tess_hw && s.ls_va ? program_at(s.ls_va) : nullptr,
+                                         s.tess_native && s.hs_va ? program_at(s.hs_va) : nullptr, s.gs && s.es_va ? program_at(s.es_va) : nullptr};
+        for (const CachedProgram* cp : progs) {
+            if (cp && cp->hlsl_gen != gen && run_part_stop(kRunStopProgram)) return false;
+        }
+        for (int k = 0; k < 5; ++k) {
+            if (progs[k]) s.hlsl_salt[k] = program_salt(*progs[k], gen);
+        }
+    }
     if (!s.gs && d.gx_objects && d.gx_objects->shader[3]) {
         // A draw that binds a geometry shader, drawn as GX's VS and PS: its ES
         // exports no position, so nothing of it is drawn. By GS program.
@@ -24130,6 +24209,8 @@ static bool draw_impl(const GpuDraw& d) {
     // A velocity shader rebuilt motion vectors rewrite: a pipeline per
     // Motion vectors setting (velo_variant).
     if (const std::uint32_t v = velo_variant(ps_name)) key = fnv1a(&v, sizeof(v), key);
+    // Edited shaders: a pipeline per set of the programs' sources.
+    if (hlsl_salted(s)) key = fnv1a(s.hlsl_salt, sizeof(s.hlsl_salt), key ^ kHlslOverrideSalt);
     // A plugin's vertex snap (host/scene_look.h, the Bloodborne PS1's): a camera
     // draw takes a pipeline whose last stage before the rasterizer snaps to
     // the grid (build_gfx_pipeline), one per grid - the 3D's size and the

@@ -25,6 +25,7 @@
 #include "host/shader_patch.h"
 #include "host/shaders/gpu_stall.spv.h"
 #include "host/shader_bundles.h"
+#include "host/shader_overrides.h"
 #include "host/translation_cache.h"
 #include "host/twin_filter.h"
 #include "host/cb_capture.h"
@@ -3142,6 +3143,7 @@ bool create_upload_buffer(DevBuffer& b, std::uint64_t size, const char* what) {
 
 std::atomic<std::size_t> g_pipeline_cache_bytes{0};  // the cache's size when last loaded or saved
 std::atomic<bool> g_cache_divert{false};             // PipelineCacheUse (gpu_internal.h)
+thread_local bool t_run_only_cache = false;          // RunOnlyCache (gpu_internal.h)
 std::atomic<int> g_cache_users{0};
 std::atomic<std::uint64_t> g_cache_diverted{0};
 
@@ -4992,6 +4994,7 @@ bool init_locked() {
     VkPipelineCacheCreateInfo side{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     if (vkCreatePipelineCache(g.device, &side, nullptr, &g.side_cache) != VK_SUCCESS) g.side_cache = VK_NULL_HANDLE;
     if (vkCreatePipelineCache(g.device, &side, nullptr, &g.opt_cache) != VK_SUCCESS) g.opt_cache = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(g.device, &side, nullptr, &g.run_cache) != VK_SUCCESS) g.run_cache = VK_NULL_HANDLE;
 
     // Descriptor layout: params UBO, then sampled images, samplers, storage images.
     std::vector<VkDescriptorSetLayoutBinding> binds;
@@ -5705,7 +5708,8 @@ gcn::TranslateOptions compute_options(std::uint32_t rsrc1, std::uint32_t rsrc2, 
 // binds those from one list for either.
 std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::uint32_t rsrc1, std::uint32_t rsrc2, const std::uint32_t* threads,
                                                 const std::vector<std::pair<std::uint32_t, bool>>& dims, const std::vector<bool>& modes,
-                                                const gcn::TranslateResult& regular, std::uint64_t key, const std::string& name, bool lift) {
+                                                const gcn::TranslateResult& regular, std::uint64_t key, const std::string& name, bool lift,
+                                                std::uint64_t salt = 0) {
     if (!cs_buffers_on() || (lift && !cs_lift_buffers_on())) return nullptr;
     auto lean = std::make_shared<ComputeLean>();
     const gcn::TranslateOptions lean_options = compute_options(rsrc1, rsrc2, threads, dims, modes, true);
@@ -5747,7 +5751,7 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
     // as it does (gcn::lift_compute_shader); refused, the program has none and
     // keeps its walking lift.
     if (why.empty() && lift) {
-        hlsl_name_next(name);
+        hlsl_name_next(name, salt);
         gcn::LiftResult l = lift_compute_cached(prog, lean_options, lean->meta);
         if (l.ok()) {
             lean->meta.spirv = std::move(l.spirv);
@@ -5784,6 +5788,7 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
             }
             std::vector<std::uint32_t> lift;
             if (why.empty() || !lean->lifted || own || !hlsl_lift_of(lean->meta.spirv, lift)) break;
+            hlsl_note_override_refused(lean->meta.spirv);
             if (lean->module) vkDestroyShaderModule(g.device, lean->module, nullptr);
             lean->module = VK_NULL_HANDLE;
             lean->meta.spirv = std::move(lift);
@@ -5863,7 +5868,7 @@ void note_compute_lift(const std::string& name, bool lifted, const std::string& 
     if (!lifted && at.empty()) at = why.empty() ? std::string("not asked for (BBHOST_LIFT_COMPUTE=0 or BBHOST_DECOMP)") : why;
 }
 void apply_compute_lift(const gcn::Program& prog, const gcn::TranslateOptions& o, gcn::TranslateResult& meta, const std::string& name, bool& lifted,
-                        std::string& why) {
+                        std::string& why, std::uint64_t salt = 0) {
     lifted = false;
     why.clear();
     if (!meta.ok()) return;
@@ -5871,7 +5876,7 @@ void apply_compute_lift(const gcn::Program& prog, const gcn::TranslateOptions& o
         note_compute_lift(name, false, why);
         return;
     }
-    hlsl_name_next(name);
+    hlsl_name_next(name, salt);
     gcn::LiftResult l = lift_compute_cached(prog, o, meta);
     if (l.ok()) {
         meta.spirv = std::move(l.spirv);
@@ -5987,6 +5992,7 @@ struct CsOptimizer {
         std::uint64_t flip = 0;        // when its stand-in was built
         std::uint64_t standin_us = 0;  // and how long that took
         VkPipelineLayout layout = VK_NULL_HANDLE;  // null: Gpu::pipe_layout
+        bool run_only = false;  // an edited shader's (RunOnlyCache): its cache goes, never merged
     };
     struct Running {
         std::string name;  // empty: the thread is idle
@@ -6127,7 +6133,7 @@ void cs_optimize_thread(int index) {
             if (g.opt_cache == VK_NULL_HANDLE || vkCreatePipelineCache(g.device, &pcci, nullptr, &own) != VK_SUCCESS) own = VK_NULL_HANDLE;
             p = create_compute(module, CsBuild::kOptimized, job.name + watch, &job.spirv, own, job.layout);
             if (own != VK_NULL_HANDLE) {
-                if (p) {
+                if (p && !job.run_only) {
                     std::lock_guard<std::mutex> lk(g_opt_cache_mu);
                     vkMergePipelineCaches(g.device, g.opt_cache, 1, &own);
                 }
@@ -6183,6 +6189,7 @@ void queue_compute_optimize(std::uint64_t key, const std::string& name, const st
         job.flip = hle_video_flip_count();
         job.standin_us = standin_us;
         job.layout = layout;
+        job.run_only = t_run_only_cache;
         g_cs_opt.jobs.push_back(std::move(job));
     }
     g_cs_opt.cv.notify_one();
@@ -6428,7 +6435,7 @@ bool precompiled_compute_done(std::uint64_t key) {
 
 ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std::vector<std::uint32_t>& words,
                               const std::string& name, const std::vector<std::pair<std::uint32_t, bool>>& dims,
-                              const std::vector<bool>& sampler_modes) {
+                              const std::vector<bool>& sampler_modes, std::uint64_t salt = 0) {
     auto it = g.pipelines.find(key);
     if (it != g.pipelines.end()) {
         if (!it->second.pending) {
@@ -6465,7 +6472,10 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         host_log("gpu: shader %s copies the V# in user[%d:%d] into an image", name.c_str(), pl.img_src_sgpr, pl.img_src_sgpr + 3);
     }
     if (pl.copy) host_log("gpu: shader %s copies the V# in user[%d:%d] to user[%d:%d] (render targets become snapshots)", name.c_str(), pl.copy_src_sgpr, pl.copy_src_sgpr + 3, pl.copy_dst_sgpr, pl.copy_dst_sgpr + 3);
-    switch (take_precompiled_compute(key, d, name, dims, sampler_modes, pl)) {
+    // A key with edited shaders' salt (host/shader_overrides.h) was never
+    // compiled ahead: built here, its pipelines the run's own, never recorded.
+    const RunOnlyCache run_only(salt != 0);
+    switch (salt ? Precompiled::kBuildHere : take_precompiled_compute(key, d, name, dims, sampler_modes, pl)) {
     case Precompiled::kTaken:
         g.translated.fetch_add(1);
         recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, false);  // a compute record's: its use counted
@@ -6493,7 +6503,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         pl.failed = true;
         return pl;
     }
-    apply_compute_lift(prog, o, pl.meta, name, pl.lifted, pl.lift_why);
+    apply_compute_lift(prog, o, pl.meta, name, pl.lifted, pl.lift_why, salt);
     if (const char* e = std::getenv("BBHOST_DUMP_SPIRV"); e && e[0] == '1') {
         host_mkdir("build/spv");
         const std::string path = "build/spv/" + name + (pl.lifted ? "-cs-lifted.spv" : "-cs.spv");
@@ -6531,6 +6541,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         }
         // BBHOST_HLSL: the driver refused DXC's module - the lift's own next.
         if (std::vector<std::uint32_t> lift; hlsl_lift_of(pl.meta.spirv, lift)) {
+            hlsl_note_override_refused(pl.meta.spirv);
             if (pl.module) vkDestroyShaderModule(g.device, pl.module, nullptr);
             pl.module = VK_NULL_HANDLE;
             pl.meta.spirv = std::move(lift);
@@ -6550,7 +6561,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     // with its buffers pushed, is the form a translated one runs in, and the
     // lift of that translation a lifted one's (BBHOST_LIFT_CS_BUFFERS) - its
     // walking lift when a buffer does not bind.
-    pl.lean = build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name, pl.lifted);
+    pl.lean = build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name, pl.lifted, salt);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     g.translated.fetch_add(1);
     static const char* trace_name = std::getenv("BBHOST_TRACE_DISPATCH");
@@ -6583,7 +6594,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     }
     // Built here, on the command processor: the next start (or a list's
     // first start) builds it on a precompile worker instead.
-    if (pl.pipeline) recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, true);
+    if (pl.pipeline && !salt) recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, true);
     return pl;
 }
 
@@ -9841,6 +9852,9 @@ struct CachedCompute {
     std::string name;
     std::uint64_t hash = 0;
     std::uint32_t head[16];
+    // Its edited shaders (host/shader_overrides.h): their salt as of the
+    // overrides' generation `hlsl_gen`, made again once it moves.
+    mutable std::uint64_t hlsl_gen = 0, hlsl_salt = 0;
 };
 std::unordered_map<std::uint64_t, CachedCompute> g_compute_programs;
 
@@ -10110,8 +10124,18 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         image_dims_for(paths_for(code_hash, words, gcn::Stage::Compute, d.rsrc1, d.rsrc2), d.user_data);
     const auto sampler_modes = sampler_modes_for(paths_for(code_hash, words, gcn::Stage::Compute, d.rsrc1, d.rsrc2), d.user_data);
     stamp.to(kDpPaths);
-    const std::uint64_t key = compute_key(code_hash, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes);
-    ComputePipeline& pl = pipeline_for(d, key, words, name, dims, sampler_modes);
+    std::uint64_t key = compute_key(code_hash, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes);
+    // Its edited shaders: a pipeline per set of their sources (host/shader_overrides.h).
+    std::uint64_t salt = 0;
+    if (const std::uint64_t gen = override_gen()) [[unlikely]] {
+        if (cc->hlsl_gen != gen) {
+            cc->hlsl_salt = override_salt(name);
+            cc->hlsl_gen = gen;
+        }
+        salt = cc->hlsl_salt;
+        if (salt) key = fnv1a(&salt, sizeof(salt), key ^ 0x0ed17edc0de5a17ull);
+    }
+    ComputePipeline& pl = pipeline_for(d, key, words, name, dims, sampler_modes, salt);
     if (g.oob.map && !pl.failed && !pl.oob_named) {  // BBHOST_OOB_COUNT: the slot's name, once
         pl.oob_named = true;
         note_oob_compute_slot(pl.meta.oob_slot, pl.name);

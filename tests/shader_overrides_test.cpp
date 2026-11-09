@@ -1,0 +1,238 @@
+// Edited shaders as variants (host/shader_overrides.h): a program's sources
+// named by one salt, which the stages built with it compile, whatever the
+// sources are by then; the player's folder before other owners, and an
+// owner's texts before its folders; a return to an earlier source compiling
+// nothing; the variant's file before the shader's before the lift hash's,
+// which ties itself to its program at that lift's first sight; a file changed
+// after it was listed, listed again; an owner turned off or gone; a geometry
+// lift's stage. Synthetic pixel shaders through the HLSL path (BBHOST_HLSL=1,
+// compiled where they are met). Skips (77) without DXC.
+#include "host/translation_cache.cpp"
+
+#include "gcn/isa.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+#include <unistd.h>
+
+std::uint32_t host_thread_id() { return 1; }
+void host_thread_set_name(const char*) {}
+void host_thread_background() {}
+int host_opt_motion_rebuilt_bits() { return 0; }
+
+using namespace gpu;
+
+static int g_failures = 0;
+#define CHECK(cond)                                                                        \
+    do {                                                                                   \
+        if (!(cond)) {                                                                     \
+            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond);  \
+            ++g_failures;                                                                  \
+        }                                                                                  \
+    } while (0)
+
+namespace {
+
+constexpr std::uint32_t kEndpgm = 0xbf810000u;
+
+// attr0's channels interpolated in the order `chans` gives, exported to mrt0
+// (as hlsl_default_test makes them).
+struct Ps {
+    gcn::Program prog;
+    gcn::TranslateOptions o;
+    gcn::TranslateResult ref;
+};
+Ps make_ps(const std::uint32_t (&chans)[4]) {
+    std::vector<std::uint32_t> w;
+    for (std::uint32_t k = 0; k < 4; ++k) {
+        const std::uint32_t vdst = 2 + k, attr = 0, chan = chans[k];
+        w.push_back(0xc8000000u | vdst << 18 | attr << 10 | chan << 8 | 0u);
+        w.push_back(0xc8000000u | vdst << 18 | 1u << 16 | attr << 10 | chan << 8 | 1u);
+    }
+    w.push_back(0xf800180fu);  // exp mrt0, v2..v5 done vm
+    w.push_back(2u | 3u << 8 | 4u << 16 | 5u << 24);
+    w.push_back(kEndpgm);
+    Ps p;
+    p.prog = gcn::decode(w.data(), w.size());
+    p.o.stage = gcn::Stage::Pixel;
+    p.o.rsrc2 = 16u << 1;
+    p.o.ps_input_ena = 2;
+    p.o.descriptor_set = 1;
+    p.o.cb_ssbo = true;
+    p.o.cb_no_fallback = true;
+    p.ref = gcn::translate(p.prog, p.o);
+    CHECK(p.ref.ok());
+    return p;
+}
+
+// The lift's own HLSL with its output scaled by `scale`: a source that
+// compiles with the lift's interface and draws differently.
+std::string scaled(const std::vector<std::uint32_t>& lift, const char* scale) {
+    std::string src = gcn::emit_hlsl(lift).source;
+    const std::size_t at = src.rfind("    lifted_main();\n");
+    CHECK(at != std::string::npos && src.find("static float4 mrt0;") != std::string::npos);
+    if (at != std::string::npos) src.insert(at + 19, std::string("    mrt0 = mrt0 * ") + scale + ";\n");
+    return src;
+}
+
+// A stage of `ps` named `name`, keyed with the program's salt as it stands now
+// (the renderer's draw), and whether it took an edited shader's module.
+gcn::LiftResult stage(const Ps& ps, const char* name, std::uint64_t salt, bool& took) {
+    hlsl_name_next(name, salt);
+    gcn::LiftResult l = lift_cached(false, ps.prog, ps.o, ps.ref);
+    took = hlsl_took_override();
+    return l;
+}
+
+}  // namespace
+
+int main() {
+    setenv("BBHOST_HLSL", "1", 1);  // compiled where met: nothing behind the test
+    unsetenv("BBHOST_HLSL_DUMP");
+    if (!hlsl_dxc().loaded()) {
+        std::fprintf(stderr, "no DXC (%s); skipped\n", hlsl_dxc().error().c_str());
+        return 77;
+    }
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("bbhost-shader-overrides-test-" + std::to_string(getpid()));
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir / "shaders", ec);
+    std::filesystem::create_directories(dir / "plugin1" / "shaders", ec);
+
+    // 1. Nothing registered: generation 0, every salt 0 - the renderer's fast path.
+    CHECK(override_gen() == 0);
+    CHECK(override_salt("12345678") == 0);
+    hlsl_set_folders(dir.string());  // the player's folder, empty
+    CHECK(override_gen() == 0 && overrides_on());
+
+    const Ps p = make_ps({0, 1, 2, 3}), q = make_ps({1, 0, 2, 3});
+    const gcn::LiftResult lp = gcn::lift_pixel_shader(p.prog, p.o, p.ref), lq = gcn::lift_pixel_shader(q.prog, q.o, q.ref);
+    CHECK(lp.ok() && lq.ok());
+    const std::string a = scaled(lp.spirv, "0.5f"), b = scaled(lp.spirv, "0.25f");
+    bool took = false;
+    const gcn::LiftResult base = stage(p, "aaaa0001", 0, took);
+    CHECK(base.ok() && !took);
+
+    // 2. Content: a text, another, the first again - its salt and module come
+    // back, compiled once each.
+    overrides_owner(1, "plugin one", (dir / "plugin1").string(), true);
+    overrides_owner(2, "plugin two", (dir / "plugin2").string(), true);
+    CHECK(overrides_set_text(1, "aaaa0001.ps", a.c_str()) == 0);
+    CHECK(override_gen() != 0);
+    const std::uint64_t s_a = override_salt("aaaa0001");
+    CHECK(s_a != 0);
+    const gcn::LiftResult ma = stage(p, "aaaa0001", s_a, took);
+    CHECK(took && ma.ok() && ma.spirv != base.spirv);
+    const std::uint64_t gen_a = override_gen();
+    CHECK(overrides_set_text(1, "aaaa0001.ps", a.c_str()) == 0 && override_gen() == gen_a);  // the same text again: no change
+    CHECK(overrides_set_text(1, "aaaa0001.ps", b.c_str()) == 0 && override_gen() != gen_a);
+    const std::uint64_t s_b = override_salt("aaaa0001");
+    CHECK(s_b != 0 && s_b != s_a);
+    const gcn::LiftResult mb = stage(p, "aaaa0001", s_b, took);
+    CHECK(took && mb.spirv != ma.spirv);
+    // The race: a draw keyed before the change builds after it - with its own salt's source.
+    const gcn::LiftResult late = stage(p, "aaaa0001", s_a, took);
+    CHECK(took && late.spirv == ma.spirv);
+    CHECK(overrides_set_text(1, "aaaa0001.ps", a.c_str()) == 0);
+    CHECK(override_salt("aaaa0001") == s_a);
+    const std::uint64_t compiles = g_hlsl_overrides.compiles.load();
+    const gcn::LiftResult again = stage(p, "aaaa0001", s_a, took);
+    CHECK(took && again.spirv == ma.spirv && g_hlsl_overrides.compiles.load() == compiles);  // nothing compiled
+    CHECK(compiles == 2);
+    // A stage keyed without the salt keeps its own module, overrides or not.
+    const gcn::LiftResult plain = stage(p, "aaaa0001", 0, took);
+    CHECK(!took && plain.spirv == base.spirv);
+
+    // 3. Owners: the player's folder first, then the owners in their order;
+    // an owner's texts before its folders.
+    CHECK(overrides_set_text(2, "aaaa0001.ps", b.c_str()) == 0);
+    std::shared_ptr<const OverrideSource> src;
+    CHECK(override_pick(override_salt("aaaa0001"), "aaaa0001", "ps", lift_hash_hex(lp.spirv), src) && src->owner == 1);
+    std::ofstream(dir / "plugin1" / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary) << b;
+    CHECK(overrides_add_folder(1, "shaders") == 1);  // relative: from the owner's own folder
+    CHECK(overrides_add_folder(1, "missing") == -1);
+    CHECK(override_salt("aaaa0001") == s_a);         // its text comes first
+    CHECK(override_pick(s_a, "aaaa0001", "ps", lift_hash_hex(lp.spirv), src) && src->owner == 1 && src->text);
+    std::ofstream(dir / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary) << b;
+    hlsl_set_folders(dir.string());  // listed again: the player's file
+    const std::uint64_t s_player = override_salt("aaaa0001");
+    CHECK(s_player != s_a && override_pick(s_player, "aaaa0001", "ps", lift_hash_hex(lp.spirv), src) && src->owner == kOverridePlayer);
+    const gcn::LiftResult mp = stage(p, "aaaa0001", s_player, took);
+    CHECK(took && mp.spirv == mb.spirv);  // b's text, from the player's file: DXC's same module
+    std::filesystem::remove(dir / "shaders" / "aaaa0001.ps.hlsl", ec);
+    hlsl_set_folders(dir.string());
+    CHECK(override_salt("aaaa0001") == s_a);
+    overrides_owner_on(1, false);  // turned off: the next owner's
+    CHECK(override_pick(override_salt("aaaa0001"), "aaaa0001", "ps", lift_hash_hex(lp.spirv), src) && src->owner == 2);
+    overrides_owner_on(1, true);
+    CHECK(override_salt("aaaa0001") == s_a);
+    overrides_drop_owner(2);
+    CHECK(overrides_set_text(2, "aaaa0001.ps", a.c_str()) == 1);  // gone
+    CHECK(overrides_set_text(1, "not a shader", a.c_str()) == 1 && overrides_set_text(1, "aaaa0001.xx", a.c_str()) == 1);
+
+    // 4. Names: the variant's file comes before the shader's, the shader's
+    // before the lift hash's.
+    const std::string hp = lift_hash_hex(lp.spirv);
+    CHECK(overrides_set_text(1, ("aaaa0001.ps~" + hp).c_str(), b.c_str()) == 0);
+    const std::uint64_t s_var = override_salt("aaaa0001");
+    CHECK(override_pick(s_var, "aaaa0001", "ps", hp, src) && src->name == "aaaa0001.ps~" + hp);
+    CHECK(override_pick(s_var, "aaaa0001", "ps", lift_hash_hex(lq.spirv), src) && src->name == "aaaa0001.ps");  // another variant
+    CHECK(overrides_set_text(1, ("aaaa0001.ps~" + hp).c_str(), nullptr) == 0 && override_salt("aaaa0001") == s_a);
+    // A lift hash's file: tied to its program at that lift's first sight (the
+    // program's next salt names it), never before.
+    const std::string hq = lift_hash_hex(lq.spirv);
+    const std::string qa = scaled(lq.spirv, "0.5f");
+    CHECK(overrides_set_text(1, (hq + ".ps").c_str(), qa.c_str()) == 0);
+    CHECK(override_salt("bbbb0002") == 0);
+    const gcn::LiftResult q0 = stage(q, "bbbb0002", 0, took);
+    CHECK(!took);
+    const std::uint64_t s_q = override_salt("bbbb0002");
+    CHECK(s_q != 0);
+    const gcn::LiftResult q1 = stage(q, "bbbb0002", s_q, took);
+    CHECK(took && q1.spirv != q0.spirv);
+    CHECK(override_salt("aaaa0001") == s_a);  // another program's salt as it was
+
+    // 5. A file changed after it was listed: refused for now, listed again,
+    // and built with its new text at the next key.
+    overrides_drop_owner(1);
+    std::ofstream(dir / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary) << a;
+    hlsl_set_folders(dir.string());
+    const std::uint64_t s_file = override_salt("aaaa0001");
+    CHECK(s_file != 0);
+    std::ofstream(dir / "shaders" / "aaaa0001.ps.hlsl", std::ios::binary | std::ios::app) << "// one more line\n";
+    const std::uint64_t gen_file = override_gen();
+    const gcn::LiftResult stale = stage(p, "aaaa0001", s_file, took);
+    CHECK(!took && stale.spirv == base.spirv && override_gen() != gen_file);  // its stage's own module; listed again
+    const std::uint64_t s_file2 = override_salt("aaaa0001");
+    CHECK(s_file2 != 0 && s_file2 != s_file);
+    const gcn::LiftResult fresh = stage(p, "aaaa0001", s_file2, took);
+    CHECK(took && fresh.spirv == ma.spirv);  // a's text and a comment
+    std::filesystem::remove(dir / "shaders" / "aaaa0001.ps.hlsl", ec);
+    hlsl_set_folders(dir.string());
+    CHECK(override_salt("aaaa0001") == 0);
+
+    // 6. A refused text: the stage keeps its own module, decided once.
+    overrides_owner(3, "plugin three", std::string(), true);
+    CHECK(overrides_set_text(3, "aaaa0001.ps", "this is not HLSL\n") == 0);
+    const std::uint64_t refused = g_hlsl_overrides.refused.load();
+    const gcn::LiftResult r1 = stage(p, "aaaa0001", override_salt("aaaa0001"), took);
+    CHECK(!took && r1.spirv == base.spirv && g_hlsl_overrides.refused.load() == refused + 1);
+    (void)stage(p, "aaaa0001", override_salt("aaaa0001"), took);
+    CHECK(g_hlsl_overrides.refused.load() == refused + 1);
+
+    // 7. A geometry lift's stage is "gs", as the dump names its files.
+    const std::vector<std::uint32_t> gs = {0x07230203u, 0x00010500u, 0, 10, 0, (5u << 16) | 15u, 3u, 1u, 0x6e69616du /* "main" */, 0};
+    CHECK(lift_stage_tag(gs) == "gs");
+
+    std::filesystem::remove_all(dir, ec);
+    if (g_failures) {
+        std::fprintf(stderr, "%d failures\n", g_failures);
+        return 1;
+    }
+    std::printf("shader overrides: ok\n");
+    return 0;
+}

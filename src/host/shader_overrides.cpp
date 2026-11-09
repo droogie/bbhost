@@ -1,0 +1,477 @@
+#include "host/shader_overrides.h"
+
+#include "host/translation_cache.h"
+#include "log.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <mutex>
+#include <set>
+#include <system_error>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace gpu {
+
+std::atomic<std::uint64_t> g_override_gen{0};
+
+namespace {
+
+constexpr std::size_t kMaxText = 4u << 20;  // a source's size: the largest printed shaders are ~1 MiB
+
+// FNV-1a over bytes and a final mix: a text's identity, a file's, a set's salt
+// (never 0, which is no override).
+struct Hash64 {
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    void bytes(const void* p, std::size_t n) {
+        const auto* b = static_cast<const unsigned char*>(p);
+        for (std::size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 0x100000001b3ull;
+    }
+    void u64(std::uint64_t v) { bytes(&v, sizeof(v)); }
+    void str(const std::string& s) {
+        u64(s.size());
+        bytes(s.data(), s.size());
+    }
+    std::uint64_t done() const {
+        std::uint64_t x = h;
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdull;
+        x ^= x >> 33;
+        x *= 0xc4ceb9fe1a85ec53ull;
+        x ^= x >> 33;
+        return x ? x : 1;
+    }
+};
+
+bool hex16(const std::string& s) {
+    if (s.size() != 16) return false;
+    for (char c : s) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
+// A set: what applies to one program, by the names its stages look for.
+using Set = std::unordered_map<std::string, std::shared_ptr<const OverrideSource>>;
+
+struct Owner {
+    std::string name;  // for the logs
+    std::string dir;   // relative folders start here
+    bool on = true;
+    std::map<std::string, std::shared_ptr<const OverrideSource>> texts;
+    struct Folder {
+        std::string dir;
+        std::map<std::string, std::shared_ptr<const OverrideSource>> files;
+    };
+    std::vector<Folder> folders;
+};
+
+struct Outcome {
+    std::uint64_t taken = 0, refused = 0;
+    std::string why;  // the last refusal's
+};
+
+struct Registry {
+    std::mutex mu;
+    bool on = false;
+    std::string why_off;
+    std::map<int, Owner> owners;  // in their order: the player's folder first
+    // What applies: each name's source, the first owner's that has one.
+    std::unordered_map<std::string, std::shared_ptr<const OverrideSource>> effective;
+    std::unordered_map<std::string, std::vector<std::string>> by_stable;  // a program's stable name -> its names
+    std::unordered_map<std::uint64_t, std::vector<std::string>> by_lift;  // a lift's hash -> its <hash>.<stage> names
+    std::unordered_map<std::string, std::set<std::uint64_t>> program_lifts;  // such hashes met for a program
+    std::unordered_map<std::uint64_t, std::shared_ptr<const Set>> sets;   // by salt; never erased in a run
+    std::map<std::tuple<int, std::string, std::uint64_t>, Outcome> outcomes;  // by owner, name and identity
+    std::set<std::pair<int, std::string>> shadow_logged;
+    std::atomic<bool> fallback{false};
+};
+// Never destroyed: the renderer's threads ask it until the process ends.
+Registry& reg() {
+    static Registry* const r = new Registry;
+    return *r;
+}
+
+// The source for the logs (override_label), under mu.
+std::string label_locked(const Registry& r, const OverrideSource& s) {
+    if (s.owner == kOverridePlayer) return "shaders/" + s.name + ".hlsl";
+    const auto o = r.owners.find(s.owner);
+    const std::string owner = o != r.owners.end() && !o->second.name.empty() ? o->second.name : "owner " + std::to_string(s.owner);
+    return owner + "'s " + (s.path.empty() ? s.name : s.path);
+}
+
+// The source of a file as it is now; null when it is not a file.
+std::shared_ptr<const OverrideSource> file_source(int owner, const std::string& name, const std::filesystem::path& p) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(p, ec)) return nullptr;
+    const std::uint64_t size = std::filesystem::file_size(p, ec);
+    if (ec) return nullptr;
+    const std::int64_t mtime = static_cast<std::int64_t>(std::filesystem::last_write_time(p, ec).time_since_epoch().count());
+    if (ec) return nullptr;
+    auto s = std::make_shared<OverrideSource>();
+    s->name = name;
+    s->owner = owner;
+    s->path = p.string();
+    s->size = size;
+    s->mtime = mtime;
+    Hash64 h;
+    h.str(s->path);
+    h.u64(size);
+    h.u64(static_cast<std::uint64_t>(mtime));
+    s->identity = h.done();
+    return s;
+}
+
+// Every <shader>.hlsl in `dir`, by name; false when it is not a folder.
+// `unnamed`: the .hlsl files whose names are no shader's.
+bool list_folder(int owner, const std::string& dir, std::map<std::string, std::shared_ptr<const OverrideSource>>& out,
+                 std::size_t* unnamed) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return false;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string file = e.path().filename().string();
+        if (file.size() <= 5 || file.compare(file.size() - 5, 5, ".hlsl") != 0) continue;
+        const std::string name = file.substr(0, file.size() - 5);
+        std::string stable, stage, hash16;
+        if (!override_parse(name, stable, stage, hash16)) {
+            if (unnamed) ++*unnamed;
+            continue;
+        }
+        if (auto s = file_source(owner, name, e.path())) out[name] = std::move(s);
+    }
+    return true;
+}
+
+// What applies, made again from the owners' sources; the generation moves
+// when it changed. Under mu.
+bool rebuild_locked(Registry& r) {
+    std::unordered_map<std::string, std::shared_ptr<const OverrideSource>> eff;
+    if (r.on) {
+        const auto offer = [&](const std::shared_ptr<const OverrideSource>& s) {
+            const auto [it, fresh] = eff.try_emplace(s->name, s);
+            if (!fresh && it->second->owner != s->owner && r.shadow_logged.emplace(s->owner, s->name).second) {
+                host_log("render: HLSL override %s not used: %s comes first", label_locked(r, *s).c_str(), label_locked(r, *it->second).c_str());
+            }
+        };
+        for (const auto& [id, o] : r.owners) {
+            if (!o.on) continue;
+            for (const auto& [name, s] : o.texts) offer(s);
+            for (const Owner::Folder& f : o.folders) {
+                for (const auto& [name, s] : f.files) offer(s);
+            }
+        }
+    }
+    bool same = eff.size() == r.effective.size();
+    for (auto it = eff.begin(); same && it != eff.end(); ++it) {
+        const auto was = r.effective.find(it->first);
+        same = was != r.effective.end() && was->second == it->second;
+    }
+    if (same) return false;
+    r.effective = std::move(eff);
+    r.by_stable.clear();
+    r.by_lift.clear();
+    for (const auto& [name, s] : r.effective) {
+        std::string stable, stage, hash16;
+        if (!override_parse(name, stable, stage, hash16)) continue;
+        if (stable.empty()) r.by_lift[std::strtoull(hash16.c_str(), nullptr, 16)].push_back(name);
+        else r.by_stable[stable].push_back(name);
+    }
+    r.fallback.store(!r.by_lift.empty(), std::memory_order_release);
+    g_override_gen.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+// A file found changed where it was read: listed again (its new identity, or
+// gone), so its shader's next draw keys and builds with what it holds now.
+void relist(const OverrideSource& s) {
+    Registry& r = reg();
+    std::shared_ptr<const OverrideSource> now = file_source(s.owner, s.name, s.path);
+    std::lock_guard<std::mutex> lk(r.mu);
+    const auto o = r.owners.find(s.owner);
+    if (o == r.owners.end()) return;
+    for (Owner::Folder& f : o->second.folders) {
+        const auto it = f.files.find(s.name);
+        if (it == f.files.end() || it->second->path != s.path) continue;
+        if (now && now->identity == it->second->identity) return;  // another thread listed it already
+        if (now) it->second = now;
+        else f.files.erase(it);
+        host_log("render: HLSL override %s changed since it was listed: its shader is built with it again at its next draw",
+                 label_locked(r, s).c_str());
+        rebuild_locked(r);
+        return;
+    }
+}
+
+}  // namespace
+
+bool override_parse(const std::string& name, std::string& stable, std::string& stage, std::string& hash16) {
+    std::string base = name, variant;
+    if (const std::size_t tilde = base.find('~'); tilde != std::string::npos) {
+        variant = base.substr(tilde + 1);
+        base.resize(tilde);
+        if (!hex16(variant)) return false;
+    }
+    const std::size_t dot = base.rfind('.');
+    if (dot == std::string::npos || dot == 0) return false;
+    stage = base.substr(dot + 1);
+    static const char* const kStages[] = {"vs", "ps", "hs", "ds", "gs", "cs"};
+    if (std::none_of(std::begin(kStages), std::end(kStages), [&](const char* k) { return stage == k; })) return false;
+    const std::string head = base.substr(0, dot);
+    for (const char c : head) {
+        if (std::strchr("<>:\"/\\|?*", c) || static_cast<unsigned char>(c) < 32) return false;
+    }
+    if (hex16(head)) {  // a lift's hash: no GX name is 16 digits long
+        if (!variant.empty()) return false;
+        stable.clear();
+        hash16 = head;
+        return true;
+    }
+    stable = head;
+    hash16 = variant;
+    return true;
+}
+
+std::string override_label(const OverrideSource& s) {
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    return label_locked(r, s);
+}
+
+void overrides_start(bool on, const std::string& why_off, const std::string& bbhost_dir) {
+    Registry& r = reg();
+    std::map<std::string, std::shared_ptr<const OverrideSource>> files;
+    std::size_t unnamed = 0;
+    const std::string dir = bbhost_dir.empty() ? std::string() : (std::filesystem::path(bbhost_dir) / "shaders").string();
+    if (on && !dir.empty()) list_folder(kOverridePlayer, dir, files, &unnamed);
+    std::lock_guard<std::mutex> lk(r.mu);
+    r.on = on;
+    r.why_off = why_off;
+    Owner& player = r.owners[kOverridePlayer];
+    player.name = "shaders/";
+    player.dir = dir;
+    player.folders.clear();
+    if (!dir.empty()) player.folders.push_back({dir, std::move(files)});
+    const std::size_t n = player.folders.empty() ? 0 : player.folders[0].files.size();
+    if (n) {
+        host_log("render: HLSL overrides: %zu edited shader%s in %s, each compiled at its stage's first use%s", n, n == 1 ? "" : "s", dir.c_str(),
+                 unnamed ? " (and .hlsl files named after no shader, which nothing reads)" : "");
+    }
+    rebuild_locked(r);
+}
+
+bool overrides_on() {
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    return r.on;
+}
+
+void overrides_owner(int owner, const std::string& name, const std::string& own_dir, bool on) {
+    if (owner == kOverridePlayer) return;
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    Owner& o = r.owners[owner];
+    o.name = name;
+    o.dir = own_dir;
+    o.on = on;
+    rebuild_locked(r);
+}
+
+void overrides_owner_on(int owner, bool on) {
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    const auto o = r.owners.find(owner);
+    if (o == r.owners.end() || owner == kOverridePlayer || o->second.on == on) return;
+    o->second.on = on;
+    rebuild_locked(r);
+}
+
+void overrides_drop_owner(int owner) {
+    if (owner == kOverridePlayer) return;
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    if (r.owners.erase(owner)) rebuild_locked(r);
+}
+
+int overrides_set_text(int owner, const char* shader, const char* hlsl) {
+    std::string stable, stage, hash16;
+    if (!shader || owner == kOverridePlayer || !override_parse(shader, stable, stage, hash16)) return 1;
+    std::shared_ptr<OverrideSource> s;
+    if (hlsl) {
+        const std::size_t n = std::strlen(hlsl);
+        if (n > kMaxText) return 1;
+        s = std::make_shared<OverrideSource>();
+        s->name = shader;
+        s->owner = owner;
+        s->text = std::make_shared<const std::string>(hlsl, n);
+        Hash64 h;
+        h.str(*s->text);
+        s->identity = h.done();
+    }
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    const auto o = r.owners.find(owner);
+    if (o == r.owners.end()) return 1;
+    if (!s) {
+        if (o->second.texts.erase(shader)) rebuild_locked(r);
+        return 0;
+    }
+    std::shared_ptr<const OverrideSource>& slot = o->second.texts[shader];
+    if (slot && slot->identity == s->identity) return 0;  // the same text again
+    slot = std::move(s);
+    rebuild_locked(r);
+    return 0;
+}
+
+int overrides_add_folder(int owner, const char* dir) {
+    if (owner == kOverridePlayer) return -1;
+    Registry& r = reg();
+    std::string base;
+    {
+        std::lock_guard<std::mutex> lk(r.mu);
+        const auto o = r.owners.find(owner);
+        if (o == r.owners.end()) return -1;
+        if (!dir || !*dir) {
+            if (!o->second.folders.empty()) {
+                o->second.folders.clear();
+                rebuild_locked(r);
+            }
+            return 0;
+        }
+        base = o->second.dir;
+    }
+    std::filesystem::path p(dir);
+    if (p.is_relative() && !base.empty()) p = std::filesystem::path(base) / p;
+    const std::string where = p.lexically_normal().string();
+    std::map<std::string, std::shared_ptr<const OverrideSource>> files;
+    if (!list_folder(owner, where, files, nullptr)) return -1;
+    const int n = static_cast<int>(files.size());
+    std::lock_guard<std::mutex> lk(r.mu);
+    const auto o = r.owners.find(owner);
+    if (o == r.owners.end()) return -1;
+    auto f = std::find_if(o->second.folders.begin(), o->second.folders.end(), [&](const Owner::Folder& x) { return x.dir == where; });
+    if (f == o->second.folders.end()) {
+        o->second.folders.push_back({where, std::move(files)});
+    } else {
+        // Listed again: the sources of unchanged files stay the same, so what applies does too.
+        for (auto& [name, s] : files) {
+            const auto was = f->files.find(name);
+            if (was != f->files.end() && was->second->identity == s->identity) s = was->second;
+        }
+        f->files = std::move(files);
+    }
+    rebuild_locked(r);
+    return n;
+}
+
+std::uint64_t override_salt(const std::string& program) {
+    if (program.empty() || !override_gen()) return 0;
+    Registry& r = reg();
+    const std::string stable = hlsl_file_name(program);  // outside the lock: the bundles' lookup
+    std::lock_guard<std::mutex> lk(r.mu);
+    if (r.effective.empty()) return 0;
+    std::vector<std::pair<std::string, std::shared_ptr<const OverrideSource>>> parts;
+    if (const auto it = r.by_stable.find(stable); it != r.by_stable.end()) {
+        for (const std::string& name : it->second) parts.emplace_back(name, r.effective.at(name));
+    }
+    if (const auto it = r.program_lifts.find(program); it != r.program_lifts.end()) {
+        for (const std::uint64_t hash : it->second) {
+            if (const auto b = r.by_lift.find(hash); b != r.by_lift.end()) {
+                for (const std::string& name : b->second) parts.emplace_back(name, r.effective.at(name));
+            }
+        }
+    }
+    if (parts.empty()) return 0;
+    std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    Hash64 h;
+    for (const auto& [name, s] : parts) {
+        h.str(name);
+        h.u64(s->identity);
+        h.u64(static_cast<std::uint64_t>(s->owner));
+    }
+    const std::uint64_t salt = h.done();
+    if (!r.sets.count(salt)) {
+        auto set = std::make_shared<Set>();
+        for (auto& [name, s] : parts) (*set)[name] = s;
+        r.sets.emplace(salt, std::move(set));
+    }
+    return salt;
+}
+
+bool override_fallback_wanted() { return reg().fallback.load(std::memory_order_acquire); }
+
+void override_lift_seen(std::uint64_t lift_hash, const std::string& program) {
+    if (program.empty()) return;
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    if (!r.by_lift.count(lift_hash) || !r.program_lifts[program].insert(lift_hash).second) return;
+    // The program's next draw takes the name into its salt.
+    g_override_gen.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool override_pick(std::uint64_t salt, const std::string& stable, const std::string& stage, const std::string& hash16,
+                   std::shared_ptr<const OverrideSource>& out) {
+    if (!salt) return false;
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    const auto it = r.sets.find(salt);
+    if (it == r.sets.end()) return false;
+    const Set& set = *it->second;
+    const std::string names[3] = {stable.empty() ? std::string() : stable + "." + stage + "~" + hash16,
+                                  stable.empty() ? std::string() : stable + "." + stage, hash16 + "." + stage};
+    for (const std::string& name : names) {
+        if (name.empty()) continue;
+        if (const auto f = set.find(name); f != set.end()) {
+            out = f->second;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool override_read(const OverrideSource& s, std::string& text, std::string& why) {
+    if (s.text) {
+        text = *s.text;
+        return true;
+    }
+    {
+        std::ifstream in(s.path, std::ios::binary);
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    // As listed, or another file than the source names: listed again.
+    std::error_code ec;
+    const std::uint64_t size = std::filesystem::file_size(s.path, ec);
+    const std::int64_t mtime = ec ? 0 : static_cast<std::int64_t>(std::filesystem::last_write_time(s.path, ec).time_since_epoch().count());
+    if (ec || size != s.size || mtime != s.mtime || text.size() != s.size) {
+        why = "the file changed since it was listed";
+        relist(s);
+        return false;
+    }
+    return true;
+}
+
+std::string override_dxc_text(const OverrideSource& s, const std::string& text) {
+    // A byte-order mark goes: past the #line it would be a character in the source.
+    const std::size_t from = text.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
+    return "#line 1 \"" + s.name + ".hlsl\"\n" + text.substr(from);
+}
+
+void override_outcome(const OverrideSource& s, bool taken, const std::string& why) {
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    Outcome& o = r.outcomes[{s.owner, s.name, s.identity}];
+    if (taken) {
+        ++o.taken;
+    } else {
+        ++o.refused;
+        o.why = why;
+    }
+}
+
+}  // namespace gpu

@@ -103,8 +103,18 @@ void hlsl_lane(int lane);
 int hlsl_lane_now();
 // The program the calling thread's next lift is made from (its GX name, or
 // the eboot's footer hash): the dump's and an edited file's header names it,
-// so a modder finds a shader by name. Taken by that lift.
-void hlsl_name_next(std::string name);
+// so a modder finds a shader by name. `salt`: the edited shaders the stage's
+// key names (host/shader_overrides.h override_salt), which that lift compiles
+// with - 0, none: a key without the salt holds the lift's own module, or
+// DXC's. Taken by that lift: every caller names its lift on the line before.
+void hlsl_name_next(std::string name, std::uint64_t salt = 0);
+// Whether the calling thread's last lift took an edited shader's module (its
+// stage, pipelines and libraries are the run's own: never kept in a file).
+bool hlsl_took_override();
+// A program's stable name, as the dump and the edited files name it: its
+// bundle entry and GX's name ("GXGuiShader_Tex.ppo@6d921b0b"), or GX's name
+// alone for the eboot's own programs.
+std::string hlsl_file_name(const std::string& program);
 // A cloth mesh's velocity vertex shader, by its GX name: its lift reads its
 // inputs 0 and 1 again at locations 14 and 15 for the previous position
 // (translation_cache.cpp velo_cloth_prev; render.cpp binds them).
@@ -119,9 +129,9 @@ void hlsl_tag_stage(std::uint64_t stage_key);
 void hlsl_note_drawn(std::uint64_t stage_key);
 // render.cpp's precompile workers: bb-hlsl waits while this says they are busy.
 void hlsl_set_busy_probe(bool (*busy)());
-// At device start: <bbhost_dir>/shaders, edited HLSL that replaces the module
-// of the lift it is named after (<hash>.<profile>.hlsl, the dump's names), and
-// <bbhost_dir>/hlsl-dump, BBHOST_HLSL_DUMP=1's folder.
+// At device start: <bbhost_dir>/hlsl-dump, BBHOST_HLSL_DUMP=1's folder, and
+// <bbhost_dir>/shaders, edited HLSL named as the dump names its files, which
+// replaces the module of the stages it is named for (host/shader_overrides.h).
 void hlsl_set_folders(const std::string& bbhost_dir);
 // BBHOST_HLSL: whether `module` is DXC's module of a lift - one the switch gave
 // a stage in the lift's place; the engine's names put on it afterwards leave
@@ -137,6 +147,9 @@ void hlsl_note_refused(const char* what, int stages, bool rebuilt);
 // Stages a later pipeline gave their lift's module before its first attempt,
 // their DXC module refused in an earlier one; counted in the same line.
 void hlsl_note_lift_again(int stages);
+// A pipeline holding this module was refused by the driver: when it is an
+// edited shader's, that shader's state says so.
+void hlsl_note_override_refused(const std::vector<std::uint32_t>& module);
 
 // At device start, after the device's features are given to the translator
 // (they are part of every key).
