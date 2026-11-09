@@ -132,6 +132,9 @@ void hlsl_set_busy_probe(bool (*busy)());
 // At device start: <bbhost_dir>/hlsl-dump, BBHOST_HLSL_DUMP=1's folder, and
 // <bbhost_dir>/shaders, edited HLSL named as the dump names its files, which
 // replaces the module of the stages it is named for (host/shader_overrides.h).
+// The off switch first (hlsl_set_overrides): `on` false, or the HLSL path
+// off, and no edited shader applies - `why_off` says what turned them off.
+void hlsl_set_overrides(bool on, const std::string& why_off);
 void hlsl_set_folders(const std::string& bbhost_dir);
 // BBHOST_HLSL: whether `module` is DXC's module of a lift - one the switch gave
 // a stage in the lift's place; the engine's names put on it afterwards leave

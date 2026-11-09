@@ -5205,6 +5205,14 @@ bool init_locked() {
     // The Shaders setting (host/options.cpp), before the first lift decides
     // the HLSL path's mode; BBHOST_HLSL wins over it.
     hlsl_set_setting(host_opt_index("shaders") != 1);
+    {
+        // Edited shaders' off switch (host/shader_overrides.h): BBHOST_SHADER_OVERRIDES=0|1
+        // wins over bbhost.toml's video.shader_overrides.
+        const char* e = std::getenv("BBHOST_SHADER_OVERRIDES");
+        const bool env = e && (e[0] == '0' || e[0] == '1') && !e[1];
+        hlsl_set_overrides(env ? e[0] == '1' : config().shader_overrides,
+                           env ? "BBHOST_SHADER_OVERRIDES=0" : "bbhost.toml's video.shader_overrides = false");
+    }
     if (const char* root = hle_fs_data_root(); root && *root) hlsl_set_folders(std::string(root) + "/bbhost");
     hlsl_set_name_lookup(&shader_bundle_file_name);
     translation_cache_load(translation_cache_path());
@@ -6595,6 +6603,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     // Built here, on the command processor: the next start (or a list's
     // first start) builds it on a precompile worker instead.
     if (pl.pipeline && !salt) recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, true);
+    if (pl.pipeline && salt) override_note_pipeline();
     return pl;
 }
 
@@ -11075,6 +11084,8 @@ std::string host_gpu_compile_report() {
     std::string out = compute_optimize_window();
     const std::string tc = translation_cache_window();
     if (!tc.empty()) out += (out.empty() ? "" : "; ") + tc;
+    const std::string ov = overrides_window();  // edited shaders built (host/shader_overrides.h)
+    if (!ov.empty()) out += (out.empty() ? "" : "; ") + ov;
     return out;
 }
 

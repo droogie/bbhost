@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace gpu {
 
@@ -108,6 +109,22 @@ bool override_prepare(const std::shared_ptr<const OverrideSource>& s);
 void override_install(const std::shared_ptr<const OverrideSource>& s);
 // A lift met for a program has this hash (a <hash>.<stage> source's compile ahead).
 void override_attribute(std::uint64_t lift_hash, const std::string& program);
+
+// ---- States and reports ----
+// What became of an owner's source of a name: as BbHostApi::shader_state's
+// BB_SHADER_* (none, waiting, taken, refused, shadowed, off), and why.
+enum OverrideState : int { kOverrideNone = 0, kOverrideWaiting, kOverrideTaken, kOverrideRefused, kOverrideShadowed, kOverrideOff };
+int overrides_state(int owner, const std::string& name, std::string* why);
+// A module compiled (`us` of DXC's time), a stage built with an edited
+// shader's module (translation_cache.cpp), a pipeline made with a salted
+// stage (render.cpp, gpu.cpp): the window's and the exit's counts.
+void override_note_compile(std::uint64_t us);
+void override_note_stage();
+void override_note_pipeline();
+// The exit report's lines: every edited shader, who gave it and what became
+// of it (empty without any); and the 300-flip report's since the last call.
+std::vector<std::string> overrides_report();
+std::string overrides_window();
 // A name split as a file's: false when it is not a shader's.
 bool override_parse(const std::string& name, std::string& stable, std::string& stage, std::string& hash16);
 

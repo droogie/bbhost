@@ -1276,8 +1276,10 @@ bool hlsl_override_module(const std::vector<std::uint32_t>& lifted, std::uint64_
         }
         if (!why.empty()) spirv.clear();
     }
+    const std::uint64_t compile_us = us_since(t0);
     g_hlsl_overrides.compiles.fetch_add(1, std::memory_order_relaxed);
-    g_hlsl_overrides.compile_us.fetch_add(us_since(t0), std::memory_order_relaxed);
+    g_hlsl_overrides.compile_us.fetch_add(compile_us, std::memory_order_relaxed);
+    override_note_compile(compile_us);
     {
         // Two threads can meet the same stage at once: the first result is
         // kept, counted and logged; the other takes it.
@@ -1721,6 +1723,7 @@ void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOpt
         g_hlsl.taken.fetch_add(1, std::memory_order_relaxed);
         hlsl_remember_lift(own, lift_key, l.spirv, src);
         t_hlsl_took_override = true;
+        override_note_stage();
         l.spirv = std::move(own);
         return;
     }
@@ -1873,13 +1876,29 @@ void hlsl_note_drawn(std::uint64_t stage_key) {
     g_hlsl_behind.by_stage.erase(it);
 }
 
+namespace {
+// The off switch (hlsl_set_overrides): video.shader_overrides, BBHOST_SHADER_OVERRIDES.
+bool g_overrides_switch = true;
+std::string g_overrides_why;
+}  // namespace
+
+void hlsl_set_overrides(bool on, const std::string& why_off) {
+    g_overrides_switch = on;
+    g_overrides_why = why_off;
+}
+
 void hlsl_set_folders(const std::string& bbhost_dir) {
-    if (bbhost_dir.empty() || !hlsl_on()) return;
+    if (bbhost_dir.empty()) return;
+    if (!hlsl_on()) {
+        // The lift alone: edited shaders are listed for the report, never applied.
+        overrides_start(false, "the HLSL path is off (the Shaders setting at Lifted, BBHOST_HLSL=0 or BBHOST_OOB_COUNT)", bbhost_dir);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(g_hlsl_dump_mu);
         g_hlsl_dump_default = (std::filesystem::path(bbhost_dir) / "hlsl-dump").string();
     }
-    overrides_start(true, std::string(), bbhost_dir);  // <bbhost_dir>/shaders, the player's (host/shader_overrides.h)
+    overrides_start(g_overrides_switch, g_overrides_why, bbhost_dir);  // <bbhost_dir>/shaders, the player's (host/shader_overrides.h)
 }
 
 gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) {
@@ -2189,6 +2208,7 @@ void translation_cache_report() {
                  static_cast<unsigned long long>(g_hlsl_lift_of.refused_again.load()),
                  static_cast<unsigned long long>(g_hlsl_lift_of.lift_again.load()));
     }
+    for (const std::string& line : overrides_report()) host_log("%s", line.c_str());  // every edited shader and what became of it
     if (!g_tc_enabled) return;
     std::size_t entries = 0;
     std::uint64_t bytes = 0;

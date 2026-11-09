@@ -11285,6 +11285,7 @@ bool hlsl_test_refused(const GfxPipeline& pl) {
 bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::size_t fetch_dwords) {
     const PipelineBuildScope build_scope(pl, "created");
     const RunOnlyCache run_only(pl.hlsl_salted);  // an edited shader's: its libraries and pipeline the run's own
+    if (pl.hlsl_salted) override_note_pipeline();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};

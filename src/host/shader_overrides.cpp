@@ -99,6 +99,9 @@ struct Registry {
     std::unordered_map<std::uint64_t, std::shared_ptr<const Set>> sets;   // by salt; never erased in a run
     std::map<std::tuple<int, std::string, std::uint64_t>, Outcome> outcomes;  // by owner, name and identity
     std::map<std::pair<int, std::string>, Pending> pending;  // by owner and name: compiling ahead
+    std::size_t player_unnamed = 0;  // the player's .hlsl files named after no shader
+    std::atomic<std::uint64_t> compiles{0}, compile_us{0}, stages{0}, pipelines{0};
+    std::atomic<std::uint64_t> window_compiles{0}, window_us{0}, window_stages{0}, window_pipelines{0};
     std::set<std::pair<int, std::string>> shadow_logged;
     std::atomic<bool> fallback{false};
 };
@@ -195,6 +198,69 @@ bool rebuild_locked(Registry& r) {
     r.fallback.store(!r.by_lift.empty(), std::memory_order_release);
     g_override_gen.fetch_add(1, std::memory_order_acq_rel);
     return true;
+}
+
+// An owner's own source of a name, in effect or not: its text, else its first
+// folder's file; null for none. Under mu.
+std::shared_ptr<const OverrideSource> own_locked(const Registry& r, int owner, const std::string& name) {
+    const auto o = r.owners.find(owner);
+    if (o == r.owners.end()) return nullptr;
+    if (const auto t = o->second.texts.find(name); t != o->second.texts.end()) return t->second;
+    for (const Owner::Folder& f : o->second.folders) {
+        if (const auto it = f.files.find(name); it != f.files.end()) return it->second;
+    }
+    return nullptr;
+}
+
+int state_locked(const Registry& r, int owner, const std::string& name, std::string* why) {
+    const std::shared_ptr<const OverrideSource> own = own_locked(r, owner, name);
+    const auto p = r.pending.find({owner, name});
+    const auto say = [&](std::string w) {
+        if (why) *why = std::move(w);
+    };
+    if (!own && p == r.pending.end()) return kOverrideNone;
+    if (!r.on) {
+        say(r.why_off.empty() ? std::string("edited shaders do not apply") : r.why_off);
+        return kOverrideOff;
+    }
+    if (const auto o = r.owners.find(owner); o != r.owners.end() && !o->second.on) {
+        say("its owner is off");
+        return kOverrideWaiting;
+    }
+    if (p != r.pending.end()) {
+        say("compiling ahead for the variants of its shader met so far");
+        return kOverrideWaiting;
+    }
+    if (const auto e = r.effective.find(name); e != r.effective.end() && e->second->owner != owner) {
+        say(label_locked(r, *e->second) + " comes first");
+        return kOverrideShadowed;
+    }
+    const auto oc = r.outcomes.find({owner, name, own->identity});
+    if (oc == r.outcomes.end() || (!oc->second.taken && !oc->second.refused)) {
+        say("none of its shader's stages built with it yet");
+        return kOverrideWaiting;
+    }
+    if (oc->second.taken) {
+        if (oc->second.refused) say("refused for a variant: " + oc->second.why);
+        return kOverrideTaken;
+    }
+    say(oc->second.why);
+    return kOverrideRefused;
+}
+
+// Every name an owner gives a source for (texts, folders' files, pending). Under mu.
+std::vector<std::string> names_locked(const Registry& r, int owner) {
+    std::set<std::string> names;
+    if (const auto o = r.owners.find(owner); o != r.owners.end()) {
+        for (const auto& [name, s] : o->second.texts) names.insert(name);
+        for (const Owner::Folder& f : o->second.folders) {
+            for (const auto& [name, s] : f.files) names.insert(name);
+        }
+    }
+    for (const auto& [key, p] : r.pending) {
+        if (key.first == owner) names.insert(key.second);
+    }
+    return {names.begin(), names.end()};
 }
 
 // Whether an owner before `owner` has a source named `name` (so one of its
@@ -315,7 +381,7 @@ void overrides_start(bool on, const std::string& why_off, const std::string& bbh
     std::map<std::string, std::shared_ptr<const OverrideSource>> files;
     std::size_t unnamed = 0;
     const std::string dir = bbhost_dir.empty() ? std::string() : (std::filesystem::path(bbhost_dir) / "shaders").string();
-    if (on && !dir.empty()) list_folder(kOverridePlayer, dir, files, &unnamed);
+    if (!dir.empty()) list_folder(kOverridePlayer, dir, files, &unnamed);  // listed off too, for the report
     std::lock_guard<std::mutex> lk(r.mu);
     r.on = on;
     r.on_flag.store(on, std::memory_order_release);
@@ -325,12 +391,33 @@ void overrides_start(bool on, const std::string& why_off, const std::string& bbh
     player.dir = dir;
     player.folders.clear();
     if (!dir.empty()) player.folders.push_back({dir, std::move(files)});
-    const std::size_t n = player.folders.empty() ? 0 : player.folders[0].files.size();
-    if (n) {
-        host_log("render: HLSL overrides: %zu edited shader%s in %s, each compiled at its stage's first use%s", n, n == 1 ? "" : "s", dir.c_str(),
-                 unnamed ? " (and .hlsl files named after no shader, which nothing reads)" : "");
-    }
+    r.player_unnamed = unnamed;
     rebuild_locked(r);
+    // The start's report: every edited shader, who gave it (the player's
+    // folder, a plugin), and the ones another comes first for; or what turned
+    // them off, and how many that leaves out.
+    std::size_t listed = 0, shadowed = 0, all = 0;
+    std::string list;
+    for (const auto& [id, o] : r.owners) {
+        for (const std::string& name : names_locked(r, id)) {
+            ++all;
+            if (!r.on) continue;
+            const auto e = r.effective.find(name);
+            if (e != r.effective.end() && e->second->owner != id) {
+                ++shadowed;
+                continue;
+            }
+            if (listed++ < 32) list += (list.empty() ? "" : ", ") + name + " (" + (id == kOverridePlayer ? std::string("your folder") : o.name) + ")";
+        }
+    }
+    if (!r.on) {
+        if (all) host_log("render: HLSL overrides off (%s): %zu edited shader%s not used", r.why_off.c_str(), all, all == 1 ? "" : "s");
+    } else if (all) {
+        host_log("render: HLSL overrides: %zu - %s%s%s; each compiled where its stage is first built%s", listed, list.c_str(),
+                 listed > 32 ? (", and " + std::to_string(listed - 32) + " more").c_str() : "",
+                 shadowed ? (" (" + std::to_string(shadowed) + " more not used: another of the same name comes first)").c_str() : "",
+                 unnamed ? "; .hlsl files named after no shader in your folder: nothing reads them" : "");
+    }
 }
 
 bool overrides_on() { return reg().on_flag.load(std::memory_order_acquire); }
@@ -591,6 +678,83 @@ void override_outcome(const OverrideSource& s, bool taken, const std::string& wh
         ++o.refused;
         o.why = why;
     }
+}
+
+
+int overrides_state(int owner, const std::string& name, std::string* why) {
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    return state_locked(r, owner, name, why);
+}
+
+void override_note_compile(std::uint64_t us) {
+    Registry& r = reg();
+    r.compiles.fetch_add(1, std::memory_order_relaxed);
+    r.compile_us.fetch_add(us, std::memory_order_relaxed);
+    r.window_compiles.fetch_add(1, std::memory_order_relaxed);
+    r.window_us.fetch_add(us, std::memory_order_relaxed);
+}
+void override_note_stage() {
+    reg().stages.fetch_add(1, std::memory_order_relaxed);
+    reg().window_stages.fetch_add(1, std::memory_order_relaxed);
+}
+void override_note_pipeline() {
+    reg().pipelines.fetch_add(1, std::memory_order_relaxed);
+    reg().window_pipelines.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::vector<std::string> overrides_report() {
+    Registry& r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    std::vector<std::string> lines;
+    std::size_t n[6] = {}, all = 0;
+    for (const auto& [id, o] : r.owners) {
+        for (const std::string& name : names_locked(r, id)) {
+            std::string why;
+            const int st = state_locked(r, id, name, &why);
+            ++n[st];
+            ++all;
+            if (lines.size() >= 64) continue;
+            std::string what;
+            switch (st) {
+                case kOverrideTaken: {
+                    const std::shared_ptr<const OverrideSource> own = own_locked(r, id, name);
+                    const auto oc = own ? r.outcomes.find({id, name, own->identity}) : r.outcomes.end();
+                    what = "taken by " + std::to_string(oc != r.outcomes.end() ? oc->second.taken : 0) + " stage builds";
+                    if (!why.empty()) what += "; " + why;
+                    break;
+                }
+                case kOverrideRefused: what = "refused: " + why; break;
+                case kOverrideShadowed: what = "not used: " + why; break;
+                case kOverrideOff: what = "off: " + why; break;
+                default: what = "not met: " + why; break;
+            }
+            lines.push_back("render: HLSL override " + name + " (" + (id == kOverridePlayer ? std::string("your folder") : o.name) + "): " + what);
+        }
+    }
+    if (!all) return {};
+    char b[400];
+    std::snprintf(b, sizeof(b),
+                  "render: HLSL overrides at exit: %zu (%zu taken, %zu refused, %zu not met, %zu not used, %zu off)%s; %llu modules compiled "
+                  "(%.1f s of DXC), %llu stages and %llu pipelines built with them",
+                  all, n[kOverrideTaken], n[kOverrideRefused], n[kOverrideWaiting], n[kOverrideShadowed], n[kOverrideOff],
+                  all > lines.size() ? (", " + std::to_string(all - lines.size()) + " not listed").c_str() : "",
+                  static_cast<unsigned long long>(r.compiles.load()), r.compile_us.load() / 1e6, static_cast<unsigned long long>(r.stages.load()),
+                  static_cast<unsigned long long>(r.pipelines.load()));
+    lines.insert(lines.begin(), b);
+    return lines;
+}
+
+std::string overrides_window() {
+    Registry& r = reg();
+    const std::uint64_t compiles = r.window_compiles.exchange(0), us = r.window_us.exchange(0), stages = r.window_stages.exchange(0),
+                        pipelines = r.window_pipelines.exchange(0);
+    if (!compiles && !stages && !pipelines) return {};
+    char b[160];
+    std::snprintf(b, sizeof(b), "HLSL overrides: %llu stages and %llu pipelines built, %llu modules compiled (%llu ms)",
+                  static_cast<unsigned long long>(stages), static_cast<unsigned long long>(pipelines), static_cast<unsigned long long>(compiles),
+                  static_cast<unsigned long long>(us / 1000));
+    return b;
 }
 
 }  // namespace gpu

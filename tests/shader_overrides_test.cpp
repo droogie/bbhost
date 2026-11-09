@@ -99,6 +99,7 @@ gcn::LiftResult stage(const Ps& ps, const char* name, std::uint64_t salt, bool& 
 }  // namespace
 
 int main() {
+    host_log_decide(true);          // the log to stderr: what the overrides say, for a reader of the test's output
     setenv("BBHOST_HLSL", "1", 1);  // compiled where met: nothing behind the test
     unsetenv("BBHOST_HLSL_DUMP");
     if (!hlsl_dxc().loaded()) {
@@ -140,6 +141,9 @@ int main() {
     const gcn::LiftResult ma = stage(p, "aaaa0001", s_a, took);
     CHECK(took && ma.ok() && ma.spirv != base.spirv);
     CHECK(g_hlsl_overrides.compiles.load() == before_a);
+    std::string why;
+    CHECK(overrides_state(1, "aaaa0001.ps", &why) == kOverrideTaken);
+    CHECK(overrides_state(1, "aaaa0002.ps", &why) == kOverrideNone);
     const std::uint64_t gen_a = override_gen();
     CHECK(overrides_set_text(1, "aaaa0001.ps", a.c_str()) == 0 && override_gen() == gen_a);  // the same text again: no change
     CHECK(overrides_set_text(1, "aaaa0001.ps", b.c_str()) == 0 && settle() && override_gen() != gen_a);
@@ -240,8 +244,31 @@ int main() {
     CHECK(!took && r1.spirv == base.spirv && g_hlsl_overrides.refused.load() == refused + 1);
     (void)stage(p, "aaaa0001", override_salt("aaaa0001"), took);
     CHECK(g_hlsl_overrides.refused.load() == refused + 1);
+    CHECK(overrides_state(3, "aaaa0001.ps", &why) == kOverrideRefused && why.find("DXC") != std::string::npos);
 
-    // 7. A geometry lift's stage is "gs", as the dump names its files.
+    // 7. States, the report and the off switch: a later owner's text of the
+    // same name is not used; a source not met waits; off, none applies.
+    overrides_owner(4, "plugin four", std::string(), true);
+    CHECK(overrides_set_text(4, "aaaa0001.ps", a.c_str()) == 0 && settle());
+    CHECK(overrides_state(4, "aaaa0001.ps", &why) == kOverrideShadowed && why.find("plugin three") != std::string::npos);
+    CHECK(overrides_set_text(4, "cccc0003.ps", a.c_str()) == 0 && settle());
+    CHECK(overrides_state(4, "cccc0003.ps", &why) == kOverrideWaiting);
+    overrides_owner_on(4, false);
+    CHECK(overrides_state(4, "cccc0003.ps", &why) == kOverrideWaiting && why == "its owner is off");
+    overrides_owner_on(4, true);
+    const std::vector<std::string> report = overrides_report();
+    CHECK(report.size() == 4 && report[0].find("at exit: 3 (0 taken, 1 refused, 1 not met, 1 not used, 0 off)") != std::string::npos);
+    hlsl_set_overrides(false, "switched off for the test");
+    hlsl_set_folders(dir.string());
+    CHECK(override_salt("aaaa0001") == 0 && !overrides_on());
+    CHECK(overrides_state(3, "aaaa0001.ps", &why) == kOverrideOff && why == "switched off for the test");
+    const gcn::LiftResult off = stage(p, "aaaa0001", 0, took);
+    CHECK(!took && off.spirv == base.spirv);
+    hlsl_set_overrides(true, std::string());
+    hlsl_set_folders(dir.string());
+    CHECK(overrides_on() && override_salt("aaaa0001") != 0);
+
+    // 8. A geometry lift's stage is "gs", as the dump names its files.
     const std::vector<std::uint32_t> gs = {0x07230203u, 0x00010500u, 0, 10, 0, (5u << 16) | 15u, 3u, 1u, 0x6e69616du /* "main" */, 0};
     CHECK(lift_stage_tag(gs) == "gs");
 
