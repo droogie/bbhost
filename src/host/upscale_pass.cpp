@@ -58,6 +58,7 @@
 // an image of their own that goes on in the picture's place. The glow is the
 // second target, RGBA16F at the scene's size, of a draw that writes the
 // scene (render.cpp). BBHOST_EMBERS=0 off.
+#include "hle/modules.h"
 #include "host/framegen.h"
 #include "engine/render_scale.h"
 #include "host/gpu_internal.h"
@@ -1259,7 +1260,7 @@ TestPass g_view_pass{"motion view (BBHOST_UPSCALE_SHOW_MOTION)", k_motion_view_s
                      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}};
 TestPass g_check_pass{"reprojection check (BBHOST_UPSCALE_CHECK)", k_motion_check_spv, sizeof(k_motion_check_spv),
                       {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                       VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}};
+                       VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}};
 
 bool test_pass_locked(TestPass& t) {
     if (t.tried) return t.pipeline != VK_NULL_HANDLE;
@@ -1296,12 +1297,14 @@ bool test_pass_locked(TestPass& t) {
     return ok;
 }
 
-// The pass `t` over g_output (its last binding), its other bindings the
-// images `views` and the sampler; the push constants the output's size, the
-// render size and `k`, `k2`, `k3`.
+// The pass `t` over g_output (its storage image), its other bindings the
+// images `views`, the sampler and a storage buffer `buffer` (a pass with one
+// is not recorded without it); the push constants the output's size, the
+// render size and `k`, `k2`, `k3`, `k4`.
 void record_test_pass(VkCommandBuffer cb, TestPass& t, std::initializer_list<VkImageView> views, float k, float k2 = 0.0f,
-                      float k3 = 0.0f, float k4 = 0.0f) {
+                      float k3 = 0.0f, float k4 = 0.0f, const VkDescriptorBufferInfo* buffer = nullptr) {
     if (!test_pass_locked(t)) return;
+    if (!buffer && std::find(t.types.begin(), t.types.end(), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) != t.types.end()) return;
     const VkDescriptorSet set = alloc_set_locked(t.set_layout);
     if (!set) return;
     std::vector<VkDescriptorImageInfo> infos(t.types.size());
@@ -1316,7 +1319,8 @@ void record_test_pass(VkCommandBuffer cb, TestPass& t, std::initializer_list<VkI
         wr[i].dstBinding = static_cast<std::uint32_t>(i);
         wr[i].descriptorCount = 1;
         wr[i].descriptorType = t.types[i];
-        wr[i].pImageInfo = &infos[i];
+        if (t.types[i] == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) wr[i].pBufferInfo = buffer;
+        else wr[i].pImageInfo = &infos[i];
     }
     vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(wr.size()), wr.data(), 0, nullptr);
     const float pc[8] = {static_cast<float>(g_ow), static_cast<float>(g_oh), static_cast<float>(g_w), static_cast<float>(g_h), k, k2, k3, k4};
@@ -1337,8 +1341,56 @@ OwnImage g_prev_scene;
 VkFormat g_prev_scene_format = VK_FORMAT_UNDEFINED;
 bool g_prev_scene_valid = false;
 
+// The check's counts (motion_check.comp's `counts`: the pixels of each class
+// in sixteen bands of the width) in a ring of kCheckRing slots of host-visible
+// memory. A slot is read kCheckLag calls after its pass was recorded - by then
+// its frame has run, as far fewer frames are ever in flight - and the sums
+// logged every 30 frames: a number for the check where no frame is dumped.
+struct CheckCounts {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    std::uint8_t* map = nullptr;
+    bool tried = false;
+    std::uint64_t calls = 0, summed = 0, sum[64] = {};
+};
+CheckCounts g_check_counts;
+constexpr std::uint32_t kCheckRing = 32, kCheckLag = 24, kCheckBytes = 64 * 4;
+
+// The slot kCheckLag calls back added to the sums; every 30 the shares logged.
+void check_counts_read_locked() {
+    CheckCounts& c = g_check_counts;
+    if (c.calls < kCheckLag) return;
+    const auto* n = reinterpret_cast<const std::uint32_t*>(c.map + ((c.calls - kCheckLag) % kCheckRing) * kCheckBytes);
+    for (int i = 0; i < 64; ++i) c.sum[i] += n[i];
+    if (++c.summed < 30) return;
+    std::uint64_t black = 0, green = 0, red = 0, blue = 0;
+    std::string bands;
+    for (int b = 0; b < 16; ++b) {
+        const std::uint64_t g_ = c.sum[b * 4 + 1], r_ = c.sum[b * 4 + 2];
+        black += c.sum[b * 4];
+        green += g_;
+        red += r_;
+        blue += c.sum[b * 4 + 3];
+        char one[16];
+        if (r_ + g_) std::snprintf(one, sizeof(one), " %.3f", static_cast<double>(r_) / static_cast<double>(r_ + g_));
+        else std::snprintf(one, sizeof(one), " -");
+        bands += one;
+    }
+    const double px = static_cast<double>(black + green + red + blue);
+    if (px > 0.0) {
+        char ratio[16] = "-";
+        if (red + green) std::snprintf(ratio, sizeof(ratio), "%.4f", static_cast<double>(red) / static_cast<double>(red + green));
+        host_log("upscaler: the reprojection check over 30 frames to flip %llu (%ux%u): red/(red+green) %s; red %.3f%%, green %.3f%%, blue "
+                 "%.3f%% of the pixels; red/(red+green) by sixteenth of the width from the left:%s",
+                 static_cast<unsigned long long>(hle_video_flip_count()), g_ow, g_oh, ratio, 100.0 * static_cast<double>(red) / px,
+                 100.0 * static_cast<double>(green) / px, 100.0 * static_cast<double>(blue) / px, bands.c_str());
+    }
+    std::memset(c.sum, 0, sizeof(c.sum));
+    c.summed = 0;
+}
+
 // The check of this frame's motion against the last frame's scene, into
-// g_output; then this frame's scene kept for the next.
+// g_output, its classes counted; then this frame's scene kept for the next.
 void record_motion_check(VkCommandBuffer cb, RtImage& scene, float gain) {
     if (g_prev_scene.image && (g_prev_scene_format != scene.format)) {
         drop(g_prev_scene);
@@ -1352,9 +1404,28 @@ void record_motion_check(VkCommandBuffer cb, RtImage& scene, float gain) {
         g_prev_scene_format = scene.format;
         g_prev_scene_valid = false;
     }
-    if (g_prev_scene_valid)
+    CheckCounts& counts = g_check_counts;
+    if (!counts.tried) {
+        counts.tried = true;
+        counts.buf = cap_buffer(VkDeviceSize{kCheckRing} * kCheckBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, counts.mem, nullptr, &counts.map);
+        if (!counts.buf) host_log("upscaler: the reprojection check's counts have no buffer: the check is not run");
+    }
+    if (g_prev_scene_valid && counts.buf) {
+        check_counts_read_locked();
+        const VkDeviceSize at = (counts.calls % kCheckRing) * kCheckBytes;
+        vkCmdFillBuffer(cb, counts.buf, at, kCheckBytes, 0);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        const VkDescriptorBufferInfo bi{counts.buf, at, kCheckBytes};
         record_test_pass(cb, g_check_pass, {scene.view, g_prev_scene.view, g_motion.view}, gain, g_check_whole ? 2.0f : 1.0f, check_box(),
-                         std::getenv("BBHOST_UPSCALE_CHECK_OVERLAY") ? 1.0f : 0.0f);
+                         std::getenv("BBHOST_UPSCALE_CHECK_OVERLAY") ? 1.0f : 0.0f, &bi);
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        ++counts.calls;
+    }
     barrier(cb, g_prev_scene.image, VK_IMAGE_ASPECT_COLOR_BIT, g_prev_scene_valid ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     barrier(cb, scene.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
