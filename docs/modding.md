@@ -165,13 +165,28 @@ Things to know:
 - **Don't share the files.** They are generated from the game's own shaders,
   so they stay on your machine and are never published.
 
-## Draw and frame hooks (planned)
+## Draw and frame hooks
 
-Not in the plugin API yet: this is the design that GX's draw methods and
-command lists, now source ([decomp.md](decomp.md#gx-srcdecompgx)), make
-possible. GX is the engine's Direct3D 11 layer - the game names the
-interfaces it emulates, `ID3D11DeviceContext`, `ID3D11CommandList` and the
-state objects - so the hooks speak its terms.
+Plugin API 27 has the frame's part of these hooks; see
+[plugins.md](plugins.md#rendering-effects-v27):
+
+- `frame_info` describes each 3D frame: its render and output sizes, the
+  upscaler, its quality and its jitter, and this frame's and the last frame's
+  camera as matrices.
+- `on_render` records compute work of a plugin's own into the frame at two
+  points: before the upscale, with the lit scene, its depth, the motion and
+  the glow; and on the final picture after the upscale, before the
+  post-processing and the HUD.
+- `aa_claim` says whether a plugin leaves the anti-aliasing to bbhost or takes
+  it over, and the menus name the plugin that does.
+
+The rest is still planned and not in the plugin API: the hooks per draw, per
+pass and per post-processing parameter below, and the frame's end at the
+present. GX's draw methods and command lists, now source
+([decomp.md](decomp.md#gx-srcdecompgx)), make them possible. GX is the
+engine's Direct3D 11 layer - the game names the interfaces it emulates,
+`ID3D11DeviceContext`, `ID3D11CommandList` and the state objects - so the
+hooks speak its terms.
 
 - **Per draw and dispatch.** Called as the game issues each draw, dispatch or
   state commit, before bbhost takes it, on the thread that records it. The
@@ -189,11 +204,13 @@ state objects - so the hooks speak its terms.
   which target, and what read it later. A plugin can name the passes,
   capture a pass's targets, run a pass of its own between two of the game's
   (an effect after the scene and before the menus), or leave one out.
-- **Per frame.** Called where a frame ends, in the swap chain's present:
-  how many frames the game may run ahead of the display (two display
-  buffers, so at most two flips in flight) and what it waits for before it
-  hands a frame over are decided there. A plugin can run a pass of its own
-  over the final image, capture it, or pace frames another way.
+- **Per frame, at the present.** Called where a frame ends, in the swap
+  chain's present: how many frames the game may run ahead of the display
+  (two display buffers, so at most two flips in flight) and what it waits for
+  before it hands a frame over are decided there. A plugin can run a pass of
+  its own over the final image with the post-processing and the HUD on it,
+  capture it, or pace frames another way. (`on_render`'s second point is
+  earlier: the picture before the post-processing.)
 - **Per post-processing parameter.** Called as the game hands each frame's
   post-processing parameters to YEBIS, the post-process library, before the
   chain runs: PPFX's 69 setters ([decomp.md](decomp.md#yebis-srcdecompyebis)),
@@ -205,14 +222,14 @@ state objects - so the hooks speak its terms.
   YEBIS takes it: turn an effect off, scale the bloom, move the focus,
   change the grading.
 
-Hooks cost nothing while no plugin registers one. A registered one runs for
-every draw on the engine's render threads, so it must be fast, thread-safe
-and never wait. YEBIS's post-processing passes are covered as the D3D11
-calls its own context takes (the targets each pass binds, its draws, its
-flushes) and where they reach Gnm, the whole chain as the two calls the
-engine runs it with (`ppfxBindFramebuffer`, `ppfxApplyEffects`), and its
-parameters as the setters the game hands them through; the Scaleform menus
-are not, until that code is source too.
+These hooks would cost nothing while no plugin registers one. A registered
+one would run for every draw on the engine's render threads, so it must be
+fast, thread-safe and never wait. YEBIS's post-processing passes are covered
+as the D3D11 calls its own context takes (the targets each pass binds, its
+draws, its flushes) and where they reach Gnm, the whole chain as the two
+calls the engine runs it with (`ppfxBindFramebuffer`, `ppfxApplyEffects`),
+and its parameters as the setters the game hands them through; the Scaleform
+menus are not, until that code is source too.
 
 ## Text
 
