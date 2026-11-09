@@ -7,7 +7,8 @@
 // may say "maybe" where nothing is; it may never say "no" where a home is.
 // The handle's packing is checked too (host/gxvk_homes.h), and the default's
 // rule (default_off: on only with a card with room or 6 GiB of small video
-// memory free, 16 hardware threads or more and a frame rate above 60;
+// memory free, 16 hardware threads or more and a frame rate above 60 - at any
+// frame rate where the run commit is on by the platform's default;
 // small_refused; homes_bound and run_commit_gives_way: Windows' run commit
 // gives way wherever the homes are bound, by the rule or BBHOST_GXVK_HOMES=1).
 #include "host/gxvk_homes.h"
@@ -60,21 +61,30 @@ int main() {
     }
     check(!gxvk_homes::is_handle(0xa0000123u) && !gxvk_homes::is_handle(0), "another tag is no handle", 0, 0);
     // The default (BBHOST_GXVK_HOMES unset): on only with a card with room, 16 hardware threads or more and a frame rate
-    // above 60 - Display-Limited at 144 Hz or uncapped (960) on, 60 and 30 off, 15 threads off - each reason its own bit.
+    // above 60 - Display-Limited at 144 Hz or uncapped (960) on, 60 and 30 off, 15 threads off - each reason its own bit;
+    // where the run commit is on by the platform's default, at any frame rate.
     {
         using namespace gxvk_homes;
-        check(default_off(false, false, false, 16, 61, false) == 0 && default_off(false, false, false, 80, 960, false) == 0 &&
-                  default_off(false, false, false, 32, 144, false) == 0,
+        check(default_off(false, false, false, 16, 61, false, false) == 0 && default_off(false, false, false, 80, 960, false, false) == 0 &&
+                  default_off(false, false, false, 32, 144, false, false) == 0,
               "on with room, 16+ threads, above 60", 0, 0);
-        check(default_off(false, false, false, 80, 60, false) == kDefaultOffRate && default_off(false, false, false, 80, 30, false) == kDefaultOffRate,
+        check(default_off(false, false, false, 80, 60, false, false) == kDefaultOffRate && default_off(false, false, false, 80, 30, false, false) == kDefaultOffRate,
               "off at 60 and below", 0, 60);
-        check(default_off(false, false, false, 15, 960, false) == kDefaultOffThreads && default_off(false, false, false, 8, 960, false) == kDefaultOffThreads,
+        // Where the run commit is on by the platform's default (Windows) the frame rate keeps nothing off - the homes take
+        // its place at 60 and 30 as uncapped - and the other reasons still do.
+        check(default_off(false, false, false, 16, 60, false, true) == 0 && default_off(false, false, false, 16, 30, false, true) == 0 &&
+                  default_off(false, false, false, 16, 960, false, true) == 0,
+              "Windows' default off at 60 and below", 16, 60);
+        check(default_off(false, false, false, 8, 60, false, true) == kDefaultOffThreads && default_off(true, false, false, 16, 60, false, true) == kDefaultOffIntegrated &&
+                  default_off(false, false, true, 16, 30, false, true) == kDefaultOffSmall,
+              "Windows' default at 60 on with 8 threads, an integrated GPU or small video memory refused", 8, 60);
+        check(default_off(false, false, false, 15, 960, false, false) == kDefaultOffThreads && default_off(false, false, false, 8, 960, false, false) == kDefaultOffThreads,
               "off below 16 threads", 15, 960);
-        check(default_off(true, false, false, 80, 960, false) == kDefaultOffIntegrated && default_off(false, true, false, 80, 960, false) == kDefaultOffTight &&
-                  default_off(false, false, true, 80, 960, false) == kDefaultOffSmall,
+        check(default_off(true, false, false, 80, 960, false, false) == kDefaultOffIntegrated && default_off(false, true, false, 80, 960, false, false) == kDefaultOffTight &&
+                  default_off(false, false, true, 80, 960, false, false) == kDefaultOffSmall,
               "off on an integrated GPU, with tight or small video memory", 0, 0);
-        check(default_off(false, false, true, 8, 60, false) == (kDefaultOffSmall | kDefaultOffThreads | kDefaultOffRate), "every reason said", 8, 60);
-        check(default_off(false, false, false, 80, 960, true) == kDefaultOffRunCommit, "off with the run commit turned on by its setting", 80, 960);
+        check(default_off(false, false, true, 8, 60, false, false) == (kDefaultOffSmall | kDefaultOffThreads | kDefaultOffRate), "every reason said", 8, 60);
+        check(default_off(false, false, false, 80, 960, true, false) == kDefaultOffRunCommit, "off with the run commit turned on by its setting", 80, 960);
         // Small video memory: refused under 6,144 MiB free at the start unless a budget is given; a card with room never.
         check(small_refused(true, 4000, false) && small_refused(true, 6143, false) && small_refused(true, 0, false),
               "small video memory under 6,144 MiB free refused", 6143, 0);
@@ -82,8 +92,8 @@ int main() {
               "small video memory from 6,144 MiB free taken, with the pool's budget", 6144, 0);
         check(!small_refused(true, 4000, true) && !small_refused(true, 0, true), "a budget given takes small video memory at any size", 4000, 1);
         check(!small_refused(false, 4000, false) && !small_refused(false, 0, false), "a card with room is never refused", 4000, 0);
-        check(default_off(false, false, small_refused(true, 7000, false), 16, 960, false) == 0 &&
-                  default_off(false, false, small_refused(true, 4000, false), 16, 960, false) == kDefaultOffSmall,
+        check(default_off(false, false, small_refused(true, 7000, false), 16, 960, false, false) == 0 &&
+                  default_off(false, false, small_refused(true, 4000, false), 16, 960, false, false) == kDefaultOffSmall,
               "on with 7,000 MiB free, off with 4,000", 7000, 4000);
         // The homes end bound by the default where nothing keeps them off, and by BBHOST_GXVK_HOMES=1 wherever the device
         // takes them: the rule's threads, frame rate and run-commit reasons do not stop 1; the device's (an integrated GPU,
@@ -107,15 +117,17 @@ int main() {
         check(run_commit_gives_way(homes_bound(Mode::kAuto, 0, false, false, false), true) &&
                   run_commit_gives_way(homes_bound(Mode::kHandle, 0, false, false, false), true),
               "the run commit gives way where the rule holds", 0, 1);
-        check(run_commit_gives_way(homes_bound(Mode::kHandle, default_off(false, false, false, 16, 60, false), false, false, false), true) &&
-                  run_commit_gives_way(homes_bound(Mode::kHandle, default_off(false, false, false, 8, 960, false), false, false, false), true),
+        check(run_commit_gives_way(homes_bound(Mode::kHandle, default_off(false, false, false, 16, 60, false, false), false, false, false), true) &&
+                  run_commit_gives_way(homes_bound(Mode::kHandle, default_off(false, false, false, 8, 960, false, false), false, false, false), true),
               "the run commit gives way to BBHOST_GXVK_HOMES=1 at 60 fps and with 8 threads", 8, 60);
         check(!run_commit_gives_way(true, false) && !run_commit_gives_way(false, false),
               "nothing to give way without the platform's default (Linux, or BBHOST_RUN_COMMIT set)", 0, 0);
-        check(!run_commit_gives_way(homes_bound(Mode::kAuto, default_off(false, false, false, 8, 960, false), false, false, false), true) &&
-                  !run_commit_gives_way(homes_bound(Mode::kAuto, default_off(false, false, false, 16, 60, false), false, false, false), true) &&
-                  !run_commit_gives_way(homes_bound(Mode::kAuto, default_off(true, false, false, 16, 960, false), true, false, false), true),
-              "Windows' default keeps the run commit with 8 threads, at 60 fps, on an integrated GPU", 8, 60);
+        check(!run_commit_gives_way(homes_bound(Mode::kAuto, default_off(false, false, false, 8, 960, false, true), false, false, false), true) &&
+                  !run_commit_gives_way(homes_bound(Mode::kAuto, default_off(true, false, false, 16, 960, false, true), true, false, false), true),
+              "Windows' default keeps the run commit with 8 threads, on an integrated GPU", 8, 60);
+        check(run_commit_gives_way(homes_bound(Mode::kAuto, default_off(false, false, false, 16, 60, false, true), false, false, false), true) &&
+                  run_commit_gives_way(homes_bound(Mode::kAuto, default_off(false, false, false, 16, 30, false, true), false, false, false), true),
+              "Windows' default gives the run commit way at 60 and 30 fps with 16 threads", 16, 60);
         check(!run_commit_gives_way(homes_bound(Mode::kHandle, kDefaultOffIntegrated, true, false, false), true),
               "BBHOST_GXVK_HOMES=1 on an integrated GPU keeps the run commit", 0, 3);
         check(!run_commit_gives_way(homes_bound(Mode::kOff, 0, false, false, false), true) &&

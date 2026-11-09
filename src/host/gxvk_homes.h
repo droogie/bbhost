@@ -86,10 +86,19 @@ Mode env_mode();
 // kSmallHomesFreeMiB or more free at the start (the device rule above: no
 // integrated GPU, no tight memory), 16 hardware threads or more for the
 // process, and a frame rate above 60 (a fixed rate above 60, or
-// Display-Limited on a display above 60 Hz). On an RTX 4070 uncapped they took
+// Display-Limited on a display above 60 Hz) where the run commit is not on by
+// the platform's default. On an RTX 4070 uncapped they took
 // the command processor's time a flip down 27-31% and the frame rate up 6.5%
 // where the command processor limited; at 60 and below, where the frame waits
-// for its limit anyway, the pool's threads cost about a core more for nothing.
+// for its limit anyway, the pool's threads cost about a core more for nothing
+// (before it rested at a cap: host/gxvk_rest.h), and Linux's path at 60 is the
+// command processor drawing in order. Where the run commit is on by the
+// platform's default (Windows), the homes take its place at any frame rate:
+// at a true 60 under Windows on an RTX 3070 Ti Laptop GPU (1080p) the homes,
+// the run commit giving way and the pool resting at the cap, took 15-33
+// points of CPU less than the run commit at Old Yharnam, the Nightmare of
+// Mensis, Cainhurst's courtyard, Central Yharnam and the sewers under it, the
+// frame rate and the slowest frames the same.
 // Nor with the run commit turned on by BBHOST_RUN_COMMIT: the pool's splices
 // give way to it, so its threads would commit ahead for nothing. Where the run
 // commit is on by the platform's default alone (Windows), it gives way instead
@@ -109,7 +118,7 @@ enum DefaultOff : unsigned {
     kDefaultOffTight = 1u << 1,       // tight memory (all heaps under 12 GiB)
     kDefaultOffSmall = 1u << 2,       // small video memory under kSmallHomesFreeMiB free, no BBHOST_GXVK_HOMES_BUDGET_MB (small_refused)
     kDefaultOffThreads = 1u << 3,     // fewer than kDefaultThreads hardware threads (host_cpu_threads)
-    kDefaultOffRate = 1u << 4,        // a frame rate of kDefaultAboveFps or less (frame_rate_game_fps)
+    kDefaultOffRate = 1u << 4,        // a frame rate of kDefaultAboveFps or less (frame_rate_game_fps), the run commit not on by default
     kDefaultOffRunCommit = 1u << 5,   // the run commit turned on by BBHOST_RUN_COMMIT (list_resolve::commit_by_setting)
 };
 constexpr unsigned kDefaultThreads = 16;
@@ -123,10 +132,11 @@ constexpr unsigned long long kSmallHomesFreeMiB = 6144;
 constexpr bool small_refused(bool small_vram, unsigned long long free_mib, bool budget_given) {
     return small_vram && !budget_given && free_mib < kSmallHomesFreeMiB;
 }
-constexpr unsigned default_off(bool integrated, bool tight, bool small_refused, unsigned threads, int fps, bool run_commit_set) {
+constexpr unsigned default_off(bool integrated, bool tight, bool small_refused, unsigned threads, int fps, bool run_commit_set,
+                               bool run_commit_by_default) {
     return (integrated ? kDefaultOffIntegrated : 0u) | (tight ? kDefaultOffTight : 0u) | (small_refused ? kDefaultOffSmall : 0u) |
-           (threads < kDefaultThreads ? kDefaultOffThreads : 0u) | (fps <= kDefaultAboveFps ? kDefaultOffRate : 0u) |
-           (run_commit_set ? kDefaultOffRunCommit : 0u);
+           (threads < kDefaultThreads ? kDefaultOffThreads : 0u) |
+           (fps <= kDefaultAboveFps && !run_commit_by_default ? kDefaultOffRate : 0u) | (run_commit_set ? kDefaultOffRunCommit : 0u);
 }
 // Whether the homes end bound by handle (homes_decide): the default where
 // nothing keeps them off by the rule above (`off` none), and

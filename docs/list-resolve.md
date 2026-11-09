@@ -698,12 +698,13 @@ on the live save), 182.4 and 177.4 off against 182.0 and 184.5, and 200.9 on.
   2026-11-04 Windows' default gives way where the constant buffers' homes and the
   pool's segments are on by their rule - a card with room or 6,144 MiB of
   video memory free, 16 hardware threads, above 60 fps (rendering.md, "On by
-  default above 60 fps"): there they ran Old Yharnam 27-29% faster than the
-  run commit on an RTX 3070 Ti Laptop GPU, and three other places 2.2-4.0%; and
-  since 2026-11-09 wherever `BBHOST_GXVK_HOMES=1` binds the homes too (at a true
-  60 there they took 9-34 points of CPU less than the run commit). It stays
-  on everywhere else (an integrated GPU such as the Radeon 8060S, fewer
-  threads, 60 fps and below). `BBHOST_RUN_COMMIT=on` turns it on anywhere, `=0`
+  default above 60 fps, and on Windows at any rate"): there they ran Old
+  Yharnam 27-29% faster than the run commit on an RTX 3070 Ti Laptop GPU, and
+  three other places 2.2-4.0%; since 2026-11-09 wherever `BBHOST_GXVK_HOMES=1`
+  binds the homes too, and by default at 60 and below as well (at a true 60
+  they took 15-33 points of CPU less than the run commit, the frame the same).
+  It stays on everywhere else (an integrated GPU such as the Radeon 8060S,
+  fewer threads, a card under 6,144 MiB free). `BBHOST_RUN_COMMIT=on` turns it on anywhere, `=0`
   (or `off`) commits every draw in order, the draw path then taking the same
   branches as before; `BBHOST_TEST_RUN_COMMIT_DEFAULT=on` takes Windows' default
   on Linux (`=off` Linux's on Windows), to test the default and its give-way. On

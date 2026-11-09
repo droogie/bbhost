@@ -148,7 +148,7 @@ void log_commit_default() {
             host_log("list-resolve: run commit off by default here - on %s, it gives way where the constant buffers' "
                      "homes are bound (their lines say why): measured at 1080p on an RTX 3070 Ti Laptop GPU, uncapped Old Yharnam ran "
                      "27%% faster with the homes and the pool's segments than with the run commit and three other places 3.0-4.0%%, "
-                     "and at 60 fps the homes took 9-34 points of CPU less (BBHOST_RUN_COMMIT=on turns it on)",
+                     "and at a true 60 the homes took 15-33 points of CPU less, the frame the same (BBHOST_RUN_COMMIT=on turns it on)",
                      where);
         else if (run_commit_default())
             host_log("list-resolve: run commit on %s (BBHOST_RUN_COMMIT=0 turns it off): measured there at 1080p, "

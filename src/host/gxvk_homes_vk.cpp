@@ -374,7 +374,8 @@ void homes_decide(bool integrated, bool small_vram, bool tight, std::uint64_t fr
     // game's code was patched, before the device.
     const unsigned threads = host_cpu_threads();
     const int fps = frame_rate_game_fps();
-    const unsigned off = default_off(integrated, tight, small_off, threads, fps, list_resolve::commit_by_setting());
+    const unsigned off = default_off(integrated, tight, small_off, threads, fps, list_resolve::commit_by_setting(),
+                                     list_resolve::commit_by_default());
     const bool gave_way = run_commit_gives_way(homes_bound(m, off, integrated, tight, small_off), list_resolve::commit_by_default());
     if (gave_way) list_resolve::commit_give_way();
     // The default (BBHOST_GXVK_HOMES unset): on as 1 turns them on, or off with its reasons in one line.
@@ -404,10 +405,10 @@ void homes_decide(bool integrated, bool small_vram, bool tight, std::uint64_t fr
             if (off & kDefaultOffRunCommit) add("the run commit on by BBHOST_RUN_COMMIT, which the pool's segments give way to");
             host_log("gxvk homes: off by default here (%s) - the constant buffers' homes, and with them the draw segments prepared on "
                      "the pool's threads, are on by default only with a graphics card with room or %llu MiB of video memory free at the "
-                     "start, %u or more hardware threads and a frame rate above %d (where the run commit is on by Windows' default, it "
-                     "gives way to them); at %d and below the pool would take about a core more for nothing. Decided at start: a frame "
-                     "rate changed in play applies at the next start. BBHOST_GXVK_HOMES=1 turns them on",
-                     why.c_str(), kSmallHomesFreeMiB, kDefaultThreads, kDefaultAboveFps, kDefaultAboveFps);
+                     "start, %u or more hardware threads and a frame rate above %d - at any frame rate where the run commit is on by "
+                     "Windows' default, which gives way to them. Decided at start: a frame rate changed in play applies at the next "
+                     "start. BBHOST_GXVK_HOMES=1 turns them on",
+                     why.c_str(), kSmallHomesFreeMiB, kDefaultThreads, kDefaultAboveFps);
             return;
         }
         const char* rc = std::getenv("BBHOST_RUN_COMMIT");

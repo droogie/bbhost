@@ -834,17 +834,23 @@ each draw of a segment that would have been spliced with its commit. On an RTX
 0.35-0.5 us a spliced draw, and the frame rate rose 5-11% at Old Yharnam,
 where the command processor had been the limit.
 
-**On by default above 60 fps (`BBHOST_GXVK_HOMES` unset).** The constant
-buffers' homes - and with them the segments, and the run batching
-(`BBHOST_RUN_BATCH`) and copy-back captures they take - are on by default only
-where the frame rate can gain from them: a graphics card with room, or one
-with small video memory that has 6,144 MiB or more free at the start (the
-homes' own rule below: not an integrated GPU, no tight memory), 16 hardware
-threads or more that the process may run on (its CPU affinity, so a
+**On by default above 60 fps, and on Windows at any rate (`BBHOST_GXVK_HOMES`
+unset).** The constant buffers' homes - and with them the segments, and the
+run batching (`BBHOST_RUN_BATCH`) and copy-back captures they take - are on by
+default only where the frame rate can gain from them: a graphics card with
+room, or one with small video memory that has 6,144 MiB or more free at the
+start (the homes' own rule below: not an integrated GPU, no tight memory), 16
+hardware threads or more that the process may run on (its CPU affinity, so a
 `taskset` counts), and a frame rate above 60 (a fixed rate above 60, or
-Display-Limited on a display above 60 Hz). At 60 and below the frame waits
-for its limit anyway, and the pool's two threads would cost about a core more
-for nothing, so everything there is as it was before them. On a card with
+Display-Limited on a display above 60 Hz). On Linux at 60 and below the frame
+waits for its limit anyway, and the command processor draws in order as it
+did before them. On Windows, where the run commit is on by default, the
+homes take its place at any frame rate: the run commit gives way to them and
+the pool rests while a cap holds the frame (its duty rule, below). At a true
+60 on an RTX 3070 Ti Laptop GPU (1080p, alternating runs) they took 15-33
+points of CPU less than the run commit at Old Yharnam, the Nightmare of
+Mensis, Cainhurst's courtyard, Central Yharnam and the sewers under it, the
+frame rate (59.7-59.8) and the slowest frames the same. On a card with
 small video memory the homes take the pool's budget (128 MiB, as on a card
 with room) and the game's memory is still imported a window at a time; under
 6,144 MiB free they stay off (on a 4 GB card the pool pushed images into host
@@ -865,7 +871,7 @@ segments without the run commit against the run commit:
 
 As shipped, the shared GPU memory stayed at 2.1 GB (whole imports, on the
 second row, pinned 4.95 GB). Where the rule does not hold - an integrated GPU,
-fewer threads, 60 fps and below, a card under 6,144 MiB free - the run commit
+fewer threads, a card under 6,144 MiB free - the run commit
 stays on by Windows' default, as before. The homes are made as
 their buffers are, so the choice is made once, with the device at start: a
 frame rate changed in play (it changes at once, 30 included) leaves the
@@ -1083,9 +1089,10 @@ as today, runs the proof over the sources as 1 would, and compares each
 version with its source at its batch.
 
 **Constant buffers in device-local homes made at their creation, bound by
-handle (`BBHOST_GXVK_HOMES`, on by default above 60 fps with 16 hardware
-threads or more and a card with room or 6,144 MiB free, the run commit giving
-way on Windows: "On by default above 60 fps" above).** A
+handle (`BBHOST_GXVK_HOMES`, on by default above 60 fps - on Windows at any
+rate - with 16 hardware threads or more and a card with room or 6,144 MiB
+free, the run commit giving way on Windows: "On by default above 60 fps, and
+on Windows at any rate" above).** A
 constant buffer's own memory is written only by GX's GPU copies: every
 UpdateSubresource of one, and every Map of a dynamic one, writes a renamed
 copy, and the map resolves copy the renames back. With `BBHOST_GXVK_HOMES=1`
