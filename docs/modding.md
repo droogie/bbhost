@@ -80,8 +80,9 @@ that HLSL and have the game use your version.
    name for it.
    - The game's own built-in shaders (the menus' Scaleform, YEBIS) have only
      GX's name, as in `38d65b32.ps.hlsl`.
-   - The stages are `ps`, `vs`, `hs`, `ds` and `cs`.
-   - Beside each file is the lift it came from (`.lift.spv`).
+   - The stages are `ps`, `vs`, `hs`, `ds`, `gs` and `cs`.
+   - Beside each file is the lift it came from (`.lift.spv`), and the folder
+     has `bbhost.hlsli`, the helpers a plugin's shader includes (below).
    - The first line names the shader again; the second gives this build's lift
      hash.
 
@@ -96,9 +97,11 @@ that HLSL and have the game use your version.
 2. Copy the files you want to change into `<data>/bbhost/shaders/`. Keep
    each file's name, and edit the copy.
 3. Start the game. The log lists the edited files it found (`render: HLSL
-   overrides: N edited shaders in ...`). The first time a shader is used,
-   its edited file is compiled, and the log says whether it was taken
-   (`render: HLSL override <file> compiled and taken for <shader>`).
+   overrides: N - <shader> (your folder), ...`). The first time a shader is
+   used, its edited file is compiled, and the log says whether it was taken
+   (`render: HLSL override <file> compiled and taken for <shader>`). The exit
+   report has a line for each edited shader: taken, refused and why, or not
+   met.
 
 For each shader, the game looks for an edited file in this order:
 
@@ -133,8 +136,20 @@ Things to know:
 - **An update can change the shader's interface.** If the update changes the
   inputs or outputs the game's own version declares, your file is refused,
   the log says why, and the game uses its own until you edit it again.
-- **When changes take effect.** Edits are read at the start, so restart the
-  game to try a change.
+- **When changes take effect.** Edits are read at the start. With
+  `BBHOST_SHADER_WATCH=1` the folder is read again every half second while
+  the game runs (`=<milliseconds>` for another period): a new, edited or
+  removed file applies at its shader's next draw, once it has compiled for
+  the variants of the shader met so far, and only that shader's pipelines are
+  built again (removing a file brings back what was built before it).
+- **Plugins can replace shaders too** ([plugins.md](plugins.md), "Shaders"),
+  by the same names. Your own file of a name comes first: the plugin's is not
+  used, and the log says so. In your own files, the helpers of `bbhost.hlsli`
+  that read a plugin's numbers read 0.
+- **Turning them all off.** `video.shader_overrides = false` in
+  `bbhost.toml`, or `BBHOST_SHADER_OVERRIDES=0`, leaves every shader the
+  game's own: your edited files and every plugin's. The log's start says how
+  many that leaves unused.
 - **The off switch turns this off too.** Edited shaders apply only while the
   HLSL path is on. With Shaders set to Lifted (HLSL Shaders off in the game's
   PC Graphics), or `BBHOST_HLSL=0`, they are ignored.

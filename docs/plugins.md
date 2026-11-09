@@ -316,6 +316,87 @@ gives the Binary Ninja address.
   upscale, and who does the anti-aliasing. See
   [Rendering effects](#rendering-effects-v27).
 
+**Shaders** (v27)
+
+A plugin can put HLSL of its own in place of any of the game's shaders, as an
+edited file in `<data>/bbhost/shaders` does ([modding.md](modding.md#shaders)):
+the same names, compiled and checked the same way, and applied while the game
+runs.
+
+- **Names.** A shader is named as `BBHOST_HLSL_DUMP=1` names its file, less
+  `.hlsl`: `GXGuiShader_Tex.ppo@6d921b0b.ps` for every variant of that pixel
+  shader whose inputs and outputs the source declares,
+  `GXGuiShader_Tex.ppo@6d921b0b.ps~7de085b59d21219a` for one variant, and a
+  lift's hash, `7de085b59d21219a.ps`, for a shader whose name is not known.
+  The stages are `vs`, `ps`, `hs`, `ds`, `gs` and `cs`.
+- `shader_override(name, shader, hlsl)`: the source for a shader (UTF-8, at
+  most 4 MiB); `NULL` gives the shader back to the game. DXC compiles it for
+  each variant of the shader met so far, off the thread that draws, and then
+  the shader's next draw uses it: its pipelines are built again, once. Going
+  back to a source drawn with before takes the pipelines built for it and
+  compiles nothing, and the same text again changes nothing. A source is
+  taken where it declares the stage's interface - the dumped file's bindings,
+  inputs and outputs - and its SPIR-V validates; elsewhere the shader keeps
+  its own. A value that changes goes through `shader_data`, not a new text:
+  each new text is a compile and new pipelines.
+- `shader_folder(name, dir)`: every `<shader>.hlsl` in a folder, relative to
+  the plugin's own folder (`plugin_dir`) or absolute, as `shader_override`
+  takes a text; `NULL` takes the plugin's folders away. The plugin's own texts
+  come first, then its folders in the order it added them. It returns how many
+  files it found, or -1 for no such folder.
+- `shader_state(name, shader, why, n)`: what became of it, and why:
+  `BB_SHADER_WAITING` (its shader not met since, compiling, or the plugin is
+  off), `BB_SHADER_TAKEN`, `BB_SHADER_REFUSED` (DXC's error, citing the
+  source's own line; another interface than the shader's; invalid SPIR-V; a
+  pipeline holding it that the driver refused - that pipeline draws with the
+  game's shader), `BB_SHADER_SHADOWED` (a file of the same name in the
+  player's folder, or an earlier plugin's, comes first) or `BB_SHADER_OFF`.
+- `shader_source(shader, &hlsl, &size)`: the HLSL this build prints for a
+  shader, as the dump writes it - the first variant met this run, or the one a
+  `~<lift hash>` name gives - so a plugin can patch the game's own source
+  instead of shipping whole copies, which an update that changes the shader's
+  interface would refuse. It returns 1 until the game has built a stage of
+  that shader in this run (ask again from `on_frame`), and 2 when overrides do
+  not apply.
+- `shader_data(name, offset, data, size)`: numbers of the plugin's own that
+  its shaders read with no binding: `BB_SHADER_DATA_BYTES` (64 KiB), zero at
+  the start, written from any thread. A shader includes `bbhost.hlsli` - the
+  host provides it; the dump folder has a copy - and reads it with
+  `bb_data_float(offset)`, `bb_data_float2` to `bb_data_float4`,
+  `bb_data_float4x4`, `bb_data_int`, `bb_data_uint` to `bb_data_uint4` (byte
+  offsets: 4-aligned, 8 for two elements, 16 for three, four or a matrix,
+  rows first). Each frame's draws read one copy of it, as it stood when the
+  frame before had been recorded, so write what belongs together in one call.
+  Changing a value builds nothing.
+
+```hlsl
+#include "bbhost.hlsli"
+// ... the shader's own source, as shader_source gave it, and in its main:
+    lifted_main();
+    mrt0.rgb = lerp(mrt0.rgb, mrt0.rgb * float3(1.0f, 0.35f, 0.35f), saturate(bb_data_float(0)));
+```
+
+```c
+float strength = 0.5f;
+api->shader_data("mine", 0, &strength, sizeof(strength));  /* from the next frame */
+```
+
+The player's own file of a name comes first, then the plugin loaded first (by
+file name); the one not used is logged once. A plugin turned off in game keeps
+its shaders until it is on again. Overrides apply on the HLSL path only (the
+Shaders setting at HLSL, the default) and to the stages it compiles: a draw
+drawn with the shader's translation instead (one whose constant buffers do not
+all bind) keeps the game's. A compute shader's
+new source is compiled where it is first dispatched when it was not met before
+(a short stall). The log's start and exit reports list each override, who gave
+it and what became of it; `BBHOST_SHADER_WATCH=1` reads the plugins' folders
+and the player's again while the game runs; `video.shader_overrides = false` or
+`BBHOST_SHADER_OVERRIDES=0` turns all of them off. Not yet: textures or
+samplers of an override's own, and an override for some draws of a shader and
+not others. `tools/shader_tint_plugin.c` is a worked example: a test plugin
+that tints one shader live, on and off, its strength pulsing through its
+shader data (built beside the tests, in no package).
+
 **Online rules** (v10)
 
 A gameplay plugin is announced to the server with every request

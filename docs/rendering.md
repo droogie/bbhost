@@ -511,10 +511,18 @@ the default, and nothing waits on DXC:
   sessions.
 - **Edited shaders.** `BBHOST_HLSL_DUMP=1` writes each module's HLSL to
   `<data>/bbhost/hlsl-dump/` (or `BBHOST_HLSL_DUMP=<dir>`), and an edited copy
-  in `<data>/bbhost/shaders/` replaces that stage's module when it compiles,
+  in `<data>/bbhost/shaders/` - or a plugin's source (plugin API 27,
+  [plugins.md](plugins.md)) - replaces that stage's module when it compiles,
   declares the lift's interface and validates ([modding.md](modding.md#shaders)).
   The source is generated from the player's own game files and stays on
-  their machine; none is committed or shipped.
+  their machine; none is committed or shipped. Edited shaders apply while the
+  game runs: a program's sources are named by one salt, the hash of their
+  identities, which goes into the keys of its draws, dispatches and lifted
+  stages, so a change builds that program's pipelines again and a return to
+  an earlier source finds them; a new source is compiled for the variants
+  met before it takes effect, and none of it is kept in the manifests or the
+  caches' files. A plugin's shaders read numbers of its own from a small
+  buffer by device address, uploaded in command order at a frame's start.
 
 - **What the HLSL is.** The lifter's SPIR-V stays the shader's IR of record:
   typed values in structured control flow. The printer reads it back and
@@ -646,8 +654,9 @@ the default, and nothing waits on DXC:
   filled by copies: copy sources through staging, constants and rewritten
   vertex data copied as recorded, compute shaders' buffers bound, the buffers
   the GPU writes held by the host; the whole import then goes.
-- Editable source beyond replacing one stage's HLSL: edits read again while
-  the game runs.
+- Edited shaders with textures or samplers of their own (a descriptor set
+  kept for them in every pipeline layout), and an edited shader for some draws
+  of a program and not others.
 
 ### Window imports and the textures' sources (a design note)
 
