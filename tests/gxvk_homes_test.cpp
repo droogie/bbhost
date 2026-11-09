@@ -6,7 +6,7 @@
 // filter's "no") checked against a plain list of the live ranges. The filter
 // may say "maybe" where nothing is; it may never say "no" where a home is.
 // The handle's packing is checked too (host/gxvk_homes.h), and the default's
-// rule (default_off: on only with a card with room or 6 GiB of small video
+// rule (default_off: on only with a card with room or 5,000 MiB of small video
 // memory free and a frame rate above 60 - at any frame rate where the run
 // commit is on by the platform's default; any number of threads;
 // small_refused; homes_bound and run_commit_gives_way: Windows' run commit
@@ -84,11 +84,14 @@ int main() {
               "off on an integrated GPU, with tight or small video memory", 0, 0);
         check(default_off(false, false, true, 60, false, false) == (kDefaultOffSmall | kDefaultOffRate), "every reason said", 8, 60);
         check(default_off(false, false, false, 960, true, false) == kDefaultOffRunCommit, "off with the run commit turned on by its setting", 80, 960);
-        // Small video memory: refused under 6,144 MiB free at the start unless a budget is given; a card with room never.
-        check(small_refused(true, 4000, false) && small_refused(true, 6143, false) && small_refused(true, 0, false),
-              "small video memory under 6,144 MiB free refused", 6143, 0);
-        check(!small_refused(true, 6144, false) && !small_refused(true, 7000, false) && !small_refused(true, 7249, false),
-              "small video memory from 6,144 MiB free taken, with the pool's budget", 6144, 0);
+        // Small video memory: refused under 5,000 MiB free at the start (a 6 GB card has more) unless a budget is given;
+        // a card with room never.
+        check(small_refused(true, 4000, false) && small_refused(true, 4999, false) && small_refused(true, 0, false) &&
+                  small_refused(true, 2950, false),
+              "small video memory under 5,000 MiB free refused (a 4 GB card's 2,950)", 4999, 0);
+        check(!small_refused(true, 5000, false) && !small_refused(true, 5300, false) && !small_refused(true, 6143, false) &&
+                  !small_refused(true, 7249, false),
+              "small video memory from 5,000 MiB free taken (a 6 GB card), with the pool's budget", 5000, 0);
         check(!small_refused(true, 4000, true) && !small_refused(true, 0, true), "a budget given takes small video memory at any size", 4000, 1);
         check(!small_refused(false, 4000, false) && !small_refused(false, 0, false), "a card with room is never refused", 4000, 0);
         check(default_off(false, false, small_refused(true, 7000, false), 960, false, false) == 0 &&

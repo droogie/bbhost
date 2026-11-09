@@ -129,10 +129,15 @@ enum DefaultOff : unsigned {
 constexpr int kDefaultAboveFps = 60;
 // Small video memory (gpu.cpp small_vram: a discrete GPU under 7,680 MiB free
 // at the start): the homes from this much free, with the pool's budget as on a
-// card with room (an 8 GB card's 7,249 MiB under Windows, above). Under it they
-// stay off unless BBHOST_GXVK_HOMES_BUDGET_MB gives a budget: a 4 GB card's
-// images went to host memory beside them.
-constexpr unsigned long long kSmallHomesFreeMiB = 6144;
+// card with room - an 8 GB card's 7,249 MiB under Windows (above), and a 6 GB
+// card's: acted out at 5,000 MiB free (BBHOST_TEST_VRAM_MB, the device-local
+// types held to it too) the homes ran Old Yharnam 36.5% faster than the run
+// commit under Windows on an RTX 3070 Ti Laptop GPU and 24% faster than the
+// old path on an RTX 4070 under Linux, the other places 2.6-6.3% or level, the
+// GPU's time at most 2.6% longer. Under it they stay off unless
+// BBHOST_GXVK_HOMES_BUDGET_MB gives a budget: a 4 GB card's images went to host
+// memory beside them.
+constexpr unsigned long long kSmallHomesFreeMiB = 5000;
 constexpr bool small_refused(bool small_vram, unsigned long long free_mib, bool budget_given) {
     return small_vram && !budget_given && free_mib < kSmallHomesFreeMiB;
 }

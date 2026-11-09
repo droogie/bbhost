@@ -838,7 +838,7 @@ where the command processor had been the limit.
 unset).** The constant buffers' homes - and with them the segments, and the
 run batching (`BBHOST_RUN_BATCH`) and copy-back captures they take - are on by
 default only where the frame rate can gain from them: a graphics card with
-room, or one with small video memory that has 6,144 MiB or more free at the
+room, or one with small video memory that has 5,000 MiB or more free at the
 start (the homes' own rule below: not an integrated GPU, no tight memory), and
 a frame rate above 60 (a fixed rate above 60, or Display-Limited on a display
 above 60 Hz). The pool takes its threads from the CPUs the process may run on
@@ -863,8 +863,14 @@ Mensis, Cainhurst's courtyard, Central Yharnam and the sewers under it, the
 frame rate (59.7-59.8) and the slowest frames the same. On a card with
 small video memory the homes take the pool's budget (128 MiB, as on a card
 with room) and the game's memory is still imported a window at a time; under
-6,144 MiB free they stay off (on a 4 GB card the pool pushed images into host
-memory), unless `BBHOST_GXVK_HOMES_BUDGET_MB` gives a budget.
+5,000 MiB free they stay off (on a 4 GB card the pool pushed images into host
+memory), unless `BBHOST_GXVK_HOMES_BUDGET_MB` gives a budget. A 6 GB card has
+more: acted out at 5,000 MiB free (`BBHOST_TEST_VRAM_MB=5000`, the
+device-local types held to it too) the homes ran Old Yharnam 36.5% faster
+than the run commit under Windows on an RTX 3070 Ti Laptop GPU (the other four
+places 2.6-4.7%, the GPU's time no longer) and 24% faster than the old path
+on an RTX 4070 under Linux (the Nightmare of Mensis 6.3%, Central Yharnam
+level, the GPU's time 2.6% longer), no image pushed to host memory.
 
 The pool's splices give way to the run commit (`BBHOST_RUN_COMMIT`). Turned
 on by its setting, it keeps the homes off by default. On by Windows' default
@@ -881,7 +887,7 @@ segments without the run commit against the run commit:
 
 As shipped, the shared GPU memory stayed at 2.1 GB (whole imports, on the
 second row, pinned 4.95 GB). Where the rule does not hold - an integrated GPU,
-a card under 6,144 MiB free - the run commit
+a card under 5,000 MiB free - the run commit
 stays on by Windows' default, as before. The homes are made as
 their buffers are, so the choice is made once, with the device at start: a
 frame rate changed in play (it changes at once, 30 included) leaves the
@@ -1100,7 +1106,7 @@ version with its source at its batch.
 
 **Constant buffers in device-local homes made at their creation, bound by
 handle (`BBHOST_GXVK_HOMES`, on by default above 60 fps - on Windows at any
-rate - with a card with room or 6,144 MiB free, the run commit giving way on
+rate - with a card with room or 5,000 MiB free, the run commit giving way on
 Windows: "On by default above 60 fps, and on Windows at any rate" above).** A
 constant buffer's own memory is written only by GX's GPU copies: every
 UpdateSubresource of one, and every Map of a dynamic one, writes a renamed
@@ -1124,10 +1130,10 @@ finds it by address; a CPU copy of its stale guest bytes is refused; a
 page-table walk that reads it gets it copied back to its memory first, and
 it stays the home. A home ends with its buffer, and a buffer made past the
 pool's budget (128 MiB, `BBHOST_GXVK_HOMES_BUDGET_MB`) takes today's path for
-its life. Off on an integrated GPU, and with small video memory under 6,144
+its life. Off on an integrated GPU, and with small video memory under 5,000
 MiB free at the start unless a budget is given (on a 4 GB card the pool's ~80
-MiB pushed images into host memory); from 6,144 MiB free the pool's budget is
-the same 128 MiB. `BBHOST_GXVK_HOMES=compare` keeps today's path bound, keeps
+MiB pushed images into host memory); from 5,000 MiB free (a 6 GB card) the
+pool's budget is the same 128 MiB. `BBHOST_GXVK_HOMES=compare` keeps today's path bound, keeps
 the homes beside it with a CPU mirror of each, and checks each binding of a
 home against its mirror (and each capture against the bytes today's copy
 takes at the token); `=twins` keeps the homes as device-local twins
