@@ -614,6 +614,18 @@ bool surface_empty() {
     return caps.currentExtent.width == 0 || caps.currentExtent.height == 0;
 }
 
+// AMD's frame generation swapchain ended before a whole-device wait of ours:
+// its threads submitting to its queues meanwhile would break vkDeviceWaitIdle's
+// rule (every queue kept from other threads) as bb-submit's submissions broke
+// AMD's. Its own drain runs under the submission thread's queue lock
+// (framegen_destroy_swapchain); the swapchain is made again after. Under the
+// renderer's lock, like its other callers.
+void framegen_end_for_idle() {
+    if (!framegen_active()) return;
+    framegen_destroy_swapchain(g_vk.device);
+    g_vk.swapchain = VK_NULL_HANDLE;
+}
+
 bool vk_create_swapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps);
@@ -725,8 +737,14 @@ bool vk_create_swapchain() {
         // the surface holds one at a time - ours goes first, its last present done.
         {
             static constexpr slow_calls::Site kFgSwitchIdleSite{slow_calls::kQueueIdle, "our swapchain going for frame generation's"};
+            // The presenter's own queue is this thread's alone; the renderer's
+            // (a device with one queue) is the submission thread's too.
+            const VkQueue q = g_vk.present_queue ? g_vk.present_queue : g_vk.queue;
+            const bool shared = q == g_vk.queue;
+            if (shared) host_gpu_queue_lock();
             slow_calls::Scope timed(kFgSwitchIdleSite);
-            vkQueueWaitIdle(g_vk.present_queue ? g_vk.present_queue : g_vk.queue);
+            vkQueueWaitIdle(q);
+            if (shared) host_gpu_queue_unlock();
         }
         vkDestroySwapchainKHR(g_vk.device, old, nullptr);
         old = VK_NULL_HANDLE;
@@ -1069,6 +1087,7 @@ bool vk_present() {
     // would otherwise never be told to do.
     if (g_swap_dirty.exchange(false)) {
         host_gpu_lock();
+        framegen_end_for_idle();
         host_gpu_queue_lock();
         {
             slow_calls::Scope timed(kRebuildIdleSite);
@@ -1116,6 +1135,7 @@ bool vk_present() {
     }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         host_gpu_lock();
+        framegen_end_for_idle();
         host_gpu_queue_lock();
         {
             slow_calls::Scope timed(kRebuildIdleSite);
@@ -3081,6 +3101,7 @@ void host_window_stop() {
         std::lock_guard<std::mutex> lock(g_vk.mu);
         g_vk.ok = false;
         host_gpu_lock();
+        framegen_end_for_idle();
         host_gpu_queue_lock();
         vkDeviceWaitIdle(g_vk.device);
         host_gpu_queue_unlock();
