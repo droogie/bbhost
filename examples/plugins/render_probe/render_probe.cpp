@@ -1,10 +1,11 @@
 // The render probe: plugin API 27's frame info, render hooks and
-// anti-aliasing claim checked on the GPU. A test aid that never ships: it is
-// built beside the tests (build/render_probe.so or .dll - not build/plugins/,
-// which every run loads), it is opt-in, and no package carries it. Copied into
-// a test kit's plugins folder and turned on ([plugins] render_probe = true) it
-// claims the anti-aliasing as its `claim` option says and registers both
-// hooks (with the motion, as its `motion` option says). Each frame:
+// anti-aliasing claim checked on the GPU. An example and a test aid that
+// never ships: it is built beside the tests (build/render_probe.so or .dll -
+// not build/plugins/, which every run loads), it is opt-in, and no package
+// carries it. Copied into a test kit's plugins folder and turned on
+// ([plugins] render_probe = true) it claims the anti-aliasing as its `claim`
+// option says and registers both hooks (with the motion, as its `motion`
+// option says). Each frame:
 //   - before the upscale, a 16x16 marker of the frame number's low 16 bits
 //     (magenta ones, black zeros) into the scene's top left - its own image,
 //     blitted in, the scene being no storage image - and on a 4x4 grid of the

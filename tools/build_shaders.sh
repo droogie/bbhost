@@ -6,8 +6,8 @@
 #   tools/build_shaders.sh [src/host/shaders/<file> ...]   (all of them by default)
 # A compute shader name.comp becomes name.spv.h (k_name_spv); a graphics
 # stage name.vert / name.frag becomes name_vert.spv.h / name_frag.spv.h
-# (k_name_vert_spv, k_name_frag_spv), each beside its source (a test tool's,
-# tools/render_probe/render_probe.comp, by name). The presenter's and the
+# (k_name_vert_spv, k_name_frag_spv), each beside its source (an example plugin's,
+# examples/plugins/render_probe/render_probe.comp, by name). The presenter's and the
 # overlay's stages are not here: host/present_spv.h and host/overlay.cpp carry
 # their own words.
 set -eu

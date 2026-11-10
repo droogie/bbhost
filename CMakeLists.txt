@@ -252,18 +252,18 @@ if(WIN32)
     OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/res/bbhost.ico;${CMAKE_BINARY_DIR}/gen/bbhost_version.h")
 endif()
 
-# The example plugin (include/bbhost_plugin.h, plugins/hello): build/plugins/hello.so
-# or .dll, which the host next to it loads.
-add_library(bb_plugin_hello MODULE plugins/hello/hello.c)
+# The example plugins (examples/plugins, include/bbhost_plugin.h): built beside
+# bbhost (build/hello.so or .dll), never into build/plugins/ - where every run
+# would list and load them - and in no package (tools/package_plugins.sh names
+# the official plugins). hello is built with bbhost, so the API's first example
+# keeps compiling.
+add_library(bb_plugin_hello MODULE examples/plugins/hello/hello.c)
 target_include_directories(bb_plugin_hello PRIVATE include)
-set_target_properties(bb_plugin_hello PROPERTIES OUTPUT_NAME hello PREFIX ""
-  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins)
+set_target_properties(bb_plugin_hello PROPERTIES OUTPUT_NAME hello PREFIX "")
 
-# The shader overrides' test plugin (plugin API 27, tools/shader_tint_plugin.c):
-# a test of the host, never a mod - built only when asked for (and by its
-# test), beside the build, never into plugins/ where bbhost would load it, and
-# in no package (tools/package_plugins.sh names the official plugins).
-add_library(shader_tint_probe MODULE EXCLUDE_FROM_ALL tools/shader_tint_plugin.c)
+# The shader overrides' example (plugin API 27, examples/plugins/shader_tint):
+# built only when asked for (and by its test).
+add_library(shader_tint_probe MODULE EXCLUDE_FROM_ALL examples/plugins/shader_tint/shader_tint.c)
 target_include_directories(shader_tint_probe PRIVATE include)
 set_target_properties(shader_tint_probe PROPERTIES OUTPUT_NAME shader_tint PREFIX "")
 
@@ -362,12 +362,12 @@ if(Vulkan_FOUND)
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # The render probe (plugin API 27's frame info, render hooks and
-  # anti-aliasing claim checked on the GPU: tools/render_probe): a test aid,
-  # built beside bbhost, never into plugins/ - where every run would load it -
-  # and in no package (tools/package_plugins.sh names the official ones). A
-  # test kit copies it into its own plugins folder.
-  add_library(render_probe MODULE tools/render_probe/render_probe.cpp)
-  target_include_directories(render_probe PRIVATE include tools/render_probe)
+  # anti-aliasing claim checked on the GPU: examples/plugins/render_probe): an
+  # example and a test aid, built beside bbhost, never into plugins/ - where
+  # every run would load it - and in no package (tools/package_plugins.sh names
+  # the official ones). A test kit copies it into its own plugins folder.
+  add_library(render_probe MODULE examples/plugins/render_probe/render_probe.cpp)
+  target_include_directories(render_probe PRIVATE include examples/plugins/render_probe)
   target_compile_features(render_probe PRIVATE cxx_std_17)
   target_link_libraries(render_probe PRIVATE Vulkan::Headers)
   set_target_properties(render_probe PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
@@ -653,7 +653,7 @@ if(UNIX)
   target_link_libraries(boss_rush_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(boss_rush_test bb_plugin_boss_rush)
   add_test(NAME boss_rush_test COMMAND boss_rush_test $<TARGET_FILE:bb_plugin_boss_rush>)
-  # The render probe (tools/render_probe) on a pretend host and a pretend
+  # The render probe (examples/plugins/render_probe) on a pretend host and a pretend
   # Vulkan device: what it asks of the device and records, and its own checks.
   if(TARGET render_probe)
     add_executable(render_probe_test tests/render_probe_test.cpp)
@@ -671,7 +671,7 @@ if(UNIX)
   target_link_libraries(ps1_plugin_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(ps1_plugin_test bb_plugin_ps1)
   add_test(NAME ps1_plugin_test COMMAND ps1_plugin_test $<TARGET_FILE:bb_plugin_ps1>)
-  # The shader overrides' test plugin on a pretend host (tools/shader_tint_plugin.c):
+  # The shader overrides' example on a pretend host (examples/plugins/shader_tint):
   # its own source asked for until met, patched, on and off by turns, its
   # strength in its shader data each frame; nothing asked of an older host.
   add_executable(shader_tint_test tests/shader_tint_test.cpp)

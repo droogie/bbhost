@@ -1,4 +1,4 @@
-// tools/shader_tint_plugin.c (plugin API 27's shaders' test plugin) on a host
+// examples/plugins/shader_tint (plugin API 27's shaders' example) on a host
 // of our own: no game, no GPU. Loaded as the host loads plugins, with a config
 // whose toggles are a few frames long, and driven a frame at a time. Checked:
 // it asks for its shader's own source until the shader is met, then hands back
