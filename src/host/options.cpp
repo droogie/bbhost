@@ -566,6 +566,8 @@ Setting g_set[kSettingCount] = {
     {"char_motion", "Character motion", {"Precise", "Velocity map"}, 0,
 #if defined(_WIN32)
      "Where TAA, FSR, DLSS and frame generation take the motion of the hunter, enemies and other moving characters from "
+#elif defined(__linux__) && defined(__x86_64__)
+     "Where TAA, FSR and DLSS take the motion of the hunter, enemies and other moving characters from "
 #else
      "Where TAA and DLSS take the motion of the hunter, enemies and other moving characters from "
 #endif
@@ -2475,7 +2477,7 @@ std::string aa_taker() { return g_setup_page ? plugins_aa_owner_scanned() : plug
 const char* upscaler_note() {
     const int u = shown_index(kUpscaler);  // the menu's Off, TAA, FSR 3, FSR 4, DLSS
     static std::string note;
-#if defined(_WIN32)
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
     const char* ours = "TAA, FSR or DLSS";
 #else
     const char* ours = "TAA or DLSS";
@@ -2499,8 +2501,20 @@ const char* upscaler_note() {
     if (u <= 1 || g_setup_page) return g_set[kUpscaler].note;
     const UpscalerCaps caps = upscaler_caps();
     const bool dlss = u == 4;
-#if !defined(_WIN32)
-    // Linux: DLSS through the NGX bridge, and no FSR.
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
+    if (!caps.loaded) {
+        note = "Not running: upscaler_bridge.dll did not load (it and AMD's FidelityFX files belong beside bbhost). The "
+               "game's own anti-aliasing runs instead; Frame generation works without it.";
+    } else if (dlss ? !caps.dlss : !caps.fsr) {
+        const std::string why = dlss ? caps.dlss_reason : caps.fsr_reason;
+        note = std::string(dlss ? "DLSS" : "FSR") + " is not available here" + (why.empty() ? "" : " (" + why + ")") +
+               ": the game's own anti-aliasing runs instead. Frame generation works without it." +
+               (dlss ? " On an AMD or Intel GPU choose FSR 4 or FSR 3." : "");
+    } else {
+        return g_set[kUpscaler].note;
+    }
+#else
+    // Linux without PE loader: DLSS through the NGX bridge, and no FSR.
     if (!dlss) {
         note = "FSR runs on Windows only: the game's own anti-aliasing runs instead.";
     } else if (!caps.loaded) {
@@ -2509,18 +2523,6 @@ const char* upscaler_note() {
     } else if (!caps.dlss) {
         note = "DLSS is not available here" + (caps.dlss_reason.empty() ? std::string() : " (" + caps.dlss_reason + ")") +
                ": the game's own anti-aliasing runs instead.";
-    } else {
-        return g_set[kUpscaler].note;
-    }
-#else
-    if (!caps.loaded) {
-        note = "Not running: upscaler_bridge.dll did not load (it and AMD's FidelityFX files belong beside bbhost.exe). The "
-               "game's own anti-aliasing runs instead; Frame generation works without it.";
-    } else if (dlss ? !caps.dlss : !caps.fsr) {
-        const std::string why = dlss ? caps.dlss_reason : caps.fsr_reason;
-        note = std::string(dlss ? "DLSS" : "FSR") + " is not available here" + (why.empty() ? "" : " (" + why + ")") +
-               ": the game's own anti-aliasing runs instead. Frame generation works without it." +
-               (dlss ? " On an AMD or Intel GPU choose FSR 4 or FSR 3." : "");
     } else {
         return g_set[kUpscaler].note;
     }

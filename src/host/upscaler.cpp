@@ -52,6 +52,7 @@ constexpr float kTaaMipBias = 0.0f;
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include "host/pe_loader.h"
 #endif
 
 #include "upscaler_bridge.h"
@@ -73,6 +74,7 @@ namespace {
 const ub_api* g_ub = nullptr;
 ub_context* g_ctx = nullptr;
 bool g_attached = false;
+static bool g_is_pe = false;
 std::mutex g_caps_mu;
 UpscalerCaps g_caps;  // under g_caps_mu
 // Its two methods' availability, read at every draw (upscaler_method) without
@@ -103,6 +105,15 @@ bool bridge_beside_exe() {
             if (std::filesystem::is_regular_file(std::filesystem::path(config_exe_dir()) / name, ec)) return true;
         }
         return false;
+    }();
+    return beside;
+}
+
+bool fsr_bridge_beside_exe() {
+    static const bool beside = [] {
+        const std::filesystem::path dir = config_exe_dir();
+        std::error_code ec;
+        return std::filesystem::is_regular_file(dir / "upscaler_bridge.dll", ec);
     }();
     return beside;
 }
@@ -149,14 +160,46 @@ bool upscaler_open() {
     host_log("upscaler: %s loaded", dll.string().c_str());
     return true;
 #else
+    // Check for Windows upscaler_bridge.dll beside the executable via PE loader first
+    const std::filesystem::path dir = config_exe_dir();
+    const std::filesystem::path pe_dll = dir / "upscaler_bridge.dll";
+    std::error_code pe_ec;
+    if (std::filesystem::is_regular_file(pe_dll, pe_ec)) {
+        pe_add_search_dir(dir.string().c_str());
+        void* pe_h = pe_load_library(pe_dll.string().c_str());
+        if (pe_h) {
+            auto get_api = reinterpret_cast<PFN_ub_get_api>(pe_get_proc_address(pe_h, "ub_get_api"));
+            const ub_api* api = get_api ? get_api(UB_API_VERSION) : nullptr;
+            if (!api) {
+                host_log("upscaler: %s is not a bridge of API %u", pe_dll.string().c_str(), UB_API_VERSION);
+                return false;
+            }
+            const std::string folder_str = dir.string();
+            const std::string data = config_user_dir() + "/ngx";
+            ub_open_desc od{};
+            od.struct_size = sizeof(od);
+            od.vendor_folder = folder_str.c_str();
+            od.data_folder = data.c_str();
+            od.engine_version = BBHOST_VERSION;
+            od.log = &bridge_log;
+            if (api->open_context(&od, &g_ctx) != UB_OK) {
+                host_log("upscaler: the bridge did not open: %s", api->last_error(nullptr));
+                return false;
+            }
+            g_ub = api;
+            g_is_pe = true;
+            host_log("upscaler: %s loaded via PE loader", pe_dll.string().c_str());
+            return true;
+        }
+    }
+
     // From the executable's own folder (/proc/self/exe's, never a library
     // path), RTLD_LOCAL: nothing of the bridge's reaches anything else.
-    const std::string dir = config_exe_dir();
     void* h = nullptr;
     std::string path;
     bool seen = false;
     for (const char* name : kLinuxBridges) {
-        const std::string p = dir + "/" + name;
+        const std::string p = dir.string() + "/" + name;
         std::error_code ec;
         if (!std::filesystem::is_regular_file(p, ec)) continue;
         seen = true;
@@ -167,7 +210,7 @@ bool upscaler_open() {
         host_log("upscaler: %s did not load: %s", p.c_str(), dlerror());
     }
     if (!h) {
-        if (!seen) host_log("upscaler: no %s beside bbhost (%s): DLSS is not available", kNgxBridge, dir.c_str());
+        if (!seen) host_log("upscaler: no %s beside bbhost (%s): DLSS is not available", kNgxBridge, dir.string().c_str());
         return false;
     }
     auto get_api = reinterpret_cast<PFN_ub_get_api>(dlsym(h, "ub_get_api"));
@@ -181,7 +224,7 @@ bool upscaler_open() {
     const std::string data = config_user_dir() + "/ngx";
     ub_open_desc od{};
     od.struct_size = sizeof(od);
-    od.vendor_folder = dir.c_str();
+    od.vendor_folder = dir.string().c_str();
     od.data_folder = data.c_str();
     od.engine_version = BBHOST_VERSION;
     od.log = &bridge_log;
@@ -190,6 +233,7 @@ bool upscaler_open() {
         return false;
     }
     g_ub = api;
+    g_is_pe = false;
     host_log("upscaler: %s loaded", path.c_str());
     return true;
 #endif
@@ -198,7 +242,12 @@ bool upscaler_open() {
 const VkInstanceCreateInfo* upscaler_prepare_instance(const VkInstanceCreateInfo* in) {
     if (!g_ub) return in;
     const VkInstanceCreateInfo* out = in;
+#if defined(_WIN32)
     g_ub->prepare_instance(g_ctx, vkGetInstanceProcAddr, in, &out);
+#else
+    PFN_vkGetInstanceProcAddr gipa = g_is_pe ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(pe_vk_get_instance_proc_addr) : vkGetInstanceProcAddr;
+    g_ub->prepare_instance(g_ctx, gipa, in, &out);
+#endif
     return out ? out : in;
 }
 
@@ -227,8 +276,13 @@ void upscaler_attach(VkInstance instance, VkPhysicalDevice phys, VkDevice device
     dd.instance = instance;
     dd.physical_device = phys;
     dd.device = device;
+#if defined(_WIN32)
     dd.get_instance_proc_addr = vkGetInstanceProcAddr;
     dd.get_device_proc_addr = vkGetDeviceProcAddr;
+#else
+    dd.get_instance_proc_addr = g_is_pe ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(pe_vk_get_instance_proc_addr) : vkGetInstanceProcAddr;
+    dd.get_device_proc_addr = g_is_pe ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(pe_vk_get_device_proc_addr) : vkGetDeviceProcAddr;
+#endif
     if (g_ub->attach_device(g_ctx, &dd) != UB_OK) {
         host_log("upscaler: attach failed: %s", g_ub->last_error(g_ctx));
         return;
@@ -332,9 +386,14 @@ bool upscaler_offered(int index) {
     return index >= 0 && index <= 4;
 #else
     if (index == 0 || index == 1) return true;  // Off, TAA
-    if (index != 4) return false;               // FSR 3, FSR 4: AMD's runtime is Windows' alone
-    // DLSS: the device's answer, or before there is one (the setup window) a bridge beside bbhost.
-    return g_tried.load(std::memory_order_acquire) ? g_caps_dlss.load(std::memory_order_relaxed) : bridge_beside_exe();
+    if (index == 2 || index == 3) {
+        return g_tried.load(std::memory_order_acquire) ? g_caps_fsr.load(std::memory_order_relaxed) : fsr_bridge_beside_exe();
+    }
+    if (index == 4) {
+        // DLSS: the device's answer, or before there is one (the setup window) a bridge beside bbhost.
+        return g_tried.load(std::memory_order_acquire) ? g_caps_dlss.load(std::memory_order_relaxed) : (bridge_beside_exe() || fsr_bridge_beside_exe());
+    }
+    return false;
 #endif
 }
 
