@@ -75,7 +75,7 @@ std::string translation_switches() {
     std::string s = std::string("offsets=") + (runtime_sample_offsets() ? "1" : "0") + ";half_rtz=" + (native_half_rtz() ? "1" : "0") +
                     ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_plain() ? "plain" : legacy_mul_min_form() ? "min" : "select") + ";";
     for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS", "BBHOST_CB_RANGED", "BBHOST_BOUND_STORES",
-                             "BBHOST_TBUFFER_DST_SEL", "BBHOST_LIFT_BRANCH"}) {
+                             "BBHOST_TBUFFER_DST_SEL", "BBHOST_LIFT_BRANCH", "BBHOST_GS_DEBUG"}) {
         s += env(name);
     }
     return s;
@@ -168,6 +168,9 @@ struct Translator {
     // TranslateOptions::tess_role: LDS is the buffer at StageParams::lds_address.
     bool lds_in_buffer = false;
     Id lds_base64 = 0;
+    // TranslateOptions::capture_position: the capture's device address
+    // (StageParams::lds_address), loaded at the entry; 0 when not asked.
+    Id capture_base64 = 0;
     // gcn::set_oob_count: the counters' device address (StageParams::lds_address),
     // loaded at the entry of a stage that counts; 0 otherwise.
     Id oob_base64 = 0;
@@ -3640,6 +3643,30 @@ struct Translator {
             coords[0] = fsub(coords[0], cf(1.0f));
             coords[1] = fsub(coords[1], cf(1.0f));
             coords[2] = fma_(m.ext_inst(t_f32, spv::GlslFloor, {fdiv(coords[2], cf(8.0f))}), cf(-2.0f), coords[2]);
+            // Each face its own 2D layer: filtering cannot cross into the next
+            // face as the GPU's cube sampling does, and the game's samplers
+            // repeat - its far edge read at every face's edge (the point
+            // lights' cube shadows' seams). Held half a texel inside the face,
+            // as a clamp to its edge - in the shader, not the sampler, which
+            // serves the draw's other textures too (a tiled dither's repeat). At
+            // an explicit LOD the margin is that level's (the reflection
+            // probes' rough levels), 2^ceil(lod) of level 0's texels.
+            m.capability(spv::CapImageQuery);
+            const Id size = m.emit(spv::OpImageQuerySizeLod, t_v3i, {image, i(c_zero_u)});
+            Id texels = cf(0.5f);
+            if (has_l)  // the LOD is the VGPR after the coordinates
+                texels = fmul(cf(0.5f), m.ext_inst(t_f32, spv::GlslExp2,
+                                                   {m.ext_inst(t_f32, spv::GlslCeil, {m.ext_inst(t_f32, spv::GlslFMax, {f(ld(vgpr_var(va))), cf(0.0f)})})}));
+            for (std::uint32_t k = 0; k < 2; ++k) {
+                // First where the game's repeat puts it (a cube sample's
+                // coordinates are not always in [1, 2]: the shadows' interiors
+                // read past it), [0, 1] kept as it is - then held inside.
+                const Id in01 = m.emit(spv::OpLogicalAnd, t_bool, {m.emit(spv::OpFOrdGreaterThanEqual, t_bool, {coords[k], cf(0.0f)}),
+                                                                   m.emit(spv::OpFOrdLessThanEqual, t_bool, {coords[k], cf(1.0f)})});
+                const Id wrapped = m.emit(spv::OpSelect, t_f32, {in01, coords[k], m.ext_inst(t_f32, spv::GlslFract, {coords[k]})});
+                const Id half = m.ext_inst(t_f32, spv::GlslFMin, {fdiv(texels, i2f(ui(extract(t_i32, size, k)))), cf(0.5f)});
+                coords[k] = m.ext_inst(t_f32, spv::GlslFClamp, {wrapped, half, fsub(cf(1.0f), half)});
+            }
         }
         // UNORM means UNnormalized: a set bit requests texel coordinates.
         // Normalized coordinates may legitimately be negative or exceed one;
@@ -3892,6 +3919,17 @@ struct Translator {
                     pos = m.emit(spv::OpSelect, t_v4f, {bad, vec4f(cf(0.0f), cf(0.0f), cf(0.0f), cf(1.0f)), pos});
                 }
                 m.store(out_position, pos);
+                if (capture_base64) {
+                    const Id base = capture_base64;
+                    if_then(m.emit(spv::OpINotEqual, t_bool, {base, m.const_u64(0)}), [&] {
+                        const Id vi = m.emit(spv::OpUConvert, t_u64, {m.load(t_u32, in_vertex_index)});
+                        const Id at = m.emit(spv::OpIAdd, t_u64, {base, m.emit(spv::OpIMul, t_u64, {vi, m.const_u64(16)})});
+                        for (int k = 0; k < 4; ++k) {
+                            const Id p = host_ptr(m.emit(spv::OpIAdd, t_u64, {at, m.const_u64(4u * k)}));
+                            m.emit_void(spv::OpStore, {p, u(comps[k]), 2u /* Aligned */, 4u});
+                        }
+                    });
+                }
             } else {
                 // PA_CL_VS_OUT_CNTL packs the extra vectors after pos0: the misc
                 // vector (bit 20), then clip/cull distance vectors 0 (bit 22) and 1 (bit 23).
@@ -4337,6 +4375,9 @@ struct Translator {
             }
             res.oob_slot = h % kOobSlots;
         }
+        if (opt.capture_position && opt.stage == Stage::Vertex && in_vertex_index && !oob_base64 && !lds_in_buffer &&
+            opt.tess_role == TranslateOptions::TessRole::None && opt.gs_role == TranslateOptions::GsRole::None)
+            capture_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
         if (lds_in_buffer) {
             lds_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
             if (params_head_v4) {

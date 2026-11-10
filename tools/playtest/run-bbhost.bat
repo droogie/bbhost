@@ -16,6 +16,6 @@ set RC=%ERRORLEVEL%
 echo.
 echo  bbhost ended (exit code %RC%). The last lines of the log:
 echo.
-powershell -NoProfile -Command "Get-Content -Tail 15 '%LOG%'"
+powershell -NoProfile -Command "Get-Content -Encoding UTF8 -Tail 15 '%LOG%'"
 echo.
 pause

@@ -4,8 +4,9 @@
 # config showing the live server's settings, launchers that pass no config,
 # and the binaries' own first-start template naming the live server over
 # https. Each bundle carries the pinned DXC library beside its executable
-# with DXC's licences, and no DXIL validator (tools/fetch_dxc.sh). The
-# publish job runs it on what it is about to sign.
+# with DXC's licences, and no DXIL validator (tools/fetch_dxc.sh), and
+# bbhost's licence's additional permission (LICENSE-EXCEPTION). The publish
+# job runs it on what it is about to sign.
 #   tools/check_release_bundle.sh DIR     (dist/release)
 set -eu
 d=${1:?usage: tools/check_release_bundle.sh DIR}
@@ -53,6 +54,63 @@ while IFS= read -r exe; do
     done
 done < <(find "$work" -mindepth 3 -maxdepth 3 -type f \( -name bbhost.exe -o -name bbhost \))
 if find "$work" -iname 'dxil.dll' -o -iname 'libdxil.so*' | grep .; then fail "a bundle carries DXC's DXIL validator"; fi
+# bbhost's licence's additional permission (LICENSE-EXCEPTION: combining bbhost
+# with GPU vendors' upscaling and frame generation runtimes) beside each
+# executable, as the repository has it: LICENSE-EXCEPTION.txt on Windows.
+exception=$(dirname "$0")/../LICENSE-EXCEPTION
+while IFS= read -r exe; do
+    b=$(dirname "$exe")
+    case "$exe" in *.exe) f=$b/LICENSE-EXCEPTION.txt ;; *) f=$b/LICENSE-EXCEPTION ;; esac
+    [ -f "$f" ] || fail "${b#"$work"/}: no $(basename "$f") beside the executable"
+    cmp -s "$f" "$exception" || fail "${f#"$work"/}: not the repository's LICENSE-EXCEPTION"
+done < <(find "$work" -mindepth 3 -maxdepth 3 -type f \( -name bbhost.exe -o -name bbhost \))
+# The upscalers' runtime beside each Windows executable, the pinned files with
+# their licences (tools/fetch_upscalers.sh): without them a release has no FSR,
+# DLSS or frame generation.
+fetch_up=$(dirname "$0")/fetch_upscalers.sh
+while IFS= read -r exe; do
+    b=$(dirname "$exe")
+    for f in $("$fetch_up" --files); do
+        [ -f "$b/$f" ] || fail "${b#"$work"/}: no $f beside bbhost.exe (tools/fetch_upscalers.sh)"
+        [ "$(sha256sum "$b/$f" | cut -d' ' -f1)" = "$("$fetch_up" --sha256 "$f")" ] || fail "${b#"$work"/}/$f: not the pinned file"
+    done
+    for l in fidelityfx/LICENSE.md dlss/LICENSE.txt upscaler_bridge/LICENSE.txt; do
+        [ -f "$b/licenses/$l" ] || fail "${b#"$work"/}: no licenses/$l"
+    done
+done < <(find "$work" -mindepth 3 -maxdepth 3 -type f -name bbhost.exe)
+# Each Windows executable runs in UTF-8 (res/bbhost.manifest): without it a
+# user or folder name outside ASCII stops bbhost at its start.
+while IFS= read -r exe; do
+    grep -aqF '<activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>' "$exe" \
+        || fail "${exe#"$work"/}: no UTF-8 code page in its manifest (res/bbhost.manifest)"
+done < <(find "$work" -mindepth 3 -maxdepth 3 -type f -name bbhost.exe)
+# DLSS on Linux beside each Linux executable: bbhost's NGX bridge and NVIDIA's
+# pinned runtime, with their licences (tools/fetch_ngx.sh; without them the
+# release has no DLSS on Linux) - and none of it in a Steam Deck kit, whose GPU
+# is AMD's. NVIDIA's NGX code is in the bridge alone, never in bbhost.
+fetch_ngx=$(dirname "$0")/fetch_ngx.sh
+while IFS= read -r exe; do
+    b=$(dirname "$exe")
+    if grep -aq 'NVSDK_NGX_VULKAN_Init' "$exe"; then fail "${exe#"$work"/}: NVIDIA's NGX code in bbhost itself"; fi
+    case "$b" in
+        */bbhost-steamdeck-*)
+            if ls "$b" | grep -E '^libbbhost_ngx_bridge\.so$|^libnvidia-ngx-dlss'; then fail "${b#"$work"/}: DLSS's files in a Steam Deck kit"; fi
+            for l in dlss ngx_bridge upscaler_bridge; do
+                [ ! -e "$b/licenses/$l" ] || fail "${b#"$work"/}: licenses/$l in a Steam Deck kit"
+            done
+            ;;
+        *)
+            [ -f "$b/libbbhost_ngx_bridge.so" ] || fail "${b#"$work"/}: no libbbhost_ngx_bridge.so beside bbhost (the NGX bridge: BBHOST_NGX, tools/fetch_ngx.sh)"
+            for f in $("$fetch_ngx" --files); do
+                [ -f "$b/$f" ] || fail "${b#"$work"/}: no $f beside bbhost (tools/fetch_ngx.sh)"
+                [ "$(sha256sum "$b/$f" | cut -d' ' -f1)" = "$("$fetch_ngx" --sha256 "$f")" ] || fail "${b#"$work"/}/$f: not the pinned file"
+            done
+            for l in dlss/LICENSE.txt ngx_bridge/LICENSE upscaler_bridge/LICENSE.txt; do
+                [ -f "$b/licenses/$l" ] || fail "${b#"$work"/}: no licenses/$l"
+            done
+            ;;
+    esac
+done < <(find "$work" -mindepth 3 -maxdepth 3 -type f -name bbhost)
 # What a first start writes (core/config.cpp's template), in each executable.
 for b in "$d"/bbhost "$d"/bbhost.exe; do
     [ -f "$b" ] || continue
@@ -63,4 +121,4 @@ for b in "$d"/bbhost "$d"/bbhost.exe; do
     done
 done
 if [ -n "$list_sha" ]; then listmsg="and the pinned pipeline list (${list_sha:0:12}) beside each executable"; else listmsg="beside each executable (no pipeline list pinned yet)"; fi
-echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg"
+echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg; the Windows ones in UTF-8 with FidelityFX, DLSS and the upscaler bridge; the Linux ones with DLSS and the NGX bridge, the Steam Deck's without"

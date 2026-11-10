@@ -23,6 +23,28 @@
 
 #include <string>
 
+// System > PC Settings' slots (engine/option_menu.cpp's g_toggles and its
+// Texture Quality and Frame Rate lists): the movie's PCSetting section has
+// this many rows, the Defaults label below them (build_option_movie). On
+// Windows one more than the donor's six, as PC Graphics has, for Stay
+// Borderless, which has no row elsewhere.
+#if defined(_WIN32)
+constexpr int kPcSettingSlots = 7;
+#else
+constexpr int kPcSettingSlots = 6;
+#endif
+
+// System > PC Upscaling's slots (engine/option_menu.cpp's pc_upscale_handler):
+// the movie's PCUpscale section has this many rows, one for each row the
+// handler builds, and the Defaults label below them. On Windows seven - the
+// donor's six and one added, Frame generation's among them; elsewhere six,
+// Frame generation having no row there.
+#if defined(_WIN32)
+constexpr int kPcUpscaleSlots = 7;
+#else
+constexpr int kPcUpscaleSlots = 6;
+#endif
+
 // Makes the assets if they are missing or stale and registers the directory
 // with the FS. False, with the reason logged, when the dump lacks a source.
 bool menu_assets_ensure();

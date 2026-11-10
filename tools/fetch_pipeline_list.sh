@@ -15,8 +15,10 @@
 #   PIPELINE_LIST_WAITS="15 30 60 120 240"                  the pauses before each try again
 #
 # GitHub's release downloads fail now and then for minutes at a time (v0.2.21's
-# first release run failed on a 504 for every try curl made in seven seconds),
-# so an answer other than 200 or 404 is tried again after each pause in
+# first release run failed on a 504 for every try curl made in seven seconds;
+# on 2026-11-08 one answered 504 for nine minutes while GitHub's API served the
+# release), so an answer other than 200 or 404 is followed by the same asset
+# through the API, and failing that tried again after each pause in
 # PIPELINE_LIST_WAITS, in seconds: about eight minutes in all before the run
 # fails. A 404 fails at once.
 #
@@ -54,11 +56,24 @@ cache=${PIPELINE_LIST_CACHE:-build/pipeline-list}
 waits=${PIPELINE_LIST_WAITS:-15 30 60 120 240}
 mkdir -p "$cache"
 file=$cache/$LIST_TAG-$LIST_ASSET
-# One try (curl's own retries included): the final answer's HTTP code in
-# `code`, 000 for none.
+# The asset through GitHub's API: the release by its tag, the asset's API
+# address from it, and that address asked for the file itself.
+api_download() {
+    local at
+    at=$(curl -sSL --fail --retry 3 -m 60 "https://api.github.com/repos/$LIST_REPO/releases/tags/$LIST_TAG" |
+        python3 -I -c 'import json, sys; d = json.loads(sys.stdin.read() or "{}"); print(next((a["url"] for a in d.get("assets", []) if a["name"] == sys.argv[1]), ""))' "$LIST_ASSET") || return 1
+    [ -n "$at" ] || return 1
+    echo "fetch_pipeline_list: $at"
+    curl -sSL --fail --retry 3 -m 600 -H 'Accept: application/octet-stream' -o "$file.part" "$at"
+}
+# One try (curl's own retries included): the download address, then, unless it
+# answered 404, the API; the download address's HTTP code in `code`, 000 for
+# none, and 200 when the API delivered.
 download() {
     code=$(curl -sSL --retry 3 --retry-connrefused -m 600 -w '%{http_code}' -o "$file.part" "$url") || code=${code:-000}
     [ "$code" = 200 ] && return 0
+    rm -f "$file.part"
+    if [ "$code" != 404 ] && api_download; then code=200; return 0; fi
     rm -f "$file.part"
     return 1
 }

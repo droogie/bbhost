@@ -227,10 +227,12 @@ bool carve_locked(std::uintptr_t at, std::uint64_t len, bool replace) {
     return true;
 }
 
-// A fresh placeholder of len below limit, anywhere.
-void* place_anywhere_locked(std::uint64_t len, std::uint64_t limit) {
+// A fresh placeholder of len below limit, anywhere; its base a multiple of
+// `align` where that is above the granularity.
+void* place_anywhere_locked(std::uint64_t len, std::uint64_t limit, std::uint64_t align = 0) {
     MEM_ADDRESS_REQUIREMENTS req{};
     req.HighestEndingAddress = reinterpret_cast<void*>(static_cast<std::uintptr_t>(limit));
+    if (align > kGran) req.Alignment = static_cast<SIZE_T>(align);
     MEM_EXTENDED_PARAMETER ep{};
     ep.Type = MemExtendedParameterAddressRequirements;
     ep.Pointer = &req;
@@ -242,6 +244,12 @@ void* place_anywhere_locked(std::uint64_t len, std::uint64_t limit) {
         if (p && reinterpret_cast<std::uintptr_t>(p) + len > limit) {
             host_log("win-vm: a placeholder landed above the guest's address limit (%p)", p);
         }
+    }
+    if (p && align > kGran && (reinterpret_cast<std::uintptr_t>(p) & (align - 1)) != 0) {
+        host_log("win-vm: a placeholder of 0x%llx at %p is not 0x%llx-aligned", static_cast<unsigned long long>(len), p,
+                 static_cast<unsigned long long>(align));
+        VirtualFree(p, 0, MEM_RELEASE);
+        return nullptr;
     }
     return p;
 }
@@ -266,19 +274,20 @@ bool win_vm_reserve(std::uint64_t base, std::uint64_t len) {
 }
 
 void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offset, unsigned long protect,
-                 WinVmPlace place, std::uint64_t limit) {
+                 WinVmPlace place, std::uint64_t limit, std::uint64_t align) {
     if (!len || !aligned(offset)) {
         host_log("win-vm: view offset 0x%llx is not 64 KiB aligned", static_cast<unsigned long long>(offset));
         return nullptr;
     }
     if (!api().ok) {  // best effort: MapViewOfFileEx at the hint
+        if (place == WinVmPlace::Anywhere && align > kGran) return nullptr;
         return MapViewOfFileEx(section, FILE_MAP_ALL_ACCESS | FILE_MAP_EXECUTE, static_cast<DWORD>(offset >> 32),
                                static_cast<DWORD>(offset), len, place == WinVmPlace::Anywhere ? nullptr : at);
     }
     std::lock_guard<std::mutex> lk(g_mu);
     std::uintptr_t base;
     if (place == WinVmPlace::Anywhere) {
-        void* p = place_anywhere_locked(len, limit);
+        void* p = place_anywhere_locked(len, limit, align);
         if (!p) return nullptr;
         base = reinterpret_cast<std::uintptr_t>(p);
     } else {

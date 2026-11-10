@@ -41,6 +41,7 @@
 #include "decomp/gx/upload_heap.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
+#include "engine/texture_origin.h"
 #include "guest_abi.h"
 #include "hle/hle.h"
 #include "hle/modules.h"
@@ -48,6 +49,7 @@
 #include "host/gpu.h"
 #include "host/gxvk.h"
 #include "host/gxvk_homes.h"
+#include "host/rt_extent.h"
 #include "log.h"
 
 #if !defined(_WIN32)
@@ -242,6 +244,12 @@ struct Entry {
     std::uint64_t created_flip = 0;
     std::uint32_t tsharp[8] = {};
     bool has_tsharp = false;
+    // A YEBIS texture's object as gx_texture_extent last read it, and the
+    // flip it read it at: read again at most once a flip (on Windows each
+    // read is a system call, and a chain's targets are asked every draw).
+    std::uint64_t yebis_flip = ~0ull;
+    bool yebis_live = false;
+    std::uint32_t yebis_w = 0, yebis_h = 0, yebis_pitch = 0;
 };
 
 std::uint64_t g_slide = 0;
@@ -315,6 +323,30 @@ std::atomic<int> g_yebis_logged[5] = {}, g_yebis_map_logged{0};
 bool g_res_yebis = true;
 constexpr std::uint64_t kYebisKey = 0x4000000000000000ull;
 std::atomic<std::uint64_t> g_yebis_registered{0}, g_yebis_unregistered{0}, g_yebis_told{0};
+// The sizes of YEBIS's textures for its draws' targets (gx_texture_extent,
+// render.cpp target_image): read from the object at a lookup, once a flip -
+// its T# (host/rt_extent.h, yebis_texture) - the object first checked to be
+// the live texture registered there (yebis_live). The 2D texture's vtable
+// (0x570bc00, slid: the creator's last store); reads that found an object
+// no longer that texture; textures made on the memory of another live one;
+// render targets registered, and of them ones whose T# gave another size than
+// their D3D11 description.
+std::uint64_t g_yebis_texture_vtable = 0;
+std::atomic<std::uint64_t> g_yebis_stale{0}, g_yebis_shared{0}, g_yebis_rt_registered{0}, g_yebis_desc_differ{0};
+std::atomic<int> g_yebis_rt_logged{0}, g_yebis_stale_logged{0};
+// The object's T# (rt_extent::kYebisTsharp) and its vtable, and whether they
+// are the live texture registered on `memory`: one read from the vtable to
+// the T#'s end (a system call on Windows).
+bool yebis_read(std::uint64_t object, std::uint64_t memory, rt_extent::YebisTexture* out) {
+    std::uint8_t b[rt_extent::kYebisTsharp + 32];
+    if (!host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(object)), b, sizeof(b))) return false;
+    std::uint64_t vtable = 0;
+    std::uint32_t t[8];
+    std::memcpy(&vtable, b, sizeof(vtable));
+    std::memcpy(t, b + rt_extent::kYebisTsharp, sizeof(t));
+    *out = rt_extent::yebis_texture(t);
+    return rt_extent::yebis_live(vtable, g_yebis_texture_vtable, *out, memory);
+}
 // Scaleform's textures (census): initialized, their planes and bytes, failed.
 std::atomic<std::uint64_t> g_sf_inits{0}, g_sf_planes{0}, g_sf_bytes{0}, g_sf_failed{0};
 std::atomic<int> g_sf_logged{0};
@@ -445,7 +477,7 @@ void note_rate(std::uint32_t bytes) {
 
 void register_entry(std::uint64_t key, Entry& e);
 
-void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool initial_data) {
+void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool initial_data, std::uint64_t data = 0) {
     if (!holder) return;
     Entry e;
     e.holder = key;
@@ -461,6 +493,9 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
     e.info.created_submit = hle_gnm_submitted_total();
     e.info.id = id & 0xffffff;
     e.info.initial_data = initial_data;
+    // A texture's texels, from the first subresource's data (D3D11_SUBRESOURCE_DATA::pSysMem): the file they came from.
+    std::uint64_t texels = 0;
+    if (kind == kTexture && data && rd(data, &texels)) e.info.origin = texture_origin_of(texels);
     e.info.write_seq = initial_data ? g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
     const unsigned t = e.info.type < 5 ? e.info.type : 0;
     g_created[t].fetch_add(1, std::memory_order_relaxed);
@@ -1012,6 +1047,7 @@ void yebis_written(std::uint64_t object, bool after_map = false) {
             if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == key) g_by_memory.erase(m);
             e.info.memory = now;
             g_by_memory[now] = key;
+            e.yebis_flip = ~0ull;  // (its object read again on the new memory)
         }
         memory = e.info.memory;
         bytes = e.info.bytes;
@@ -1197,6 +1233,37 @@ void register_yebis_2d(std::uint64_t object, bool initial_data) {
     e.info.initial_data = initial_data;
     e.info.write_seq = initial_data ? g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
     g_yebis_registered.fetch_add(1, std::memory_order_relaxed);
+    {
+        // Two live textures of YEBIS's on one memory: the registry keeps the
+        // newer, and the older's draws are sized from their scissors.
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (const auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && (m->second & kYebisKey) && m->second != e.holder) {
+            const auto h = g_by_holder.find(m->second);
+            rt_extent::YebisTexture old;
+            if (h != g_by_holder.end() && h->second.info.alive && yebis_read(m->second & ~kYebisKey, e.info.memory, &old) &&
+                g_yebis_shared.fetch_add(1, std::memory_order_relaxed) < 8) {
+                host_log("gx-resources: YEBIS made a %ux%u texture (object 0x%llx) on memory 0x%llx its live %ux%u texture (object 0x%llx) holds",
+                         d[0], d[1], static_cast<unsigned long long>(object), static_cast<unsigned long long>(e.info.memory), old.w, old.h,
+                         static_cast<unsigned long long>(m->second & ~kYebisKey));
+            }
+        }
+    }
+    if (d[8] & 0x20) {
+        // A render target: the size its T# gives against the description it
+        // was made from.
+        g_yebis_rt_registered.fetch_add(1, std::memory_order_relaxed);
+        rt_extent::YebisTexture t;
+        const bool live = yebis_read(object, e.info.memory, &t);
+        const bool differ = !live || t.w != d[0] || t.h != d[1];
+        if (differ) g_yebis_desc_differ.fetch_add(1, std::memory_order_relaxed);
+        if (g_yebis_rt_logged.fetch_add(1, std::memory_order_relaxed) < 12 || (differ && g_yebis_desc_differ.load() <= 8)) {
+            host_log("gx-resources: YEBIS render target %ux%u (format %u, mips %u, array %u): T# %ux%u, pitch %u, on 0x%llx%s; object 0x%llx, "
+                     "memory 0x%llx, %u bytes, flip %llu",
+                     d[0], d[1], d[4], d[2], d[3], t.w, t.h, t.pitch, static_cast<unsigned long long>(t.memory), live ? "" : " (not read as live)",
+                     static_cast<unsigned long long>(object), static_cast<unsigned long long>(e.info.memory), bytes,
+                     static_cast<unsigned long long>(e.created_flip));
+        }
+    }
     register_entry(kYebisKey | object, e);
 }
 
@@ -1487,7 +1554,7 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
             key = holder;
         }
         if (holder) {
-            register_holder(key, holder, p.kind, p.type != 0);
+            register_holder(key, holder, p.kind, p.type != 0, p.type);
             if (key & kMemoryKey) {
                 std::uint64_t memory = 0;
                 rd(holder + 0x20, &memory);
@@ -1609,6 +1676,7 @@ void gx_resources_install(ElfImage* image) {
         hook(kYebisMap, kYebisMapPrologue, sizeof(kYebisMapPrologue), reinterpret_cast<void*>(&yebis_map_hook), 0);
         hook(kYebisUpdate, kYebisUpdatePrologue, sizeof(kYebisUpdatePrologue), reinterpret_cast<void*>(&yebis_update_hook), 0);
         dtor_with(kYebisTex2DDelete, kYebisTex2DVtable, reinterpret_cast<void*>(&yebis_tex2d_dtor_hook));
+        g_yebis_texture_vtable = at(kYebisTex2DVtable) + 0x10;  // (the vtable's address point, as the destructor stores it)
     }
     g_res_scaleform = [] {
         const char* e = std::getenv("BBHOST_RES_SCALEFORM");
@@ -1650,6 +1718,7 @@ void gx_resources_install(ElfImage* image) {
 // other creators are.
 void gx_resources_install_late(ElfImage* image) {
     if (!g_gx_res_after_thunk) return;
+    texture_origin_prepare();  // the map folders' texture names, before the first texture is made
     // The upload heap's pool, for the census and GX on Vulkan's arena: ours of
     // its init tells the host of it (the entry above); the game's is hooked at
     // its prologue for the census (the arena then has no heap: today's path).
@@ -1776,6 +1845,48 @@ bool gx_resource_tsharp(std::uint64_t memory, std::uint32_t out[8]) {
     std::memcpy(out, h->second.tsharp, 32);
     out[0] = static_cast<std::uint32_t>(memory >> 8);
     out[1] = (out[1] & ~0xffu) | static_cast<std::uint32_t>((memory >> 40) & 0xff);
+    return true;
+}
+
+bool gx_texture_extent(std::uint64_t memory, GxTextureExtent* out) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    const auto m = g_by_memory.find(memory);
+    if (m == g_by_memory.end()) return false;
+    const auto h = g_by_holder.find(m->second);
+    if (h == g_by_holder.end() || !h->second.info.alive) return false;
+    Entry& e = h->second;
+    *out = GxTextureExtent{};
+    out->gen = e.info.gen;
+    if (e.has_tsharp) {
+        out->width = (e.tsharp[2] & 0x3fff) + 1;
+        out->height = ((e.tsharp[2] >> 14) & 0x3fff) + 1;
+        return true;
+    }
+    if (!(m->second & kYebisKey) || (m->second & kMemoryKey)) return false;
+    const std::uint64_t object = m->second & ~kYebisKey;
+    if (const std::uint64_t flip = hle_video_flip_count(); e.yebis_flip != flip) {
+        rt_extent::YebisTexture t;
+        e.yebis_flip = flip;
+        e.yebis_live = yebis_read(object, memory, &t);
+        e.yebis_w = t.w;
+        e.yebis_h = t.h;
+        e.yebis_pitch = t.pitch;
+        if (!e.yebis_live) {
+            g_yebis_stale.fetch_add(1, std::memory_order_relaxed);
+            if (g_yebis_stale_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                host_log("gx-resources: the YEBIS texture registered on 0x%llx (object 0x%llx, generation %llu, made at flip %llu) is no "
+                         "longer there at flip %llu: it sizes nothing",
+                         static_cast<unsigned long long>(memory), static_cast<unsigned long long>(object),
+                         static_cast<unsigned long long>(e.info.gen), static_cast<unsigned long long>(e.created_flip),
+                         static_cast<unsigned long long>(flip));
+            }
+        }
+    }
+    if (!e.yebis_live) return false;
+    out->width = e.yebis_w;
+    out->height = e.yebis_h;
+    out->yebis = true;
+    out->pitch = e.yebis_pitch;
     return true;
 }
 
@@ -2082,8 +2193,12 @@ void gx_resources_report() {
             for (const auto& [m, o] : g_yebis_by_memory) live_bytes += o.bytes;
         }
         if (g_res_yebis)
-            host_log("gx-resources: YEBIS's 2D textures as resources (BBHOST_RES_YEBIS): registered %llu, destroyed %llu, told of CPU writes %llu",
-                     static_cast<ull>(g_yebis_registered.load()), static_cast<ull>(g_yebis_unregistered.load()), static_cast<ull>(g_yebis_told.load()));
+            host_log("gx-resources: YEBIS's 2D textures as resources (BBHOST_RES_YEBIS): registered %llu, destroyed %llu, told of CPU writes %llu; "
+                     "render targets %llu (%llu of them with a T# of another size than their description); made on the "
+                     "memory of another live one %llu; asked for a size, the object no longer the texture registered %llu",
+                     static_cast<ull>(g_yebis_registered.load()), static_cast<ull>(g_yebis_unregistered.load()), static_cast<ull>(g_yebis_told.load()),
+                     static_cast<ull>(g_yebis_rt_registered.load()), static_cast<ull>(g_yebis_desc_differ.load()),
+                     static_cast<ull>(g_yebis_shared.load()), static_cast<ull>(g_yebis_stale.load()));
         host_log("gx-resources: Scaleform's textures initialized %llu (%llu planes, %llu MiB), failed %llu", static_cast<ull>(g_sf_inits.load()),
                  static_cast<ull>(g_sf_planes.load()), static_cast<ull>(g_sf_bytes.load() >> 20), static_cast<ull>(g_sf_failed.load()));
         if (g_res_scaleform)

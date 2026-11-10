@@ -29,12 +29,15 @@
 #include "core/memory.h"
 #include "core/host_clock.h"
 #include "host/perf_meter.h"
+#include "host/gxvk_lists.h"
 #include "core/portable.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
 #include "hle/hle.h"
 #include "hle/modules.h"
 #include "host/frame_stats.h"
+#include "host/framegen.h"
+#include "host/gpu.h"
 #include "host/plugins.h"
 #include "host/options.h"
 #include "host/settings.h"
@@ -604,8 +607,8 @@ static_assert(sizeof(kPlayTimeAddWas) - 1 == 2 * 13, "the add and its replacemen
 // SprjFlipper::Update the cave loads ours instead (movss xmm0,[step]; nop8;
 // nop5), written every frame in the image's tail just before the cave runs:
 // the same clamp, times a plugin's time scale (frame_rate_set_time_scale),
-// at most 1/30. Above 30 everything steps by that step, so slow motion
-// scales the step rather than stretching the frames.
+// at most 1/30 (below 30, the rate's own frame). Above 30 everything steps by
+// that step, so slow motion scales the step rather than stretching the frames.
 constexpr std::uint32_t kStepLoad = 0x2418e3d;
 constexpr char kStepLoadWas[] = "f30f108364020000f30f5f4318f30f5d0512d59002";
 static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions are 21 bytes");
@@ -825,22 +828,21 @@ static_assert(clock_loads_clear_of(kSixtySites) && clock_loads_clear_of(kFrameTi
 constexpr std::uint32_t kClothScalars = 0x4d3bd00;  // 4 x the stiffness scale
 constexpr std::uint8_t kClothScalarsWas[16] = {'D', 'L', 'L', 'i', 'g', 'h', 't', 'M', 'u', 't', 'e', 'x', '.', 'c', 'p', 'p'};
 
-// The rates the Frame rate option offers besides 30 and Uncapped
-// (host/options.cpp, engine/option_menu.cpp, host/launcher.cpp list the
-// same): each runs the game's mode 2 with a 1/fps target. Uncapped runs the
+// The rates the Frame rate option lists besides 30 and Uncapped - 60, 90,
+// 120, 150, 180, 240, 360, 480, 960 (host/options.cpp, engine/option_menu.cpp)
+// - each run the game's mode 2 with a 1/fps target. Uncapped runs the
 // display's refresh rate the same way (engine/uncapped_limit.h), whatever it
-// is - 144, 165 - so any rate from 30 to 960 can run.
-constexpr int kFrameRates[] = {60, 90, 120, 150, 180, 240, 360, 480, 960};
+// is - 144, 165 - and the Custom limit the player's own number, so any rate
+// from 10 to 960 can run. Below 30 runs converted the same way: the steps and
+// rated constants follow 1/fps there too, so the game keeps real time.
 
-// A frame rate as one of the modes: 30, a converted rate, or 0 (Uncapped).
-// Another number takes the nearest mode below it.
+// A frame rate as the game runs it: 30, a converted rate, or 0 (Uncapped).
+// Any number from 10 to 960 runs as itself (45 runs at 45, 15 at 15); above
+// 960 is 960.
+constexpr int kLowestFps = 10;
 int mode_of(int fps) {
     if (fps <= 0) return 0;
-    int mode = 30;
-    for (const int r : kFrameRates) {
-        if (fps >= r) mode = r;
-    }
-    return mode;
+    return std::clamp(fps, kLowestFps, uncapped_limit::kMaxFps);
 }
 
 std::string mode_name(int fps) { return fps == 0 ? std::string("Display-Limited") : std::to_string(fps); }
@@ -887,8 +889,11 @@ const Rated* rated(std::uint32_t at) {
 
 // A count's bytes at a frame rate.
 void count_bytes(const Counted& c, int fps, std::uint8_t* out) {
-    const std::uint64_t v = c.kind == Count::Frames ? static_cast<std::uint64_t>(c.was) * static_cast<std::uint64_t>(fps) / 30
-                                                    : static_cast<std::uint64_t>(c.was) * 30 / static_cast<std::uint64_t>(fps);
+    std::uint64_t v = c.kind == Count::Frames ? static_cast<std::uint64_t>(c.was) * static_cast<std::uint64_t>(fps) / 30
+                                              : static_cast<std::uint64_t>(c.was) * 30 / static_cast<std::uint64_t>(fps);
+    // Below 30 a count of frames shrinks: one that was some is kept at one
+    // (a count of 0 frames means "never" or "at once" to the code reading it).
+    if (c.kind == Count::Frames && c.was > 0 && v == 0) v = 1;
     if (c.kind == Count::Digits) {
         char d[16];
         std::snprintf(d, sizeof(d), "%05u", static_cast<unsigned>(std::min<std::uint64_t>(v, 99999)));
@@ -910,7 +915,12 @@ void count_was(const Counted& c, std::uint8_t* out) {
 
 // The game's pace: 30, or the rate it was converted to (60 to 960; Uncapped's
 // is the display's refresh rate, g_uncapped).
-int g_game_fps = 30;
+std::atomic<int> g_game_fps{30};
+// Whether the game's steps are converted (apply_rate): at the start, or from
+// the game's own 30 while it runs (convert_live). A converted run taken to 30
+// stays converted - its 30 is a rate like any other - so g_game_fps alone
+// does not say it.
+std::atomic<bool> g_converted{false};
 bool g_uncapped = false;
 std::size_t g_sites_applied = 0, g_frame_time_applied = 0, g_cloth_applied = 0;
 std::atomic<std::uint64_t> g_frames{0};
@@ -977,6 +987,21 @@ struct Late {
     double shown;  // the start-time value, for the log
 };
 std::vector<Late> g_late;
+// What a frame rate or an effect timing chosen while the game runs rewrites
+// (frame_rate_request, frame_rate_retime), kept by apply_rate: the image, the
+// rated constants and the counts it wrote at the rate's values, whether the
+// cloth's caves may go in later (a start at 60 leaves them out), and the
+// effects' step slot (BN; 0 when SprjSfx::Update's load is not ours to
+// move). Used on the main thread, between frames (frame_manager_hook).
+ElfImage* g_image = nullptr;
+std::vector<const Constant*> g_live_constants;
+std::vector<const Counted*> g_live_counts;
+bool g_cloth_ok = false;
+std::uint64_t g_sfx_bn = 0;
+// A rate asked for (0 Display-Limited) and an effect timing changed, taken at
+// the next frame.
+std::atomic<int> g_rate_asked{-1};
+std::atomic<bool> g_retime_asked{false};
 
 template <typename T>
 void put(std::uint64_t a, T v) {
@@ -1499,11 +1524,157 @@ float swing_target(float base) {
     return static_cast<float>(1.0 / fps);
 }
 
-// The converted pace's target for this frame; 0 at 30.
-float pace_target() {
-    if (g_game_fps == 30) return 0.0f;
+// The converted pace's target for this frame; 0 at the game's own 30.
+float pace_target_of_rate() {
+    if (!g_converted) return 0.0f;
     if (g_game_fps == 60) return swing_target(kSixtieth);  // the eboot's own mode 2
     return swing_target(1.0f / static_cast<float>(g_game_fps));
+}
+
+// Frame generation's pace (host/framegen.h). AMD's swapchain shows a
+// generated frame half way between two real ones, timed from how far apart
+// the real ones came; it is even only while they come evenly. Under a cap
+// the machine reaches, the limiter makes them even. Above what it reaches (960,
+// or Display-Limited at 180 Hz with ~80 real frames) nothing waits: the GPU is
+// full, the game's frames queue behind it, each starts when the queue lets it,
+// and AMD's generation - on the same GPU, after the real frame's work - comes
+// out late by whatever the next frame put ahead of it. Kyo's 960 cap, 80 real
+// (160 shown): latency, stutter and uneven frames.
+// So while frames are generated: the real frames are held to half the
+// display's refresh rate at most, whatever the cap - real and generated
+// together never past the display (Kyo: 960 at 180 Hz is 90 real + 90
+// generated; 40 + 40 is fine where that is all the game manages; at 960 the
+// game reached 99 real, 197 shown on 180 Hz, and the frames past it tore) -
+// Display-Limited among them; and a cap that is not
+// reached is replaced by a held one, 3% under the rate the game manages, so
+// the limiter - not the GPU's queue - starts each frame. The held pace is
+// checked every 32 frames: with the limiter no longer waiting (the frames as
+// fast as they go: the scene got heavier, or the pace was tried too fast) it is
+// set again from what they took; every 8th check it tries 2% faster, in case
+// the scene got lighter. The GPU's busy share would say when there is room,
+// but AMD's generation is not in it (host/gpu_busy.cpp counts our command
+// buffers): 84% there was a full GPU in the 2026-11-06 runs. BBHOST_FG_PACE=0:
+// the cap as it is.
+// A change of the upscaler, its quality, Sharpness, TAA strength or frame
+// generation lets the held pace go and skips the next 64 frames (the scene's
+// targets made again at a new size, the bridge's context): it was learned
+// from a picture that is no longer drawn, and the rebuild's hitch would
+// otherwise be held as the pace (Kyo, 2026-11-07: swapping in game "tanks
+// performance until restarting" - FSR 3 held at 62 real frames of the 90 it
+// made, the limiter waiting 5.7 ms a frame). And a held pace the limiter
+// waits on for more than a tenth of each frame comes down at once to what the
+// frames take, not 2% each 256 frames.
+struct FgPace {
+    bool on = true;
+    double headroom = 1.03;  // the held interval over the one the frames manage (BBHOST_FG_PACE_HEADROOM=<percent>)
+    float held_s = 0.0f;  // the held real frame interval, 0 when not holding
+    std::uint32_t n = 0;  // this window's frames
+    double interval_s = 0.0, wait_s = 0.0;
+    std::uint64_t last_ns = 0, window_ns = 0, busy_ns = 0, gpu_on = 0;
+    std::uint32_t windows = 0;
+    std::uint64_t settings_key = 0;  // the upscaler's settings the pace was learned under
+    std::uint32_t skip = 0;          // frames still to let pass after a change
+};
+FgPace g_fg_pace = [] {
+    FgPace p;
+    const char* e = std::getenv("BBHOST_FG_PACE");
+    p.on = !(e && e[0] == '0');
+    if (const char* h = std::getenv("BBHOST_FG_PACE_HEADROOM"); h && *h) p.headroom = 1.0 + std::clamp(std::atof(h), 0.0, 50.0) / 100.0;
+    return p;
+}();
+
+bool fg_generating() { return framegen_shown_per_frame() > 1.5f; }
+
+// The frame just paced: its interval since the last one and the limiter's wait in it.
+void fg_pace_note(std::uint64_t now_ns, std::uint64_t wait_ns, float rate_target_s) {
+    FgPace& p = g_fg_pace;
+    const std::uint64_t was = p.last_ns;
+    p.last_ns = now_ns;
+    if (!p.on || rate_target_s <= 0.0f || !fg_generating() || loading_screen_up()) {
+        if (p.held_s > 0.0f) host_log("frame rate: frame generation's held pace %.1f fps let go", 1.0 / p.held_s);
+        p.held_s = 0.0f;
+        p.n = 0;
+        return;
+    }
+    if (!was || now_ns - was > 200000000ull) return;  // a stall (a load, a hitch) is not a frame to pace by
+    {
+        const HostSettings& h = host_settings_ref();
+        const std::uint64_t key = static_cast<std::uint64_t>(h.upscaler) | static_cast<std::uint64_t>(h.upscale_quality) << 8 |
+                                  static_cast<std::uint64_t>(h.frame_generation) << 16 |
+                                  static_cast<std::uint64_t>(h.sharpness * 100.0f + 0.5f) << 24 |
+                                  static_cast<std::uint64_t>(h.taa_strength * 100.0f + 0.5f) << 40 |
+                                  static_cast<std::uint64_t>(h.char_motion) << 48;
+        if (key != p.settings_key) {
+            if (p.settings_key && p.held_s > 0.0f)
+                host_log("frame rate: frame generation's held pace %.1f fps let go: the upscaler's settings changed", 1.0 / p.held_s);
+            p.settings_key = key;
+            p.held_s = 0.0f;
+            p.n = 0;
+            p.skip = 64;
+        }
+        if (p.skip) {
+            --p.skip;
+            return;
+        }
+    }
+    if (p.n == 0) {
+        p.interval_s = p.wait_s = 0.0;
+        p.window_ns = was;
+        const GpuBusy b = host_gpu_busy();
+        p.busy_ns = b.busy_ns;
+        p.gpu_on = b.on;
+    }
+    p.interval_s += static_cast<double>(now_ns - was) * 1e-9;
+    p.wait_s += static_cast<double>(wait_ns) * 1e-9;
+    if (++p.n < 32) return;
+    const double interval = p.interval_s / p.n, wait = p.wait_s / p.n;
+    const GpuBusy b = host_gpu_busy();
+    const bool gpu_known = p.gpu_on && b.on && now_ns > p.window_ns;
+    const double gpu = gpu_known ? static_cast<double>(b.busy_ns - p.busy_ns) / static_cast<double>(now_ns - p.window_ns) : -1.0;
+    p.n = 0;
+    ++p.windows;
+    const float cap = rate_target_s;
+    const float before = p.held_s;
+    if (p.held_s <= 0.0f) {
+        // Not holding: only a cap the frames do not reach is replaced.
+        if (interval > cap * 1.05) p.held_s = static_cast<float>(interval * p.headroom);
+    } else if (wait < interval * 0.02) {
+        p.held_s = static_cast<float>(interval * p.headroom);  // the limiter no longer holds them: as fast as they go, the pace follows
+    } else if (wait > interval * 0.10) {
+        // The limiter waits a tenth of each frame or more: the frames take
+        // less than the pace - it comes down to what they take.
+        p.held_s = static_cast<float>(std::max((interval - wait) * p.headroom, static_cast<double>(cap)));
+    } else if (p.windows % 8 == 0) {
+        p.held_s *= 0.98f;  // a little faster now and then: the scene may have got lighter
+    }
+    p.held_s = std::min(p.held_s, kThirtieth);
+    if (p.held_s > 0.0f && p.held_s <= cap * 1.01f) p.held_s = 0.0f;  // the cap is reached again: the cap paces
+    if ((before > 0.0f) != (p.held_s > 0.0f) || (p.windows % 64 == 0 && p.held_s > 0.0f))
+        host_log("frame rate: frame generation's held pace %.1f fps (cap %.1f; real frames %.1f/s, limiter wait %.1f ms, gpu %s)",
+                 p.held_s > 0.0f ? 1.0 / p.held_s : 1.0 / cap, 1.0 / cap, 1.0 / interval, wait * 1e3,
+                 gpu_known ? (std::to_string(static_cast<int>(gpu * 100.0 + 0.5)) + "%").c_str() : "unknown");
+}
+
+// The cap's real frame interval: the rate's, and while frames are generated
+// at least two refreshes of the display the window is on
+// (host_window_refresh_hz: cached for a second, safe off the window's thread -
+// the flip clock asks it too - where host_desktop_refresh_hz brings SDL's video
+// up and down); 0 when no display says it (headless), and then the cap's alone.
+float fg_cap_target() {
+    static bool was = false;
+    const float t = pace_target_of_rate();
+    const bool on = t > 0.0f && g_fg_pace.on && fg_generating() && !loading_screen_up();
+    const float hz = on ? host_window_refresh_hz() : 0.0f;
+    if (on && !was && hz >= 48.0f && 2.0f / hz > t)
+        host_log("frame rate: frame generation on: real frames at most %.0f a second, half the display's %.0f Hz (the cap %.0f)",
+                 static_cast<double>(hz / 2.0f), static_cast<double>(hz), static_cast<double>(1.0f / t));
+    was = on;
+    return on && hz >= 48.0f ? std::max(t, 2.0f / hz) : t;
+}
+
+float pace_target() {
+    const float t = fg_cap_target();
+    return t > 0.0f && g_fg_pace.held_s > 0.0f ? std::max(t, g_fg_pace.held_s) : t;
 }
 
 // BBHOST_TEST_STEP_FPS=N (a test switch): every frame's step is exactly 1/N
@@ -1528,9 +1699,15 @@ const float g_test_step = [] {
 // reader on a worker sees the last frame's value or this one's.
 void each_frame(const SprjFlipper* f) {
     const float scale = g_scale_by_step.load(std::memory_order_relaxed) ? g_time_scale.load(std::memory_order_relaxed) : 1.0f;
-    const auto scaled = [scale](float s) { return scale == 1.0f ? s : std::min(s * scale, kThirtieth); };
+    // The longest step: 1/30, or below 30 (a Custom limit of 10 to 29) the
+    // rate's own frame - capped at 1/30 a 10 fps frame advanced the game a
+    // third of its time, slow motion. A frame longer than that (a stall) is
+    // still slow motion, as at every rate.
+    const int game_fps = g_game_fps.load(std::memory_order_relaxed);
+    const float longest = game_fps > 0 && game_fps < 30 ? 1.0f / static_cast<float>(game_fps) : kThirtieth;
+    const auto scaled = [scale, longest](float s) { return scale == 1.0f ? s : std::min(s * scale, longest); };
     const float measured = g_test_step > 0.0f ? g_test_step : f->measured_frame_seconds;
-    const float step = scaled(std::min(std::max(measured, g_test_step > 0.0f ? g_test_step : f->target_frame_seconds), kThirtieth));
+    const float step = scaled(std::min(std::max(measured, g_test_step > 0.0f ? g_test_step : f->target_frame_seconds), longest));
     if (step > 0.0f) {  // also NaN: the cave keeps the last step
         // The frame clock (engine/frame_clock.h): with BBHOST_FRAME_CLOCK=1, or
         // for what counts game time by default (frame_clock::publishing).
@@ -1575,7 +1752,7 @@ void each_frame(const SprjFlipper* f) {
     const float floor_s = std::max(f->target_frame_seconds, 1.0f / static_cast<float>(g_game_fps));
     const float dt = frame_clock::on()  ? std::max(step, kShortestFrame)
                      : g_test_step > 0.0f ? scaled(g_test_step)
-                                          : scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
+                                          : scaled(std::min(std::max(f->measured_frame_seconds, floor_s), longest));
     if (!(dt > 0.0f)) return;  // also NaN
     frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
     const double fps = 1.0 / static_cast<double>(dt);
@@ -1610,6 +1787,135 @@ void each_frame(const SprjFlipper* f) {
     }
 }
 
+// The 1.09 image's executable segment ends at 0x54d96dc (its first PT_LOAD);
+// a site past it is in the read-write data segment, and its page goes back
+// to read-write - the frame-time slot (0x575a908) is written every frame.
+constexpr std::uint32_t kCodeEnd = 0x54d96dc;
+
+std::uint64_t rate_va(std::uint32_t bn) { return g_image->mem.slide + (bn - kPreferredGuestSlide); }
+
+// One write into the image at a BN address, its pages opened and closed again.
+void rate_write(std::uint32_t bn, const void* src, std::size_t n) {
+    const std::uint64_t at = rate_va(bn), lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
+    guest_protect_rwx(&g_image->mem, lo, hi - lo);
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), src, n);
+    if (bn < kCodeEnd) guest_protect_rx(&g_image->mem, lo, hi - lo);
+    else guest_protect_rw(&g_image->mem, lo, hi - lo);
+}
+
+// The rel32 of a load whose instruction ends 4 bytes after it, pointed at
+// `to` (a BN address), and where one points now.
+void point_load(std::uint32_t at, std::uint64_t to) {
+    const auto d = static_cast<std::int32_t>(static_cast<std::int64_t>(to) - static_cast<std::int64_t>(at + 4));
+    rate_write(at, &d, 4);
+}
+std::uint64_t load_target(std::uint32_t at) {
+    std::int32_t d;
+    std::memcpy(&d, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(rate_va(at))), 4);
+    return static_cast<std::uint64_t>(static_cast<std::int64_t>(at) + 4 + d);
+}
+
+EffectTiming effect_timing(int fps);
+
+// The effect timing at `fps` while the game runs (Effect timing or the Frame
+// rate changed): what apply_rate set at the start, set again - the effects'
+// whole steps a second, the gate on the frames between, smooth's steps,
+// SprjSfx::Update's load (our step slot, or the frame-time slot for frame),
+// the wind's three loads (the effects' step with whole 1/30 s steps, else the
+// frame-time slot) and the emission clock's sub-steps. On the main thread
+// between frames, so each_frame sees the new state whole.
+void retime_effects(int fps) {
+    if (!g_sfx_bn) {
+        host_log("frame rate: the effects' step is not ours to move (see the start's lines); effect timing applies at the next start");
+        return;
+    }
+    const EffectTiming timing = effect_timing(fps);
+    const int steps = timing.steps;
+    const bool wind_steps = steps == 30;
+    std::size_t wind_moved = 0;
+    for (const std::uint32_t at : kWindStepDisps) {
+        const std::uint64_t to = load_target(at);
+        if (wind_steps && to == kFrameTimeSlot) {
+            point_load(at, g_sfx_bn);
+            ++wind_moved;
+        } else if (!wind_steps && to == g_sfx_bn) {
+            point_load(at, kFrameTimeSlot);
+            ++wind_moved;
+        }
+    }
+    bool smooth = false;
+    if (steps == 0) {
+        g_sfx_step_va = 0;  // each_frame stops writing it, and the load reads the frame's time
+        point_load(kSfxStepLoad + 4, kFrameTimeSlot);
+        g_sfx_gate = false;
+        decomp_sfx_gate_frame(false);
+        decomp_sfx_step_frame(false);
+    } else {
+        g_sfx_steps_a_second = steps;
+        g_sfx_gate = steps < fps;
+        if (const char* e = std::getenv("BBHOST_SFX_GATE"); e && (e[0] == '0' || e[0] == '1')) g_sfx_gate = e[0] == '1';
+        smooth = timing.smooth && steps == 30;
+        if (smooth) g_sfx_gate = true;
+        g_sfx_carry = 0.0;
+        const std::uint64_t slot = rate_va(static_cast<std::uint32_t>(g_sfx_bn));
+        put<float>(slot, steps == 30 ? kThirtieth : steps == 60 ? kSixtieth : 1.0f / static_cast<float>(steps));
+        g_sfx_step_va = slot;
+        point_load(kSfxStepLoad + 4, g_sfx_bn);
+    }
+    decomp_sfx_smooth(smooth);
+    if (config_effect_emission() != "30") sfx_node::set_emission_clock(steps == 0 ? 0 : steps == 30 ? 2 : 1);
+    const std::string how = steps == 0 ? std::string("the effects step by the frame's time") : "whole 1/" + std::to_string(steps) + " s steps";
+    host_log("frame rate: effect timing %s at %d while the game runs: %s%s, the frames between %s, the wind %s (%zu loads moved)",
+             timing.readable ? timing.value.c_str() : kEffectTimingDefault, fps, how.c_str(), smooth ? ", smooth" : "",
+             g_sfx_gate ? "held" : "counted", wind_steps ? "in whole 1/30 s" : "by the frame's time", wind_moved);
+}
+
+// A converted rate to another while the game runs: the rated constants and
+// the counts apply_rate wrote, at the new rate's values; the cloth's caves
+// put in when the game started at 60 and goes above it; the pace, the
+// flips' and the effects' timing. On the main thread between frames. The
+// code sites are the same at every converted rate, and the every-frame
+// values follow the frame's time already.
+void retarget(int want) {
+    int fps = want;
+    if (fps == 0) fps = uncapped_limit::rate_fps(g_uncapped_forced, g_uncapped_forced ? 0.0f : host_display_refresh_hz());
+    g_uncapped = want == 0;
+    if (fps == g_game_fps) return;
+    if (fps != 60 && !g_cloth_applied) {
+        if (!g_cloth_ok) {
+            host_log("frame rate: %s needs the cloth's code rewrites, which were refused at the start; it applies at the next start",
+                     mode_name(want).c_str());
+            return;
+        }
+        for (const Site& site : kClothSites) {
+            const std::vector<std::uint8_t> now = hex_bytes(site.now);
+            rate_write(site.at, now.data(), now.size());
+            ++g_cloth_applied;
+        }
+        g_cloth_va = rate_va(kClothScalars);
+        guest_keep_writable(&g_image->mem, g_cloth_va & ~0xfffull);
+    }
+    const int was = g_game_fps;
+    for (const Constant* c : g_live_constants) {
+        const Rated* r = rated(c->at);
+        const std::uint32_t now = fps != 60 ? float_bits(rated_value(r->kind, bits_float(c->was), fps)) : c->now;
+        rate_write(c->at, &now, 4);
+    }
+    for (const Counted* c : g_live_counts) {
+        std::uint8_t now[8];
+        count_bytes(*c, fps, now);
+        rate_write(c->at, now, c->n);
+    }
+    g_game_fps = fps;
+    hle_video_set_game_pace(fps);
+    retime_effects(fps);
+    host_log("frame rate: %d -> %s%s while the game runs (%zu constants and %zu counts at its values%s)", was, mode_name(fps).c_str(),
+             g_uncapped ? " (Display-Limited)" : "", g_live_constants.size(), g_live_counts.size(),
+             g_cloth_va ? ", the cloth's stiffness scale above 60" : "");
+}
+
+void convert_live(int want);
+
 // rdi: the frame-time manager.
 GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* saved) {
     sound_wake_frame();  // the frame's work is done: its sound requests go to a pass now (engine/sound_wake.h)
@@ -1624,7 +1930,16 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
     world_chr_tick();   // a test warp a plugin queued this frame (BBHOST_TEST_WARP, engine/world_chr.h)
     loading_tick(hle_video_flip_count());  // the loading screens' lengths and the first in-game frame (engine/loading.h)
     auto* f = reinterpret_cast<SprjFlipper*>(static_cast<std::uintptr_t>(saved[5]));
-    const bool converted = g_game_fps != 30;
+    // A rate or an effect timing chosen in the menus since the last frame; from
+    // the game's own 30, the conversion the start would have made.
+    if (g_source == Source::Ours) {
+        if (const int asked = g_rate_asked.exchange(-1, std::memory_order_acq_rel); asked >= 0) {
+            if (g_converted) retarget(asked);
+            else convert_live(asked);
+        }
+        if (g_retime_asked.exchange(false, std::memory_order_acq_rel) && g_converted) retime_effects(g_game_fps);
+    }
+    const bool converted = g_converted;
     if (g_source == Source::Ours) {
         note_main_frame_work(saved[5]);
         RealClock clock;
@@ -1634,8 +1949,12 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
         sprj_flipper_update(f, clock, target);
         // The bottleneck meter (host/perf_meter.h): the limiter's wait and the
         // rate it held the frame to (none on a loading screen; the game's own 30).
-        perf_meter_limiter(host_clock_monotonic_ns() - wait_t0, static_cast<std::uint64_t>(clock.spun_us) * 1000,
-                           g_fast_target ? 0.0f : target > 0.0f ? 1.0f / target : g_game_fps == 30 ? 30.0f : 0.0f);
+        const std::uint64_t waited_t1 = host_clock_monotonic_ns();
+        const std::uint64_t waited_ns = waited_t1 - wait_t0;
+        const float cap_fps = g_fast_target ? 0.0f : target > 0.0f ? 1.0f / target : !converted ? 30.0f : 0.0f;
+        perf_meter_limiter(waited_ns, static_cast<std::uint64_t>(clock.spun_us) * 1000, cap_fps);
+        fg_pace_note(waited_t1, waited_ns, g_fast_target ? 0.0f : fg_cap_target());
+        gxvk_lists::frame_paced(waited_ns, cap_fps, loading_screen_up());  // the draw pool's duty (host/gxvk_lists.h resting)
         g_fast_target = false;
         host_fps_frame_start();  // the FPS counter: the frame starts as the limiter lets it go (host/window.h)
         if (converted) each_frame(f);
@@ -1676,7 +1995,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
 }
 
 // The Frame rate option as the game started with it: 30, a rate of
-// kFrameRates, or 0 for Uncapped (frame_rate_install makes that the display's
+// the list or the Custom limit's (10 to 960), or 0 for Uncapped (frame_rate_install makes that the display's
 // refresh rate). BBHOST_GAME_FPS=30, 60, ... 960 or 0 (also "uncapped": atoi
 // reads 0) overrides it.
 int wanted_fps() {
@@ -1736,6 +2055,7 @@ bool sites_hold(ElfImage* image, const Site (&sites)[N], const char* group) {
 // without the code rewrites if those do not hold theirs; 60 if another rate's
 // do not. Never part of a group.
 int apply_rate(ElfImage* image, int want) {
+    g_image = image;
     const auto va = [&](std::uint32_t bn) { return image->mem.slide + (bn - kPreferredGuestSlide); };
     // A value a patch manifest the player turned on changed (Kyo's Movement +
     // Roll-Dodge and Aerial Vectors write some of these) is the manifest's: left
@@ -1788,11 +2108,12 @@ int apply_rate(ElfImage* image, int want) {
     const bool sixty_ok = sites_on && sites_hold(image, kSixtySites, "the 60 FPS++ list") &&
                           sites_hold(image, kFrameTimeSites, "the frame-time sites");
     int mode = want;
+    // Checked at 60 too: a rate above it chosen while the game runs puts them in (retarget).
+    g_cloth_ok = sixty_ok && sites_hold(image, kClothSites, "the cloth caves") &&
+                 std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(kClothScalars))), kClothScalarsWas,
+                             sizeof(kClothScalarsWas)) == 0;
     if (mode != 60) {
-        const bool cloth_ok = sixty_ok && sites_hold(image, kClothSites, "the cloth caves") &&
-                              std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(kClothScalars))),
-                                          kClothScalarsWas, sizeof(kClothScalarsWas)) == 0;
-        if (!cloth_ok) {
+        if (!g_cloth_ok) {
             host_log("frame rate: %s needs the 60 FPS++, frame-time and cloth code rewrites, which were refused; the game "
                      "runs at 60",
                      mode_name(mode).c_str());
@@ -1800,17 +2121,7 @@ int apply_rate(ElfImage* image, int want) {
         }
     }
 
-    // The 1.09 image's executable segment ends at 0x54d96dc (its first PT_LOAD);
-    // a site past it is in the read-write data segment, and its page goes back
-    // to read-write - the frame-time slot (0x575a908) is written every frame.
-    constexpr std::uint32_t kCodeEnd = 0x54d96dc;
-    const auto write = [&](std::uint32_t bn, const void* src, std::size_t n) {
-        const std::uint64_t at = va(bn), lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
-        guest_protect_rwx(&image->mem, lo, hi - lo);
-        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at)), src, n);
-        if (bn < kCodeEnd) guest_protect_rx(&image->mem, lo, hi - lo);
-        else guest_protect_rw(&image->mem, lo, hi - lo);
-    };
+    const auto write = rate_write;
     // The Camera tuning: Original leaves Kyo's camera sites and constants out.
     const bool original_camera = camera_original();
     const auto write_sites = [&](const auto& sites) {
@@ -1854,6 +2165,7 @@ int apply_rate(ElfImage* image, int want) {
         }
         if (r && mode != 60 && !r->each_frame) ++rated_fixed;
         write(c.at, &now, 4);
+        if (r) g_live_constants.push_back(&c);
     }
     // The counts handed back (kCountsHandedOver) keep the game's the same way.
     const auto count_handed_back = [&](const CountHandedOver& h) {
@@ -1872,6 +2184,7 @@ int apply_rate(ElfImage* image, int want) {
         std::uint8_t now[8];
         count_bytes(c, fps, now);
         write(c.at, now, c.n);
+        g_live_counts.push_back(&c);
     }
     for (const Bytes& b : kBytes) {
         if (!skipped(b.at)) write(b.at, b.now, b.n);
@@ -1959,6 +2272,9 @@ int apply_rate(ElfImage* image, int want) {
                          "(sub_2713870's loads at 0x%x and 0x%x; BBHOST_WIND_PACE=0 for the frame's step)",
                          kWindStepAt, kWindForceAt);
             }
+            // SprjSfx::Update's load as the 60 FPS++ sites leave it: ours to
+            // point at our step or back, now and while the game runs.
+            if (holds(kSfxStepLoad, kSfxStepLoadSixty)) g_sfx_bn = sfx_bn;
             // The effects' timing, and what decided it (effect_timing).
             const EffectTiming timing = effect_timing(fps);
             const int steps = timing.steps;
@@ -2237,6 +2553,67 @@ int apply_rate(ElfImage* image, int want) {
     return mode;
 }
 
+// What follows a conversion at the start or while the game runs: the pace,
+// the flips, the clock's publishing and the effects' emission at `got`.
+void converted_start(int got) {
+    g_game_fps = got;
+    g_converted = true;
+    hle_video_set_game_pace(got);  // above 60: flips complete at once (hle/video.cpp)
+    // The replay ghosts and the local player's character sync count game time by
+    // default, the frame clock on or off (kHandedOver and kCountsHandedOver's
+    // by_default rows, decomp/chr/): they read the clock's 30 fps frames, which
+    // our frame-time manager then publishes every frame although nothing else
+    // of the clock is on. Each has its own switch.
+    {
+        const auto off = [](const char* k) {
+            const char* e = std::getenv(k);
+            return e && e[0] == '0';
+        };
+        const bool replay = !off("BBHOST_REPLAY_STEP"), sync = !off("BBHOST_CHR_SYNC_STEP");
+        frame_clock::set_publishing(g_source == Source::Ours && (replay || sync));
+        if (frame_clock::publishing() && !frame_clock::on())
+            host_log("frame rate: %s%s%s count game time, not the rate's frames (BBHOST_REPLAY_STEP=0, BBHOST_CHR_SYNC_STEP=0): the "
+                     "frame clock's 30 fps frames are published for them, nothing else of the clock is on (engine/frame_clock.h)",
+                     replay ? "the replay ghosts" : "", replay && sync ? " and " : "", sync ? "the character sync" : "");
+    }
+    // Above 30 the effects' whole steps set the clock's sub-steps: two in a whole 1/30 s step, one in any other (a
+    // whole 1/60 s step's one event an update is 60 a second already; a shorter step's events wait for their
+    // interval); effect timing frame stays the game's.
+    if (sfx_node::emission_clock() > 0) {
+        const int steps = effect_timing(got).steps;
+        if (steps != 30) sfx_node::set_emission_clock(1);
+        if (steps == 0) {
+            sfx_node::set_emission_clock(0);
+            host_log("frame rate: effect timing frame: the effects' emission stays the game's, one event an update");
+        }
+    }
+}
+
+// From the game's own 30 to a converted rate while the game runs (a game
+// started at 30 used to need the next start for any other): the conversion
+// the start makes for one, on the main thread between frames, as retarget's
+// rewrites are, then what the start puts in after it - the values the decomps
+// not in place take, the Bloodletter's self-hit. Taken back to 30 later it
+// stays converted (retarget), a 30 like the Custom limit's 10 to 29.
+void convert_live(int want) {
+    int fps = want;
+    if (fps == 0) fps = uncapped_limit::rate_fps(g_uncapped_forced, g_uncapped_forced ? 0.0f : host_display_refresh_hz());
+    if (fps == 30) return;  // the game's own already
+    g_uncapped = want == 0;
+    const int got = apply_rate(g_image, fps);
+    if (got == 30) {
+        host_log("frame rate: the game's steps could not be converted; it stays at its own 30");
+        return;
+    }
+    converted_start(got);
+    frame_rate_install_late(g_image);
+    frame_rate_atk_params_loaded();
+    host_log("frame rate: 30 -> %s%s while the game runs, converted from the game's own mode (%zu constants and %zu counts at its "
+             "values, %zu 60 FPS++, %zu frame-time and %zu cloth code sites)",
+             mode_name(got).c_str(), g_uncapped ? " (Display-Limited)" : "", g_live_constants.size(), g_live_counts.size(),
+             g_sites_applied, g_frame_time_applied, g_cloth_applied);
+}
+
 }  // namespace
 
 // As the guest's update returns (compare mode): ours on the snapshot, the
@@ -2269,6 +2646,25 @@ asm(".text\n.globl frame_ret\n" FR_TYPE_(frame_ret) "frame_ret:\n"
     "mov %rax, %r11\n pop %rdx\n pop %rax\n jmp *%r11\n");
 
 int frame_rate_game_fps() { return g_game_fps; }
+
+// From the game's own 30 any rate converts (a refused cloth runs 60, as at the
+// start); from a converted rate, 30 included, any rate the cloth allows.
+bool frame_rate_live(int fps) {
+    if (g_source != Source::Ours || !g_image) return false;
+    return !g_converted || fps == 60 || g_cloth_applied || g_cloth_ok;
+}
+
+bool frame_rate_converted() { return g_converted; }
+
+bool frame_rate_request(int fps) {
+    if (!frame_rate_live(fps)) return false;
+    g_rate_asked.store(fps, std::memory_order_release);
+    return true;
+}
+
+void frame_rate_retime() {
+    if (g_converted && g_source == Source::Ours) g_retime_asked.store(true, std::memory_order_release);
+}
 
 float frame_rate_limit_fps() { return static_cast<float>(g_game_fps); }
 
@@ -2310,7 +2706,7 @@ void frame_rate_install(ElfImage* image) {
     // (engine/uncapped_limit.h). A display changed while the game runs applies
     // on the next run, as every rate does.
     if (want == 0) {
-        const float hz = g_uncapped_forced ? 0.0f : host_desktop_refresh_hz();
+        const float hz = g_uncapped_forced ? 0.0f : host_display_refresh_hz();
         want = uncapped_limit::rate_fps(g_uncapped_forced, hz);
         g_uncapped = true;
         if (g_uncapped_forced) {
@@ -2360,6 +2756,7 @@ void frame_rate_install(ElfImage* image) {
                 g_source = Source::Guest;
             }
         }
+        g_image = image;  // a rate chosen while the game runs converts it then (convert_live)
         hle_video_set_game_pace(30);
         return;
     }
@@ -2376,36 +2773,7 @@ void frame_rate_install(ElfImage* image) {
         hle_video_set_game_pace(30);
         return;  // the hook keeps mode 2 only while g_game_fps says 60
     }
-    g_game_fps = got;
-    hle_video_set_game_pace(got);  // above 60: flips complete at once (hle/video.cpp)
-    // The replay ghosts and the local player's character sync count game time by
-    // default, the frame clock on or off (kHandedOver and kCountsHandedOver's
-    // by_default rows, decomp/chr/): they read the clock's 30 fps frames, which
-    // our frame-time manager then publishes every frame although nothing else
-    // of the clock is on. Each has its own switch.
-    {
-        const auto off = [](const char* k) {
-            const char* e = std::getenv(k);
-            return e && e[0] == '0';
-        };
-        const bool replay = !off("BBHOST_REPLAY_STEP"), sync = !off("BBHOST_CHR_SYNC_STEP");
-        frame_clock::set_publishing(g_source == Source::Ours && (replay || sync));
-        if (frame_clock::publishing() && !frame_clock::on())
-            host_log("frame rate: %s%s%s count game time, not the rate's frames (BBHOST_REPLAY_STEP=0, BBHOST_CHR_SYNC_STEP=0): the "
-                     "frame clock's 30 fps frames are published for them, nothing else of the clock is on (engine/frame_clock.h)",
-                     replay ? "the replay ghosts" : "", replay && sync ? " and " : "", sync ? "the character sync" : "");
-    }
-    // Above 30 the effects' whole steps set the clock's sub-steps: two in a whole 1/30 s step, one in any other (a
-    // whole 1/60 s step's one event an update is 60 a second already; a shorter step's events wait for their
-    // interval); effect timing frame stays the game's.
-    if (sfx_node::emission_clock() > 0) {
-        const int steps = effect_timing(got).steps;
-        if (steps != 30) sfx_node::set_emission_clock(1);
-        if (steps == 0) {
-            sfx_node::set_emission_clock(0);
-            host_log("frame rate: effect timing frame: the effects' emission stays the game's, one event an update");
-        }
-    }
+    converted_start(got);
     frame_tick_install(image);
     const std::size_t kCountsN = sizeof(kCounts) / sizeof(kCounts[0]), kBytesN = sizeof(kBytes) / sizeof(kBytes[0]);
     const std::size_t constants = sizeof(kConstants) / sizeof(kConstants[0]);
@@ -2436,7 +2804,7 @@ void frame_rate_install_late(ElfImage* image) {
 }
 
 void frame_rate_atk_params_loaded() {
-    if (g_game_fps == 30) return;
+    if (!g_converted) return;
     std::size_t bytes = 0;
     auto* row = static_cast<std::uint8_t*>(params_row("AtkParam_Pc", kBloodletterSelfHit, &bytes));
     const ParamDefinition* def = params_definition("AtkParam_Pc");

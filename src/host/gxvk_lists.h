@@ -42,14 +42,21 @@ inline bool census() { return g_census; }
 // processor compare its own answers at each draw with the pool's: equal, the
 // pool's "not made yet" (made since), changed since (a write between), or
 // different (a reader's wrong answer: must stay 0). The pool's threads:
-// BBHOST_GXVK_LIST_THREADS, else 2 on 16 or more hardware threads, 1 on 8-15,
-// none below (the pool off). Read before any of the game's code runs.
+// BBHOST_GXVK_LIST_THREADS, else pool_threads_for the hardware threads the
+// process may run on (host_cpu_threads: its affinity) - 2 on 16 or more, 1 on
+// 8-15, none below (the pool off). Read before any of the game's code runs.
 // 0 off, 1 the pool's lookups, 2 and the compare, 3 splice, 4 splice-compare,
 // 5 segments, 6 segments-compare. Settled once the device is chosen (settle):
 // 0 until then.
 extern std::atomic<int> g_pool_mode;
 inline int pool_mode() { return g_pool_mode.load(std::memory_order_relaxed); }
 int pool_threads();             // 0 when the pool is off (or may not run: no switch, fewer than 8 hardware threads)
+// The pool's threads by default for a process that may run on `threads`
+// hardware threads. Counted from the affinity, not the machine
+// (std::thread::hardware_concurrency, which ignores it: 80 under a 4-CPU
+// affinity on two Xeon Gold 6230), so a process confined by a taskset, numactl,
+// `start /affinity` or a job object gets what a machine of that size gets.
+constexpr int pool_threads_for(unsigned threads) { return threads >= 16 ? 2 : threads >= 8 ? 1 : 0; }
 inline bool pool() { return pool_mode() != 0; }
 inline bool compare() { return pool_mode() == 2; }
 
@@ -88,6 +95,37 @@ inline bool segments_compare() { return pool_mode() == 6; }
 // said so already) - and the readers' lock turned on when the pool will run.
 void settle(bool homes_bind, const char* homes_why);
 
+
+// BBHOST_GXVK_LISTS_TIMES=1 (a diagnostic, in the pool's lines): when each
+// stored draw was stored, when its list closed and when the pool's commit of
+// it began and ended, against the command processor's arrival at its token -
+// by where the pool was then (its feed's entry not taken yet, and how far
+// behind; committing; done) - and the commit's time by part, the pool's time
+// parked and waiting. Read before any of the game's code runs.
+extern const bool g_times;
+inline bool times() { return g_times; }
+
+// The pool works only where it shortens the frame (host/gxvk_rest.h): resting,
+// it commits nothing and the command processor draws every GX-native draw in
+// order, as with the pool off (the constant buffers' homes on as before). It
+// rests while a frame cap holds the frame, while the frame is the GPU's, and
+// wherever the command processor drawing in order does not hold the game
+// back - found while it works by a probe now and then (a rest of three
+// half-second windows) - and works where it does. A loading screen changes
+// nothing. BBHOST_GXVK_LISTS_REST=0: it never rests.
+extern std::atomic<bool> g_resting;
+inline bool resting() { return g_resting.load(std::memory_order_relaxed); }
+// The main loop's frame limiter, once a frame (engine/frame_rate.cpp): how long
+// it waited, the rate it held the frame to (0: none, as on a loading screen)
+// and whether a loading screen is up (engine/loading.h).
+void frame_paced(std::uint64_t wait_ns, float cap_fps, bool loading);
+// The command processor's queue 0 (bb-cp0) spent `ns` on a job (hle/gnm_exec.cpp):
+// its busy share, for the rest's lines.
+void cp_busy(std::uint64_t ns);
+// A game thread waited `ns` for the command processor's backlog (hle/gnm_exec.cpp,
+// the back-pressure the bottleneck meter calls "held back by the command
+// processor"): counted always, for the rest's rule.
+void cp_held(std::uint64_t ns);
 
 // The pool's cores (stage 4b.1b, BBHOST_GXVK_LIST_CPUS: auto, the default
 // with splice - the last physical cores of the process's CPUs, one a pool

@@ -8,6 +8,7 @@
 #include "core/memory.h"
 #include "core/portable.h"
 #include "engine/addr.h"
+#include "engine/camera.h"
 #include "engine/camera_target.h"
 #include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
@@ -30,13 +31,21 @@
 #include "guest_abi.h"
 #include "hle/fs.h"
 #include "hle/modules.h"
+#include "host/audio_crush.h"
 #include "host/bindings.h"
+#include "host/options.h"
 #include "host/ruleset.h"
+#include "host/pixel_cutaway.h"
+#include "host/render_api.h"
+#include "host/render_hooks.h"
+#include "host/shader_overrides.h"
+#include "host/scene_look.h"
 #include "host/updater.h"
 #include "host/window.h"
 #include "log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -48,6 +57,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -70,7 +80,15 @@ struct Plugin {
     const BbOption* options = nullptr;  // bb_plugin_options, ended by a zero type
     bool official = false;  // signed with the release key
     bool visitor = false;   // off, but loaded to play other players' worlds (BB_PLUGIN_ADOPTS_RULES)
+    bool dormant = false;   // off, but loaded to be turned on in game (BB_PLUGIN_LIVE_SWITCH); main thread
+    int shader_owner = 0;   // its shader overrides' owner (host/shader_overrides.h): its place in the load order, from 1
 };
+
+// A plugin that turns on and off while the game runs (BB_PLUGIN_LIVE_SWITCH):
+// opt-in and not a gameplay plugin, whose rules are the session's.
+bool live_switch(std::uint32_t flags) {
+    return (flags & BB_PLUGIN_LIVE_SWITCH) && (flags & BB_PLUGIN_OPT_IN) && !(flags & BB_PLUGIN_GAMEPLAY);
+}
 std::vector<Plugin> g_plugins;
 ElfImage* g_image = nullptr;
 bool g_early = true;  // register_hle allowed
@@ -1132,6 +1150,48 @@ int api_on_camera(void (*fn)(BbCamera*, void*), void* user) {
     return 0;
 }
 
+// The scene's camera, after the copy above: the game state's update keeps it
+// in r15, loaded at 0x1d3bb93 from the object the slot at 0x594f880 holds
+// (+0x10). At 0x1d3bec5 the copy is done and a scripted camera's replacing it
+// is still to come (mov rax, [r13+0x110]; cmp dword [rax+0xc4], 0 - the scripted
+// camera's switch). The stub keeps only the argument registers, so the camera is
+// found again through the slot rather than r15.
+std::vector<CameraCallback> g_view_callbacks;  // under g_frame_mu
+bool g_view_hooked = false;
+
+GUEST_ABI std::int64_t view_hook(std::uint64_t, const std::uint64_t*) {
+    const std::uint64_t slot = runtime_of(0x594f880, 8);
+    std::uint64_t holder = 0, scene = 0;
+    if (!slot || !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(slot)), &holder, 8) || !holder ||
+        !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(holder + 0x10)), &scene, 8) || !scene)
+        return 0;
+    std::vector<CameraCallback> now;
+    {
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        now = g_view_callbacks;
+    }
+    auto* cam = reinterpret_cast<BbCamera*>(static_cast<std::uintptr_t>(scene + 0x10));
+    for (const CameraCallback& c : now) c.fn(cam, c.user);
+    return 0;
+}
+
+int api_on_view(void (*fn)(BbCamera*, void*), void* user) {
+    if (!fn || !g_image || !api_eboot_is_109()) return 1;
+    {
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        g_view_callbacks.push_back({fn, user});
+    }
+    if (g_view_hooked) return 0;
+    g_view_hooked = true;
+    static const std::uint8_t after_copy[14] = {0x49, 0x8b, 0x85, 0x10, 0x01, 0x00, 0x00,
+                                                0x83, 0xb8, 0xc4, 0x00, 0x00, 0x00, 0x00};
+    if (!engine_site_hook(g_image, runtime_of(0x1d3bec5, sizeof after_copy), after_copy, sizeof after_copy,
+                          reinterpret_cast<void*>(&view_hook))) {
+        host_log("plugin: 0x1d3bec5 is not the end of the scene camera's copy; on_view is not called");
+    }
+    return 0;
+}
+
 int api_key_bound(std::uint16_t scancode) {
     if (scancode == 0) return 0;
     // A plugin's own keys work in play, where a menu's actions press nothing
@@ -1143,12 +1203,254 @@ int api_key_bound(std::uint16_t scancode) {
     return 0;
 }
 
-void api_draw_style(int style) { gx_draw_style(style & (kGxDrawLines | kGxDrawBlack | kGxDrawSubtract)); }
+void api_draw_style(int style) { gx_draw_style(style & kGxDrawAll); }
 
 int api_on_scene_category(std::int32_t pass, void (*fn)(std::uint64_t, void*), void* user) {
     if (!g_image || !api_eboot_is_109()) return 1;
     render_queue_scene_insert(pass, fn, user);
     return 0;
+}
+
+// Version 18: the 3D's look (host/scene_look.h).
+void api_scene_snap(std::uint32_t lines) {
+    scene_look_set_snap(lines);
+    if (!lines) host_log("plugin: the 3D's vertices as they are");
+    else if (lines == kSnapPixels) host_log("plugin: the 3D's vertices snapped to its pixels");
+    else host_log("plugin: the 3D's vertices snapped to a grid %u lines high", lines);
+}
+void api_scene_filter(int filter) { scene_look_set_nearest(filter == BB_FILTER_NEAREST); }
+void api_scene_scale(int scale, std::uint32_t lines) { scene_look_set_scale(scale == BB_SCALE_NEAREST, lines); }
+void api_scene_colour_bits(int bits) { scene_look_set_colour_8bit(bits == 8); }
+void api_grading_filter(int filter) { scene_look_set_grading_nearest(filter == BB_FILTER_NEAREST); }
+void api_gbuffer_ambient(float level) { gx_gbuffer_ambient(level); }
+
+// Version 22: the cutaway (host/vertex_cutaway.h, host/scene_look.h).
+void api_view_cutaway(float tan_x, float tan_y, float near_z, float radius) {
+    const bool was = scene_look_cutaway(nullptr);
+    scene_look_set_cutaway(tan_x, tan_y, near_z, radius);
+    const bool on = scene_look_cutaway(nullptr);
+    if (on) host_log("plugin: cutaway within %.2f m of the view's axis nearer than %.2f m", static_cast<double>(radius), static_cast<double>(near_z));
+    else if (was) host_log("plugin: no cutaway");
+}
+
+// Version 23: the cutaway per pixel (host/pixel_cutaway.h, host/scene_look.h).
+void api_view_cutaway2(const BbCutaway* c) {
+    PixelCut p{};
+    if (c && c->radius > 0.0f) {
+        p.distance = c->distance;
+        p.sin_pitch = std::sin(c->pitch);
+        p.cos_pitch = std::cos(c->pitch);
+        p.radius = c->radius;
+        p.widen = c->widen;
+        p.height = c->height;
+        p.margin = c->margin;
+        p.feather = c->feather;
+    }
+    const bool was = scene_look_pixel_cut(nullptr);
+    scene_look_set_pixel_cut(p);
+    // Said when it turns on: a zoom sets it each frame.
+    if (scene_look_pixel_cut(nullptr) && !was)
+        host_log("plugin: cutaway per pixel within %.2f m (+%.2f a metre nearer) of the view's axis, %.2f m up and %.2f m in front "
+                 "of the point %.2f m off, faded over %.2f m",
+                 static_cast<double>(p.radius), static_cast<double>(p.widen), static_cast<double>(p.height),
+                 static_cast<double>(p.margin), static_cast<double>(p.distance), static_cast<double>(p.feather));
+    else if (was)
+        host_log("plugin: no cutaway per pixel");
+}
+
+// Version 24: the objects' cone (host/scene_look.h).
+void api_view_cutaway_objects(float start) {
+    const bool was = scene_look_object_cut() >= 0.0f;
+    scene_look_set_object_cut(start);
+    if (start >= 0.0f && start < 1.0f && !was)
+        host_log("plugin: the map's objects cut too, by the same cone from %.2f of the way to the camera", static_cast<double>(start));
+}
+
+// Version 26: the Camera Zoom presses for the plugin (engine/camera.h).
+int api_camera_zoom(int* steps, int* reset) {
+    bool r = false;
+    const int n = camera_zoom_take(&r);
+    if (steps) *steps = n;
+    if (reset) *reset = r ? 1 : 0;
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true)) host_log("plugin: the Camera Zoom keys zoom a plugin's view, not the game's camera");
+    return 0;
+}
+
+// Version 25: the PS1's dither over the finished picture (host/scene_look.h).
+void api_scene_dither(std::uint32_t bits) {
+    scene_look_set_dither(bits);
+    if (scene_look_dither()) host_log("plugin: the picture dithered to %u bits a channel before the HUD", scene_look_dither());
+    else host_log("plugin: the picture not dithered");
+}
+
+// A change the settings' listeners follow (the velocity map's patches, the
+// render size, the game's own anti-aliasing pass): the settings published
+// again, on the options' thread - nothing before the start, which reads them
+// itself.
+void republish_settings() {
+    if (g_early) return;
+    if (host_window_active())
+        host_options_post([] { host_opt_republish(); });
+    else
+        host_opt_republish();
+}
+
+// Version 27: the frame as it is drawn, and plugins' compute work in it
+// (host/render_hooks.h, host/upscale_pass.cpp).
+int api_frame_info(BbFrameInfo* out) { return render_frame_info(out); }
+
+int api_on_render(const char* name, std::uint32_t points, BbRenderFn fn, void* user) {
+    bool motion_changed = false;
+    if (render_hooks_add(name, points, fn, user, &motion_changed) != 0) return 1;
+    if (motion_changed) republish_settings();  // host_opt_motion_wanted follows
+    return 0;
+}
+
+// Who does the anti-aliasing (aa_claim, BbPluginInfo.flags' BB_PLUGIN_AA_*):
+// each plugin's claim by its name, and the one that holds over the plugins
+// that are on (render_api.h aa_resolve) - kept in g_aa, which upscaler_method
+// reads at every draw. Worked out again on the main thread: at each claim,
+// once the plugins are loaded, after their image phase, and at a live switch.
+std::mutex g_aa_mu;
+std::map<std::string, int> g_aa_claims;  // under g_aa_mu
+std::vector<std::string> g_aa_takers;    // the titles of the plugins on that take it over, in load order (under g_aa_mu)
+std::atomic<int> g_aa{kAaNone};
+
+const char* aa_name(int claim) { return claim == kAaTake ? "takes it over" : claim == kAaLeave ? "leaves it to bbhost" : "none"; }
+
+void aa_update() {
+    std::vector<int> claims;
+    std::vector<char> on;
+    std::vector<std::string> titles;
+    {
+        std::lock_guard<std::mutex> lk(g_aa_mu);
+        for (const Plugin& p : g_plugins) {
+            const auto it = g_aa_claims.find(p.name);
+            claims.push_back(it == g_aa_claims.end() ? kAaNone : it->second);
+            on.push_back(!p.visitor && !p.dormant);
+            titles.push_back(p.info && p.info->title && p.info->title[0] ? p.info->title : p.name);
+        }
+    }
+    std::unique_ptr<bool[]> on_a(new bool[on.size() + 1]);
+    for (std::size_t k = 0; k < on.size(); ++k) on_a[k] = on[k] != 0;
+    std::size_t first = 0;
+    const int held = render_api::aa_resolve(claims.data(), on_a.get(), claims.size(), &first);
+    std::vector<std::string> takers;
+    for (std::size_t k = 0; k < claims.size(); ++k) {
+        if (on[k] && claims[k] == kAaTake) takers.push_back(titles[k]);
+    }
+    bool changed;
+    {
+        std::lock_guard<std::mutex> lk(g_aa_mu);
+        changed = takers != g_aa_takers;
+        g_aa_takers = takers;
+    }
+    const int was = g_aa.exchange(held);
+    if (held != was || changed) {
+        if (held == kAaTake && takers.size() > 1) {
+            std::string all;
+            for (std::size_t k = 0; k < takers.size(); ++k) all += (k ? k + 1 == takers.size() ? " and " : ", " : "") + takers[k];
+            host_log("plugin: %s all take the anti-aliasing over: each runs its own; the menus name %s", all.c_str(), takers[0].c_str());
+        } else if (held == kAaTake) {
+            host_log("plugin: %s takes the anti-aliasing over: no jitter, TAA, FSR, DLSS or game anti-aliasing pass while it is on; the 3D at "
+                     "the Resolution",
+                     takers[0].c_str());
+        } else if (held == kAaLeave) {
+            host_log("plugin: the anti-aliasing is left to bbhost: TAA runs even beside a Vulkan layer that would keep it off");
+        } else if (was != kAaNone) {
+            host_log("plugin: the anti-aliasing is bbhost's again");
+        }
+    }
+    // The render size, the game's own size and its anti-aliasing pass follow.
+    if (held != was) republish_settings();
+}
+
+int api_aa_claim(const char* name, int claim) {
+    if (!name || !name[0] || claim < BB_AA_NONE || claim > BB_AA_TAKE || render_hooks_in_call()) return 1;
+    {
+        std::lock_guard<std::mutex> lk(g_aa_mu);
+        int& c = g_aa_claims[name];
+        if (c == claim) return 0;
+        c = claim;
+    }
+    host_log("plugin: %s: its anti-aliasing claim: %s", name, aa_name(claim));
+    aa_update();
+    return 0;
+}
+
+// Version 27: shader overrides (host/shader_overrides.h). Each plugin is an
+// owner of its own, in the order the plugins load (after the player's
+// folder); off while the plugin is (a visitor, a live switch off).
+static_assert(BB_SHADER_NONE == gpu::kOverrideNone && BB_SHADER_WAITING == gpu::kOverrideWaiting && BB_SHADER_TAKEN == gpu::kOverrideTaken &&
+                  BB_SHADER_REFUSED == gpu::kOverrideRefused && BB_SHADER_SHADOWED == gpu::kOverrideShadowed && BB_SHADER_OFF == gpu::kOverrideOff,
+              "shader_state's values are the overrides' states");
+static_assert(BB_SHADER_DATA_BYTES == gpu::kOverrideDataBytes, "a plugin's shader data");
+std::mutex g_shader_owner_mu;
+std::map<std::string, int> g_shader_owners;  // under g_shader_owner_mu: a plugin's name -> its owner
+int shader_owner(const char* name) {
+    if (!name) return 0;
+    std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+    const auto it = g_shader_owners.find(name);
+    return it == g_shader_owners.end() ? 0 : it->second;
+}
+
+int api_shader_override(const char* name, const char* shader, const char* hlsl) {
+    const int owner = shader_owner(name);
+    if (!owner || !shader) return 1;
+    const int r = gpu::overrides_set_text(owner, shader, hlsl);
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 32) {
+        host_log("plugin: %s: shader %s %s%s", name, shader, hlsl ? "replaced" : "given back to the game",
+                 r ? " - refused: no shader is named so, or the text is over 4 MiB" : "");
+    }
+    return r;
+}
+
+int api_shader_folder(const char* name, const char* dir) {
+    const int owner = shader_owner(name);
+    if (!owner) return -1;
+    const int n = gpu::overrides_add_folder(owner, dir);
+    if (dir && *dir) host_log("plugin: %s: shaders from %s: %d", name, dir, n);
+    return n;
+}
+
+int api_shader_state(const char* name, const char* shader, char* why, std::size_t n) {
+    const int owner = shader_owner(name);
+    std::string w;
+    const int state = owner && shader ? gpu::overrides_state(owner, shader, &w) : BB_SHADER_NONE;
+    if (why && n) {
+        const std::size_t k = std::min(n - 1, w.size());
+        std::memcpy(why, w.data(), k);
+        why[k] = '\0';
+    }
+    return state;
+}
+
+// Per thread, as game_file's: good until that thread's next call.
+thread_local std::string g_shader_source;
+int api_shader_source(const char* shader, const char** hlsl, std::size_t* size) {
+    if (!shader || !hlsl || !size) return 1;
+    // The game's first frames come before the renderer starts: nothing met
+    // yet, and nothing known to be off (gpu::overrides_started).
+    if (!gpu::overrides_started()) return 1;
+    if (const int r = gpu::hlsl_override_source(shader, g_shader_source)) return r;
+    *hlsl = g_shader_source.c_str();
+    *size = g_shader_source.size();
+    return 0;
+}
+
+int api_shader_data(const char* name, std::uint32_t offset, const void* data, std::uint32_t size) {
+    const int owner = shader_owner(name);
+    return owner ? gpu::overrides_data_write(owner, offset, data, size) : 1;
+}
+
+// Version 21: old-hardware sound (host/audio_crush.h).
+void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
+    audio_crush_set(rate_hz, bits, lowpass_hz);
+    if (!audio_crush_on()) host_log("plugin: the game's sound as it is");
+    else host_log("plugin: the game's sound held to %d Hz, %d bits, low-passed at %.0f Hz (0: off)", rate_hz, bits,
+                  static_cast<double>(lowpass_hz));
 }
 
 const BbHostApi g_api = {
@@ -1168,6 +1470,19 @@ const BbHostApi g_api = {
     &api_show_text,
     &api_on_scene_category,
     &api_draw_style,
+    &api_scene_snap, &api_scene_filter, &api_scene_scale, &api_scene_colour_bits, &api_grading_filter,
+    &api_gbuffer_ambient,
+    &api_on_view,
+    &api_audio_crush,
+    &api_view_cutaway,
+    &api_view_cutaway2,
+    &api_view_cutaway_objects,
+    &api_scene_dither,
+    &api_camera_zoom,
+    &api_frame_info,
+    &api_on_render,
+    &api_aa_claim,
+    &api_shader_override, &api_shader_folder, &api_shader_state, &api_shader_source, &api_shader_data,
     &api_on_camera_target,
 };
 
@@ -1216,6 +1531,7 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
         e.description = info->description ? info->description : "";
     }
     if (e.title.empty()) e.title = e.name;
+    std::string group_when;  // the last heading's BB_OPT_WHEN
     for (const BbOption* o = options; o && o->type != BB_OPT_END; ++o) {
         PluginOptionDesc d;
         d.type = o->type & 0xffu;
@@ -1225,6 +1541,10 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
         d.help = o->help ? o->help : "";
         d.def = o->def ? o->def : "";
         d.choices = o->choices ? o->choices : "";
+        if ((o->type & BB_OPT_WHEN) && d.type != BB_OPT_CHOICE) d.when = d.choices;
+        // A heading's condition covers the rows under it, up to the next heading.
+        if (d.type == BB_OPT_HEADING) group_when = d.when;
+        else if (d.when.empty()) d.when = group_when;
         d.min = o->min;
         d.max = o->max;
         e.options.push_back(std::move(d));
@@ -1323,6 +1643,9 @@ void plugins_load() {
         // turns it off.
         if (off && (flags & BB_PLUGIN_ADOPTS_RULES) && join_modded_worlds()) {
             p.visitor = true;
+        } else if (off && live_switch(flags)) {
+            // Off, and asks for nothing until the player turns it on in game.
+            p.dormant = true;
         } else if (off) {
             if (sw == 0) host_log("plugin: %s: off (plugins.%s = false)", p.name.c_str(), p.name.c_str());
             else host_log("plugin: %s: off until turned on ([plugins] %s = true)", p.name.c_str(), p.name.c_str());
@@ -1330,10 +1653,39 @@ void plugins_load() {
             continue;
         }
 
+        // Its render hooks (plugin API 27) are not called while it is off, and
+        // its flags' anti-aliasing claim is the one it starts with.
+        if (p.visitor || p.dormant) render_hooks_plugin_on(p.name, false);
+        if (const int aa = render_api::aa_of_flags(flags); aa != kAaNone) {
+            std::lock_guard<std::mutex> lk(g_aa_mu);
+            g_aa_claims[p.name] = aa;
+        }
+        // Its shader overrides' owner, before its init can ask for one: after
+        // the player's folder and the plugins loaded before it; off while it is.
+        {
+            static int owners = 0;
+            p.shader_owner = ++owners;
+            const char* data = hle_fs_data_root();
+            const bool plain = !std::strpbrk(p.name.c_str(), "/\\.:");
+            gpu::overrides_owner(p.shader_owner, "plugin " + p.name,
+                                 data && *data && plain ? std::string(data) + "/plugins/" + p.name : std::string(), !(p.visitor || p.dormant));
+            std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+            g_shader_owners[p.name] = p.shader_owner;
+        }
         if (p.init) {
             const int r = p.init(&g_api);
             if (r != 0) {
                 host_log("plugin: %s: init returned %d; unloaded", p.name.c_str(), r);
+                render_hooks_drop(p.name);  // what it registered goes with it
+                {
+                    std::lock_guard<std::mutex> lk(g_aa_mu);
+                    g_aa_claims.erase(p.name);
+                }
+                gpu::overrides_drop_owner(p.shader_owner);
+                {
+                    std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+                    g_shader_owners.erase(p.name);
+                }
                 close_lib(h);
                 continue;
             }
@@ -1345,13 +1697,17 @@ void plugins_load() {
         if (p.info) {
             host_log("plugin: %s %s loaded%s%s (%s)", p.name.c_str(), p.info->version ? p.info->version : "",
                      official ? ", official" : "",
-                     p.visitor ? ", off: only to play other players' worlds" : (flags & BB_PLUGIN_GAMEPLAY) ? ", changes the game" : "",
+                     p.visitor   ? ", off: only to play other players' worlds"
+                     : p.dormant ? ", off until turned on in game"
+                     : (flags & BB_PLUGIN_GAMEPLAY) ? ", changes the game"
+                                                    : "",
                      path.c_str());
         } else {
             host_log("plugin: %s loaded%s (%s)", p.name.c_str(), official ? ", official" : "", path.c_str());
         }
         g_plugins.push_back(p);
     }
+    aa_update();
     g_early = false;
 }
 
@@ -1374,6 +1730,16 @@ void plugins_image(ElfImage* image) {
             const int r = p.image(&g_api);
             if (r != 0) {
                 host_log("plugin: %s: image phase returned %d; unloaded", p.name.c_str(), r);
+                render_hooks_drop(p.name);
+                {
+                    std::lock_guard<std::mutex> lk(g_aa_mu);
+                    g_aa_claims.erase(p.name);
+                }
+                gpu::overrides_drop_owner(p.shader_owner);
+                {
+                    std::lock_guard<std::mutex> lk(g_shader_owner_mu);
+                    g_shader_owners.erase(p.name);
+                }
                 close_lib(p.handle);
                 g_plugins.erase(g_plugins.begin() + static_cast<std::ptrdiff_t>(i));
                 continue;
@@ -1382,6 +1748,7 @@ void plugins_image(ElfImage* image) {
         ++i;
     }
     g_in_image = false;
+    aa_update();
 }
 
 void plugins_frame() {
@@ -1411,9 +1778,22 @@ void plugins_frame() {
             }
             continue;
         }
-        const std::string raw = toml_value(r.value);
-        config_value_set(r.name + "." + r.key, raw);
-        config_set_values(config_user_file(), {{r.name, r.key, raw}});
+        if (r.key.empty()) {
+            // A live switch (plugins_set_enabled): the plugin on or off.
+            const bool on = r.value == "true";
+            for (Plugin& p : g_plugins) {
+                if (p.name != r.name) continue;
+                p.dormant = !on;
+                gpu::overrides_owner_on(p.shader_owner, on);  // its shader overrides with it
+            }
+            host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
+            if (render_hooks_plugin_on(r.name, on)) republish_settings();
+            aa_update();
+        } else {
+            const std::string raw = toml_value(r.value);
+            config_value_set(r.name + "." + r.key, raw);
+            config_set_values(config_user_file(), {{r.name, r.key, raw}});
+        }
         for (const OptionCallback& c : options) {
             if (c.name == r.name) c.fn(r.key.c_str(), r.value.c_str(), c.user);
         }
@@ -1481,6 +1861,7 @@ std::vector<PluginEntry> plugins_scan() {
         }
         e.official = official;
         e.bad_signature = bad;
+        e.aa = render_api::aa_of_flags(e.flags);
         const int sw = config_switch(e.name);
         e.enabled = !bad && (sw == 1 || (sw < 0 && !(e.flags & BB_PLUGIN_OPT_IN)));
         out.push_back(std::move(e));
@@ -1496,7 +1877,12 @@ std::vector<PluginEntry> plugins_catalog() {
         e.official = p.official;
         e.loaded = true;
         e.visitor = p.visitor;
-        e.enabled = !p.visitor;
+        e.enabled = !p.visitor && !p.dormant;
+        {
+            std::lock_guard<std::mutex> lk(g_aa_mu);
+            const auto it = g_aa_claims.find(p.name);
+            e.aa = it == g_aa_claims.end() ? kAaNone : it->second;
+        }
         out.push_back(std::move(e));
     }
     return out;
@@ -1505,7 +1891,15 @@ std::vector<PluginEntry> plugins_catalog() {
 void plugins_set_enabled(const std::string& name, bool on) {
     config_set_values(config_user_file(), {{"plugins", name, on ? "true" : "false"}});
     config_value_set("plugins." + name, on ? "true" : "false");
+    // In game, a live switch's plugin is told at once (plugins_frame).
+    for (const Plugin& p : g_plugins) {
+        if (p.name != name || !p.info || !live_switch(p.info->flags) || p.visitor) continue;
+        std::lock_guard<std::mutex> lk(g_frame_mu);
+        g_menu_requests.push_back({false, name, "", on ? "true" : "false"});
+    }
 }
+
+bool plugins_live_switch(const PluginEntry& p) { return p.loaded && live_switch(p.flags); }
 
 std::string plugins_option_value(const PluginEntry& p, const PluginOptionDesc& o) {
     const std::string v = config_value(p.name + "." + o.key);
@@ -1619,7 +2013,7 @@ std::vector<std::string> rules_without(const std::string& rules, const std::vect
 
 bool plugins_active(const std::string& name) {
     for (const Plugin& p : g_plugins) {
-        if (p.name == name && !p.visitor) return true;
+        if (p.name == name && !p.visitor && !p.dormant) return true;
     }
     return false;
 }
@@ -1631,6 +2025,25 @@ std::string plugins_ruleset() {
         if (!g_visiting.empty()) return g_visiting;
     }
     return own_ruleset();
+}
+
+int plugins_aa_claim() { return g_aa.load(std::memory_order_relaxed); }
+
+std::string plugins_aa_owner() {
+    std::lock_guard<std::mutex> lk(g_aa_mu);
+    return g_aa_takers.empty() ? std::string() : g_aa_takers.front();
+}
+
+std::string plugins_aa_owner_scanned() {
+    // The files as the setup window found them (they do not change under it);
+    // each one's switch as the config holds it now - the Plugins tab changes it.
+    static const std::vector<PluginEntry> files = plugins_scan();
+    for (const PluginEntry& e : files) {
+        const int sw = config_switch(e.name);
+        const bool on = !e.bad_signature && (sw == 1 || (sw < 0 && !(e.flags & BB_PLUGIN_OPT_IN)));
+        if (on && render_api::aa_of_flags(e.flags) == kAaTake) return e.title;
+    }
+    return {};
 }
 
 std::string plugins_adopts() {

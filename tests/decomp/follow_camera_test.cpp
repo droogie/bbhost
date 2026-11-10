@@ -415,6 +415,16 @@ int main(int argc, char** argv) {
         body[mouse_camera::kHoldSites[2].bn - kUpdate] = 0xcc;
         ok = ok && !follow_camera_body_ok(body.data());
         for (const auto& site : mouse_camera::kHoldSites) std::memcpy(&body[site.bn - kUpdate], site.game, 9);
+        // So do a plugin's nops at the stick's two read-backs (plugins/iso).
+        u8 read_back[2][9];
+        for (int i = 0; i < 2; ++i) {
+            const u64 at = i ? 0x183cb97 : 0x183cb56;
+            std::memcpy(read_back[i], &body[at - kUpdate], 9);
+            std::memcpy(&body[at - kUpdate], mouse_camera::kNop9, 9);
+        }
+        ok = ok && follow_camera_body_ok(body.data());
+        std::memcpy(&body[0x183cb56 - kUpdate], read_back[0], 9);
+        std::memcpy(&body[0x183cb97 - kUpdate], read_back[1], 9);
         body[0x183ce54 - kUpdate] ^= 0xff;
         ok = ok && !follow_camera_body_ok(body.data());
         body[0x183ce54 - kUpdate] ^= 0xff;

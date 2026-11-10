@@ -244,7 +244,9 @@ bool hle_np_context_started() {
 
 std::string hle_np_online_status() {
     std::string s = "Signed in as " + net::online_id();
-    if (net::account_logged_in()) s += " (account)";
+    if (net::account_logged_in() && net::account_refused())
+        s = config().online_require_account ? "Signed out: the server refused the sign-in" : s + " (account, refused by the server)";
+    else if (net::account_logged_in()) s += " (account)";
     else if (config().online_require_account) s = "Signed out: log in below";
     if (g.in_room) {
         s += "; room " + std::to_string(g.room_id) + " as member " + std::to_string(g.member_id) +

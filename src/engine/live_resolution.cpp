@@ -9,9 +9,12 @@
 #include "engine/graphics_patch.h"
 #include "engine/gx_resources.h"
 #include "engine/option_menu.h"
+#include "engine/patch_manifest.h"
+#include "engine/render_scale.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/options.h"
+#include "host/window.h"
 #include "log.h"
 
 #include <algorithm>
@@ -23,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -72,9 +76,13 @@ constexpr std::uint64_t kListenerYebisShutdownCall = 0x269c82a;  // in the graph
 constexpr std::uint64_t kGxFree = 0x15e6b00, kGxFreeRecord = 0x15e69e0;
 constexpr std::uint64_t kSwfPlayerCtor = 0x2358360, kSwfPlayerDtor = 0x2358670, kSwfPlayerVtable = 0x5756a00;
 
-// The largest entries of the Resolution setting, wide and tall: 5120x2160
-// (21:9) and 3840x2160 (16:9) - the display buffers fit both.
-constexpr std::uint32_t kMaxW = 5120, kMaxH = 2160;
+// The largest entries of the Resolution setting, wide and tall: 11520x2160
+// (three 16:9 screens) and 7680x4320 (8K) - the display buffers fit any size
+// up to the window's display's, within these. With no display to go by, the
+// widest and tallest of the entries up to 5120x2160 (21:9), as before the
+// list grew past it.
+constexpr std::uint32_t kMaxW = 11520, kMaxH = 4320;
+constexpr std::uint32_t kNoDisplayW = 5120, kNoDisplayH = 2160;
 
 std::uint64_t g_slide = 0;
 bool g_installed = false;
@@ -168,6 +176,9 @@ GUEST_ABI std::int64_t yebis_shutdown_call_hook(std::uint64_t, const std::uint64
     g_dead_lo.store(lo);
     g_dead_hi.store(lo && size > 0 ? lo + static_cast<std::uint64_t>(size) : 0);
     hle_call_guest6(guest_fn(kYebisShutdown), static_cast<std::int64_t>(glue), 0, 0, 0, 0, 0);
+    // Its targets went with the region, unseen (the frees dropped above): the
+    // host lets them go too, before the next YEBIS makes its own there.
+    if (const std::uint64_t hi = g_dead_hi.load()) host_gpu_forget_region(lo, hi);
     g_dead_hi.store(0);
     g_dead_lo.store(0);
     return 1;
@@ -642,10 +653,12 @@ constexpr BothSidesSite kBothSidesSites[] = {
 };
 
 bool g_both_sides = false;  // install_scene_both_sides() went in
+std::atomic<bool> g_rebuild{false};  // live_resolution_rebuild: a change at the same size
 
 // Where the graphics manager's scene renders its picture at w x h, by the test
 // Initialize makes (the patched one or the game's), for the log.
 const char* scene_target_path(std::uint32_t w, std::uint32_t h) {
+    if (RenderScale rs; render_scale_on(&rs)) return "at the render size, upscaled to the output size (render scale)";
     const bool wide = g_display[0] == w, tall = g_display[1] == h;
     return (g_both_sides ? wide && tall : wide || tall) ? "straight into the display buffers" : "into a target of its own";
 }
@@ -785,11 +798,211 @@ bool remake_default_depth(std::uint64_t out, std::uint32_t w, std::uint32_t h) {
     return true;
 }
 
+// ---- The back buffer at the window's display's size ----------------------------
+//
+// The GX init's swap chain (sub_2ad5a80, its object at the output entry's +0)
+// makes two layers at the descriptor's size: three VideoOut scan-out buffers
+// in one block, registered with VideoOut, and one ordinary GX 2D texture, the
+// back buffer (CreateTexture sub_2565f90 at 0x2ad66d2, kept at the swap
+// chain's +0x33d0), which GetBuffer (sub_2ad5d00) puts at the entry's +0x58
+// with no reference of its own. The GX init wraps it in an RTV (sub_25667a0,
+// the entry's +0x60; it takes a reference on the texture) and DefRenderTarget
+// (0x80 bytes, vtable 0x57b6940, the texture set by its slot +0x98; the
+// entry's +0x68). Each present copies the back buffer into the next scan-out
+// buffer with a rect pass (sub_2ab6cb0) whose viewport is the scan-out
+// header's size (the swap chain's +0x374/+0x376). Nothing in the shipped game
+// resizes either: sub_2ad5d60, a ResizeBuffers, is `xor eax, eax; ret`.
+//
+// Only the back buffer's size decides whether a scene context renders
+// straight into the output entry's targets (both sides alike,
+// install_scene_both_sides) or into a target of its own copied in. So the
+// scan-out buffers are made once at the largest size any display can ask for
+// (g_reserved: the widest and the tallest display, each side apart) and the
+// back buffer at the size of the display the window is on (g_display), made
+// again here when the window moves to a display of another size or a
+// display's mode changes - at the frame end's quiet point, as a new texture,
+// RTV and DefRenderTarget, the way the GX init makes them, put in the old
+// ones' places. The copy's header takes the back buffer's size, so the copy
+// is 1:1 into the scan-out buffer's top left and the host's image there is
+// the back buffer's size (render.cpp keeps one image per address and makes
+// it again when its size changes); the presenter shows its top-left picture
+// as before. The old three are let go three flips later, as DefDepthStencil
+// is: the RTV's reference on the texture and the swap chain's own (the RTV's
+// 0x50 bytes are left, its allocator not being kept in it), DefRenderTarget
+// by its count. BBHOST_BACK_BUFFER_FOLLOWS=0 keeps the back buffer at the
+// scan-out buffers' size, as before.
+constexpr std::uint64_t kCreateTexture = 0x2565f90, kCreateRtv = 0x25667a0;
+constexpr std::uint64_t kRenderTargetVtable = 0x57b6940;
+constexpr std::uint64_t kDefRenderTargetName = 0x4dc2e22;  // u"DefRenderTarget"
+constexpr std::uint64_t kScAllocator = 0x2c0, kScGpuAllocator = 0x2c8, kScDesc = 0x300, kScCopyW = 0x374, kScBackBuffer = 0x33d0;
+std::uint32_t g_reserved[2] = {0, 0};  // the scan-out buffers' size
+std::uint64_t g_back_start = 0;        // the back buffer's size for the GX init's hook to make, 0 to keep it
+std::uint64_t g_back_failed = 0;       // a size remake_back_buffer could not make: not tried again
+const bool g_back_follows = [] {
+    const char* e = std::getenv("BBHOST_BACK_BUFFER_FOLLOWS");
+    return !(e && e[0] == '0');
+}();
+struct OldBack {
+    std::uint64_t tex, rtv, rt, flip;
+};
+std::vector<OldBack> g_old_back;  // main thread: the GX init, the frame end
+
+// One reference on a GX texture let go, as the swap chain's destroy does
+// (sub_2ad5c80): the count at +0x10, then at none its destructor and its
+// allocator's (+8) free.
+void release_texture(std::uint64_t tex) {
+    if (!tex) return;
+    auto* refs = reinterpret_cast<std::int32_t*>(static_cast<std::uintptr_t>(tex + 0x10));
+    if (__atomic_fetch_sub(refs, 1, __ATOMIC_ACQ_REL) != 1) return;
+    const std::uint64_t alloc = at_<std::uint64_t>(tex + 8);
+    call_slot(tex, 0);
+    if (alloc) call_slot(alloc, 0x70, static_cast<std::int64_t>(tex));
+}
+
+void release_old_back(std::uint64_t flip) {
+    std::size_t kept = 0;
+    for (const OldBack& o : g_old_back) {
+        if (flip < o.flip + 3) {
+            g_old_back[kept++] = o;
+            continue;
+        }
+        if (o.rt) release_ref(o.rt);
+        if (o.rtv) {
+            const std::uint64_t t = at_<std::uint64_t>(o.rtv + 8);
+            at_<std::uint64_t>(o.rtv + 8) = 0;
+            release_texture(t);
+        }
+        const std::int32_t left = at_<std::int32_t>(o.tex + 0x10);
+        release_texture(o.tex);
+        host_log("resolution: the old back buffer 0x%llx let go (%d references before the swap chain's, %s)",
+                 static_cast<unsigned long long>(o.tex), left, left == 1 ? "freed" : "still held elsewhere");
+    }
+    g_old_back.resize(kept);
+}
+
+// The back buffer, its RTV and DefRenderTarget made again at w x h. False,
+// with the old ones kept, when anything is not as the GX init left it or the
+// heap lacks the room.
+bool remake_back_buffer(std::uint64_t dev, std::uint32_t w, std::uint32_t h) {
+    const std::uint64_t out = at_<std::uint64_t>(dev + 0x90);
+    const std::uint64_t sc = out ? at_<std::uint64_t>(out) : 0;
+    const std::uint64_t ctx = at_<std::uint64_t>(dev);
+    const std::uint64_t alloc = at_<std::uint64_t>(dev + 0xc0);
+    if (!sc || !ctx || !alloc) return false;
+    const std::uint64_t old_tex = at_<std::uint64_t>(sc + kScBackBuffer), old_rtv = at_<std::uint64_t>(out + 0x60),
+                        old_rt = at_<std::uint64_t>(out + 0x68);
+    if (!old_tex || old_tex != at_<std::uint64_t>(out + 0x58) || !old_rt || at_<std::uint64_t>(old_rt) != guest(kRenderTargetVtable) ||
+        (old_rtv && at_<std::uint64_t>(old_rtv + 8) != old_tex) || at_<std::uint64_t>(out + 0x78)) {
+        static bool told = false;
+        if (!told) host_log("resolution: the back buffer is not as the GX init left it; it keeps its size");
+        told = true;
+        return false;
+    }
+    if (at_<std::uint16_t>(old_tex + 0x44) == w && at_<std::uint16_t>(old_tex + 0x46) == h) return true;
+    std::uint64_t largest = 0;
+    target_heap_free_mib(dev, &largest);
+    const std::uint64_t need_mib = (static_cast<std::uint64_t>(w) * h * 4 >> 20) + 2;
+    if (largest < need_mib) {
+        host_log("resolution: no room for a %ux%u back buffer (%llu MiB needed, the largest free block %llu); it stays %ux%u", w, h,
+                 (unsigned long long)need_mib, (unsigned long long)largest, at_<std::uint16_t>(old_tex + 0x44), at_<std::uint16_t>(old_tex + 0x46));
+        return false;
+    }
+    // The texture, described as the swap chain does from its descriptor
+    // (0x2ad660a..0x2ad66d2).
+    const std::uint64_t d = sc + kScDesc;
+    const std::uint32_t bind = at_<std::uint32_t>(d + 0x24);
+    struct {
+        std::uint32_t w, h, mips, layers, format, samples, z0, z1, flags, z2, misc, z3;
+    } desc = {w, h, 1, 1, at_<std::uint32_t>(d + 0x3c) ? at_<std::uint32_t>(d + 0x3c) : at_<std::uint32_t>(d + 0x10), 1, 0, 0,
+              (bind << 5 & 0x80) | (bind << 5 & 0x20) | (bind << 2 & 8), 0, at_<std::uint32_t>(d + 0x40), 0};
+    std::uint64_t tex = 0;
+    GuestCallRegs r{};
+    r.fn = guest_fn(kCreateTexture);
+    r.ints[0] = ctx;
+    r.ints[1] = reinterpret_cast<std::uintptr_t>(&tex);
+    r.ints[2] = reinterpret_cast<std::uintptr_t>(&desc);
+    r.ints[3] = 0;
+    r.ints[4] = at_<std::uint64_t>(sc + kScAllocator);
+    r.ints[5] = at_<std::uint64_t>(sc + kScGpuAllocator);
+    r.stack[0] = 0;
+    hle_call_guest_regs(&r);
+    if (static_cast<std::int32_t>(r.ret) != 0 || !tex) {
+        host_log("resolution: a %ux%u back buffer was not made (error %d); it keeps its size", w, h, static_cast<int>(r.ret));
+        return false;
+    }
+    // Its RTV (0x2594f97..0x2594fee).
+    struct {
+        std::uint32_t format, dim, z0, z1, one;
+    } rtv_desc = {at_<std::uint8_t>(tex + 0x4b), at_<std::uint16_t>(tex + 0x4c) > 1 ? 6u : 4u, 0, 0, 1};
+    std::uint64_t rtv = 0;
+    hle_call_guest6(guest_fn(kCreateRtv), static_cast<std::int64_t>(ctx), static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(&rtv)),
+                    static_cast<std::int64_t>(tex), static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(&rtv_desc)),
+                    static_cast<std::int64_t>(alloc), 0);
+    // DefRenderTarget (0x2595124..0x25951c7).
+    const auto rt = static_cast<std::uint64_t>(hle_call_guest6(
+        reinterpret_cast<void*>(static_cast<std::uintptr_t>(at_<std::uint64_t>(at_<std::uint64_t>(alloc) + 0x58))), static_cast<std::int64_t>(alloc),
+        0x80, 0x10, 0, 0, 0));
+    if (!rtv || !rt) {
+        host_log("resolution: the %ux%u back buffer's %s was not made; it keeps its size", w, h, rtv ? "DefRenderTarget" : "RTV");
+        if (rtv) {
+            at_<std::uint64_t>(rtv + 8) = 0;
+            release_texture(tex);
+        }
+        release_texture(tex);
+        return false;
+    }
+    std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(rt)), 0, 0x80);
+    at_<std::uint64_t>(rt) = guest(kRenderTargetVtable);
+    at_<float>(rt + 0x10) = 1.0f;
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(rt + 0x20)), guest_ptr(g_image->mem, guest(kDepthStencilDefaults)), 16);
+    at_<std::uint64_t>(rt + 0x68) = ~0ull;
+    at_<std::uint32_t>(rt + 0x70) = ~0u;
+    call_slot(rt, 0x98, static_cast<std::int64_t>(tex), 0);
+    at_<std::int32_t>(rt + 8) += 1;
+    call_slot(rt, 0x80, static_cast<std::int64_t>(guest(kDefRenderTargetName)));
+    // In the old ones' places, and every copy of the size.
+    at_<std::uint64_t>(sc + kScBackBuffer) = tex;
+    at_<std::uint64_t>(out + 0x58) = tex;
+    at_<std::uint64_t>(out + 0x60) = rtv;
+    at_<std::uint64_t>(out + 0x68) = rt;
+    at_<std::uint32_t>(out + 0x10) = w;
+    at_<std::uint32_t>(out + 0x14) = h;
+    at_<std::uint32_t>(out + 0xa4) = w;
+    at_<std::uint32_t>(out + 0xa8) = h;
+    at_<std::uint32_t>(sc + kScDesc) = w;
+    at_<std::uint32_t>(sc + kScDesc + 4) = h;
+    at_<std::uint16_t>(sc + kScCopyW) = static_cast<std::uint16_t>(w);
+    at_<std::uint16_t>(sc + kScCopyW + 2) = static_cast<std::uint16_t>(h);
+    if (g_rect_resource) g_rect_resource->store(tex);
+    g_old_back.push_back({old_tex, old_rtv, old_rt, hle_video_flip_count()});
+    host_log("resolution: back buffer %ux%u -> %ux%u (0x%llx; the scan-out buffers stay %ux%u)", at_<std::uint16_t>(old_tex + 0x44),
+             at_<std::uint16_t>(old_tex + 0x46), w, h, static_cast<unsigned long long>(tex), g_reserved[0], g_reserved[1]);
+    g_display[0] = w;
+    g_display[1] = h;
+    return true;
+}
+
+// The back buffer's size for the window's display now: that display's size,
+// never below the render size `cw` x `ch` (a Resolution above the display's)
+// nor above the scan-out buffers. 0 when it should stay as it is.
+std::uint64_t back_buffer_wanted(std::uint32_t cw, std::uint32_t ch) {
+    if (!g_back_follows || !g_reserved[0]) return 0;
+    int dw = 0, dh = 0;
+    if (!host_window_display_now(&dw, &dh) || dw <= 0 || dh <= 0) return 0;
+    const std::uint32_t w = std::min(std::max(static_cast<std::uint32_t>(dw), cw), g_reserved[0]);
+    const std::uint32_t h = std::min(std::max(static_cast<std::uint32_t>(dh), ch), g_reserved[1]);
+    const std::uint64_t want = pack(w, h);
+    return (w == g_display[0] && h == g_display[1]) || want == g_back_failed ? 0 : want;
+}
+
 // The output entry's render size and viewport (x, y, w, h floats at +0x88;
 // GX init's aspect fit inside the display buffer), which the scene contexts
 // rebuild from, DefDepthStencil and the rectangle binding the display buffers
 // sets; then the game's broadcast and the contexts it does not reach.
-int broadcast_size(std::uint64_t dev, std::uint64_t gm, std::uint32_t ow, std::uint32_t oh, std::uint32_t w, std::uint32_t h) {
+// Under render scale the scene contexts are the render size: rs_before and
+// rs_after give the unregistered ones' sizes (render_scale_retarget).
+int broadcast_size(std::uint64_t dev, std::uint64_t gm, std::uint32_t ow, std::uint32_t oh, std::uint32_t w, std::uint32_t h,
+                   const RenderScale* rs_before = nullptr, const RenderScale* rs_after = nullptr) {
     const std::uint64_t out = at_<std::uint64_t>(dev + 0x90);
     at_<std::uint32_t>(out + 0x80) = w;
     at_<std::uint32_t>(out + 0x84) = h;
@@ -801,6 +1014,8 @@ int broadcast_size(std::uint64_t dev, std::uint64_t gm, std::uint32_t ow, std::u
     if (!remake_default_depth(out, w, h)) host_log("resolution: DefDepthStencil was not made at %ux%u; the scene keeps a depth of its own", w, h);
     const std::vector<std::uint64_t> before = live_scene_ctxs();
     hle_call_guest6(guest_fn(kResizeBroadcast), static_cast<std::int64_t>(dev), w, h, 0, 0, 0);
+    if (rs_before && rs_after)
+        return resize_scene_ctxs(dev, gm, before, rs_before->render_w, rs_before->render_h, rs_after->render_w, rs_after->render_h);
     return resize_scene_ctxs(dev, gm, before, ow, oh, w, h);
 }
 
@@ -825,17 +1040,30 @@ bool resize(std::uint32_t w, std::uint32_t h) {
     const std::uint32_t was_w = at_<std::uint32_t>(out + 0x80), was_h = at_<std::uint32_t>(out + 0x84);
     g_dead_frees.store(0);
     const std::uint64_t failed = gx_resources_create_failures();
-    int ctxs = broadcast_size(dev, gm, was_w, was_h, w, h);
+    RenderScale rs_was, rs_now;
+    const bool scaled = render_scale_retarget(w, h, g_display[0], g_display[1], hle_video_flip_count(), &rs_was, &rs_now);
+    // The resources that die from here to the end of the broadcasts are the
+    // old size's: their targets go at the end (host_gpu_targets_rebuild),
+    // before the next frame makes the new size's.
+    host_gpu_targets_rebuild(true);
+    int ctxs = scaled ? broadcast_size(dev, gm, was_w, was_h, w, h, &rs_was, &rs_now) : broadcast_size(dev, gm, was_w, was_h, w, h);
     bool fitted = true;
     const std::uint64_t unfit = unfit_scene_ctx();
     if (unfit || gx_resources_create_failures() != failed) {
         host_log("resolution: %ux%u did not fit the render-target heap (%llu resources not made%s); back to %ux%u", w, h,
                  (unsigned long long)(gx_resources_create_failures() - failed), unfit ? ", a scene context's pass among them" : "", was_w, was_h);
-        ctxs += broadcast_size(dev, gm, w, h, was_w, was_h);
+        if (scaled) {
+            RenderScale rs_back;
+            render_scale_retarget(was_w, was_h, g_display[0], g_display[1], hle_video_flip_count(), nullptr, &rs_back);
+            ctxs += broadcast_size(dev, gm, w, h, was_w, was_h, &rs_now, &rs_back);
+        } else {
+            ctxs += broadcast_size(dev, gm, w, h, was_w, was_h);
+        }
         w = was_w;
         h = was_h;
         fitted = false;
     }
+    host_gpu_targets_rebuild(false);
     // The window size SprjInitStuff derives from the res words at the start
     // (0x59404d8/dc), which sub_212c630 divides the res words by; the Sprj
     // listener sets only the res words and the UI scale. Booted at this size
@@ -945,6 +1173,169 @@ void confirm_tick() {
     }
 }
 
+// ---- Shadow resolution while the game runs --------------------------------------
+//
+// The Shadow resolution setting's sizes (engine/patch_manifest.cpp
+// shadow_resolution_manifest) are made again at the quiet point below:
+//
+// The sun's: sub_12ac210, which each view's scene draw (sub_269cb70) calls
+// with the area's ShadowParam, compares the shadow object's size (+0x860,
+// +0x864) with the size its site gives and, when they differ, resizes it
+// through sub_12abf20 - which releases the five maps (sub_12abd40) before it
+// makes them again, the path the game takes between areas that ask for 2048
+// and 4096. So the site written (patch_manifest_refresh_live) is the whole
+// change: the next frame's draw makes them.
+//
+// The lamps' and torches': the light shadow manager (the graphics manager's
+// +0x5878) is made once, by sub_26440b0 from the size block its caller fills
+// at 0x261b0f3 (the spot maps' size and four LODs' counts, the cube faces'
+// size and theirs). sub_26440b0 starts by releasing everything it made
+// (sub_2643e80: the maps' arrays and the refcounted shared targets of each
+// LOD), and the maps are handed out to the lights afresh each frame
+// (sub_2644cf0, from per-LOD counters the release zeroes) - so it is run
+// again on the manager with the new sizes and the counts it has, between
+// frames with the command processor and the GPU idle.
+//
+// Both come from the render-target heap. At the start it is grown for the
+// largest entry a live change may reach (live_shadow_room_mib, below); a
+// change is made only when the heap has the room it needs now, and a larger
+// entry applies when the game next starts.
+constexpr std::uint64_t kLightShadowInit = 0x26440b0;
+constexpr std::uint64_t kLightShadowManager = 0x5878;  // the graphics manager's
+constexpr int kShadowLiveTier = 4;  // Ultra: the largest entry the heap is grown for by default
+std::atomic<bool> g_shadow_request{false};
+bool g_shadow_known = false;          // the built-in patch was read for this eboot
+std::uint64_t g_shadow_room_mib = 0;  // what the heap was grown by for the shadow maps
+ShadowMapSizes g_shadow_now{0, 512, 256};  // main thread: the sizes the maps are made at
+std::uint64_t g_shadow_now_mib = 0;        // and what they take past the game's
+
+// The heap's growth for the shadow maps: the starting entry's, and Ultra's
+// so a change up to it fits - except where the GPU's memory is tight (the
+// heap is imported for the GPU whole) or BBHOST_SHADOW_LIVE_ROOM=0. Giga's
+// ~1.8 GB is only there when the game starts at Giga.
+std::uint64_t live_shadow_room_mib() {
+    bool applied = false;
+    g_shadow_known = shadow_resolution_known(&applied);
+    if (!g_shadow_known) return 0;
+    g_shadow_now_mib = applied ? shadow_resolution_more_mib() : 0;
+    if (applied) g_shadow_now = shadow_resolution_sizes();
+    const char* e = std::getenv("BBHOST_SHADOW_LIVE_ROOM");
+    if ((e && e[0] == '0') || host_gpu_memory_tight()) return g_shadow_now_mib;
+    return std::max(g_shadow_now_mib, shadow_resolution_more_mib(kShadowLiveTier));
+}
+
+std::string sun_name(std::uint32_t sun) { return sun ? std::to_string(sun) : std::string("the area's"); }
+
+// The sizes the settings now ask for, made (main thread, at the quiet point).
+void apply_shadow_sizes(std::uint64_t dev, std::uint64_t gm) {
+    const ShadowMapSizes want = shadow_resolution_sizes(), was = g_shadow_now;
+    if (want.sun == was.sun && want.spot == was.spot && want.cube == was.cube) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::uint64_t want_mib = shadow_resolution_more_mib();
+    std::uint64_t largest = 0;
+    const std::uint64_t free_mib = target_heap_free_mib(dev, &largest);
+    // The release goes first in both, so a change needs what the new maps
+    // take past the old; and the largest single map (a cube's six faces are
+    // one texture) a block of its own.
+    const std::uint64_t need = want_mib > g_shadow_now_mib ? want_mib - g_shadow_now_mib : 0;
+    const std::uint64_t biggest = std::max({4ull * want.sun * want.sun, 4ull * want.spot * want.spot, 24ull * want.cube * want.cube}) >> 20;
+    if (need && (free_mib < need + 64 || largest < biggest)) {
+        host_log("shadows: the sun %s, lamps %u, torches %u need %llu MiB more of the render-target heap (%llu free, largest block %llu); "
+                 "they apply when the game next starts",
+                 sun_name(want.sun).c_str(), want.spot, want.cube, (unsigned long long)need, (unsigned long long)free_mib,
+                 (unsigned long long)largest);
+        return;
+    }
+    // The sun's (and the lights' block's) code sites from the settings now:
+    // the game's own bytes when they ask for the game's sizes.
+    bool changed = false;
+    std::string why;
+    if (!patch_manifest_refresh_live("shadow-resolution", want.sun != 0, &changed, &why)) {
+        host_log("shadows: the sizes' code cannot change now (%s); they apply when the game next starts", why.c_str());
+        return;
+    }
+    // The lamps' and torches': the manager made again with the counts it has.
+    const std::uint64_t mgr = at_<std::uint64_t>(gm + kLightShadowManager);
+    const char* lights = "made again";
+    ShadowMapSizes made = want;
+    if (want.spot != was.spot || want.cube != was.cube) {
+        std::uint32_t block[10] = {want.spot, 0, 0, 0, 0, want.cube, 0, 0, 0, 0};
+        bool ok = mgr != 0;
+        for (int l = 0; ok && l < 4; ++l) {
+            block[1 + l] = static_cast<std::uint32_t>(at_<std::uint64_t>(mgr + 0x10 + 0x18 * l + 8));
+            block[6 + l] = static_cast<std::uint32_t>(at_<std::uint64_t>(mgr + 0xa0 + 0x18 * l + 8));
+            ok = block[1 + l] <= 64 && block[6 + l] <= 64;  // the game's are 2, 4, 6, 10 and 2 a LOD
+        }
+        if (!ok) {
+            lights = "left as they were (the manager is not as expected)";
+            made.spot = was.spot;
+            made.cube = was.cube;
+        } else {
+            const std::uint64_t failed = gx_resources_create_failures();
+            hle_call_guest6(guest_fn(kLightShadowInit), static_cast<std::int64_t>(mgr),
+                            static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(block)), 0, 0, 0, 0);
+            if (gx_resources_create_failures() != failed) {
+                // Not all made: back to the sizes they had, which fit.
+                block[0] = was.spot;
+                block[5] = was.cube;
+                hle_call_guest6(guest_fn(kLightShadowInit), static_cast<std::int64_t>(mgr),
+                                static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(block)), 0, 0, 0, 0);
+                lights = "not all made: back to their sizes";
+                made.spot = was.spot;
+                made.cube = was.cube;
+            }
+        }
+    } else {
+        lights = "as they were";
+    }
+    g_shadow_now = made;
+    g_shadow_now_mib = want_mib;
+    std::uint64_t largest_after = 0;
+    const std::uint64_t free_after = target_heap_free_mib(dev, &largest_after);
+    host_log("shadows: the sun %s -> %s (at the next frame), lamps %u -> %u, torches %u -> %u while the game runs, in %lld ms; the lights' "
+             "maps %s (render-target heap %llu -> %llu MiB free, largest block %llu)",
+             sun_name(was.sun).c_str(), sun_name(want.sun).c_str(), was.spot, made.spot, was.cube, made.cube,
+             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()), lights,
+             (unsigned long long)free_mib, (unsigned long long)free_after, (unsigned long long)largest_after);
+}
+
+// The GX play thread's done event. sub_25b6620 makes the play object (the
+// device's +0x348) with GXRenderThread and three events; the thread
+// (sub_25b6910) sets +0x68 once it has played the queue the frame end handed
+// it (sub_2599af0) and made the frame's flip (0x25b6a68), and the frame end
+// (sub_2598fd0) waits on it before it hands over the next queue (0x25998db,
+// no time limit) and resets it. A Dantelion2 event (vtable 0x56b97a0, the
+// created flag bit 0 of +0x18): slot +0x20 polls it (0 once set), slot +0x18
+// waits for it - one condition wait of a number of microseconds, so it is
+// polled again after.
+constexpr std::uint64_t kPlayObject = 0x348, kPlayDone = 0x68, kEventVtable = 0x56b97a0;
+constexpr int kEventWait = 0x18, kEventPoll = 0x20;
+// How long the change waits for that play: longer than any frame plays -
+// lavapipe takes up to 14 s over a 2560x1440 frame at the Nightmare of
+// Mensis, and by its pixels more than twice that over a 3840x2160 one - so
+// that only a play that is not ending meets it, and the change then waits for
+// a later frame instead.
+constexpr auto kPlayDoneLimit = std::chrono::seconds(60);
+
+// 1: the frame the frame end handed over has been played and flipped; 0: not
+// within the limit; -1: no play object this knows at the device's +0x348.
+int wait_play_done(std::uint64_t dev) {
+    const std::uint64_t play = at_<std::uint64_t>(dev + kPlayObject);
+    const std::uint64_t ev = play ? play + kPlayDone : 0;
+    if (!ev || at_<std::uint64_t>(ev) != guest(kEventVtable) || !(at_<std::uint32_t>(ev + 0x18) & 1)) return -1;
+    const auto poll = [ev] {
+        const auto set = hle_call_guest6(reinterpret_cast<void*>(static_cast<std::uintptr_t>(at_<std::uint64_t>(at_<std::uint64_t>(ev) + kEventPoll))),
+                                         static_cast<std::int64_t>(ev), 0, 0, 0, 0, 0);
+        return static_cast<std::int32_t>(set) == 0;
+    };
+    const auto until = std::chrono::steady_clock::now() + kPlayDoneLimit;
+    while (!poll()) {
+        if (std::chrono::steady_clock::now() >= until) return 0;
+        call_slot(ev, kEventWait, 100000);  // a tenth of a second at a time
+    }
+    return 1;
+}
+
 // The quiet point. The present step (sub_21976e0, main thread) queues the
 // frame's command context (sub_2594340) and calls the GX device's frame end,
 // sub_2598fd0 (0x2197853). In the device's queued mode (+0x84) that swaps
@@ -953,33 +1344,112 @@ void confirm_tick() {
 // while the main loop goes on and the workers record the next frame. So the
 // change goes right after that call returns, before the main loop moves on:
 // the call is sent through a stub whose host side makes it itself, then
-// waits for the frame it ended to be shown (two flips: the queue runs a
-// frame behind), for the command processor and the host GPU to finish, and
+// waits for the GX thread to have played the frame it ended (its done event,
+// wait_play_done), for the command processor and the host GPU to finish, and
 // resizes. Nothing records meanwhile (the main thread is here) and nothing
-// recorded is still to be played.
+// recorded is still to be played. It waited for two flips, at most 500 ms:
+// a frame that played longer (lavapipe's at 1440p, 7 to 14 s) was still in
+// YEBIS's flip pass (sub_25d5f80) when the change's broadcast shut YEBIS
+// down (sub_25d2830 releases the post effect's constant buffer at +0x70 and
+// stores 0), and the pass's update of it (sub_2568a20) read the null
+// resource's bind flags. A play that does not end within the limit leaves
+// the change for a later frame rather than shutting YEBIS down under it.
+// Shadow resolution's change (apply_shadow_sizes), which releases maps the
+// play may still read, waits the same way and is kept for later with it.
+//
+// The wait cannot hold the play up: the main thread waits holding no lock of
+// the game's (the present step takes none around the frame end, which has
+// returned) nor of the host's (the hook keeps only atomics; the event's own
+// mutex is let go by its condition wait), and the play and its flip need
+// nothing of the main thread - the game's own frame end waits on the same
+// event, with no limit, every frame.
 GUEST_ABI std::int64_t present_frame_end_hook(std::uint64_t, const std::uint64_t* saved) {
     const std::uint64_t dev = saved[5];  // rdi
     const std::uint64_t f0 = hle_video_flip_count();
     if (g_next_test < g_tests.size() && f0 >= g_tests[g_next_test].first) g_request.store(g_tests[g_next_test++].second);
     const bool settled = std::chrono::steady_clock::now().time_since_epoch().count() >= g_request_not_before.load();
-    const std::uint64_t req = settled ? g_request.exchange(0) : 0;
+    std::uint64_t req = settled ? g_request.exchange(0) : 0;
+    const bool shadows = g_shadow_request.exchange(false);
     hle_call_guest6(guest_fn(kFrameEnd), static_cast<std::int64_t>(dev), 0, 0, 0, 0, 0);
     if (!g_old_depth.empty()) release_old_depth(f0);
+    if (!g_old_back.empty()) release_old_back(f0);
+    render_scale_flip(f0);
     confirm_tick();
-    if (!req) return 1;  // the frame end ran; back to the caller
+    // A request at the size the game has is made only as a rebuild there
+    // (live_resolution_rebuild); else it is dropped.
+    bool rebuild = false;
+    if (req && req == g_current.load()) {
+        rebuild = g_rebuild.exchange(false);
+        if (!rebuild) {
+            g_request_confirm.store(false);
+            req = 0;
+        }
+    }
+    // The back buffer for the window's display (a move to another display,
+    // a display's mode changed), or for a requested size past it.
+    const std::uint64_t sized = req ? req : g_current.load();
+    const std::uint64_t back = sized ? back_buffer_wanted(static_cast<std::uint32_t>(sized >> 32), static_cast<std::uint32_t>(sized)) : 0;
+    if (!req && !shadows && !back) return 1;  // the frame end ran; back to the caller
     const auto w = static_cast<std::uint32_t>(req >> 32), h = static_cast<std::uint32_t>(req);
-    if (req == g_current.load()) {
-        g_request_confirm.store(false);
+    const int played = wait_play_done(dev);
+    if (played == 0) {
+        // Kept for a later frame (a request made meanwhile stands instead),
+        // and the shadow maps' change with it.
+        std::uint64_t none = 0;
+        if (req && g_request.compare_exchange_strong(none, req) && rebuild) g_rebuild.store(true);
+        if (shadows) g_shadow_request.store(true);
+        static bool logged = false;  // main thread
+        if (!logged) {
+            logged = true;
+            if (req)
+                host_log("resolution: the frame before the change to %ux%u was still being played after %lld s; the change waits for a "
+                         "later frame",
+                         w, h, static_cast<long long>(kPlayDoneLimit.count()));
+            else
+                host_log("resolution: the frame before the shadow maps' change was still being played after %lld s; the change waits "
+                         "for a later frame",
+                         static_cast<long long>(kPlayDoneLimit.count()));
+        }
         return 1;
     }
-    const auto start = std::chrono::steady_clock::now();
-    while (hle_video_flip_count() < f0 + 2 && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500))
-        host_sleep_us(200);
+    if (played < 0) {
+        static bool logged = false;  // main thread
+        if (!logged) {
+            logged = true;
+            host_log("resolution: no GX play thread's done event at the device's +0x%llx; the change waits for two flips instead",
+                     static_cast<unsigned long long>(kPlayObject));
+        }
+        const auto start = std::chrono::steady_clock::now();
+        while (hle_video_flip_count() < f0 + 2 && std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500))
+            host_sleep_us(200);
+    }
     hle_gnm_cp_drain();  // the command processor has run everything submitted
     host_gpu_flush();    // and the host GPU has finished it
+    if (shadows) {
+        std::uint64_t d = 0, gm = 0;
+        if (device_ready(&d, &gm)) apply_shadow_sizes(d, gm);
+    }
+    if (back) {
+        // Made again, then everything that took the old one rebuilt by the
+        // change's broadcast - at the size asked for, or else at the size it
+        // has (a rebuild there).
+        const auto bw = static_cast<std::uint32_t>(back >> 32), bh = static_cast<std::uint32_t>(back);
+        if (remake_back_buffer(dev, bw, bh)) {
+            if (!req) req = g_current.load();
+        } else {
+            g_back_failed = back;
+            if (req && (w > g_display[0] || h > g_display[1])) {
+                host_log("resolution: %ux%u is past the back buffer (%ux%u); it applies at the next start", w, h, g_display[0], g_display[1]);
+                if (g_request_confirm.exchange(false)) g_answer.store(2);
+                req = 0;
+            }
+        }
+    }
+    if (!req) return 1;
+    const auto rw = static_cast<std::uint32_t>(req >> 32), rh = static_cast<std::uint32_t>(req);
     const bool confirm = g_request_confirm.exchange(false);
     const std::uint64_t before = g_current.load();
-    if (resize(w, h)) {
+    if (resize(rw, rh)) {
         if (confirm) {
             g_before_asked.store(before);
             g_confirm = Confirm::ToOpen;
@@ -1003,11 +1473,19 @@ GUEST_ABI std::int64_t gx_init_call_hook(std::uint64_t, const std::uint64_t* sav
     const std::int64_t ok = hle_call_guest6(guest_fn(kGxInit), static_cast<std::int64_t>(saved[5]), 0, 0, 0, 0, 0);
     std::uint64_t dev = 0, gm = 0;
     device_ready(&dev, &gm);
+    // The back buffer at the window's display's size (remake_back_buffer),
+    // before anything has taken the one the init made at the scan-out
+    // buffers' size.
+    if (dev && g_back_start && !remake_back_buffer(dev, static_cast<std::uint32_t>(g_back_start >> 32), static_cast<std::uint32_t>(g_back_start)))
+        g_back_failed = g_back_start;
+    // The init made the GPU device and with it the upscaler; the graphics
+    // manager is built after it: its size, or the full one with no upscaler.
+    render_scale_gx_init(g_display[0], g_display[1], hle_video_flip_count());
     const std::uint64_t out = dev ? at_<std::uint64_t>(dev + 0x90) : 0;
     if (out) {
         const std::uint32_t w = g_res_words[0], h = g_res_words[1];
-        host_log("resolution: display buffers %ux%u, rendering %ux%u; the scene renders %s", at_<std::uint32_t>(out + 0x80),
-                 at_<std::uint32_t>(out + 0x84), w, h, scene_target_path(w, h));
+        host_log("resolution: back buffer %ux%u (scan-out buffers %ux%u), rendering %ux%u; the scene renders %s", g_display[0], g_display[1],
+                 g_reserved[0], g_reserved[1], w, h, scene_target_path(w, h));
         at_<std::uint32_t>(out + 0x80) = w;
         at_<std::uint32_t>(out + 0x84) = h;
         at_<float>(out + 0x88) = 0.0f;
@@ -1060,7 +1538,13 @@ bool pin_display_read(ElfImage* image, std::uint64_t site, std::uint64_t word, s
 // little to spare: +1 GiB fits, but +2 GiB left no room for
 // GFX_GraphicsPrivateB (it was not made, and its allocations went to the
 // grown heap - nothing gained) and +3 GiB failed at the start. So past 1 GiB
-// the direct memory grows by the same amount (hle_kernel_set_dmem_size). The
+// the direct memory grows by the same amount (hle_kernel_set_dmem_size) - as
+// far as the guest's direct-memory window goes (7936 MiB, the most it holds:
+// 1792 more), so the heap grows by at most 2816 MiB, about 11.5 million
+// pixels. Grown past what the window granted, the heaps after it in the table
+// found no room (GFX_GraphicsPrivateB's 886 MiB the first), and at 7680x2160
+// the whole picture was black. Larger sizes draw their 3D at a render size
+// (engine/render_scale.cpp), and the heap is sized for that instead. The
 // memory is the PC's but pinned for the GPU, so a
 // run is not grown for sizes it will not reach: a run with live changes
 // covers 3440x1440's pixels (+1088 MiB, about v0.2.5's +1 GiB) or its
@@ -1082,16 +1566,28 @@ std::uint64_t gfx_heap_more_mib(std::uint64_t px) {
     return std::max(mib, kFitsInDmemMiB);
 }
 
+// The Shadow resolution setting's shadow maps (engine/patch_manifest.cpp
+// shadow_resolution_manifest) are made from this heap as the game starts, the
+// stock heap's room short of them at High (~1.7 GiB): their cost comes on top
+// of the render size's, and what a live change may reach is worked out from
+// the render size's share alone.
 void grow_gfx_heap(ElfImage* image, std::uint64_t px) {
     constexpr std::uint64_t kGfxPrivate = 0x4b36d40 + 1 * 0x80 + 3 * 8;
     constexpr std::uint64_t kGfxPrivateStock = 0x8ef00000ull;
     const char* e = std::getenv("BBHOST_GFX_HEAP_MORE_MIB");
     const bool given = e && *e;
-    std::uint64_t more = given ? std::strtoull(e, nullptr, 10) : gfx_heap_more_mib(px);
+    const std::uint64_t room = live_shadow_room_mib();  // (and what a live change starts from)
+    const std::uint64_t shadows = given ? 0 : room;
+    std::uint64_t more = given ? std::strtoull(e, nullptr, 10) : gfx_heap_more_mib(px) + shadows;
     if (!more) {
         if (!given) g_live_max_px = px;
         return;
     }
+    // The most pixels the heap's growth past the shadows' holds.
+    const auto px_for = [&](std::uint64_t mib) {
+        const double r = static_cast<double>(mib) - static_cast<double>(shadows) - 256.0;
+        return kPx1080 + static_cast<std::uint64_t>(std::max(0.0, r) / 270.0 * 1e6);
+    };
     auto* sz = static_cast<std::uint64_t*>(guest_ptr(image->mem, guest(kGfxPrivate)));
     if (*sz != kGfxPrivateStock) {
         host_log("resolution: refused, GFX_GraphicsPrivate's size is 0x%llx, not 0x%llx", (unsigned long long)*sz,
@@ -1104,15 +1600,28 @@ void grow_gfx_heap(ElfImage* image, std::uint64_t px) {
         return;
     }
     const std::uint64_t dmem_more = more > kFitsInDmemMiB ? more - kFitsInDmemMiB : 0;
-    if (dmem_more && !hle_kernel_set_dmem_size(hle_kernel_dmem_size() + (dmem_more << 20))) {
+    const std::uint64_t dmem_before = hle_kernel_dmem_size();
+    if (dmem_more && !hle_kernel_set_dmem_size(dmem_before + (dmem_more << 20))) {
         more = kFitsInDmemMiB;  // the direct memory exists already: what fits in it
-        px = kPx1080 + static_cast<std::uint64_t>((static_cast<double>(more) - 256.0) / 270.0 * 1e6);
+        px = px_for(more);
+    } else if (const std::uint64_t granted = (hle_kernel_dmem_size() - dmem_before) >> 20; granted < dmem_more) {
+        // The window's end: what it granted, and the heaps after this one keep their room.
+        host_log("resolution: the direct memory grew by %llu MiB of the %llu asked (the guest's window is full); the render-target heap grows by %llu MiB",
+                 (unsigned long long)granted, (unsigned long long)dmem_more, (unsigned long long)(kFitsInDmemMiB + granted));
+        more = kFitsInDmemMiB + granted;
+        px = std::min(px, px_for(more));
     }
+    if (more < shadows)
+        host_log("resolution: the heap grew by %llu MiB, short of the %llu MiB Shadow resolution's maps take: areas' "
+                 "meshes and textures may not all be made - a lower Shadow resolution fits",
+                 (unsigned long long)more, (unsigned long long)shadows);
     *sz = kGfxPrivateStock + (more << 20);
     g_live_max_px = given ? ~0ull : px;
-    host_log("resolution: GFX_GraphicsPrivate %llu -> %llu MiB, direct memory %llu MiB - live changes up to %.1f million pixels",
-             (unsigned long long)(kGfxPrivateStock >> 20), (unsigned long long)(*sz >> 20), (unsigned long long)(hle_kernel_dmem_size() >> 20),
-             given ? 99.9 : static_cast<double>(px) / 1e6);
+    g_shadow_room_mib = given ? more : std::min(shadows, more);
+    host_log("resolution: GFX_GraphicsPrivate %llu -> %llu MiB (%llu MiB of it Shadow resolution's), direct memory %llu MiB - live "
+             "changes up to %.1f million pixels",
+             (unsigned long long)(kGfxPrivateStock >> 20), (unsigned long long)(*sz >> 20), (unsigned long long)shadows,
+             (unsigned long long)(hle_kernel_dmem_size() >> 20), given ? 99.9 : static_cast<double>(px) / 1e6);
 }
 
 }  // namespace
@@ -1121,29 +1630,38 @@ bool live_resolution_install(ElfImage* image) {
     g_slide = image->mem.slide;
     g_image = image;
     int w = 0, h = 0;
-    if (!host_opt_resolution(&w, &h)) w = 1920, h = 1080;
+    if (!host_opt_output_size(&w, &h)) w = 1920, h = 1080;
     const bool live = [] {
         const char* e = std::getenv("BBHOST_LIVE_RESOLUTION");
         return !(e && e[0] == '0');
     }();
     const std::uint64_t start_px = static_cast<std::uint64_t>(w) * static_cast<std::uint32_t>(h);
     const bool tight = live && host_gpu_memory_tight();
-    // How large a live change may go: the largest display's size (a picture
-    // larger than every screen only scales down), or the starting size when
-    // that is larger. The display buffers and the render-target heap are made
-    // for it at the start and cost memory pinned for the GPU for the whole
-    // run whether a change ever comes or not - made at 5120x2160 they were
-    // 4 x 42.5 MiB of display buffers, a 5120x2160 depth target, whole-image
-    // clears of them every frame and +1,088 MiB of heap on a 1080p screen.
-    // A larger entry applies at the next start (live_resolution_can).
+    // How large a live change may go: the largest display's size, the widest
+    // and the tallest apart (a picture larger than every screen only scales
+    // down), or the starting size when that is larger - the scan-out buffers'
+    // size (g_reserved), which the back buffer may grow to while the game runs
+    // (remake_back_buffer). The back buffer itself starts at the size of the
+    // display the window is on - before the window is made, the primary
+    // display's, where it opens (as options' output_for). The scan-out buffers
+    // and the render-target heap are made for the largest at the start and
+    // cost memory pinned for the GPU for the whole run whether a change ever
+    // comes or not - made at 5120x2160 they were 4 x 42.5 MiB of display
+    // buffers, a 5120x2160 depth target, whole-image clears of them every
+    // frame and +1,088 MiB of heap on a 1080p screen. A larger entry applies
+    // at the next start (live_resolution_can).
     // BBHOST_LIVE_MAX=<w>x<h> sets the size, =max the Resolution setting's
-    // largest entries (5120x2160), as before.
-    std::uint32_t max_w = kMaxW, max_h = kMaxH;
-    const char* max_why = "the Resolution setting's largest entries";
+    // largest entries (11520 wide, 4320 tall).
+    std::uint32_t max_w = kNoDisplayW, max_h = kNoDisplayH;
+    const char* max_why = "no display size; up to 5120x2160";
     int desk_w = 0, desk_h = 0;
     if (const char* e = std::getenv("BBHOST_LIVE_MAX"); e && *e) {
         unsigned ew = 0, eh = 0;
-        if (std::strcmp(e, "max") != 0 && std::sscanf(e, "%ux%u", &ew, &eh) == 2 && ew && eh) {
+        if (std::strcmp(e, "max") == 0) {
+            max_w = kMaxW;
+            max_h = kMaxH;
+            max_why = "BBHOST_LIVE_MAX=max: the Resolution setting's largest entries";
+        } else if (std::sscanf(e, "%ux%u", &ew, &eh) == 2 && ew && eh) {
             max_w = std::min<std::uint32_t>(ew, kMaxW);
             max_h = std::min<std::uint32_t>(eh, kMaxH);
             max_why = "BBHOST_LIVE_MAX";
@@ -1170,6 +1688,10 @@ bool live_resolution_install(ElfImage* image) {
     const std::uint64_t live_px = std::max(start_px, std::min(static_cast<std::uint64_t>(max_w) * max_h, kPxLiveDefault));
     install_water_wave_full();  // at any size, live changes or not (before the heap's size, which counts it)
     grow_gfx_heap(image, !live ? start_px : live_px);
+    if (!std::getenv("BBHOST_GFX_HEAP_MORE_MIB") && start_px > g_live_max_px)
+        host_log("resolution: %dx%d (%.1f million pixels) is more than the render-target heap holds (%.1f million): its targets may not "
+                 "all be made - Upscaling below Native AA draws the 3D at a size that fits",
+                 w, h, static_cast<double>(start_px) / 1e6, static_cast<double>(g_live_max_px) / 1e6);
     if (tight)
         host_log("resolution: live changes up to %.1f million pixels, the GPU's memory is tight (larger sizes apply at the next start)",
                  static_cast<double>(g_live_max_px) / 1e6);
@@ -1181,10 +1703,16 @@ bool live_resolution_install(ElfImage* image) {
     g_manager_slot = static_cast<const std::uint64_t*>(guest_ptr(image->mem, guest(kGraphicsManagerSlot)));
     g_res_words = static_cast<const std::uint32_t*>(guest_ptr(image->mem, guest(kResWidth)));
     // The widest and tallest entry a live change can reach (above), or the
-    // starting size when larger.
-    g_display[0] = std::max<std::uint32_t>(max_w, static_cast<std::uint32_t>(w));
-    g_display[1] = std::max<std::uint32_t>(max_h, static_cast<std::uint32_t>(h));
+    // starting size when larger: the scan-out buffers, and the back buffer
+    // until the GX init's hook makes it at the window's display's size.
+    g_reserved[0] = g_display[0] = std::max<std::uint32_t>(max_w, static_cast<std::uint32_t>(w));
+    g_reserved[1] = g_display[1] = std::max<std::uint32_t>(max_h, static_cast<std::uint32_t>(h));
     host_log("resolution: live changes up to %ux%u (%s); larger sizes apply at the next start", g_display[0], g_display[1], max_why);
+    if (g_back_follows && (host_window_display_now(&desk_w, &desk_h) || host_desktop_primary_size(&desk_w, &desk_h))) {
+        g_back_start = pack(std::min(std::max(static_cast<std::uint32_t>(desk_w), static_cast<std::uint32_t>(w)), g_reserved[0]),
+                            std::min(std::max(static_cast<std::uint32_t>(desk_h), static_cast<std::uint32_t>(h)), g_reserved[1]));
+        if (g_back_start == pack(g_reserved[0], g_reserved[1])) g_back_start = 0;
+    }
 
     // Every edit is checked before any is made, so a mismatch leaves the
     // image as it was. The call sites and prologues are checked by the hooks
@@ -1214,6 +1742,8 @@ bool live_resolution_install(ElfImage* image) {
     if (!install_display_rect_stubs())
         host_log("resolution: the render-target viewport code is not as expected; debug draws keep the display buffers' size");
     g_both_sides = install_scene_both_sides();
+    // Render scale's back buffer goes through the colour test edited above.
+    render_scale_install(image);
     if (!engine_prologue_hook(image, guest(kGxFree), free_pro, sizeof(free_pro), reinterpret_cast<void*>(&gx_free_hook)) ||
         !engine_prologue_hook(image, guest(kGxFreeRecord), free_rec_pro, sizeof(free_rec_pro), reinterpret_cast<void*>(&gx_free_record_hook)) ||
         !engine_prologue_hook(image, guest(kSwfPlayerCtor), swf_ctor_pro, sizeof(swf_ctor_pro), reinterpret_cast<void*>(&swf_player_ctor_hook)) ||
@@ -1283,7 +1813,9 @@ bool live_resolution_available() {
 }
 
 bool live_resolution_can(unsigned w, unsigned h) {
-    return g_installed && w && h && w <= g_display[0] && h <= g_display[1] && static_cast<std::uint64_t>(w) * h <= g_live_max_px;
+    // Past the back buffer, up to the scan-out buffers: it grows first (back_buffer_wanted).
+    const std::uint32_t* most = g_back_follows ? g_reserved : g_display;
+    return g_installed && w && h && w <= most[0] && h <= most[1] && static_cast<std::uint64_t>(w) * h <= g_live_max_px;
 }
 
 bool live_resolution_request(unsigned w, unsigned h, bool confirm) {
@@ -1299,6 +1831,13 @@ bool live_resolution_request(unsigned w, unsigned h, bool confirm) {
 }
 
 int live_resolution_take_answer() { return g_answer.exchange(0); }
+
+void live_resolution_rebuild() {
+    if (!g_installed) return;
+    g_rebuild.store(true);
+    g_request_not_before.store(0);
+    g_request.store(g_current.load());
+}
 
 void live_resolution_go_back() {
     const std::uint64_t b = g_before_asked.exchange(0);
@@ -1321,4 +1860,12 @@ std::uint64_t live_resolution_current(unsigned* w, unsigned* h) {
     if (w) *w = static_cast<unsigned>(c >> 32);
     if (h) *h = static_cast<unsigned>(c & 0xffffffffu);
     return g_applied.load();
+}
+
+void live_shadows_request() {
+    if (g_installed && g_shadow_known) g_shadow_request.store(true);
+}
+
+bool live_shadows_can(int tier) {
+    return g_installed && g_shadow_known && shadow_resolution_more_mib(tier) <= g_shadow_room_mib;
 }

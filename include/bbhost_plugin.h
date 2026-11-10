@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 17.
+/* bbhost plugin API, version 28.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 17
+#define BB_PLUGIN_API_VERSION 28
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -115,6 +115,15 @@ typedef struct BbChr {
                                      vanilla player can be summoned into a world this plugin made; the
                                      server lets players advertising it (X-BBHost-Adopt) meet across
                                      this plugin's rules */
+#define BB_PLUGIN_LIVE_SWITCH 8u  /* version 21: turned on and off while the game runs. With BB_PLUGIN_OPT_IN it
+                                     is loaded even when off - bb_plugin_init and bb_plugin_image run, and
+                                     config("plugins.<name>") says whether it is on ("true") - and asks for
+                                     nothing until it is; the player's switch then comes to on_option as
+                                     the key "" ("true" or "false"), on the main thread, and the plugin
+                                     applies or takes back what it does. Not for BB_PLUGIN_GAMEPLAY
+                                     plugins (their rules are the session's): the host ignores it there. */
+#define BB_PLUGIN_AA_LEAVE 16u    /* version 27: starts with aa_claim's BB_AA_LEAVE ... */
+#define BB_PLUGIN_AA_TAKE 32u     /* ... or BB_AA_TAKE (both: TAKE) - the setup window reads it before the plugin runs */
 typedef struct BbPluginInfo {
     uint32_t api_version;    /* BB_PLUGIN_API_VERSION it was built against */
     uint32_t flags;          /* BB_PLUGIN_* */
@@ -148,6 +157,12 @@ typedef struct BbPluginInfo {
 #define BB_OPT_HEADING 7   /* a section title: label (and help) only */
 #define BB_OPT_LIVE 0x100u /* or-ed into type: takes effect at once in game
                               (on_option); without it, at the next start */
+#define BB_OPT_WHEN 0x200u /* version 21, or-ed into the type of any option but a
+                              CHOICE: its `choices` is "key=value" ("key=a|b" for any
+                              of them), and the menus grey the row out unless the
+                              plugin's option `key` holds that value (older hosts
+                              show it as always). On a HEADING it covers the rows
+                              under it, up to the next heading. */
 typedef struct BbOption {
     uint32_t type;        /* BB_OPT_*, maybe | BB_OPT_LIVE */
     const char* key;      /* the config key; an action's id */
@@ -189,6 +204,158 @@ typedef struct BbCamera {
     float aspect;          /* width over height */
     float near_z, far_z;   /* the clip planes' distances */
 } BbCamera;
+
+/* Version 23: view_cutaway2's numbers. */
+typedef struct BbCutaway {
+    float distance;      /* metres from the camera to the point it looks at */
+    float pitch;         /* radians the view looks down below the horizon */
+    float radius;        /* metres about the view's axis at that point (0: off) */
+    float widen;         /* metres wider for each metre nearer the camera */
+    float height;        /* metres above the point looked at where the cut starts */
+    float margin;        /* metres in front of the point looked at where the cut starts */
+    float feather;       /* metres over which it fades in */
+} BbCutaway;
+
+/* Version 27: the frame as bbhost draws it, for effects of a plugin's own
+ * recorded into it (frame_info, on_render), and who does the anti-aliasing
+ * (aa_claim).
+ *
+ * The conventions. A matrix is 16 floats in column-major order (m[column * 4
+ * + row]: GLSL's mat4 and GLM's layout, HLSL's column_major) applied to
+ * column vectors: clip = proj * view * (x, y, z, 1). The world is the game's,
+ * in metres, y up (player_position's, BbCamera's). The view: x right, y up, z
+ * the way the camera looks, in metres. Clip space is Vulkan's over the 3D's
+ * images: divided by w (the view's z), x runs from -1 at their left edge to +1
+ * at their right, y from -1 at their top to +1 at their bottom, and z is the
+ * value the G-buffer's depth holds - 0 at the near plane and 1 at the far one
+ * as the game draws (the other way round with BB_FRAME_DEPTH_REVERSED). A
+ * pixel (px, py) of a w x h image is centred at ((px + 0.5) / w * 2 - 1,
+ * (py + 0.5) / h * 2 - 1); the picture at the output size covers the same
+ * view. Angles are radians, sizes pixels, times seconds. */
+
+/* A camera as the frame drew it - an on_view plugin's change included -
+ * without the jitter. */
+typedef struct BbFrameCamera {
+    BbCamera camera;          /* its basis (right, up, forward) and eye in the world - the four in a row are its
+                                 view-to-world matrix, column by column - fov_y, aspect, and near_z and far_z: the
+                                 view distances the depth's 0 and 1 stand for (1e6 at most: an infinite far plane) */
+    float view[16];           /* world to view */
+    float proj[16];           /* view to clip. The frame's camera draws were moved by the jitter: their projection is
+                                 this one with m[8] = 2 * jitter_x / render_width and m[9] = 2 * jitter_y / render_height */
+    float view_proj[16];      /* proj * view: world to clip */
+    float inv_view_proj[16];  /* clip to world: a pixel's (x, y, depth, 1) to a world point times w */
+} BbFrameCamera;
+
+#define BB_FRAME_CAMERA 1u          /* `now` is this frame's: its camera draws were seen (else the last known; reset) */
+#define BB_FRAME_PREV 2u            /* `prev` is the last frame's (else this frame's again) */
+#define BB_FRAME_CUT 4u             /* the camera jumped since the last frame - moved more than 4 m, turned more than 75
+                                       degrees or its field of view by more than 10: a cut (reset) */
+#define BB_FRAME_DEPTH_REVERSED 8u  /* the depth holds 1 at the near plane and 0 at the far one */
+#define BB_FRAME_AA_PLUGIN 16u      /* a plugin does the anti-aliasing (aa_claim's BB_AA_TAKE): bbhost's is off */
+
+#define BB_UPSCALE_NONE 0u  /* BbFrameInfo.method: the 3D is the picture as drawn - Upscaling Off, an upscaler this
+                               machine cannot run, or a plugin's anti-aliasing */
+#define BB_UPSCALE_DLSS 1u
+#define BB_UPSCALE_FSR 2u   /* FSR 3 or FSR 4 */
+#define BB_UPSCALE_TAA 3u   /* bbhost's own */
+
+#define BB_QUALITY_NATIVE 0u      /* the 3D at the picture's size: DLAA, FSR's native AA, TAA */
+#define BB_QUALITY_QUALITY 1u     /* two thirds each way - also a Resolution below the window's, whatever its share */
+#define BB_QUALITY_BALANCED 2u    /* about 59% */
+#define BB_QUALITY_PERFORMANCE 3u /* half */
+
+/* What a 3D frame is (frame_info, BbRenderCall.frame). Size first: a newer
+ * host appends fields after `prev`. */
+typedef struct BbFrameInfo {
+    uint32_t size;            /* the bytes filled */
+    uint32_t flags;           /* BB_FRAME_* */
+    uint64_t frame;           /* 1 for the first 3D frame described, one more for each after it (a frame without the
+                                 3D - a loading screen - is none) */
+    uint64_t flip;            /* the host's flips so far as it was recorded: its log's flip numbers */
+    uint32_t render_width, render_height;  /* the 3D's: the scene's, the depth's, the motion's and the glow's size */
+    uint32_t output_width, output_height;  /* the picture's: the upscaler's output, the 3D's size without one */
+    uint32_t method;          /* BB_UPSCALE_*: what takes the 3D to the picture this frame */
+    uint32_t quality;         /* BB_QUALITY_*, as the upscaler is told it (the sizes are exact) */
+    float jitter_x, jitter_y; /* render pixels this frame's camera draws were moved by, +x right, +y down: what the
+                                 upscaler is told; 0 when none runs */
+    float frame_seconds;      /* real time since the last frame described */
+    uint32_t reset;           /* 1: nothing to blend with - the first frame, a new render or output size or method,
+                                 no camera this frame or the last, a cut, or more than a quarter of a second since the
+                                 last frame */
+    BbFrameCamera now;        /* this frame's camera */
+    BbFrameCamera prev;       /* the last frame's */
+} BbFrameInfo;
+
+/* on_render's points, and what a hook may ask for. */
+#define BB_RENDER_BEFORE_UPSCALE 1u /* the 3D drawn - lit, its transparency on it - before the upscaler, TAA, the
+                                       embers, the sharpening and frame generation read it; with none running too */
+#define BB_RENDER_AFTER_UPSCALE 2u  /* the final picture, after all of them, before the post-processing copies it */
+#define BB_RENDER_MOTION 0x100u     /* or-ed in: the frame's motion made for the hooks (BbRenderCall.motion) whether
+                                       or not an upscaler or frame generation runs */
+
+#define BB_IMAGE_WRITE 1u  /* BbRenderImage.flags: the hook may write it */
+
+/* An image of the frame as Vulkan has it (cast to the Vulkan types). */
+typedef struct BbRenderImage {
+    uint64_t image;       /* VkImage; 0: not in this call */
+    uint64_t view;        /* VkImageView: 2D, its one level and layer, its format (a depth image's depth aspect) */
+    uint64_t generation;  /* a new number whenever the host makes the image or its view again (a Resolution change):
+                             while it stays the same, the handles are the same image and view in every call */
+    uint32_t format;      /* VkFormat */
+    uint32_t layout;      /* VkImageLayout it is in - and must be in again when the hook returns */
+    uint32_t usage;       /* VkImageUsageFlags it was made with: what the hook can do with it */
+    uint32_t width, height;
+    uint32_t flags;       /* BB_IMAGE_* */
+} BbRenderImage;
+
+typedef void (*BbVkVoidFunction)(void);
+
+/* The Vulkan device bbhost draws with: one for the run. */
+typedef struct BbRenderDevice {
+    uint32_t size;              /* sizeof(BbRenderDevice) as the host fills it */
+    uint32_t api_version;       /* the Vulkan version it is used at (1.3), with synchronization2, buffer device
+                                   address and storage images read and written without a format */
+    void* instance;             /* VkInstance */
+    void* physical_device;      /* VkPhysicalDevice */
+    void* device;               /* VkDevice */
+    BbVkVoidFunction (*get_instance_proc_addr)(void* instance, const char* name); /* vkGetInstanceProcAddr */
+    BbVkVoidFunction (*get_device_proc_addr)(void* device, const char* name);     /* vkGetDeviceProcAddr */
+    uint32_t queue_family;      /* the family of the queue the frames go to: graphics, compute and transfer */
+    uint32_t frames_in_flight;  /* what a hook records may still be read by the GPU this many frames later: a
+                                   resource its commands used is destroyed (or written again) no sooner */
+} BbRenderDevice;
+
+/* One call of a render hook. Size first: a newer host appends fields after
+ * `picture`. */
+typedef struct BbRenderCall {
+    uint32_t size;                 /* sizeof(BbRenderCall) as the host fills it */
+    uint32_t point;                /* BB_RENDER_BEFORE_UPSCALE or BB_RENDER_AFTER_UPSCALE */
+    void* command_buffer;          /* VkCommandBuffer: the frame's, recording, outside any render pass (this call only) */
+    const BbFrameInfo* frame;      /* this frame's (this call only) */
+    const BbRenderDevice* device;  /* the run's (valid for the whole run) */
+    BbRenderImage scene;           /* the lit 3D at the render size in linear light, before the post-processing:
+                                      RGBA16F, or B10G11R11 with the Performance patch. Written before the upscale
+                                      (BB_IMAGE_WRITE), read after it. A render target: sampled and transfer, never
+                                      storage - a hook copies or blits its result in */
+    BbRenderImage depth;           /* the G-buffer's depth at the render size, jittered as the scene (read) */
+    BbRenderImage motion;          /* with BB_RENDER_MOTION: R16G16_SFLOAT at the render size, the render pixels from
+                                      each pixel to where its surface was in the last frame, x right, y down, without
+                                      the jitter (read) */
+    BbRenderImage glow;            /* the scene's second target - the effects' glow, which the bloom reads - at the
+                                      render size, when the frame has one (read) */
+    BbRenderImage picture;         /* after the upscale: the final picture at the output size - what the
+                                      post-processing reads (written); the scene itself when no upscaler runs; 0
+                                      before the upscale */
+} BbRenderCall;
+typedef void (*BbRenderFn)(const BbRenderCall* call, void* user);
+
+/* aa_claim's claims. */
+#define BB_AA_NONE 0   /* no claim (the default) */
+#define BB_AA_LEAVE 1  /* the plugin does none and moves no draws: bbhost's runs as the settings say - also beside a
+                          Vulkan layer that would otherwise keep its TAA off */
+#define BB_AA_TAKE 2   /* the plugin does it: while it is on, bbhost moves no draws (no jitter) and runs no TAA, FSR or
+                          DLSS nor the game's own anti-aliasing pass, and draws the 3D at the Resolution, as with
+                          Upscaling Off; the menus name the plugin */
 
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
@@ -359,7 +526,9 @@ typedef struct BbHostApi {
     /* Version 9: settings and actions from the plugin menus, and files. */
     /* fn(key, value, user) when the player changes one of the calling
      * plugin's options in the in-game menu (key without the section; value
-     * as text). `name` is the plugin's BbPluginInfo name. Main thread. */
+     * as text). `name` is the plugin's BbPluginInfo name. Main thread.
+     * Version 21: a BB_PLUGIN_LIVE_SWITCH plugin also gets the key "" when
+     * the player turns it on ("true") or off ("false"). */
     int (*on_option)(const char* name, void (*fn)(const char* key, const char* value, void* user), void* user);
     /* fn(action, user) when the player presses one of the plugin's
      * BB_OPT_ACTION buttons in the in-game menu. Main thread. */
@@ -470,8 +639,9 @@ typedef struct BbHostApi {
      * thread state, on a worker: call only the game's draw code (BB_GUEST_ABI
      * pointers from guest_addr) and nothing of the host's but log. Not called
      * on a frame whose scene has nothing at or after the pass. One pass for
-     * all plugins - a later call replaces it; -1 takes it away. 0 on success;
-     * 1 for another eboot. */
+     * each fn and user (version 17, up to four in all; one for all plugins
+     * before) - a later call with the same fn and user replaces it; -1 takes
+     * it away. 0 on success; 1 for another eboot. */
     int (*on_scene_category)(int32_t pass, void (*fn)(uint64_t cc, void* user), void* user);
 
     /* Version 16. */
@@ -485,10 +655,227 @@ typedef struct BbHostApi {
      * there; pulled toward the viewer a little, its depth written). A shader
      * that shades from the triangle's slope on screen draws its lines dark:
      * white lines are drawn as black ones over white faces, then the faces
-     * again subtracting. No plugin uses it today. */
+     * again subtracting. Version 17: BB_DRAW_DEPTH_ONLY - no colour written,
+     * the depth tested and written; BB_DRAW_DEPTH_EQUAL - the depth tested
+     * less-or-equal and not written, pulled toward the viewer a little: a draw
+     * made depth-only early in the scene (an occluder for the game's
+     * occlusion queries) and again later lands on its own depth. Version 19:
+     * BB_DRAW_GBUFFER - drawn into the G-buffer, where the game's lighting
+     * lights it as it does the map (the sun, the lamps and their shadows, the
+     * fog), with the host's pixel shader in place of the draw's: for the
+     * game's simple coloured draw (the debug draw's), rgb the albedo (linear)
+     * and alpha the face's world normal when negative - -(1 + u + 2048 v), u
+     * and v its octahedral coordinates in 11 bits each (gbuffer_flat.frag).
+     * The draw marks the stencil as the map's G-buffer draws do, which the
+     * lights test. Only where the G-buffer is bound (a pass of the scene
+     * ahead of 3e/13, such as 3e/0c); elsewhere the draw is drawn as it is. */
     void (*draw_style)(int style);
 
-    /* Version 17: the recompiled follow camera's visual target. Register once
+    /* Version 18: the 3D's look. What the camera's draws - the 3D world, its
+     * characters, its sky and effects: the draws with the scene's depth that
+     * are not full-screen rect lists, as the upscaler's jitter takes them - are
+     * drawn with. The shadow maps, the post-processing and the HUD and menus
+     * keep the game's own. scene_scale and scene_colour_bits decide the scene's
+     * targets: call them from bb_plugin_init for the start, or once the game
+     * runs from the main thread (on_frame, on_option), which makes the targets
+     * again at the next quiet point, as a Resolution change does - from
+     * bb_plugin_image they change nothing until then. The others: any thread,
+     * from the next frame. */
+    /* The 3D's vertices moved, as their stage writes them, to the nearest
+     * corner of a grid of the screen `lines` cells high and as many across as
+     * the 3D's shape gives (240: 427 x 240 at 16:9), as the PS1's landed on
+     * its pixels; BB_SNAP_PIXELS the 3D's own pixels; 0 off. */
+    void (*scene_snap)(uint32_t lines);
+    /* How the 3D samples its textures: BB_FILTER_NEAREST - the nearest texel of
+     * the nearest mip, no anisotropy (depth comparisons keep their own) - or
+     * BB_FILTER_AS_IS. */
+    void (*scene_filter)(int filter);
+    /* The 3D's size against the game's: BB_SCALE_NEAREST draws the game, its
+     * HUD and menus at the window's size and the 3D at the Resolution - or
+     * `lines` high (0: the Resolution) as wide as the window's shape - brought
+     * up to the window texel for texel, with no smoothing: no upscaler and no
+     * anti-aliasing; a Resolution as large as the window or larger draws the
+     * 3D at the window's size.
+     * BB_SCALE_AS_IS gives it back to the Resolution, Upscaling and
+     * anti-aliasing settings. */
+    void (*scene_scale)(int scale, uint32_t lines);
+    /* The scene's colour targets - the lit scene, its light and its
+     * reflections - in 8 bits a channel (RGBA8, as the rgba8f patch makes
+     * them), or (0) in the game's and its patches' formats. */
+    void (*scene_colour_bits)(int bits);
+    /* The colour grading's table - the area's CGrading textures
+     * (map/mXX/mXX_cgrading.tpf: m24_00_CGrading0001 ...), copied each frame
+     * into a 16x16x16 table that the post-processing's grading pass samples -
+     * sampled BB_FILTER_NEAREST, the grading stepping from entry to entry (16
+     * shades a channel), or BB_FILTER_AS_IS, smoothly between them. */
+    void (*grading_filter)(int filter);
+    /* Version 19: BB_DRAW_GBUFFER draws' indirect light - what a lightmap
+     * gives the map, which they have none of - from the next frame (0.03 by
+     * default; 0 leaves what no lamp reaches black). */
+    void (*gbuffer_ambient)(float level);
+
+    /* Version 20: the camera the scene is drawn from. */
+    /* fn(cam, user) each frame once the game has copied the player's camera
+     * (on_camera's, after its callbacks) into the scene's, before a scripted
+     * camera (a cutscene's) replaces it: what fn writes is what is drawn, while
+     * the game's own camera - the one the follow camera keeps, the controls
+     * move by and the aim reads - stays as on_camera left it. Not called in
+     * the game state on_camera reaches through its second hook (a warp's).
+     * Main thread. 0 on success; 1 for another eboot. */
+    int (*on_view)(void (*fn)(BbCamera* cam, void* user), void* user);
+
+    /* Version 21: old-hardware sound. Everything the game plays - its final
+     * mix, as it reaches the device - low-passed at `lowpass_hz` (a one-pole
+     * filter: the muffled top end of a PS1-era sound chip), held down to
+     * `rate_hz` (sample-and-hold, the steps kept across buffers), rounded to
+     * `bits` a sample (no dither: the crunch; quieter than half a step is
+     * silence) and, after a hold, smoothed at 0.45 of `rate_hz` as a DAC's
+     * output filter smoothed its steps. 0 turns each off; all three
+     * 0 is the game's own sound, which costs nothing. Any thread, from the
+     * next buffer. */
+    void (*audio_crush)(int rate_hz, int bits, float lowpass_hz);
+
+    /* Version 22: a cutaway for a high camera (the Isometric's). The camera's
+     * draws - the world, its characters, the effects, not the shadows - are
+     * clipped where they lie within `radius` of the view's axis and nearer
+     * than `near_z` along it (both in metres, view space): what stands between
+     * the camera and the character at the screen's middle, `near_z` the
+     * character's distance less a margin. `tan_x` and `tan_y` are the tangents
+     * of half the drawn view's field of view across and up (on_view's fov_y
+     * and aspect). radius 0 turns it off. Each new set of numbers makes the
+     * camera draws' pipelines again (rounded to 1/4 m), so set it as the
+     * distance or the field of view change, not every frame. Any thread. */
+    void (*view_cutaway)(float tan_x, float tan_y, float near_z, float radius);
+
+    /* Version 23: the cutaway per pixel, faded (BbCutaway). The map's own
+     * camera draws (never the characters, the objects or their parts) leave out, in their pixel
+     * stage, what lies within `radius` of the view's axis - `widen` metres
+     * wider for each metre nearer the camera than the point looked at - more
+     * than `height` metres above that point and more than `margin` in front of
+     * it, fading in over `feather` metres at each of those edges (a dither:
+     * the G-buffer has no blending). The view only turns and moves: `pitch`
+     * (radians below the horizon) and `distance` (to the point looked at, at
+     * the screen's middle) place it; the field of view and the depth come from
+     * the drawn view itself. NULL or radius 0 turns it off. Turning it on
+     * makes the camera draws' pipelines again once; after that (since version
+     * 26) the numbers are read live, so a new set each frame - a zoom easing
+     * in - builds nothing. Any thread. */
+    void (*view_cutaway2)(const struct BbCutaway* cut);
+    /* Version 24: view_cutaway2's cone for the map's objects too (never the
+     * characters or what they carry), its tip `start` of the way from the
+     * point looked at toward the camera - 0.5 halfway - and the rest of it
+     * as view_cutaway2 sets it. Below 0 (the default) the objects are never
+     * cut. Read live since version 26: it may change each frame. Any
+     * thread. */
+    void (*view_cutaway_objects)(float start);
+    /* Version 25: the finished picture - the 3D and its post effects, before
+     * the HUD and the menus are drawn over it - rounded to `bits` a channel
+     * through the PS1 GPU's 4x4 ordered dither, a cell of the pattern a pixel
+     * of the 3D (scene_scale's lines: as coarse as the 3D). 5 is the PS1's
+     * 15-bit colour; 0 (the default) off. Any thread. */
+    void (*scene_dither)(uint32_t bits);
+    /* Version 26: the player's Camera Zoom presses (the wheel and the middle
+     * button by default, as bound; in the world only) since the last call:
+     * `steps` notches out (in when negative), `reset` 1 when Camera Zoom
+     * Reset was pressed. From the first call on they are the plugin's and
+     * the game's camera no longer zooms. Any thread. 0 on success. */
+    int (*camera_zoom)(int* steps, int* reset);
+
+    /* Version 27: the frame as it is drawn, plugins' compute work in it,
+     * and who does the anti-aliasing (the conventions above BbFrameCamera). */
+    /* The 3D frame being recorded (inside a hook), else the last one
+     * described, into *out: set out->size to sizeof(*out) first; the host
+     * fills as much as both know and sets out->size to that. From the first
+     * call on (or the first on_render) the host describes every 3D frame.
+     * Any thread. 0 on success; 1 before a frame is described, or for a size
+     * under 8. */
+    int (*frame_info)(BbFrameInfo* out);
+    /* fn(call, user) at each of `points` (BB_RENDER_BEFORE_UPSCALE,
+     * BB_RENDER_AFTER_UPSCALE, or-ed; | BB_RENDER_MOTION for the motion) of
+     * every 3D frame, on the thread that records the frame - not the game's
+     * main thread - with the renderer's lock held: the command buffer is
+     * outside any render pass, every image in `call` is in the layout it
+     * gives, and what the frame wrote to them is visible to compute and
+     * transfer. fn records compute and transfer work only - dispatches,
+     * copies, blits, clears and the barriers between its own steps: no render
+     * pass, draw, graphics pipeline or dynamic state - and leaves each image
+     * in its layout. It never submits, ends the command buffer or waits for
+     * the GPU (no queue, fence, semaphore or query-wait calls), and calls
+     * nothing of the host's but log, frame_info and on_render. The host makes
+     * what fn wrote visible to what follows and binds its own state again
+     * after it. A later call with the same fn and user replaces its points;
+     * no points take it away. `name` is the plugin's BbPluginInfo name: its
+     * hooks are not called while it is off (BB_PLUGIN_LIVE_SWITCH), and go if
+     * it is unloaded. Several hooks run in the order they were registered.
+     * From bb_plugin_init on, any thread. 0 on success; 1 for a bad
+     * argument. */
+    int (*on_render)(const char* name, uint32_t points, BbRenderFn fn, void* user);
+    /* The calling plugin's anti-aliasing claim: BB_AA_NONE, BB_AA_LEAVE or
+     * BB_AA_TAKE (its BbPluginInfo.flags' BB_PLUGIN_AA_* is the claim it
+     * starts with). The strongest claim of the plugins that are on holds -
+     * BB_AA_TAKE before BB_AA_LEAVE - and a plugin that is off has none. From
+     * bb_plugin_init for the start, or once the game runs from the main
+     * thread (on_frame, on_option): the 3D's size follows at the next quiet
+     * point, as at a Resolution change. Never from a render hook. 0 on
+     * success; 1 for a bad argument or from a hook. */
+    int (*aa_claim)(const char* name, int claim);
+
+    /* Version 27: shader overrides (docs/plugins.md, "Shaders") - a plugin's
+     * HLSL in place of one of the game's shaders, as an edited file in
+     * <data>/bbhost/shaders replaces one (docs/modding.md). `shader` is named
+     * as BBHOST_HLSL_DUMP=1 names the shader's file, less ".hlsl":
+     * "GXGuiShader_Tex.ppo@6d921b0b.ps" - its bundle entry and GX's name, then
+     * the stage (vs, ps, hs, ds, gs or cs) - for every variant of the shader in
+     * that stage whose interface the source declares;
+     * "GXGuiShader_Tex.ppo@6d921b0b.ps~7de085b59d21219a" for that one variant;
+     * "<lift hash>.ps" for a shader whose name is not known. The source is
+     * compiled by DXC for each variant met, and drawn with where it declares
+     * the stage's interface (the dumped file's bindings, inputs and outputs)
+     * and its SPIR-V validates; anywhere else the shader keeps its own. Only on
+     * the HLSL path (the Shaders setting's default). The player's own file of
+     * the same name comes first, then the plugin loaded first (by file name).
+     * A change is compiled for the variants met so far, then takes effect at
+     * the shader's next draw, which builds the pipelines drawing with it again
+     * - once: going back to a source drawn with before takes the pipelines made
+     * for it and compiles nothing. A value that changes goes through
+     * shader_data, not the text. Any thread. */
+    /* `hlsl` (UTF-8, ended by a 0, at most 4 MiB) for `shader`; NULL takes the
+     * plugin's away. The same text again changes nothing. 0 on success; 1 for
+     * a name that is no shader's, an unknown plugin or too long a text. */
+    int (*shader_override)(const char* name, const char* shader, const char* hlsl);
+    /* Every <shader>.hlsl file in `dir` - absolute, or relative to the
+     * plugin's own folder (plugin_dir) - as shader_override takes a text, each
+     * read when its shader is built (and again when it changes, with
+     * BBHOST_SHADER_WATCH=1). The plugin's shader_override texts come before
+     * its folders' files, and a folder before the ones added after it. NULL
+     * takes all its folders away. The number of .hlsl files in it, or -1 when
+     * it is not a folder. */
+    int (*shader_folder)(const char* name, const char* dir);
+    /* What became of the plugin's override of `shader` (BB_SHADER_*), and why
+     * into `why` (n bytes with its ending 0; may be NULL): DXC's first error,
+     * the interface that differs, the file or plugin that comes first, why
+     * overrides are off. */
+    int (*shader_state)(const char* name, const char* shader, char* why, size_t n);
+    /* The HLSL this build prints for `shader`, as BBHOST_HLSL_DUMP writes it -
+     * "<name>.<stage>": the first variant this run met; "...~<lift hash>":
+     * that one - so a plugin can patch the game's own source rather than ship
+     * whole copies, which an update that changes the shader's interface
+     * refuses. Into a buffer the host owns until the calling thread's next
+     * call: *hlsl, and its length without the ending 0 in *size. 0 on success;
+     * 1 while no stage of it has been built this run (as the game creates or
+     * first draws it: ask again from on_frame); 2 when overrides do not apply
+     * (BB_SHADER_OFF). */
+    int (*shader_source)(const char* shader, const char** hlsl, size_t* size);
+    /* `size` bytes at `offset` into the plugin's shader data -
+     * BB_SHADER_DATA_BYTES of its own, 0 at the start - which its overrides
+     * read with bbhost.hlsli's bb_data_* (#include "bbhost.hlsli"). Each frame's
+     * draws read one copy: the data as it stood when the frame before had been
+     * recorded, so write what goes together in one call. Changing it builds
+     * nothing. Any thread. 0 on success; 1 past the end or for an unknown
+     * plugin. */
+    int (*shader_data)(const char* name, uint32_t offset, const void* data, uint32_t size);
+
+    /* Version 28: the recompiled follow camera's visual target. Register once
      * from bb_plugin_image. fn receives the character whose controls the
      * camera uses and returns a live ChrIns to follow, or NULL for unchanged.
      * Called on the game thread for each update; never retain a dead actor.
@@ -498,10 +885,30 @@ typedef struct BbHostApi {
     int (*on_camera_target)(void* (*fn)(void* character, void* user), void* user);
 } BbHostApi;
 
+#define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */
+
+#define BB_SHADER_DATA_BYTES 65536u /* version 27: a plugin's shader data (shader_data) */
+/* Version 27: shader_state. */
+#define BB_SHADER_NONE 0     /* the plugin has no override of that shader */
+#define BB_SHADER_WAITING 1  /* none of the shader's stages built with it yet: not met since it was set (or compiling) */
+#define BB_SHADER_TAKEN 2    /* compiled and drawn with (why: a variant it does not fit, if any) */
+#define BB_SHADER_REFUSED 3  /* refused - DXC, another interface, invalid SPIR-V, the driver: the shader keeps its own */
+#define BB_SHADER_SHADOWED 4 /* not used: the player's own file of that name, or an earlier plugin's, comes first */
+#define BB_SHADER_OFF 5      /* overrides do not apply: the lift alone (the Shaders setting at Lifted,
+                                BBHOST_HLSL=0) or video.shader_overrides = false (without DXC every
+                                override is refused instead: "DXC not found") */
+#define BB_FILTER_AS_IS 0          /* version 18: scene_filter, grading_filter: the game's filtering */
+#define BB_FILTER_NEAREST 1        /* version 18: the nearest texel of the nearest mip */
+#define BB_SCALE_AS_IS 0           /* version 18: scene_scale: the settings' sizes */
+#define BB_SCALE_NEAREST 1         /* version 18: the 3D at its own size, brought up nearest */
+
 #define BB_DRAW_AS_IS 0
 #define BB_DRAW_LINES 1
 #define BB_DRAW_BLACK 2
 #define BB_DRAW_SUBTRACT 4
+#define BB_DRAW_DEPTH_ONLY 8   /* version 17: no colour written, the depth tested and written */
+#define BB_DRAW_DEPTH_EQUAL 16 /* version 17: the depth tested less-or-equal, not written, pulled toward the viewer a little */
+#define BB_DRAW_GBUFFER 32     /* version 19: into the G-buffer, lit by the game (see draw_style) */
 
 #define BB_TEXT_LEFT 0u
 #define BB_TEXT_CENTRE 1u

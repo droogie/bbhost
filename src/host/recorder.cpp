@@ -79,7 +79,7 @@ const char* stream::op_name(stream::Op op) {
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
                                         "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker",
-                                        "push buffers",   "list draw",    "execute commands", "list run"};
+                                        "push buffers",   "list draw",    "execute commands", "list run",      "update buffer"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -90,6 +90,12 @@ StreamStats g_stream_stats;
 namespace {
 
 using stream::Op;
+
+// The recorder's driver calls and its waits for the submission thread, for
+// the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kBeginSite{slow_calls::kBeginCommands, "the recorder's"};
+constexpr slow_calls::Site kEndSite{slow_calls::kEndCommands, "the recorder's"};
+constexpr slow_calls::Site kSubmittedSite{slow_calls::kSubmitted, "a submission"};
 
 inline void cpu_relax() {
 #if defined(__x86_64__)
@@ -551,16 +557,16 @@ void replay_block(const Block& b) {
             VkCommandBufferBeginInfo bi{};
             bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            const std::uint64_t t0 = host_clock_monotonic_ns();
+            slow_calls::Scope timed(kBeginSite, 0, true);  // its clock reads the figure's too
             vkBeginCommandBuffer(r->cmd, &bi);
-            add_relaxed(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+            add_relaxed(g_stream_stats.endbegin_ns, timed.end());
             break;
         }
         case Op::kEndSubmit: {
             const auto* r = reinterpret_cast<const stream::EndSubmit*>(p);
-            const std::uint64_t t0 = host_clock_monotonic_ns();
+            slow_calls::Scope timed(kEndSite, 0, true);  // its clock reads the figure's too
             vkEndCommandBuffer(r->cmds[r->ncmds - 1]);
-            add_relaxed(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+            add_relaxed(g_stream_stats.endbegin_ns, timed.end());
             add_relaxed(g_stream_stats.endbegin_n, 1);
             // R4: this core's commands are in memory before another thread
             // submits them (enqueue's mutex would also drain them).
@@ -767,6 +773,11 @@ void replay_block(const Block& b) {
             const auto* bindings = tail<std::uint32_t>(q, r->n);
             const auto* infos = tail<VkDescriptorBufferInfo>(q, r->n);
             push_buffer_writes(cmd, r->bind_point, r->layout, r->set, r->n, bindings, infos);
+            break;
+        }
+        case Op::kUpdateBuffer: {
+            const auto* r = reinterpret_cast<const stream::UpdateBuffer*>(p);
+            vkCmdUpdateBuffer(cmd, r->buffer, r->offset, r->size, p + round8(sizeof(*r)));
             break;
         }
         case Op::kCount: break;
@@ -1016,6 +1027,8 @@ std::uint64_t recorder_reserve_packets(std::uint32_t n) {
     return first;
 }
 
+std::uint64_t recorder_next_packet() { return g_pk_taken; }
+
 void recorder_append_packet(std::uint64_t number) {
     std::uint8_t* at = append_record(Op::kDrawState, sizeof(stream::DrawState));
     put_struct<stream::DrawState>(at)->packet = number;
@@ -1182,7 +1195,7 @@ void stream_wait_submitted(std::uint64_t serial) {
     // validation layer reports and AMD's driver answered once with a
     // 10-second timeout in the self-test.
     ++g_counts.submitted_waits;
-    const std::uint64_t t0 = host_clock_monotonic_ns();
+    slow_calls::Scope timed(kSubmittedSite, 0, true);  // a slow call's, its clock reads the count's too
     for (std::uint64_t spins = 0; stream_submitted_serial() <= serial; ++spins) {
         if ((spins & 1023) == 0 && g_mode == kModeThread && g_sleeping.load(std::memory_order_seq_cst)) published_wake();
         if (spins < 4096) {
@@ -1193,7 +1206,7 @@ void stream_wait_submitted(std::uint64_t serial) {
             host_sleep_us(20);
         }
     }
-    g_counts.submitted_wait_ns += host_clock_monotonic_ns() - t0;
+    g_counts.submitted_wait_ns += timed.end();
 }
 
 std::string stream_last_op() {
@@ -1450,6 +1463,15 @@ void Rec::fill_buffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, s
     before_op(REC_SITE);
     std::uint8_t* at = append_record(Op::kFill, sizeof(stream::Fill));
     *put_struct<stream::Fill>(at) = stream::Fill{buffer, offset, size, data, 0};
+    after_op();
+}
+
+void Rec::update_buffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void* data) {
+    if (!stream_on()) return vkCmdUpdateBuffer(in_place(REC_SITE), buffer, offset, size, data);
+    before_op(REC_SITE);
+    std::uint8_t* at = append_record(Op::kUpdateBuffer, round8(sizeof(stream::UpdateBuffer)) + round8(static_cast<std::size_t>(size)));
+    *put_struct<stream::UpdateBuffer>(at) = stream::UpdateBuffer{buffer, offset, size};
+    put_array(at, static_cast<const std::uint8_t*>(data), static_cast<std::size_t>(size));
     after_op();
 }
 

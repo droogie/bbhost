@@ -22,6 +22,15 @@ Requirements:
   executable, else the system's. `tools/fetch_dxc.sh linux build` puts the
   packages' pinned library beside `build/bbhost`. Without one, every shader
   keeps the lifter's SPIR-V
+- for DLSS, NVIDIA's NGX SDK (its headers and `libnvsdk_ngx.a`), which the
+  configure step fetches from NVIDIA's DLSS repository with
+  `tools/fetch_ngx.sh`, each file pinned by SHA-256 (kept in `build/ngx`,
+  `NGX_CACHE` elsewhere). It builds `build/libbbhost_ngx_bridge.so`, bbhost's
+  NGX bridge (`src/ngx_bridge`, MIT, not GPL: the only thing NVIDIA's library
+  is linked into), which bbhost loads at run time from beside itself.
+  `-DBBHOST_NGX=OFF`, or no network, builds without it: DLSS is then off and
+  everything else is the same. `tools/fetch_ngx.sh runtime build` puts
+  NVIDIA's DLSS runtime beside `build/bbhost`, for DLSS on an RTX card
 
 On Arch Linux the packages are `vulkan-headers vulkan-icd-loader sdl3 ffmpeg
 curl zlib spirv-tools`. On Ubuntu 24.04 the distribution's Vulkan headers and
@@ -62,6 +71,20 @@ Kyo's Central Yharnam save (640x360 and 1080p) as the profile, where the
 command processor is the limit on a Radeon 8060S: 148 and 136 fps against 134
 and 124 for the same build without it, alternating (+10%). A profile outlives
 small changes: a function it no longer matches is built as without one.
+
+The release's Windows build is built with the repository's profile,
+`pgo/bbhost.proftext` (`CI_PGO=1 tools/ci_windows.sh`, the release workflow):
+LLVM's text form, which any later `llvm-profdata` reads, with the source tree
+it was recorded in written `@SRC@` - a file-local function's name carries its
+source's absolute path (about 40% of them), so a profile used from another
+checkout would miss those. `tools/pgo_store.sh <profdata> <tree it was built
+from>` stores a new one; `tools/pgo_use.sh <out.profdata> [tree]` makes the
+`.profdata` for a tree. Record it again before a release (an instrumented
+build from a clean tree, headless runs in the places that limit the frame -
+Kyo's Central Yharnam house, the clinic, the burning Hunter's Dream - with
+`BBHOST_RUN_COMMIT=0 BBHOST_GXVK_BUFFERS=0`: a profile with the run commit's
+parts in it was no faster) and check it against the build without it. The
+Linux builds stay without: Ubuntu 24.04's Clang 18 is not the profile's.
 
 A ThreadSanitizer build (`-DCMAKE_CXX_FLAGS=-fsanitize=thread`, the same in
 `CMAKE_C_FLAGS` and the linker flags) runs with the write watch off unless
@@ -115,6 +138,15 @@ The Windows build has the same target under wine (`build-win`, target
 `build/gcn2spv --check <dvdroot_ps4>/shader/*.dcx` translates and validates
 every shader in the game's shader bundles.
 
+`bbhost --compile-selftest DIR` (ctest's `shader_compile_e2e`) runs the setup
+window's **Compile shaders now** end to end: bbhost started again as the
+window starts it, with children that pretend the compile (no GPU, no game
+files; the folder, eboot and configuration they use are made in `DIR`), whose
+lines arrive, end without a newline, are lost after the first ones, or never
+come. The Windows build runs it under wine the same way; started with no
+file or pipe for its output, it opens a console as a double-clicked
+`bbhost.exe` does.
+
 ## Packages
 
 | Target or script | Produces |
@@ -146,6 +178,18 @@ entry pointing at one keeps working when it is replaced. The packages pick no
 server, so they play on the live server (`https://thehuntersdream.com`),
 bbhost's default; `tools/check_release_bundle.sh` fails a release whose
 packages would go anywhere else, or that carries a playtest kit.
+
+The Windows package carries the upscalers' runtime beside `bbhost.exe`
+(`tools/fetch_upscalers.sh`): AMD's FidelityFX DLLs and NVIDIA's
+`nvngx_dlss.dll`, each from its maker's repository at a pinned tag and
+SHA-256 with its licence, and Numity1504's `upscaler_bridge.dll`. The Linux
+package carries DLSS the same way: the NGX bridge the build made and NVIDIA's
+`libnvidia-ngx-dlss.so.310.9.16` (`tools/fetch_ngx.sh runtime`), with their
+licences in `licenses/dlss`, `licenses/ngx_bridge` and
+`licenses/upscaler_bridge`; the Steam Deck kit leaves them out. None of
+NVIDIA's or AMD's files is in the repository, and bbhost itself links none of
+their code. `tools/check_release_bundle.sh` fails a release whose Windows or
+Linux package lacks them, or whose Steam Deck kit has DLSS's.
 
 The Windows and Linux packages (and so the Steam Deck kit) carry the pipeline
 list beside the executable, `pipeline-list.bin`: every pipeline a tour of the

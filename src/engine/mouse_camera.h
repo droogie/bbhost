@@ -9,7 +9,10 @@
 //
 // (0.25 at its default 5), after the stick has turned it and only when the
 // stick has not - with no frame time in it, no dead zone, no cap and no
-// acceleration, so the same movement always turns the same angle. Bloodborne
+// acceleration, so the same movement always turns the same angle. The step is
+// DS3's, the scale is not: DS3's slowest, 0.1 degrees, is too fast for most
+// mice today, so Mouse sensitivity runs from 0.005 to 0.4 degrees a count,
+// 0.045 at 5 (engine/mouse_camera_step.h, degrees_per_count). Bloodborne
 // has the same camera class without the mouse; this adds DS3's step where DS3
 // has it, in NS_SPRJ::ChrExFollowCam::Update - in our source of it when that
 // is in place (decomp/camera/follow_camera.cpp), else by hooks on the game's.
@@ -31,12 +34,15 @@ struct ElfImage;
 void mouse_camera_install(ElfImage* image);
 bool mouse_camera_installed();
 
-// DS3's degrees per count at a sensitivity of 0..10.
-float mouse_camera_degrees_per_count(int sensitivity);
+// The degrees per count at a sensitivity of 0..10.
+float mouse_camera_degrees_per_count(float sensitivity);
+// A 0-100 Mouse sensitivity saved on DS3's scale (an options file before
+// version 8), on today's: the same degrees a count.
+int mouse_camera_setting_from_ds3(int setting);
 
 // For the pad read, every read: what the camera turns by, and whether the
 // camera's own turns are held (engine/mouse_camera_step.h).
-void mouse_camera_publish(int sensitivity, bool invert_x, bool invert_y, bool hold_auto_rotation);
+void mouse_camera_publish(float sensitivity, bool invert_x, bool invert_y, bool hold_auto_rotation);
 
 // For the pad read: whether the mouse has just flicked for a lock-on target
 // switch, and the right stick that switches it (-1..1, x right, y down).

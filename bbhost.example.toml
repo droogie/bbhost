@@ -69,12 +69,12 @@ height = 1080
 fps_cap = 30
 # The default of F10's Effect timing (the setup window's Game page has the
 # same row): how the effects - fire, blood, magic, the lamps' and candles'
-# flicker - keep time above 30 fps. smooth (the default): whole 1/30 s steps,
-# 30 a second as at 30, for what they count in updates (the flicker among
-# it), with what they move by time moved by each frame's own time in the
-# effects converted for it. 30: whole 1/30 s steps alone. Both step the wind
-# on grass and trees in whole 1/30 s too. auto: whole 1/60 s at every frame
-# rate above 30. fps: a whole step every frame (1/120 s at 120). A number
+# flicker - keep time above 30 fps. 30 (30 fps): whole 1/30 s steps, the wind
+# on grass and trees too. auto (60 fps, the default): whole 1/60 s at every
+# frame rate above 30. fps (Frame rate-dependent): a whole step every frame
+# (1/120 s at 120). smooth: whole 1/30 s steps for what they count in updates
+# (the flicker among it), with what they move by time moved by each frame's
+# own time in the effects converted for it - most still look like 30. A number
 # from 1 to 960 ("120") steps them that many times a second at any frame
 # rate - below 30 to test them in coarse steps ("5": a 1/5 s step five times
 # a second). frame: by each frame's time. Wherever there are fewer steps than
@@ -82,7 +82,7 @@ fps_cap = 30
 # in F10 or the setup window wins over this (the row shows a number or frame
 # from here as Custom), and BBHOST_SFX_STEP over both.
 # Requires a restart.
-# effect_steps = "smooth"
+# effect_steps = "auto"
 # The effects' emission clock: 60 (the default) makes their particles and
 # children as the game's effects do at 60 updates a second, at every frame
 # rate (30 included); 30 keeps the game's one emission an update, 30 a second
@@ -95,13 +95,18 @@ fps_cap = 30
 # its chosen frame rate. What F10 or the setup window saves wins over it, and
 # BBHOST_FRAME_CLOCK=1 or 0 over both. Requires a restart.
 # frame_clock = false
-# The defaults of four F10 settings, by an entry's name; what F10 or the
+# The defaults of five F10 settings, by an entry's name; what F10 or the
 # game's PC Graphics menu saves wins over them (the Steam Deck kit's toml sets
-# "1280x800" and "Fullscreen").
+# "1280x800" and "Borderless").
 # resolution = "1920x1080"
-# window_mode = "Windowed"
+# window_mode = "Windowed"  # Windowed, Borderless, Fullscreen (exclusive)
 # model_detail = "Normal"   # Full, Normal, Low, Lowest: the game's LOD bias
+# texture_quality = "High"  # Lowest (0.125x), Low (0.25x), Medium (0.5x), High (1.0x): the textures' width and height in video memory
 # shaders = "HLSL"          # HLSL (compiled by DXC on this PC, in the background) or Lifted (the translator's SPIR-V only)
+# Edited shaders (<data>/bbhost/shaders, docs/modding.md) and the shaders plugins
+# replace apply on the HLSL path; false turns all of them off (BBHOST_SHADER_OVERRIDES=0
+# or 1 wins over it). Requires a restart.
+# shader_overrides = true
 # OBS's game capture hooks Vulkan programs through a layer that loads into
 # every one of them once OBS is installed. On an AMD card bbhost keeps it out
 # (it hung the GPU there); "on" lets it in, "off" keeps it out on any card.
@@ -176,18 +181,14 @@ all_post_processors = false
 # shipped one is off until true puts it in. The setup window's Patches tab
 # writes these; a manifest tied to a setting (skip-intro, debug-camera, ...)
 # follows that setting instead.
-# old-hunters: the game takes itself for the edition that includes The Old
-# Hunters (Kyo's 1.09 patch) and counts the DLC as installed; its title screen
-# reads "The Old Hunters Edition". Off: the base game.
-# old-hunters = true
 # fov-uncap = true
 
 [world]
 # The PC enhancements: additions to the game itself, all on by default. The
 # setup window's PC enhancements tab, F10 > PC ENHANCEMENTS and the game's
 # System > PC Enhancements turn each on or off for the next start, and what is
-# chosen there wins over these lines. Turn all three off for the game as it
-# shipped (The Old Hunters is a patch: old-hunters under [patches] above).
+# chosen there wins over these lines. Turn them all off for the game as it
+# shipped (The Old Hunters is always on, part of bbhost).
 #
 # The mirror in the Hunter's Dream workshop: the developers placed a "Put on
 # Disguise" action there and never enabled it. true: it works - the first time
@@ -214,6 +215,24 @@ five_players = true
 # The death screen's YOU DIED reads SKILL ISSUE instead, in every language.
 # The one enhancement off by default. BBHOST_SKILL_ISSUE=0 or 1 overrides.
 skill_issue = false
+
+# Full Phantom HP. Summoned into another hunter's world - a cooperator, an
+# invader, a covenant's adversary - the game gives a hunter 70% of their max
+# HP there. true: yours stays whole. It is each visitor's own setting: a
+# host's changes nothing for the hunters in its world, and every game in the
+# session shows a visitor's HP as the visitor's own game has it. false keeps
+# the game's 70%. BBHOST_FULL_PHANTOM_HP=0 or 1 overrides this setting.
+full_phantom_hp = true
+
+# Auto-Replenish Items. Blood Vials and Quicksilver Bullets refill from storage
+# up to what the hunter can carry, after a death in the hunter's own world and
+# on arriving in the Hunter's Dream. true: so do twenty more consumables -
+# Antidote, Sedative, Beast Blood Pellet, Blue Elixir, the Molotov and Rope
+# Molotov Cocktails and their delayed kinds, Poison Knife, Oil Urn, Pebble,
+# Throwing Knife, Pungent Blood Cocktail, Numbing Mist, Fire and Bolt Paper,
+# Bone Marrow Ash, Bold Hunter's Mark, Shining Coins and Lead Elixir. false
+# keeps the game's two. BBHOST_AUTO_REPLENISH=0 or 1 overrides this setting.
+auto_replenish = true
 
 # [plugins]
 # Gameplay plugins (docs/plugins.md): randomizer, boss_rush, mutators - each

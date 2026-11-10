@@ -29,12 +29,17 @@ cp -r patches "$dir/patches"
 mkdir -p "$dir/plugins"
 cp include/bbhost_plugin.h "$dir/plugins/"
 cp LICENSE "$dir/LICENSE.txt"
+cp LICENSE-EXCEPTION "$dir/LICENSE-EXCEPTION.txt"
 tools/package_plugins.sh "$(dirname "$exe")/plugins" "$dir/plugins"
 llvm-objcopy --strip-debug "$exe" "$dir/bbhost.exe"
 cp "$exe" "$out/$name.debug.exe"
 # The HLSL path's compiler beside the exe, where bbhost looks first.
 tools/fetch_dxc.sh windows "$dir"
 dxc_tag=$(cat third_party/dxc/VERSION)
+# The upscalers' and frame generation's runtime beside the exe: AMD's
+# FidelityFX, NVIDIA's DLSS and the upscaler bridge, each under its own
+# licence (tools/fetch_upscalers.sh).
+tools/fetch_upscalers.sh "$dir"
 # The pipeline list beside the binary, where bbhost reads it at each start and
 # builds every pipeline it names (render.cpp pipeline_manifest_load): the
 # pinned release asset (tools/fetch_pipeline_list.sh), or the local list
@@ -56,8 +61,10 @@ bbhost for Windows, build $name
 
 bbhost runs Bloodborne on PC: the game's own 1.09 executable, its calls into
 the PS4's system libraries answered by bbhost and its graphics recompiled for
-Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE.txt); the
-source is at https://github.com/droogie/bbhost.
+Vulkan. Free software under the GNU GPL, version 3 or later (LICENSE.txt),
+with an additional permission to combine it with GPU vendors' upscaling and
+frame generation runtimes (LICENSE-EXCEPTION.txt); the source is at
+https://github.com/droogie/bbhost.
 
 You need
   - Your own copy of Bloodborne, dumped from your own PS4 - nothing from the
@@ -141,6 +148,25 @@ The shader compiler
   the translator's own. Without dxcompiler.dll that path keeps every shader
   as it was, and nothing else uses it.
 
+Upscaling and frame generation
+  Graphics > Upscaling's FSR 3, FSR 4 and DLSS and Frame generation run
+  through these files beside bbhost.exe, each its maker's own, unmodified and
+  under its own licence; bbhost's licence permits combining bbhost with them
+  (LICENSE-EXCEPTION.txt):
+    - amd_fidelityfx_loader_vk.dll, amd_fidelityfx_upscaler_vk.dll and
+      amd_fidelityfx_framegeneration_vk.dll: AMD FidelityFX (FSR 3, FSR 4 and
+      frame generation), Copyright (C) Advanced Micro Devices, Inc., from the
+      FidelityFX SDK (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK);
+      licence in licenses\\fidelityfx.
+    - nvngx_dlss.dll: NVIDIA DLSS, Copyright (C) NVIDIA Corporation, from the
+      DLSS SDK (https://github.com/NVIDIA/DLSS), for NVIDIA RTX graphics cards
+      only; licence in licenses\\dlss. bbhost is not sponsored or endorsed by
+      NVIDIA or AMD.
+    - upscaler_bridge.dll: the Upscaler Bridge by Numity1504 (MIT licence, in
+      licenses\\upscaler_bridge), which bbhost calls FSR and DLSS through.
+  TAA is bbhost's own and needs none of them. Without them, FSR, DLSS and
+  frame generation stay off.
+
 Plugins
   plugins/ holds the official ones, signed by the bbhost release key
   (the .sig beside each). Turn them on and set them up in the setup
@@ -153,9 +179,11 @@ Plugins
       mutators = true      # speed, bullet time, one-hit, chaos and more
       quake = true         # first person with Quake 3's movement and guns
       lohit = true         # the map's collision drawn in place of the map
+      ps1 = true           # the 3D drawn as the first PlayStation drew it
+      iso = true           # an isometric camera, the walls in its way cut away
       debug_menu = true    # the developers' debug menu: \` opens it
   Each one's settings go in a section of its own name ([randomizer],
-  [boss_rush], [mutators], [quake], [lohit]); docs/plugins.md in the repository lists them.
+  [boss_rush], [mutators], [quake], [lohit], [ps1], [iso]); docs/plugins.md in the repository lists them.
   Use the boss rush on a save of its own. Cheating against other players
   with the debug menu gets an account banned; trying it out online with
   friends is fine.

@@ -1,0 +1,10 @@
+FidelityFX API headers from AMD's FidelityFX SDK v2.4.0
+(github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK), MIT as each file says,
+for frame generation (host/framegen.cpp): ffx_api.h, ffx_api_types.h,
+ffx_framegeneration.h, ffx_framegeneration_api_types.h, vk/ffx_api_vk.h and
+vk/ffx_api_framegeneration_vk.h, with their #include paths made relative to
+this folder, and ffx_api.h's FFX_API_ENTRY (__declspec(dllexport)) defined
+only on Windows - empty elsewhere, where frame generation is not loaded and
+the declarations are never called, so the Linux build compiles them. The runtime - amd_fidelityfx_loader_vk.dll and
+amd_fidelityfx_framegeneration_vk.dll, AMD-signed, under the SDK's binary
+licence - is not here: it goes beside bbhost.exe, as the upscaler bridge's.

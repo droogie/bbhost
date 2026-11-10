@@ -25,12 +25,15 @@
 #include "host/shader_patch.h"
 #include "host/shaders/gpu_stall.spv.h"
 #include "host/shader_bundles.h"
+#include "host/shader_overrides.h"
 #include "host/translation_cache.h"
 #include "host/twin_filter.h"
 #include "host/cb_capture.h"
 #include "host/gxvk_homes.h"
 #include "host/gxvk_lists.h"
 #include "host/options.h"
+#include "host/render_hooks.h"
+#include "host/upscaler.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -220,6 +223,28 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
 // environment wins over the config. imports_whole() (gpu_internal.h) reads it.
 std::atomic<std::uint64_t> g_imports_made{0}, g_imports_merged{0}, g_import_bytes{0}, g_import_us{0};
 
+// The queue's calls, for the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kSubmitLockSite{slow_calls::kQueueLock, "a submission"};
+constexpr slow_calls::Site kSubmitSite{slow_calls::kQueueSubmit, "one job"};
+constexpr slow_calls::Site kSubmitMergedSite{slow_calls::kQueueSubmit, "merged jobs"};
+constexpr slow_calls::Site kSubmitInPlaceSite{slow_calls::kQueueSubmit, "in place"};
+constexpr slow_calls::Site kQueueGuardSite{slow_calls::kQueueLock, "a one-off use of the queue"};
+constexpr slow_calls::Site kHostQueueLockSite{slow_calls::kQueueLock, "the window's use of the queue"};
+constexpr slow_calls::Site kSlotFenceSite{slow_calls::kWaitFences, "a submission's fence"};
+constexpr slow_calls::Site kFailedIdleSite{slow_calls::kDeviceIdle, "a failed submission"};
+constexpr slow_calls::Site kLandingValueSite{slow_calls::kSemaphoreValue, "the label landing"};
+constexpr slow_calls::Site kLandingWaitSite{slow_calls::kWaitSemaphores, "the label landing"};
+constexpr slow_calls::Site kPresentReadsSite{slow_calls::kSemaphoreValue, "the presenter's copy"};
+constexpr slow_calls::Site kTimelineValueSite{slow_calls::kSemaphoreValue, "the timeline"};
+constexpr slow_calls::Site kTimelineWaitSite{slow_calls::kWaitSemaphores, "the timeline"};
+constexpr slow_calls::Site kPresenterTicketSite{slow_calls::kSubmitted, "the presenter's copy"};
+constexpr slow_calls::Site kFrameSubmittedSite{slow_calls::kSubmitted, "the frame's submissions"};
+constexpr slow_calls::Site kEndInPlaceSite{slow_calls::kEndCommands, "the command processor's"};
+constexpr slow_calls::Site kBeginInPlaceSite{slow_calls::kBeginCommands, "the command processor's"};
+// A wait bounded by a timeout this short is a poll step: its time past it is what counts.
+constexpr std::uint64_t kPollStepNs = 100'000'000ull;
+std::uint64_t poll_slack(std::uint64_t timeout_ns) { return timeout_ns <= kPollStepNs ? timeout_ns : 0; }
+
 // ---- The submission thread (BBHOST_SUBMIT_THREAD, on unless 0) ----
 // vkQueueSubmit off the command processor. The kernel's half of a submission
 // grows with the buffers it has to make resident - all of them, since shaders
@@ -313,7 +338,9 @@ void submit_job_now(const SubmitJob& job) {
     tl.add(si, job.serial);
     VkResult r;
     {
+        slow_calls::Scope timed(kSubmitLockSite);
         std::lock_guard<std::mutex> q(g.queue_mu);
+        timed.next(kSubmitSite);
         r = vkQueueSubmit(g.queue, 1, &si, job.fence);
     }
     if (r != VK_SUCCESS) {
@@ -395,7 +422,9 @@ void submit_jobs_merged(const SubmitJob* jobs, std::uint32_t n) {
     VkResult r;
     std::uint32_t fences = 0;
     {
+        slow_calls::Scope timed(kSubmitLockSite);
         std::lock_guard<std::mutex> q(g.queue_mu);
+        timed.next(kSubmitMergedSite);
         r = vkQueueSubmit(g.queue, 1, &si, last.fence);
         for (std::uint32_t i = 0; i + 1 < n && r == VK_SUCCESS; ++i) {
             if (!jobs[i].fence) continue;
@@ -635,6 +664,11 @@ VkDeviceMemory dmabuf_memory(std::uint64_t offset, std::uint64_t size, std::uint
     return m;
 }
 
+// A dma-buf import's sparse binds, for the slow-call registry (host/slow_calls.h).
+constexpr slow_calls::Site kDmabufLockSite{slow_calls::kQueueLock, "a dma-buf import's binds"};
+constexpr slow_calls::Site kDmabufBindSite{slow_calls::kBindSparse, "a dma-buf import"};
+constexpr slow_calls::Site kDmabufFenceSite{slow_calls::kWaitFences, "a dma-buf import's binds"};
+
 // [offset, offset + size) of direct memory into c as dma-buf imports: a
 // buffer bound to one, or a sparse buffer over several. Under the GPU lock,
 // as every use of the renderer's queue is: the sparse binds go on it.
@@ -687,10 +721,14 @@ VkResult dmabuf_span(Chunk& c, std::uint64_t offset, std::uint64_t size) {
     if (const VkResult r = vkCreateFence(g.device, &fci, nullptr, &fence); r != VK_SUCCESS) return r;
     VkResult r;
     {
-        QueueGuard queue;
+        QueueGuard queue(kDmabufLockSite);
+        slow_calls::Scope timed(kDmabufBindSite);
         r = vkQueueBindSparse(g.queue, 1, &bsi, fence);
     }
-    if (r == VK_SUCCESS) r = vkWaitForFences(g.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (r == VK_SUCCESS) {
+        slow_calls::Scope timed(kDmabufFenceSite);
+        r = vkWaitForFences(g.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    }
     vkDestroyFence(g.device, fence, nullptr);
     return r;
 }
@@ -1358,7 +1396,9 @@ void stream_submit_job(const VkCommandBuffer* cmds, std::uint32_t ncmds, VkSemap
 
 std::uint64_t stream_submitted_serial() { return g_stream_submitted.load(std::memory_order_acquire); }
 
-QueueGuard::QueueGuard() {
+QueueGuard::QueueGuard() : QueueGuard(kQueueGuardSite) {}
+QueueGuard::QueueGuard(const slow_calls::Site& site) {
+    slow_calls::Scope timed(site);
     queue_drain();
     g.queue_mu.lock();
 }
@@ -3103,6 +3143,7 @@ bool create_upload_buffer(DevBuffer& b, std::uint64_t size, const char* what) {
 
 std::atomic<std::size_t> g_pipeline_cache_bytes{0};  // the cache's size when last loaded or saved
 std::atomic<bool> g_cache_divert{false};             // PipelineCacheUse (gpu_internal.h)
+thread_local bool t_run_only_cache = false;          // RunOnlyCache (gpu_internal.h)
 std::atomic<int> g_cache_users{0};
 std::atomic<std::uint64_t> g_cache_diverted{0};
 
@@ -3946,6 +3987,24 @@ bool init_locked() {
                  app.pApplicationName, app.pEngineName ? app.pEngineName : "");
     std::vector<const char*> iext;
     for (const std::string& e : g_instance_exts) iext.push_back(e.c_str());
+#if defined(_WIN32)
+    // VK_KHR_get_surface_capabilities2, for a window, where the loader has it:
+    // the device's VK_EXT_full_screen_exclusive (below) needs it, and with that
+    // Stay borderless has Borderless's swapchain tell the driver it may not
+    // make the window exclusive fullscreen (window.cpp, exclusive_policy).
+    bool surface_caps2 = false;
+    if (g_want_present) {
+        std::uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> ie(n);
+        if (n) vkEnumerateInstanceExtensionProperties(nullptr, &n, ie.data());
+        for (std::uint32_t i = 0; i < n && i < ie.size(); ++i)
+            surface_caps2 |= std::strcmp(ie[i].extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+        bool asked = false;  // SDL's list may hold it already
+        for (const char* e : iext) asked |= std::strcmp(e, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0;
+        if (surface_caps2 && !asked) iext.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+    }
+#endif
     std::vector<const char*> layers;
     if (g_validate) {
         layers.push_back("VK_LAYER_KHRONOS_validation");
@@ -3968,7 +4027,14 @@ bool init_locked() {
     ici.ppEnabledExtensionNames = iext.data();
     ici.enabledLayerCount = static_cast<std::uint32_t>(layers.size());
     ici.ppEnabledLayerNames = layers.data();
-    if (vkCreateInstance(&ici, nullptr, &g.instance) != VK_SUCCESS) {
+    // The upscaler bridge (host/upscaler.h) adds what DLSS needs to the
+    // instance and the device; without it, or when that fails, ours as asked.
+    upscaler_open();
+    const VkInstanceCreateInfo* ici_use = upscaler_prepare_instance(&ici);
+    VkResult ir = vkCreateInstance(ici_use, nullptr, &g.instance);
+    upscaler_instance_done(ir);
+    if (ir != VK_SUCCESS && upscaler_instance_retry(&ici, ici_use)) ir = vkCreateInstance(&ici, nullptr, &g.instance);
+    if (ir != VK_SUCCESS) {
         host_log("gpu: no Vulkan 1.3 instance%s", g_validate ? " (validation layer requested)" : "");
         return false;
     }
@@ -4058,7 +4124,8 @@ bool init_locked() {
             g_imports_whole.compare_exchange_strong(undecided, mp.windows ? 0 : 1, std::memory_order_relaxed);
         }
         twins_decide(c.type_rank == 4);
-        homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight);
+        homes_decide(g.integrated, host_gpu_memory_policy().device == memory_policy::Device::kSmallVram, g.tight,
+                     host_gpu_memory_policy().free_at_start);
         {
             // Stage 4b.2's switch follows the homes when it is unset (host/gxvk_lists.h settle). Off by their default,
             // the homes' own line said why (null: no second line).
@@ -4071,7 +4138,7 @@ bool init_locked() {
                               : hm == gxvk_homes::Mode::kTwins   ? "the constant buffers' homes are twins (BBHOST_GXVK_HOMES=twins)"
                               : g.integrated                     ? "the homes are off on an integrated GPU"
                               : g.tight                          ? "the homes are off with tight memory"
-                                                                 : "the homes are off with small video memory";
+                                                                 : "the homes are off with small video memory, under 5,000 MiB free";
             gxvk_lists::settle(hb, why);
         }
 #if !defined(_WIN32)
@@ -4254,6 +4321,20 @@ bool init_locked() {
             const char* e = std::getenv("BBHOST_DYNAMIC_DEPTH_CLAMP");
             g.dynamic_depth_clamp = q3.extendedDynamicState3DepthClampEnable && !(e && e[0] == '0');
         }
+        // GL's clip space (PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear: z clipped at
+        // -w, not 0 - the point lights' cube shadows' casters): VK_EXT_depth_clip_control's
+        // [-1, 1]. Without it those draws lost everything in the near part of
+        // the light's range (render.cpp gl_clip_space_draw).
+        if (has("VK_EXT_depth_clip_control")) {
+            VkPhysicalDeviceDepthClipControlFeaturesEXT qc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 qf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            qf.pNext = &qc;
+            vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+            const char* e = std::getenv("BBHOST_GL_CLIP_SPACE");
+            g.has_depth_clip_control = qc.depthClipControl && !(e && e[0] == '0');
+        }
+        host_log("gpu: GL's clip space %s", g.has_depth_clip_control ? "clipped at -w (VK_EXT_depth_clip_control)"
+                                                                      : "clipped at 0 as D3D's (no VK_EXT_depth_clip_control, or BBHOST_GL_CLIP_SPACE=0)");
         // VK_EXT_memory_budget: what the driver says this process holds per
         // heap - the number to compare with nvidia-smi when instances starve.
         g.has_memory_budget = has("VK_EXT_memory_budget");
@@ -4305,6 +4386,24 @@ bool init_locked() {
             }
         }
 #endif
+#if defined(_WIN32)
+        // VK_EXT_full_screen_exclusive, with the instance's
+        // VK_KHR_get_surface_capabilities2 (above): the swapchain can say
+        // whether the driver may make the window exclusive fullscreen, and
+        // Stay borderless says it may not (window.cpp, exclusive_policy).
+        // Without it the driver decides, as it always did.
+        if (g_want_present && has_swapchain) {
+            const bool listed = has("VK_EXT_full_screen_exclusive");
+            g.full_screen_exclusive = listed && surface_caps2;
+            host_log("gpu: %s",
+                     g.full_screen_exclusive ? "VK_EXT_full_screen_exclusive on (and the instance's VK_KHR_get_surface_capabilities2): "
+                                               "Stay borderless keeps the driver from making Borderless exclusive fullscreen"
+                     : listed ? "VK_EXT_full_screen_exclusive left off - the instance has no VK_KHR_get_surface_capabilities2: "
+                                "the driver decides on exclusive fullscreen, Stay borderless or not"
+                              : "no VK_EXT_full_screen_exclusive on this device: the driver decides on exclusive fullscreen, "
+                                "Stay borderless or not");
+        }
+#endif
     }
 
     // A second queue, when the family has one, is the presenter's: a present
@@ -4314,15 +4413,21 @@ bool init_locked() {
     // queue under its lock - as shadPS4 and vkcube make their devices. An A/B
     // for what Windows' per-process GPU counters see of a program that
     // presents from a queue of its own; it costs the command processor the present's blocking.
-    const float prio[2] = {1.0f, 1.0f};
+    // Frame generation (host/framegen.h) takes three more of the family's
+    // queues when it has five: AMD's frame generation swapchain presents,
+    // acquires and runs its async work on queues of its own (2, 3, 4).
+    const float prio[5] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = g.family;
     const char* one_queue = std::getenv("BBHOST_VK_QUEUES");
     if (one_queue && one_queue[0] == '1') g.family_queues = 1;
-    qci.queueCount = g.family_queues >= 2 ? 2 : 1;
+    qci.queueCount = g.family_queues >= 5 ? 5 : g.family_queues >= 2 ? 2 : 1;
     qci.pQueuePriorities = prio;
     host_log("gpu: queue family %u (%u queues): %u queue%s, priority 1.0%s", g.family, usable[static_cast<std::size_t>(chosen)].queues,
-             qci.queueCount, qci.queueCount == 2 ? "s - the second the presenter's" : ", the presents on it too",
+             qci.queueCount,
+             qci.queueCount == 5   ? "s - the second the presenter's, three for frame generation"
+             : qci.queueCount == 2 ? "s - the second the presenter's"
+                                   : ", the presents on it too",
              one_queue && one_queue[0] == '1' ? " (BBHOST_VK_QUEUES=1)" : "");
     std::vector<const char*> dext = {"VK_EXT_external_memory_host"};
     if (g.has_maint8) dext.push_back("VK_KHR_maintenance8");
@@ -4348,12 +4453,15 @@ bool init_locked() {
         dext.push_back("VK_EXT_graphics_pipeline_library");
     }
     if (g.dynamic_depth_clamp) dext.push_back("VK_EXT_extended_dynamic_state3");
+    if (g.has_depth_clip_control) dext.push_back("VK_EXT_depth_clip_control");
     if (g_want_present && has_swapchain) {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         g.present_capable = true;
         if (g.fifo_latest_ready_ext) dext.push_back(g.fifo_latest_ready_ext);
+        if (g.full_screen_exclusive) dext.push_back("VK_EXT_full_screen_exclusive");
     } else {
         g.fifo_latest_ready_ext = nullptr;
+        g.full_screen_exclusive = false;
     }
     VkPhysicalDeviceFaultFeaturesEXT ffault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     ffault.deviceFault = VK_TRUE;
@@ -4417,6 +4525,12 @@ bool init_locked() {
     if (g.dynamic_depth_clamp) {
         feds3.pNext = f13.pNext;
         f13.pNext = &feds3;
+    }
+    VkPhysicalDeviceDepthClipControlFeaturesEXT fdcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+    fdcc.depthClipControl = VK_TRUE;
+    if (g.has_depth_clip_control) {
+        fdcc.pNext = f13.pNext;
+        f13.pNext = &fdcc;
     }
     // Pixel shaders at wave32 (gcn/wave.h).
     // The translated stages use subgroup operations in SPIR-V 1.5 without
@@ -4729,7 +4843,12 @@ bool init_locked() {
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = static_cast<std::uint32_t>(dext.size());
     dci.ppEnabledExtensionNames = dext.data();
-    if (vkCreateDevice(g.phys, &dci, nullptr, &g.device) == VK_SUCCESS && g.has_push_descriptor) {
+    const VkDeviceCreateInfo* dci_use = upscaler_prepare_device(g.instance, g.phys, &dci);
+    VkResult dr = vkCreateDevice(g.phys, dci_use, nullptr, &g.device);
+    upscaler_device_done(dr);
+    if (dr != VK_SUCCESS && dci_use != &dci) dr = vkCreateDevice(g.phys, &dci, nullptr, &g.device);
+    if (dr == VK_SUCCESS) upscaler_attach(g.instance, g.phys, g.device, kSlots + 2);
+    if (dr == VK_SUCCESS && g.has_push_descriptor) {
         g.cmd_push_descriptor_set =
             reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(g.device, "vkCmdPushDescriptorSetKHR"));
         if (!g.cmd_push_descriptor_set) g.has_push_descriptor = false;
@@ -4793,6 +4912,9 @@ bool init_locked() {
     }
     vkGetDeviceQueue(g.device, g.family, 0, &g.queue);
     if (g.family_queues >= 2) vkGetDeviceQueue(g.device, g.family, 1, &g.present_queue);
+    if (g.family_queues >= 5) {
+        for (std::uint32_t i = 0; i < 3; ++i) vkGetDeviceQueue(g.device, g.family, 2 + i, &g.fg_queues[i]);
+    }
     if (f12.timelineSemaphore) {
         VkSemaphoreTypeCreateInfo st{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
         st.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -4872,6 +4994,7 @@ bool init_locked() {
     VkPipelineCacheCreateInfo side{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     if (vkCreatePipelineCache(g.device, &side, nullptr, &g.side_cache) != VK_SUCCESS) g.side_cache = VK_NULL_HANDLE;
     if (vkCreatePipelineCache(g.device, &side, nullptr, &g.opt_cache) != VK_SUCCESS) g.opt_cache = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(g.device, &side, nullptr, &g.run_cache) != VK_SUCCESS) g.run_cache = VK_NULL_HANDLE;
 
     // Descriptor layout: params UBO, then sampled images, samplers, storage images.
     std::vector<VkDescriptorSetLayoutBinding> binds;
@@ -5082,6 +5205,21 @@ bool init_locked() {
     // The Shaders setting (host/options.cpp), before the first lift decides
     // the HLSL path's mode; BBHOST_HLSL wins over it.
     hlsl_set_setting(host_opt_index("shaders") != 1);
+    {
+        // Edited shaders' off switch (host/shader_overrides.h): BBHOST_SHADER_OVERRIDES=0|1
+        // wins over bbhost.toml's video.shader_overrides.
+        // The compile session (Compile shaders now) has no draws: it fills the
+        // caches with the game's own shaders, which edited ones never enter.
+        const char* e = std::getenv("BBHOST_SHADER_OVERRIDES");
+        const bool env = e && (e[0] == '0' || e[0] == '1') && !e[1];
+        const bool session = g_compile_session.load();
+        hlsl_set_overrides(!session && (env ? e[0] == '1' : config().shader_overrides),
+                           session ? "the shader compile builds the game's own shaders"
+                           : env   ? "BBHOST_SHADER_OVERRIDES=0"
+                                   : "bbhost.toml's video.shader_overrides = false");
+    }
+    overrides_set_data_maker(&shader_data_make);  // the plugins' shader data, made at an owner's first compile
+    overrides_set_clock(&hle_video_flip_count);   // the exit report names a removed override's flip
     if (const char* root = hle_fs_data_root(); root && *root) hlsl_set_folders(std::string(root) + "/bbhost");
     hlsl_set_name_lookup(&shader_bundle_file_name);
     translation_cache_load(translation_cache_path());
@@ -5184,9 +5322,9 @@ void begin_recording_locked() {
             VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             const VkCommandBuffer cmd = g_cmd();
-            const std::uint64_t t0 = host_clock_monotonic_ns();
+            slow_calls::Scope timed(kBeginInPlaceSite, 0, true);  // its clock reads the figure's too
             vkBeginCommandBuffer(cmd, &bi);
-            bump(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+            bump(g_stream_stats.endbegin_ns, timed.end());
         }
         ++g.record_serial;  // dynamic state recorded so far is gone
         g.recording = true;
@@ -5204,6 +5342,7 @@ void begin_recording_locked() {
             rec().write_timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.qpool, kQueriesPerSlot - 2);
             sl.span = true;
         }
+        shader_data_upload_locked();  // the plugins' shader data a frame's end latched (host/shader_overrides.h)
     }
 }
 
@@ -5585,7 +5724,8 @@ gcn::TranslateOptions compute_options(std::uint32_t rsrc1, std::uint32_t rsrc2, 
 // binds those from one list for either.
 std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::uint32_t rsrc1, std::uint32_t rsrc2, const std::uint32_t* threads,
                                                 const std::vector<std::pair<std::uint32_t, bool>>& dims, const std::vector<bool>& modes,
-                                                const gcn::TranslateResult& regular, std::uint64_t key, const std::string& name, bool lift) {
+                                                const gcn::TranslateResult& regular, std::uint64_t key, const std::string& name, bool lift,
+                                                std::uint64_t salt = 0) {
     if (!cs_buffers_on() || (lift && !cs_lift_buffers_on())) return nullptr;
     auto lean = std::make_shared<ComputeLean>();
     const gcn::TranslateOptions lean_options = compute_options(rsrc1, rsrc2, threads, dims, modes, true);
@@ -5627,7 +5767,7 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
     // as it does (gcn::lift_compute_shader); refused, the program has none and
     // keeps its walking lift.
     if (why.empty() && lift) {
-        hlsl_name_next(name);
+        hlsl_name_next(name, salt);
         gcn::LiftResult l = lift_compute_cached(prog, lean_options, lean->meta);
         if (l.ok()) {
             lean->meta.spirv = std::move(l.spirv);
@@ -5664,6 +5804,7 @@ std::shared_ptr<ComputeLean> build_compute_lean(const gcn::Program& prog, std::u
             }
             std::vector<std::uint32_t> lift;
             if (why.empty() || !lean->lifted || own || !hlsl_lift_of(lean->meta.spirv, lift)) break;
+            hlsl_note_override_refused(lean->meta.spirv);
             if (lean->module) vkDestroyShaderModule(g.device, lean->module, nullptr);
             lean->module = VK_NULL_HANDLE;
             lean->meta.spirv = std::move(lift);
@@ -5743,7 +5884,7 @@ void note_compute_lift(const std::string& name, bool lifted, const std::string& 
     if (!lifted && at.empty()) at = why.empty() ? std::string("not asked for (BBHOST_LIFT_COMPUTE=0 or BBHOST_DECOMP)") : why;
 }
 void apply_compute_lift(const gcn::Program& prog, const gcn::TranslateOptions& o, gcn::TranslateResult& meta, const std::string& name, bool& lifted,
-                        std::string& why) {
+                        std::string& why, std::uint64_t salt = 0) {
     lifted = false;
     why.clear();
     if (!meta.ok()) return;
@@ -5751,7 +5892,7 @@ void apply_compute_lift(const gcn::Program& prog, const gcn::TranslateOptions& o
         note_compute_lift(name, false, why);
         return;
     }
-    hlsl_name_next(name);
+    hlsl_name_next(name, salt);
     gcn::LiftResult l = lift_compute_cached(prog, o, meta);
     if (l.ok()) {
         meta.spirv = std::move(l.spirv);
@@ -5867,6 +6008,7 @@ struct CsOptimizer {
         std::uint64_t flip = 0;        // when its stand-in was built
         std::uint64_t standin_us = 0;  // and how long that took
         VkPipelineLayout layout = VK_NULL_HANDLE;  // null: Gpu::pipe_layout
+        bool run_only = false;  // an edited shader's (RunOnlyCache): its cache goes, never merged
     };
     struct Running {
         std::string name;  // empty: the thread is idle
@@ -6007,7 +6149,7 @@ void cs_optimize_thread(int index) {
             if (g.opt_cache == VK_NULL_HANDLE || vkCreatePipelineCache(g.device, &pcci, nullptr, &own) != VK_SUCCESS) own = VK_NULL_HANDLE;
             p = create_compute(module, CsBuild::kOptimized, job.name + watch, &job.spirv, own, job.layout);
             if (own != VK_NULL_HANDLE) {
-                if (p) {
+                if (p && !job.run_only) {
                     std::lock_guard<std::mutex> lk(g_opt_cache_mu);
                     vkMergePipelineCaches(g.device, g.opt_cache, 1, &own);
                 }
@@ -6063,6 +6205,7 @@ void queue_compute_optimize(std::uint64_t key, const std::string& name, const st
         job.flip = hle_video_flip_count();
         job.standin_us = standin_us;
         job.layout = layout;
+        job.run_only = t_run_only_cache;
         g_cs_opt.jobs.push_back(std::move(job));
     }
     g_cs_opt.cv.notify_one();
@@ -6308,7 +6451,7 @@ bool precompiled_compute_done(std::uint64_t key) {
 
 ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std::vector<std::uint32_t>& words,
                               const std::string& name, const std::vector<std::pair<std::uint32_t, bool>>& dims,
-                              const std::vector<bool>& sampler_modes) {
+                              const std::vector<bool>& sampler_modes, std::uint64_t salt = 0) {
     auto it = g.pipelines.find(key);
     if (it != g.pipelines.end()) {
         if (!it->second.pending) {
@@ -6345,7 +6488,10 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         host_log("gpu: shader %s copies the V# in user[%d:%d] into an image", name.c_str(), pl.img_src_sgpr, pl.img_src_sgpr + 3);
     }
     if (pl.copy) host_log("gpu: shader %s copies the V# in user[%d:%d] to user[%d:%d] (render targets become snapshots)", name.c_str(), pl.copy_src_sgpr, pl.copy_src_sgpr + 3, pl.copy_dst_sgpr, pl.copy_dst_sgpr + 3);
-    switch (take_precompiled_compute(key, d, name, dims, sampler_modes, pl)) {
+    // A key with edited shaders' salt (host/shader_overrides.h) was never
+    // compiled ahead: built here, its pipelines the run's own, never recorded.
+    const RunOnlyCache run_only(salt != 0);
+    switch (salt ? Precompiled::kBuildHere : take_precompiled_compute(key, d, name, dims, sampler_modes, pl)) {
     case Precompiled::kTaken:
         g.translated.fetch_add(1);
         recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, false);  // a compute record's: its use counted
@@ -6373,7 +6519,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         pl.failed = true;
         return pl;
     }
-    apply_compute_lift(prog, o, pl.meta, name, pl.lifted, pl.lift_why);
+    apply_compute_lift(prog, o, pl.meta, name, pl.lifted, pl.lift_why, salt);
     if (const char* e = std::getenv("BBHOST_DUMP_SPIRV"); e && e[0] == '1') {
         host_mkdir("build/spv");
         const std::string path = "build/spv/" + name + (pl.lifted ? "-cs-lifted.spv" : "-cs.spv");
@@ -6411,6 +6557,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         }
         // BBHOST_HLSL: the driver refused DXC's module - the lift's own next.
         if (std::vector<std::uint32_t> lift; hlsl_lift_of(pl.meta.spirv, lift)) {
+            hlsl_note_override_refused(pl.meta.spirv);
             if (pl.module) vkDestroyShaderModule(g.device, pl.module, nullptr);
             pl.module = VK_NULL_HANDLE;
             pl.meta.spirv = std::move(lift);
@@ -6430,7 +6577,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     // with its buffers pushed, is the form a translated one runs in, and the
     // lift of that translation a lifted one's (BBHOST_LIFT_CS_BUFFERS) - its
     // walking lift when a buffer does not bind.
-    pl.lean = build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name, pl.lifted);
+    pl.lean = build_compute_lean(prog, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, pl.meta, key, name, pl.lifted, salt);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     g.translated.fetch_add(1);
     static const char* trace_name = std::getenv("BBHOST_TRACE_DISPATCH");
@@ -6463,7 +6610,8 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     }
     // Built here, on the command processor: the next start (or a list's
     // first start) builds it on a precompile worker instead.
-    if (pl.pipeline) recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, true);
+    if (pl.pipeline && !salt) recipe_note_compute(name, words, key, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes, true);
+    if (pl.pipeline && salt) override_note_pipeline();
     return pl;
 }
 
@@ -7130,15 +7278,20 @@ bool fence_wait_locked(int k, std::uint64_t& waited_us) {
     Gpu::Slot& sl = g.slots[k];
     waited_us = 0;
     if (g_device_lost.load(std::memory_order_acquire)) return false;
-    const auto t0 = std::chrono::steady_clock::now();
-    g.wait_started_ns.store(static_cast<std::uint64_t>(t0.time_since_epoch().count()), std::memory_order_relaxed);
+    // A slow call's (host/slow_calls.h), its clock reads this wait's own: the
+    // monotonic count, steady_clock's on both hosts.
+    slow_calls::Scope timed(kSlotFenceSite, 0, true);
+    const std::uint64_t t0 = timed.start_ns();
+    g.wait_started_ns.store(t0, std::memory_order_relaxed);
     g.waiting_slot.store(k, std::memory_order_relaxed);
     VkResult r = VK_TIMEOUT;
     double secs = 0.0;
     bool slow = false;
+    std::uint64_t t1 = t0;
     for (;;) {
         r = vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, fence_step_ns());
-        secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        t1 = host_clock_monotonic_ns();
+        secs = static_cast<double>(t1 - t0) / 1e9;
         if (r != VK_TIMEOUT) break;
         slow = true;
         if (!sl.said_stuck) {
@@ -7149,6 +7302,7 @@ bool fence_wait_locked(int k, std::uint64_t& waited_us) {
         }
         if (secs >= fence_limit_s()) break;
     }
+    timed.end_at(t1);
     g.waiting_slot.store(-1, std::memory_order_relaxed);
     waited_us = static_cast<std::uint64_t>(secs * 1e6);
     if (r == VK_SUCCESS) {
@@ -7364,9 +7518,12 @@ void present_reads_wait(std::uint64_t target) {
     const auto start = std::chrono::steady_clock::now();
     for (int k = 0;; ++k) {
         std::uint64_t v = 0;
-        if (vkGetSemaphoreCounterValue(g.device, g.present_timeline, &v) != VK_SUCCESS || v >= target ||
-            g_device_lost.load(std::memory_order_relaxed))
-            return;
+        VkResult r;
+        {
+            slow_calls::Scope timed(kPresentReadsSite);
+            r = vkGetSemaphoreCounterValue(g.device, g.present_timeline, &v);
+        }
+        if (r != VK_SUCCESS || v >= target || g_device_lost.load(std::memory_order_relaxed)) return;
         if (std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) break;
         if (k < 64) std::this_thread::yield();
         else host_sleep_us(250);
@@ -7382,7 +7539,9 @@ namespace {
 // host_gpu_wait_completed land, and the thread is the one landing.
 std::uint64_t timeline_value() {
     std::uint64_t v = 0;
-    if (g_device_lost.load(std::memory_order_relaxed) || vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS) return ~0ull;
+    if (g_device_lost.load(std::memory_order_relaxed)) return ~0ull;
+    slow_calls::Scope timed(kLandingValueSite);
+    if (vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS) return ~0ull;
     return v;
 }
 bool timeline_wait(std::uint64_t need, std::uint64_t timeout_ns) {
@@ -7391,6 +7550,7 @@ bool timeline_wait(std::uint64_t need, std::uint64_t timeout_ns) {
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g.timeline;
     wi.pValues = &need;
+    slow_calls::Scope timed(kLandingWaitSite, poll_slack(timeout_ns));
     return vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
 }
 void landing_thread_start() {
@@ -7463,6 +7623,7 @@ void retire_slot_locked(int k) {
     if (!g.ok && g_sub_failed.load(std::memory_order_relaxed)) {
         // Its submission may never have gone in: the fence would never signal.
         QueueGuard queue;
+        slow_calls::Scope timed(kFailedIdleSite);
         vkDeviceWaitIdle(g.device);
         sl.in_flight = false;
         busy_retired_locked(sl, false);
@@ -8239,11 +8400,19 @@ bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool 
     return true;
 }
 
+// An image or view a plugin's render hook was handed: the hooks' next one of
+// its place is a new generation (host/render_hooks.h), even if the driver
+// makes the next under the same handle.
+static void render_hooks_note_gone(const void* handle) {
+    if (handle && render_hooks_on()) render_hooks_gone_locked(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handle)));
+}
+
 void defer_destroy_image(VkImage image, const ImageMemory& m) {
     if (m.block < 0) {
         defer_destroy_image(image, m.memory);
         return;
     }
+    render_hooks_note_gone(image);
     bump_view_epoch();
     if (image) g.slots[g.slot].dead_images.push_back(image);
     g.slots[g.slot].dead_ranges.push_back(m);
@@ -8900,12 +9069,14 @@ void start_memory_reserve() {
 }
 
 void defer_destroy_image(VkImage image, VkDeviceMemory memory) {
+    render_hooks_note_gone(image);
     bump_view_epoch();
     if (image) g.slots[g.slot].dead_images.push_back(image);
     if (memory) g.slots[g.slot].dead_memory.push_back(memory);
 }
 
 void defer_destroy_view(VkImageView view) {
+    render_hooks_note_gone(view);
     bump_view_epoch();
     if (!view) return;
     set_cache_forget_view_locked(view);
@@ -8920,6 +9091,7 @@ void defer_destroy_view(VkImageView view) {
 // view memos every frame: on a Steam Deck building views was 9.5% of the
 // command processor, the words memo hit 47%.
 void defer_destroy_private_view(VkImageView view) {
+    render_hooks_note_gone(view);
     if (view) g.slots[g.slot].dead_views.push_back(view);
 }
 
@@ -9187,9 +9359,9 @@ void submit_locked() {
     const bool streamed = stream_on();
     if (!streamed) {
         const VkCommandBuffer cmd = g_cmd();
-        const std::uint64_t t0 = host_clock_monotonic_ns();
+        slow_calls::Scope timed(kEndInPlaceSite, 0, true);  // its clock reads the figure's too
         vkEndCommandBuffer(cmd);
-        bump(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+        bump(g_stream_stats.endbegin_ns, timed.end());
         bump(g_stream_stats.endbegin_n);
     }
     g.recording = false;
@@ -9269,7 +9441,11 @@ void submit_locked() {
         busy_submitted_locked(cur);
         TimelineSignal tl;
         tl.add(si, cur.serial);
-        const VkResult r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
+        VkResult r;
+        {
+            slow_calls::Scope timed(kSubmitInPlaceSite);
+            r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
+        }
         g_stream_submitted.store(cur.serial + 1, std::memory_order_release);
         if (r != VK_SUCCESS) {
             host_log("gpu: submit of %u items failed (%d)%s", g.queued, r,
@@ -9515,7 +9691,7 @@ bool host_gpu_available() {
 GpuStats host_gpu_stats() {
     GpuStats st{g.draws.load(),      g.dispatches.load(),        g.flushes, g.gpu_us.load(),
                 g.gfx_pipelines.load(), g.transfers.load(), g.transfer_batches.load(), {}};
-    for (int i = 0; i < 8; ++i) st.phase_ns[i] = g.phase_ns[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kPhaseCount; ++i) st.phase_ns[i] = g.phase_ns[i].load(std::memory_order_relaxed);
     st.draw_calls = g.draw_calls.load();
     st.draw_failures = g.draw_failures.load();
     st.draws_empty = g.draws_empty.load();
@@ -9579,7 +9755,9 @@ const char* host_gpu_vs_why_name(int why) {
                                                     "a short stride",      "data outside one buffer"};
     return why >= 0 && why < kVsWhyCount ? names[why] : nullptr;
 }
-void host_gpu_phase_add(int phase, std::uint64_t ns) { g.phase_ns[phase & 7].fetch_add(ns, std::memory_order_relaxed); }
+void host_gpu_phase_add(int phase, std::uint64_t ns) {
+    if (phase >= 0 && phase < kPhaseCount) g.phase_ns[phase].fetch_add(ns, std::memory_order_relaxed);
+}
 
 GpuHandles host_gpu_handles() {
     GpuHandles h;
@@ -9588,8 +9766,10 @@ GpuHandles host_gpu_handles() {
     h.device = g.device;
     h.queue = g.queue;
     h.present_queue = g.present_queue;
+    for (int i = 0; i < 3; ++i) h.fg_queues[i] = g.fg_queues[i];
     h.family = g.family;
     h.fifo_latest_ready = g.fifo_latest_ready_ext != nullptr;
+    h.full_screen_exclusive = g.full_screen_exclusive;
     return h;
 }
 
@@ -9597,11 +9777,15 @@ void host_gpu_lock() { g.mu.lock(); }
 bool host_gpu_device_lost() { return g_device_lost.load(std::memory_order_acquire); }
 void host_gpu_unlock() { g.mu.unlock(); }
 void host_gpu_queue_lock() {
+    slow_calls::Scope timed(kHostQueueLockSite);
     queue_drain();
     g.queue_mu.lock();
 }
 void host_gpu_queue_unlock() { g.queue_mu.unlock(); }
-void host_gpu_queue_lock_only() { g.queue_mu.lock(); }
+void host_gpu_queue_lock_only() {
+    slow_calls::Scope timed(kHostQueueLockSite);
+    g.queue_mu.lock();
+}
 
 std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wait_stage, void* signal, void* fence) {
     if (!g_sub_running) return 0;
@@ -9624,6 +9808,7 @@ std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wai
 
 void host_gpu_wait_submitted(std::uint64_t ticket) {
     if (!ticket) return;
+    slow_calls::Scope timed(kPresenterTicketSite);  // ends after the lock is let go
     std::unique_lock<std::mutex> lk(g_sub_mu);
     if (ticket & kForeignTicket) {
         // A kForeignSubmit: once the recorder has replayed up to it and
@@ -9640,7 +9825,8 @@ void host_gpu_wait_work_submitted(std::uint64_t need) {
     // Its serial is need - 1: in the driver once stream_submitted_serial() is
     // past it. Bounded, and over at a lost device, whose recording is dropped
     // and never submitted: the presenter must not sit here for good.
-    const std::uint64_t t0 = host_clock_monotonic_ns();
+    slow_calls::Scope timed(kFrameSubmittedSite, 0, true);
+    const std::uint64_t t0 = timed.start_ns();
     for (std::uint64_t spins = 0; stream_submitted_serial() < need; ++spins) {
         if (g_device_lost.load(std::memory_order_acquire)) return;
         if (spins < 4096) {
@@ -9683,6 +9869,9 @@ struct CachedCompute {
     std::string name;
     std::uint64_t hash = 0;
     std::uint32_t head[16];
+    // Its edited shaders (host/shader_overrides.h): their salt as of the
+    // overrides' generation `hlsl_gen`, made again once it moves.
+    mutable std::uint64_t hlsl_gen = 0, hlsl_salt = 0;
 };
 std::unordered_map<std::uint64_t, CachedCompute> g_compute_programs;
 
@@ -9952,8 +10141,18 @@ bool host_gpu_dispatch(const GpuDispatch& d_in) {
         image_dims_for(paths_for(code_hash, words, gcn::Stage::Compute, d.rsrc1, d.rsrc2), d.user_data);
     const auto sampler_modes = sampler_modes_for(paths_for(code_hash, words, gcn::Stage::Compute, d.rsrc1, d.rsrc2), d.user_data);
     stamp.to(kDpPaths);
-    const std::uint64_t key = compute_key(code_hash, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes);
-    ComputePipeline& pl = pipeline_for(d, key, words, name, dims, sampler_modes);
+    std::uint64_t key = compute_key(code_hash, d.rsrc1, d.rsrc2, d.threads, dims, sampler_modes);
+    // Its edited shaders: a pipeline per set of their sources (host/shader_overrides.h).
+    std::uint64_t salt = 0;
+    if (const std::uint64_t gen = override_gen()) [[unlikely]] {
+        if (cc->hlsl_gen != gen) {
+            cc->hlsl_salt = override_salt(name);
+            cc->hlsl_gen = gen;
+        }
+        salt = cc->hlsl_salt;
+        if (salt) key = fnv1a(&salt, sizeof(salt), key ^ 0x0ed17edc0de5a17ull);
+    }
+    ComputePipeline& pl = pipeline_for(d, key, words, name, dims, sampler_modes, salt);
     if (g.oob.map && !pl.failed && !pl.oob_named) {  // BBHOST_OOB_COUNT: the slot's name, once
         pl.oob_named = true;
         note_oob_compute_slot(pl.meta.oob_slot, pl.name);
@@ -10893,7 +11092,13 @@ std::string host_gpu_compile_report() {
     std::string out = compute_optimize_window();
     const std::string tc = translation_cache_window();
     if (!tc.empty()) out += (out.empty() ? "" : "; ") + tc;
+    const std::string ov = overrides_window();  // edited shaders built (host/shader_overrides.h)
+    if (!ov.empty()) out += (out.empty() ? "" : "; ") + ov;
     return out;
+}
+
+void host_gpu_frame_recorded() {
+    override_data_latch();  // the plugins' shader data: the next frame reads what they wrote by now
 }
 
 void host_gpu_submit() {
@@ -11488,7 +11693,7 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     }
     if (g_twins.load(std::memory_order_relaxed) == 3 && !twin_armed_meets_locked(va, bytes)) return false;
     // A candidate's twin made, let go or dropped, a pass ended: in order.
-    if (run_part_stop(kRunStopBuffers)) return false;
+    if (run_part_stop_buffers(kBsTwin)) return false;
     std::uint64_t memory = 0, cbytes = 0, gen = 0;
     std::uint64_t edge[2] = {0, 0};  // twins a range across their edge must let go first
     int n_edge = 0;
@@ -12522,6 +12727,21 @@ void host_gpu_texture_retire(std::uint64_t base, std::size_t bytes, std::uint64_
     textures_retire(base, bytes, after_submitted, gen);  // its own lock: callable from the kernel's unmap
 }
 
+void host_gpu_targets_rebuild(bool on) {
+    textures_rebuild_window(on);
+    if (on) return;
+    // The change ran with the command processor drained, so the old size's
+    // retirements are due: a submission of their own carries them out (its
+    // textures_before_submit) and is retired at once, which gives their room
+    // in the image heap back before the next frame makes the new size's
+    // targets. Retired with the next frame's work instead, the old images
+    // still held it while the new size's were placed.
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok) return;
+    begin_recording_locked();
+    flush_locked();
+}
+
 void host_gpu_texture_written(std::uint64_t base, std::size_t bytes) {
     textures_gx_written(base, bytes);  // its own lock, as the retirement's
 }
@@ -13410,8 +13630,12 @@ std::uint64_t host_gpu_work_needs() {
 std::uint64_t host_gpu_submissions_completed() {
     if (g_timeline_on.load(std::memory_order_acquire)) {
         std::uint64_t v = 0;
-        if (g_device_lost.load(std::memory_order_relaxed) || vkGetSemaphoreCounterValue(g.device, g.timeline, &v) != VK_SUCCESS)
-            v = ~0ull;  // nothing more will run: nothing to wait for
+        bool read = false;
+        if (!g_device_lost.load(std::memory_order_relaxed)) {
+            slow_calls::Scope timed(kTimelineValueSite);
+            read = vkGetSemaphoreCounterValue(g.device, g.timeline, &v) == VK_SUCCESS;
+        }
+        if (!read) v = ~0ull;  // nothing more will run: nothing to wait for
         // What counts as run has its labels in memory (label_landing.h).
         if (landing_on()) label_landing::land_through(v);
         return v;
@@ -13447,7 +13671,11 @@ bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns) {
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g.timeline;
     wi.pValues = &need;
-    const bool done = vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
+    bool done;
+    {
+        slow_calls::Scope timed(kTimelineWaitSite, poll_slack(timeout_ns));
+        done = vkWaitSemaphores(g.device, &wi, timeout_ns) == VK_SUCCESS;
+    }
     if (done && landing_on()) label_landing::land_through(need);  // its labels in memory before the caller reads it
     return done;
 }

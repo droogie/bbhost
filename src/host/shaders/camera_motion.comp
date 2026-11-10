@@ -1,0 +1,70 @@
+#version 460
+// The temporal upscaler's motion from the camera (host/upscale_pass.cpp):
+// for each render pixel, where the surface in it was a frame ago minus where
+// it is, in render pixels, x right and y down - from the G-buffer's depth and
+// the two frames' cameras (Numity1504's handoff, step 4). Pixel centres, so
+// no jitter enters it. A pixel with no distance (the sky, an infinite far
+// plane) moves with the camera's turn alone. A point behind the last camera,
+// or no last camera, is no motion.
+//
+// The game's view has x right, y up and z forward. The camera is given as its
+// view-to-world rows (rotation | eye) for this frame and world-to-view rows
+// (the rotation transposed | its eye taken out) for the last.
+//
+// What moves of itself - the player, enemies, their weapons - comes from the
+// game's own velocity map (the motion blur's, upscale_pass.cpp): a full-screen
+// pass writes the camera's motion into it, (uv now - uv then) x the camera
+// scale + 0.5, and each moving mesh then writes its own over it, (NDC now -
+// NDC then) x the mesh scale x 0.5 + 0.5. A mesh's motion is its own alone:
+// the game projects where it was through this frame's camera too (its blur
+// leaves a camera turn to the camera's pass), so a mesh standing still while
+// the camera turns writes none. A texel that differs from what the camera's
+// pass would have written there is a mesh's, and its motion is added to the
+// camera's from the depth there - the surface's whole motion. Rebuilt (mode 3,
+// host/translation_cache.cpp velo_rebuilt): a mesh's texel holds its NDC
+// motion itself, now minus then, alpha 0.5 marking it - stored as
+// (v - offset) x scale, at 8 bits (v - 0.5) / 2 - and with the pass given last
+// frame's matrices (host/render.cpp velo_previous_locked, velo_size.w) it is
+// the whole motion, camera and walk included; without, added the same way.
+//
+// Compiled offline (tools/build_shaders.sh) into camera_motion.spv.h.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D depth_plane;
+layout(set = 0, binding = 1) uniform sampler any_sampler;
+layout(set = 0, binding = 2) uniform writeonly image2D motion;  // R16G16_SFLOAT, written without a format
+layout(set = 0, binding = 3) uniform texture2D velo_map;           // the game's velocity map (velo_size.z == 0: none)
+// The depth as a plain R32F image, for the upscalers and frame generation:
+// the game's is D32_SFLOAT_S8_UINT, and the view FSR makes of a depth-stencil
+// image of its own did not read clean depth (upscale_pass.cpp g_depth_r32).
+layout(set = 0, binding = 4, r32f) uniform writeonly image2D depth_copy;
+// The captured meshes (upscale_pass.cpp, capture_motion.vert/.frag): NDC now
+// minus NDC then in red and green, the view distance in blue, alpha 0.5 where
+// a skinned mesh was drawn - each mesh's own corners this frame and last, as
+// BBNextGenSuite captures them. Taken before the velocity map where it is the
+// surface seen; alpha 0 elsewhere.
+layout(set = 0, binding = 5) uniform texture2D cap_map;
+
+layout(push_constant) uniform Params {
+    vec4 now_proj;  // tan(fov_x / 2), tan(fov_y / 2), A, r2w: view distance = r2w / (raw - A)
+    vec4 now_r0, now_r1, now_r2;     // view to world
+    vec4 prev_proj;  // the last camera's tangents (x <= 0: none), then the render size
+    vec4 prev_r0, prev_r1, prev_r2;  // world to the last camera's view
+    // The velocity map: the camera's pass's scale (x 2.5, its uv delta's),
+    // the meshes' (their NDC delta's x 0.5, y as uv: down)
+    vec4 velo_k;
+    vec4 velo_size;  // its size, then mode (0: unused, 1: the meshes', 2: all of it, 3: rebuilt), the tolerance
+    // (rebuilt: velo_k is the decode, scale then offset)
+};
+
+#define MOTION_SAMPLER any_sampler
+#include "motion_at.glsl"
+
+void main() {
+    const vec2 size = prev_proj.zw;
+    const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= int(size.x) || xy.y >= int(size.y)) return;
+    const float raw = texelFetch(sampler2D(depth_plane, any_sampler), xy, 0).r;
+    imageStore(depth_copy, xy, vec4(raw, 0.0, 0.0, 0.0));
+    imageStore(motion, xy, vec4(motion_at(xy, raw), 0.0, 0.0));
+}

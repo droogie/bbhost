@@ -5,6 +5,7 @@
 #include "core/elf.h"
 #include "core/memory.h"
 #include "engine/addr.h"
+#include "engine/patch_manifest.h"
 #include "hle/modules.h"
 #include "host/options.h"
 #include "host/settings.h"
@@ -178,10 +179,18 @@ void find_tables() {
 }
 
 // The settings' listener: the multipliers the settings object carries
-// (host/settings.h) - distance and height 10% a step around the game's own,
-// field of view 5% wider a step, BBHOST_FOV overriding - kept for the next
-// view, which has work only when they moved.
+// (host/settings.h) - distance and height 1% a step around the game's own,
+// field of view 1% wider a step, BBHOST_FOV overriding - kept for the next
+// view, which has work only when they moved. A field of view wider than the
+// game's takes the game's 48-degree clamp out (the built-in fov-uncap,
+// engine/patch_manifest.cpp), and the game's own puts it back.
 void settings_changed(const HostSettings& hs) {
+    static int wide = -1;  // the clamp out (1) or in (0) as last asked; -1 as the start left it
+    const bool want_wide = hs.fov_scale > 1.0f;
+    if (wide != (want_wide ? 1 : 0)) {
+        if (wide >= 0 || want_wide) patch_manifest_set_live("fov-uncap", want_wide, nullptr);
+        wide = want_wide ? 1 : 0;
+    }
     const Scales k{hs.camera_distance_scale, hs.camera_height_scale, hs.fov_scale};
     std::lock_guard<std::mutex> lock(g_want_mu);
     if (k == g_want) return;  // another setting changed
@@ -237,18 +246,34 @@ void fov_watch() {
     }
 }
 
-// The clamp at kFovClamp is taken out by patches/fov-uncap.toml;
-// this only says whether it happened, for the log's sake.
+// The clamp at kFovClamp is taken out by the built-in fov-uncap while the
+// Field of view is wider than the game's; this only says how it starts.
 void camera_install(ElfImage* image) {
     const std::uint64_t at = image->mem.slide + (kFovClamp - kPreferredGuestSlide);
     const auto* p = static_cast<const std::uint8_t*>(guest_ptr(image->mem, at));
     if (std::memcmp(p, kFovNoClamp, sizeof(kFovNoClamp)) != 0) {
-        host_log("camera: the field of view stays capped at 48 degrees (patches/fov-uncap.toml not applied)");
+        host_log("camera: the game's 48-degree field of view cap is in (Field of view +0%%; a wider one takes it out)");
     }
     host_settings_listen(&settings_changed);
 }
 
+// A plugin's zoom (camera_zoom_take): the presses since it last took them.
+std::atomic<bool> g_zoom_taken{false};
+std::atomic<int> g_taken_steps{0};
+std::atomic<bool> g_taken_reset{false};
+
+int camera_zoom_take(bool* reset) {
+    g_zoom_taken.store(true, std::memory_order_relaxed);
+    *reset = g_taken_reset.exchange(false);
+    return g_taken_steps.exchange(0);
+}
+
 void camera_zoom(int steps, bool reset) {
+    if (g_zoom_taken.load(std::memory_order_relaxed)) {
+        if (reset) g_taken_reset.store(true);
+        g_taken_steps.fetch_add(reset ? 0 : steps);
+        return;
+    }
     std::lock_guard<std::mutex> lock(g_want_mu);
     const float was = g_zoom;
     if (reset) {

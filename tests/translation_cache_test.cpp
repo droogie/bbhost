@@ -27,6 +27,8 @@
 std::uint32_t host_thread_id() { return 1; }
 void host_thread_set_name(const char*) {}
 void host_thread_background() {}
+// Motion vectors as the settings have them (host/options.cpp): not rebuilt.
+int host_opt_motion_rebuilt_bits() { return 0; }
 
 using namespace gpu;
 

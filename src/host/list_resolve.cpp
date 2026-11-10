@@ -33,17 +33,34 @@ const int g_mode = [] {
 namespace {
 // BBHOST_RUN_COMMIT's default where it is unset: on (2) on Windows, where it
 // was measured to win, and off (0) on Linux, where it was measured to lose
-// (log_commit_default says why).
+// (log_commit_default says why). On Windows it gives way wherever the constant
+// buffers' homes are bound, by their rule or BBHOST_GXVK_HOMES=1
+// (host/gxvk_homes.h run_commit_gives_way, commit_give_way below).
 #if defined(_WIN32)
 constexpr int kRunCommitDefault = 2;
 #else
 constexpr int kRunCommitDefault = 0;
 #endif
-// BBHOST_RUN_COMMIT's mode: kRunCommitDefault unless it says otherwise - on
-// (2), 0 or off, fork (1), compare (3), or the number.
+// BBHOST_TEST_RUN_COMMIT_DEFAULT=on takes Windows' default on any platform,
+// =off Linux's: a test of the default and its give-way where the other
+// platform is not at hand (ThreadSanitizer, lavapipe).
+const char* test_default_env() {
+    const char* t = std::getenv("BBHOST_TEST_RUN_COMMIT_DEFAULT");
+    return t && *t ? t : nullptr;
+}
+int run_commit_default() {
+    if (const char* t = test_default_env()) return std::strcmp(t, "on") == 0 || std::strcmp(t, "1") == 0 ? 2 : 0;
+    return kRunCommitDefault;
+}
+bool run_commit_set() {
+    const char* e = std::getenv("BBHOST_RUN_COMMIT");
+    return e && *e;
+}
+// BBHOST_RUN_COMMIT's mode: the default (run_commit_default) unless it says
+// otherwise - on (2), 0 or off, fork (1), compare (3), or the number.
 int run_commit_from_env() {
     const char* e = std::getenv("BBHOST_RUN_COMMIT");
-    if (!e || !*e) return kRunCommitDefault;
+    if (!e || !*e) return run_commit_default();
     if (std::strcmp(e, "on") == 0) return 2;
     if (std::strcmp(e, "off") == 0) return 0;
     if (std::strcmp(e, "fork") == 0) return 1;
@@ -83,7 +100,7 @@ const int g_draw_ctx = [] {
     return std::strcmp(e, "chunks") == 0 || e[0] == '1' ? 1 : 0;
 }();
 
-const int g_commit = run_commit_from_env();
+std::atomic<int> g_commit = run_commit_from_env();
 
 // (Read from the environment, not from g_commit or gxvk_lists: no order
 // between the two modules' initialisers.)
@@ -92,7 +109,26 @@ std::atomic<bool> g_parts = [] {
     return lists_may_splice_from_env();
 }();
 
-std::atomic<bool> g_sinks = g_commit != 0 || g_parts.load();  // (after both: this file's order)
+std::atomic<bool> g_sinks = g_commit.load() != 0 || g_parts.load();  // (after both: this file's order)
+
+namespace {
+std::atomic<bool> g_gave_way{false};  // commit_give_way turned the default off
+}  // namespace
+
+bool commit_by_setting() { return run_commit_set() && run_commit_from_env() != 0; }
+bool commit_by_default() { return !run_commit_set() && run_commit_default() != 0; }
+
+void commit_give_way() {
+    if (!commit_by_default()) return;
+    // With the device (gpu.cpp init_locked, homes_decide): at the start where there is a window, else inside the
+    // command processor's first draw or dispatch, before it records anything. Until then the only reads of the mode are
+    // that first draw token's (gnm_exec: with commit_draws() it looks ahead for nothing; its fork, run_commit_after,
+    // comes after the draw and reads the mode again), so no fork has run and no worker exists (start_pool, at the
+    // first fork); nothing keeps a copy of it. The batching and the part machinery stay on as the commit had them:
+    // the homes' default (follow_homes) and BBHOST_GXVK_HOMES=1 want them too.
+    g_commit.store(0, std::memory_order_relaxed);
+    g_gave_way.store(true, std::memory_order_relaxed);
+}
 
 void follow_homes() {
     const char* l = std::getenv("BBHOST_GXVK_LISTS");
@@ -106,11 +142,22 @@ void follow_homes() {
 void log_commit_default() {
     static std::once_flag once;
     std::call_once(once, [] {
-        const char* e = std::getenv("BBHOST_RUN_COMMIT");
-        if (e && *e) return;  // set: the setting's own choice
-        if (kRunCommitDefault)
-            host_log("list-resolve: run commit on by default on Windows (BBHOST_RUN_COMMIT=0 turns it off): measured there at 1080p, "
-                     "+12% on a Radeon 8060S and +2% on an RTX 3070 Ti Laptop GPU");
+        if (run_commit_set()) return;  // set: the setting's own choice
+        const char* where = test_default_env() ? "by Windows' default (BBHOST_TEST_RUN_COMMIT_DEFAULT)" : "by default on Windows";
+        if (g_gave_way.load(std::memory_order_relaxed))
+            host_log("list-resolve: run commit off by default here - on %s, it gives way where the constant buffers' "
+                     "homes are bound (their lines say why): measured at 1080p on an RTX 3070 Ti Laptop GPU, uncapped Old Yharnam ran "
+                     "27%% faster with the homes and the pool's segments than with the run commit and three other places 3.0-4.0%%, "
+                     "and at a true 60 the homes took 15-33 points of CPU less, the frame the same (BBHOST_RUN_COMMIT=on turns it on)",
+                     where);
+        else if (run_commit_default())
+            host_log("list-resolve: run commit on %s (BBHOST_RUN_COMMIT=0 turns it off): measured there at 1080p, "
+                     "+12%% on a Radeon 8060S and +2%% on an RTX 3070 Ti Laptop GPU; it gives way only where the constant buffers' homes "
+                     "are bound, by their rule or BBHOST_GXVK_HOMES=1 (host/gxvk_homes.h), and BBHOST_GXVK_HOMES=0 keeps it",
+                     where);
+        else if (test_default_env())
+            host_log("list-resolve: run commit off by default here (BBHOST_TEST_RUN_COMMIT_DEFAULT: Linux's default) - every draw "
+                     "committed in order (BBHOST_RUN_COMMIT=on turns it on)");
         else
             host_log("list-resolve: run commit off by default on Linux - every draw committed in order, as before it "
                      "(BBHOST_RUN_COMMIT=on turns it on): on an RTX 4070 with two Xeon Gold 6230 it lost 14-21% of the frame rate "
@@ -349,7 +396,11 @@ void count(Count k, std::uint64_t n) {
     g_batch_n[k].store(g_batch_n[k].load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
 }
 
+thread_local constinit int t_last_split = kSplits;
+int last_split() { return t_last_split; }
+
 void split(Split why) {
+    t_last_split = why;
     ++t_serial;
     t_run_left = 0;
     t_run_hold = 0;
@@ -389,7 +440,7 @@ void note_draw(const GpuDrawInputs& in, const GxDrawObjects& o) {
 }
 
 void report(bool at_exit) {
-    if (at_exit && g_commit) log_commit();
+    if (at_exit && committing()) log_commit();
     if (at_exit && batching()) log_batch();
     if (at_exit && g_draw_ctx) log_ctx();
     if (!g_mode || !host_tooling()) return;

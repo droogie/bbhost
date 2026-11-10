@@ -1,5 +1,6 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/plugin_ui.h"
+#include "host/launcher_ui.h"
 
 #include "bbhost_plugin.h"
 #include "core/config.h"
@@ -77,7 +78,24 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
     const std::string label = o.label + (later ? "  (next start)" : "");
     bool helped = false;  // the widget put its help after something of its own
     const std::string value = plugins_option_value(p, o);
-    const float width = 260 * scale;
+    const float width = 380 * scale;
+    // BB_OPT_WHEN: greyed out unless another of the plugin's options holds one of its values.
+    bool greyed = false;
+    if (const std::size_t eq = o.when.find('='); eq != std::string::npos) {
+        const std::string key = o.when.substr(0, eq);
+        const std::vector<std::string> want = split(o.when.substr(eq + 1), '|');
+        for (const PluginOptionDesc& other : p.options) {
+            if (other.key == key) greyed = std::find(want.begin(), want.end(), plugins_option_value(p, other)) == want.end();
+        }
+    }
+    ImGui::BeginDisabled(greyed);
+    // A number option's reset to its default (BbOption's default text).
+    const auto reset = [&](bool at_default) {
+        if (launcher_ui::reset_button("##reset", at_default)) {
+            plugins_set_option(p.name, o.key, o.def);
+            ui.edits.erase(id);
+        }
+    };
     switch (o.type) {
     case BB_OPT_HEADING:
         ImGui::SeparatorText(o.label.c_str());
@@ -96,6 +114,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
             plugins_set_option(p.name, o.key, std::to_string(v));
             ui.edits.erase(id);
         }
+        reset(v == std::atoi(o.def.c_str()));
         break;
     }
     case BB_OPT_FLOAT: {
@@ -113,6 +132,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
             plugins_set_option(p.name, o.key, t);
             ui.edits.erase(id);
         }
+        reset(std::fabs(v - static_cast<float>(std::atof(o.def.c_str()))) < 0.005f);
         break;
     }
     case BB_OPT_CHOICE: {
@@ -179,6 +199,7 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
     } else if (!o.help.empty() && !helped) {
         help(o.help);
     }
+    ImGui::EndDisabled();
     ImGui::PopID();
 }
 
@@ -186,12 +207,14 @@ void option_row(PluginUi& ui, const PluginEntry& p, const PluginOptionDesc& o, f
 
 void plugin_ui_refresh(PluginUi& ui) {
     ui.plugins = plugins_scan();
-    // In the game, which of them are running.
+    // In the game, which of them are running, and the anti-aliasing claim each
+    // holds now - one made by aa_claim as well as one its flags declare.
     for (const PluginEntry& loaded : plugins_catalog()) {
         for (PluginEntry& p : ui.plugins) {
             if (p.name != loaded.name) continue;
             p.loaded = !loaded.visitor;  // a visitor is not the player's plugin running
             p.visitor = loaded.visitor;
+            if (!loaded.visitor) p.aa = loaded.aa;
         }
     }
     std::sort(ui.plugins.begin(), ui.plugins.end(), [](const PluginEntry& a, const PluginEntry& b) {
@@ -278,6 +301,18 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
             ImGui::TextUnformatted(p.description.c_str());
             ImGui::PopTextWrapPos();
         }
+        // Plugin API 27's anti-aliasing claim (host/plugins.h): its flags', or in game the one it holds now.
+        if (p.aa == kAaTake) {
+            ImGui::PushTextWrapPos(0.0f);
+#if defined(_WIN32)
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "Does the anti-aliasing itself: while it is on, bbhost's TAA, FSR and DLSS "
+                                                                  "and the game's own anti-aliasing are off, and Graphics > Upscaling says so.");
+#else
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "Does the anti-aliasing itself: while it is on, bbhost's TAA and DLSS and "
+                                                                  "the game's own anti-aliasing are off, and Graphics > Upscaling says so.");
+#endif
+            ImGui::PopTextWrapPos();
+        }
         ImGui::Spacing();
         ImGui::BeginDisabled(p.bad_signature);
         bool on = p.enabled;
@@ -289,7 +324,7 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
         if (p.visitor && !p.enabled) {
             ImGui::SameLine();
             ImGui::TextDisabled("off - joins other players' %s worlds when summoned", p.title.c_str());
-        } else if (ui.in_game && p.enabled != p.loaded) {
+        } else if (ui.in_game && p.enabled != p.loaded && !plugins_live_switch(p)) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), p.enabled ? "starts with the next launch" : "stops at the next launch");
         }

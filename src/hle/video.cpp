@@ -11,6 +11,8 @@
 #include "host/bindings.h"
 #include "engine/world_chr.h"
 #include "host/gpu.h"
+#include "host/options.h"
+#include "host/plugins.h"
 #include "core/config.h"
 #include "host/window.h"
 
@@ -315,6 +317,13 @@ void test_requests_read(const std::string& dir) {
             {
                 std::ifstream f(p);
                 f >> r.verb >> r.arg >> r.arg2;
+                // A plugin option's value may hold spaces ("240 lines"): the rest of the line.
+                if (r.verb == "plugin") {
+                    std::string rest;
+                    std::getline(f, rest);
+                    while (!rest.empty() && (rest.back() == '\r' || rest.back() == '\n' || rest.back() == ' ')) rest.pop_back();
+                    r.arg2 += rest;
+                }
             }
             fs::remove(p, ec);
             std::lock_guard<std::mutex> lk(g_test_req_mu);
@@ -387,6 +396,20 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
             const bool ok = world_lamp_warp_queue(std::atoi(arg.c_str()));
             host_log("test: lamp travel to return point %s at flip %llu%s", arg.c_str(), static_cast<unsigned long long>(count),
                      ok ? "" : ": not queued (BBHOST_TEST_WARP=1, in the world)");
+        } else if (verb == "opt" && !arg.empty() && !arg2.empty()) {
+            // A setting changed as the menus change it (host/options.h): its entry by index.
+            host_opt_set_index(arg.c_str(), std::atoi(arg2.c_str()));
+            host_log("test: option %s set to entry %s at flip %llu", arg.c_str(), arg2.c_str(), static_cast<unsigned long long>(count));
+        } else if (verb == "plugin" && arg.find('.') != std::string::npos && !arg2.empty()) {
+            // A plugin's option changed as its menu changes it (host/plugins.h): <name>.<key> <value>.
+            const std::size_t dot = arg.find('.');
+            plugins_set_option(arg.substr(0, dot), arg.substr(dot + 1), arg2);
+            host_log("test: plugin option %s set to \"%s\" at flip %llu", arg.c_str(), arg2.c_str(), static_cast<unsigned long long>(count));
+        } else if (verb == "plugin_on" && !arg.empty() && !arg2.empty()) {
+            // A plugin turned on or off as its menu's switch does: <name> <true|false>.
+            plugins_set_enabled(arg, arg2 == "true");
+            host_log("test: plugin %s turned %s at flip %llu", arg.c_str(), arg2 == "true" ? "on" : "off",
+                     static_cast<unsigned long long>(count));
         } else if (verb == "exit") {
             host_log("test: exit asked for at flip %llu", static_cast<unsigned long long>(count));
             g_test_exit.store(true);
@@ -698,7 +721,8 @@ void flip_waiter() {
 
 void start_vsync() {
     std::call_once(g_vsync_once, [] {
-        // Set, never cleared: the game above 60 or uncapped has set it already
+        // Set here, cleared only by a frame rate of 60 chosen while the game
+        // runs: the game above 60 or uncapped has set it already
         // (hle_video_set_game_pace).
         if (const char* e = std::getenv("BBHOST_UNCAP"); e && e[0] == '1') g_flip_uncapped.store(true);
         if (g_flip_keeper) {
@@ -1174,6 +1198,11 @@ void hle_video_set_game_pace(int fps) {
             host_log("video: flips complete as soon as they are recorded (the game paces itself, uncapped)");
         }
     } else {
+        // 60 (or 30) after a rate above it chosen while the game runs
+        // (engine/frame_rate.h frame_rate_request): flips held to the pace
+        // again, unless BBHOST_UNCAP asks otherwise.
+        const char* e = std::getenv("BBHOST_UNCAP");
+        if (!(e && e[0] == '1')) g_flip_uncapped.store(false);
         g_fps_cap.store(fps);
     }
 }
@@ -1183,12 +1212,13 @@ int hle_video_game_pace() { return g_game_pace.load(std::memory_order_relaxed); 
 void hle_video_set_fps_cap(int fps) {
     // The game's pace is chosen when it starts (engine/frame_rate.h): its
     // steps are converted for that rate, so capping it lower now would slow
-    // the game itself down. A frame rate picked while it runs applies on the
-    // next run.
+    // the game itself down. A converted rate picked while it runs goes to
+    // frame_rate_request instead; what reaches here (30 either side) applies
+    // on the next run.
     if (const int pace = g_game_pace.load(); pace >= 0) {
         if (fps != pace) {
-            host_log("video: frame rate %d applies on the next run (the game is running at %d; 0 is uncapped), and with it the default "
-                     "for the draw work prepared on the pool's threads, decided at start (host/gxvk_homes.h)",
+            host_log("video: frame rate %d applies on the next run (the game is running at %d; 0 is uncapped), and with it the defaults "
+                     "for the draw work - prepared on the pool's threads, or on Windows by the run commit - decided at start (host/gxvk_homes.h)",
                      fps, pace);
         }
         return;

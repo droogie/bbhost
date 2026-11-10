@@ -80,8 +80,9 @@ that HLSL and have the game use your version.
    name for it.
    - The game's own built-in shaders (the menus' Scaleform, YEBIS) have only
      GX's name, as in `38d65b32.ps.hlsl`.
-   - The stages are `ps`, `vs`, `hs`, `ds` and `cs`.
-   - Beside each file is the lift it came from (`.lift.spv`).
+   - The stages are `ps`, `vs`, `hs`, `ds`, `gs` and `cs`.
+   - Beside each file is the lift it came from (`.lift.spv`), and the folder
+     has `bbhost.hlsli`, the helpers a plugin's shader includes (below).
    - The first line names the shader again; the second gives this build's lift
      hash.
 
@@ -96,9 +97,12 @@ that HLSL and have the game use your version.
 2. Copy the files you want to change into `<data>/bbhost/shaders/`. Keep
    each file's name, and edit the copy.
 3. Start the game. The log lists the edited files it found (`render: HLSL
-   overrides: N edited shaders in ...`). The first time a shader is used,
-   its edited file is compiled, and the log says whether it was taken
-   (`render: HLSL override <file> compiled and taken for <shader>`).
+   overrides: N - <shader> (your folder), ...`). The first time a shader is
+   used, its edited file is compiled, and the log says whether it was taken
+   (`render: HLSL override <file> compiled and taken for <shader>`). The exit
+   report has a line for each edited shader the run had: taken, refused and
+   why, or not met - or, for a file removed while the game ran, the flip it
+   went at and how many stages it was built into while it was there.
 
 For each shader, the game looks for an edited file in this order:
 
@@ -123,31 +127,66 @@ reads.
 Things to know:
 
 - **Names survive updates; hashes don't.** A file named after the shader
-  (`<name>.<stage>.hlsl`) keeps working after a bbhost update and on another
+  (`<name>.<stage>.hlsl`) keeps matching after a bbhost update and on another
   machine: both parts come from the game's own files. A lift hash
   identifies the shader as translated for your GPU and this bbhost version:
   the device's features (half-precision rounding, run-time sample offsets)
   and the translator are part of it. So `~<hash>` variant files and
   `<hash>` fallback files stop matching after an update; write out a fresh
   set then. A file that no shader matches does nothing.
+- **A dump is printed for the GPU that wrote it.** The device's features
+  change the HLSL, not only the hash: half-precision values are `float16_t2`
+  on a Steam Deck and are packed with `PackHalf2x16` on NVIDIA cards and
+  lavapipe. So a file edited from one GPU's dump can be refused on another
+  (DXC: `unknown type name 'float16_t2'`). A mod meant for every player should
+  patch, from a plugin, the text `shader_source` gives on the player's own
+  machine ([plugins.md](plugins.md), "Shaders") rather than ship whole files;
+  one that ships files needs one for each GPU family it has tested.
 - **An update can change the shader's interface.** If the update changes the
   inputs or outputs the game's own version declares, your file is refused,
   the log says why, and the game uses its own until you edit it again.
-- **When changes take effect.** Edits are read at the start, so restart the
-  game to try a change.
+- **When changes take effect.** Edits are read at the start. With
+  `BBHOST_SHADER_WATCH=1` the folder is read again every half second while
+  the game runs (`=<milliseconds>` for another period): a new, edited or
+  removed file applies at its shader's next draw, once it has compiled for
+  the variants of the shader met so far, and only that shader's pipelines are
+  built again (removing a file brings back what was built before it).
+- **Plugins can replace shaders too** ([plugins.md](plugins.md), "Shaders"),
+  by the same names. Your own file of a name comes first: the plugin's is not
+  used, and the log says so. In your own files, the helpers of `bbhost.hlsli`
+  that read a plugin's numbers read 0.
+- **Turning them all off.** `video.shader_overrides = false` in
+  `bbhost.toml`, or `BBHOST_SHADER_OVERRIDES=0`, leaves every shader the
+  game's own: your edited files and every plugin's. The log's start says how
+  many that leaves unused.
 - **The off switch turns this off too.** Edited shaders apply only while the
   HLSL path is on. With Shaders set to Lifted (HLSL Shaders off in the game's
   PC Graphics), or `BBHOST_HLSL=0`, they are ignored.
 - **Don't share the files.** They are generated from the game's own shaders,
   so they stay on your machine and are never published.
 
-## Draw and frame hooks (planned)
+## Draw and frame hooks
 
-Not in the plugin API yet: this is the design that GX's draw methods and
-command lists, now source ([decomp.md](decomp.md#gx-srcdecompgx)), make
-possible. GX is the engine's Direct3D 11 layer - the game names the
-interfaces it emulates, `ID3D11DeviceContext`, `ID3D11CommandList` and the
-state objects - so the hooks speak its terms.
+Plugin API 27 has the frame's part of these hooks; see
+[plugins.md](plugins.md#rendering-effects-v27):
+
+- `frame_info` describes each 3D frame: its render and output sizes, the
+  upscaler, its quality and its jitter, and this frame's and the last frame's
+  camera as matrices.
+- `on_render` records compute work of a plugin's own into the frame at two
+  points: before the upscale, with the lit scene, its depth, the motion and
+  the glow; and on the final picture after the upscale, before the
+  post-processing and the HUD.
+- `aa_claim` says whether a plugin leaves the anti-aliasing to bbhost or takes
+  it over, and the menus name the plugin that does.
+
+The rest is still planned and not in the plugin API: the hooks per draw, per
+pass and per post-processing parameter below, and the frame's end at the
+present. GX's draw methods and command lists, now source
+([decomp.md](decomp.md#gx-srcdecompgx)), make them possible. GX is the
+engine's Direct3D 11 layer - the game names the interfaces it emulates,
+`ID3D11DeviceContext`, `ID3D11CommandList` and the state objects - so the
+hooks speak its terms.
 
 - **Per draw and dispatch.** Called as the game issues each draw, dispatch or
   state commit, before bbhost takes it, on the thread that records it. The
@@ -165,11 +204,13 @@ state objects - so the hooks speak its terms.
   which target, and what read it later. A plugin can name the passes,
   capture a pass's targets, run a pass of its own between two of the game's
   (an effect after the scene and before the menus), or leave one out.
-- **Per frame.** Called where a frame ends, in the swap chain's present:
-  how many frames the game may run ahead of the display (two display
-  buffers, so at most two flips in flight) and what it waits for before it
-  hands a frame over are decided there. A plugin can run a pass of its own
-  over the final image, capture it, or pace frames another way.
+- **Per frame, at the present.** Called where a frame ends, in the swap
+  chain's present: how many frames the game may run ahead of the display
+  (two display buffers, so at most two flips in flight) and what it waits for
+  before it hands a frame over are decided there. A plugin can run a pass of
+  its own over the final image with the post-processing and the HUD on it,
+  capture it, or pace frames another way. (`on_render`'s second point is
+  earlier: the picture before the post-processing.)
 - **Per post-processing parameter.** Called as the game hands each frame's
   post-processing parameters to YEBIS, the post-process library, before the
   chain runs: PPFX's 69 setters ([decomp.md](decomp.md#yebis-srcdecompyebis)),
@@ -181,14 +222,14 @@ state objects - so the hooks speak its terms.
   YEBIS takes it: turn an effect off, scale the bloom, move the focus,
   change the grading.
 
-Hooks cost nothing while no plugin registers one. A registered one runs for
-every draw on the engine's render threads, so it must be fast, thread-safe
-and never wait. YEBIS's post-processing passes are covered as the D3D11
-calls its own context takes (the targets each pass binds, its draws, its
-flushes) and where they reach Gnm, the whole chain as the two calls the
-engine runs it with (`ppfxBindFramebuffer`, `ppfxApplyEffects`), and its
-parameters as the setters the game hands them through; the Scaleform menus
-are not, until that code is source too.
+These hooks would cost nothing while no plugin registers one. A registered
+one would run for every draw on the engine's render threads, so it must be
+fast, thread-safe and never wait. YEBIS's post-processing passes are covered
+as the D3D11 calls its own context takes (the targets each pass binds, its
+draws, its flushes) and where they reach Gnm, the whole chain as the two
+calls the engine runs it with (`ppfxBindFramebuffer`, `ppfxApplyEffects`),
+and its parameters as the setters the game hands them through; the Scaleform
+menus are not, until that code is source too.
 
 ## Text
 
@@ -204,8 +245,8 @@ later file replacing an earlier one with the same name:
 1. `<exe dir>/patches` (the release package)
 2. `<exe dir>/../patches` (a build tree: `build/bbhost` reads the repository's `patches/`)
 3. `patches` in the per-user folder (`%APPDATA%\bbhost\patches`,
-   `~/.config/bbhost/patches`): your own, which no release carries and every
-   copy of bbhost reads
+   `~/.local/share/bbhost/patches`): your own, which no release carries and
+   every copy of bbhost reads
 4. `<mods>/patches` (a mod's own)
 
 ```toml
@@ -282,10 +323,19 @@ Shipped patches, in their order. Left out are the list's patches bbhost
 does itself - its resolutions and FPS++ (the Resolution and Frame rate
 settings), the light grids, Restore Change Appearance (PC Enhancements), the
 Model LODs and Disable AA, SSAO, DoF, Bloom, Motion Blur and Chromatic
-Aberration (PC Graphics), Increased camera distance (Camera distance),
+Aberration (PC Graphics), the HD Motion Blur sizes (HD motion blur and its
+resolution, PC Graphics), Increased camera distance (Camera distance),
 Increased Graphics Heap Sizes (bbhost grows that heap for the render size),
-Faster loading screens (bbhost runs loading screens unpaced) and Skip Intro
-(Skip company logos, built into bbhost) - and the ones a release does not
+Faster loading screens (bbhost runs loading screens unpaced), Skip Intro
+(Skip company logos, built into bbhost) and Unlock Game Region (System >
+Language lists all 21 text languages on every disc, built into bbhost
+without changing the region, so online play keeps working), and the Intel
+Black Tonemap Fix (its bytes are the built-in performance patch's, always on),
+The Old Hunters (built in and always on: the game is the edition that
+includes it) and Modern Movement's hold D-pad Down for the first quick item
+(built in, on; the NR ports' Controls carry their own copy, which it steps
+aside for)
+- and the ones a release does not
 carry: the debug patches (camera, dash, menu, Enemy Control), the rally and
 weapon-size changes, and the emulator workarounds and extras (FMOD Crash Fix,
 the Intel SFX workaround, Disable HTTP Requests, Disable Facegen, Enable TAA,
@@ -294,15 +344,9 @@ wants one keeps its file in their own patches folder.
 
 | File | Patch |
 |---|---|
-| `performance-v3-decals-on.toml` | **Performance Patch (Perf Increase)**: Modifies some of the game's debug parameters for better performance without affecting visuals (Kyo). (on by default; one of performance v3; at the next start) |
-| `performance-v3-velomap.toml` | **Performance Patch v3 (Velomap + Camera Blur)**: Performance Patch v3 (Velomap + Camera Blur, Decals On) (Kyo) (off by default; one of performance v3; at the next start) |
 | `disable-misc-renders.toml` | **Disable Misc. Renders**: Disable Misc. Renders - Kyo's patch: four of the scene's extra targets are not made, nor their passes drawn (off by default; at the next start) |
-| `rgba8f-color-space.toml` | **rgba8f color space (Perf Increase)**: Affects visuals: the rgba16f colour targets become rgba8f. Less GPU use, for older or weaker hardware. (off by default; at the next start) |
-| `disable-dynamic-light-shadow.toml` | **Disable Dynamic Light Shadows (Perf Increase)**: Disable Dynamic Light Shadow - Kyo's patch: dynamic lights cast no shadows (faster) (off by default) |
 | `fxaa2-gs-dlaa-gs.toml` | **Better AA**: FXAA2_GS + DLAA_GS - Kyo's patch: both anti-aliasing filters (off by default) |
-| `screen-space-reflections.toml` | **Enable Screen Space Reflections**: Screen space reflections on, with the depth renders back at the game's default resolutions. It loads last, so other patches' render changes give way to it. (off by default; at the next start) |
 | `text-scale-50.toml` | **50% Text scale**: Smaller text, which looks good at higher resolutions. (off by default) |
-| `intel-tonemap-fix.toml` | **Intel Black Tonemap Fix**: Fixes the black tonemap colours, most noticeable in the DLC's areas, when using an Intel CPU. (off by default) |
 | `ds1-physics.toml` | **DS1-like physics**: Corpses and objects can be flung around, as in Dark Souls. (off by default; one of object physics) |
 | `lower-object-physics.toml` | **Lower object/corpse physics**: Corpses resist being moved by the player or anything else. (off by default; one of object physics) |
 | `disable-camera-auto-rotation.toml` | **Disable Camera Auto Rotation via Movement**: The camera no longer turns by itself as the character moves; turning it by hand and lock-on still work. (off by default; at the next start) |
@@ -311,19 +355,11 @@ wants one keeps its file in their own patches folder.
 | `auto-refill-from-storage.toml` | **Auto-Refill From Storage on Any Area Refresh/Reload**: Eligible consumables refill from your storage whenever an area is refreshed or reloaded, taking from storage as the game does, without dying or going back to the Hunter's Dream. The game's own auto-refill; no free items. (off by default) |
 | `smaller-hunter.toml` | **Smaller Hunter**: A smaller hunter (smol). (off by default; one of hunter size) |
 | `smallest-hunter.toml` | **Smallest Hunter**: The smallest hunter (teeny). (off by default; one of hunter size) |
-| `unlock-game-region.toml` | **Unlock Game Region (DISABLES ONLINE PLAY)**: Unlocks the game's region for more language options. Online play does not work while it is on. The Cross and Circle buttons are not swapped. (off by default; at the next start) |
 | `zero-gravity.toml` | **Zero-Gravity Physics**: Havok's gravity at zero: objects and corpses float. (off by default; one of gravity) |
 | `anti-gravity.toml` | **Anti-Gravity Physics**: Havok's gravity reversed: objects and corpses fall upward. (off by default; one of gravity) |
-| `hd-motion-blur-360p.toml` | **HD Motion Blur 360p (640x360)**: HD Motion Blur 360p (640x360) - Kyo's patch (off by default; one of hd motion blur; at the next start) |
-| `hd-motion-blur-1080p.toml` | **HD Motion Blur 1080p (1920x1080)**: Motion blur's velocity map is half the render resolution by default; this makes it 1080p. Uses more video memory. (off by default; one of hd motion blur; at the next start) |
-| `hd-motion-blur-1440p.toml` | **HD Motion Blur 1440p (2560x1440)**: Motion blur's velocity map is half the render resolution by default; this makes it 1440p. Uses more video memory. (off by default; one of hd motion blur; at the next start) |
-| `hd-motion-blur-4k.toml` | **HD Motion Blur 4K (3840x2160)**: HD Motion Blur 4K (3840x2160) - Kyo's patch (off by default; one of hd motion blur; at the next start) |
-| `lower-specific-renders.toml` | **Lower specific renders (Perf Increase)**: Lowers the resolution of some renders (the velocity map, glow, the scaled depth): faster, with no visual difference unless Enable Screen Space Reflections is on. (off by default; one of low res renders; at the next start) |
-| `old-hunters.toml` | **The Old Hunters**: The Old Hunters is available: the game takes itself for the edition that includes it (on by default; at the next start) |
 | `quick-reentry.toml` | **Quick re-entry**: A load after a death or lamp travel ends when the area is ready, not after a 12-second minimum (follows `[loading] quick_reentry`, on by default) |
 | `ingame-post-processors.toml` | **All post-processors in play**: All three resource post-processors run in play, not two (follows `[streaming] all_post_processors`, off by default) |
 | `deflate-level.toml` | **Deflate level 1**: The game's run-time deflate compresses at level 1, not 9 (a main-thread hitch every ~50 s) (off by default) |
-| `fov-uncap.toml` | **Uncapped field of view**: The field of view is no longer capped at 48 degrees (off by default) |
 | `glow-blur.toml` | **Glow: force on + Blur**: Glow: force on + Blur 12.5/12.5/30 (all time slots) (Kyo) (off by default) |
 
 Patches whose bytes depend on settings, and anything that needs a hook rather

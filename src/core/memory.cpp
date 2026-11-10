@@ -49,6 +49,19 @@ bool guest_alloc(GuestMemory* mem, std::uint64_t slide, std::size_t size) {
         return false;
     }
     if (mem->base != reinterpret_cast<void*>(slide)) {
+        // The fixed fallback home Windows reserves for it (0x300000000), so a
+        // run's guest addresses are the same every time. Linux takes it here
+        // rather than reserving it at the start: the image is mapped before
+        // the game's Vulkan device and the upscaler bridge come up. Else
+        // where the kernel put it.
+        void* const fallback = reinterpret_cast<void*>(0x300000000ull);
+        void* fb = mmap(fallback, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (fb == fallback) {
+            munmap(mem->base, size);
+            mem->base = fb;
+        } else if (fb != MAP_FAILED) {
+            munmap(fb, size);  // a kernel before 4.17 takes MAP_FIXED_NOREPLACE for a hint
+        }
         mem->slide = reinterpret_cast<std::uint64_t>(mem->base);
         host_log("guest slide is 0x%llx (preferred 0x%llx was a hint)",
                  static_cast<unsigned long long>(mem->slide),

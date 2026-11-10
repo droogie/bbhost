@@ -68,8 +68,8 @@ tells you which paths to fill in.
 is read in layers, each overriding only the keys it sets:
 
 1. the per-user `bbhost.toml`: `%APPDATA%\bbhost` on Windows,
-   `$XDG_CONFIG_HOME/bbhost` or `~/.config/bbhost` on Linux
-   (`BBHOST_CONFIG_DIR` replaces the folder);
+   `$XDG_DATA_HOME/bbhost` or `~/.local/share/bbhost` on Linux, beside the
+   data folder (`BBHOST_CONFIG_DIR` replaces the folder);
 2. `bbhost.toml` next to the executable, or in the working directory;
 3. `--config <file>`;
 4. the command line: `--app0 <dir>`, `--data <dir>`, `--eboot <file>`, or the
@@ -88,6 +88,17 @@ The in-game settings (F10, or the PC Settings, PC Graphics and Key Bindings
 entries the game's own System menu gains) are saved beside the per-user config
 in `bbhost-options.toml` - or in one next to the executable, when there is
 one there.
+
+Older versions kept the Linux settings in `$XDG_CONFIG_HOME/bbhost` or
+`~/.config/bbhost`. At each start bbhost moves what it keeps there -
+`bbhost.toml`, the `bbhost-options*.toml` files, `plugins` and `patches` - to
+the new folder, and the setup window says what moved until you dismiss it.
+Nothing is overwritten: a file the new folder already has stays in use, and
+the old one goes beside it as `<name>.from-config-<date>`. Anything else in
+the old folder is yours and stays there, so a path in `bbhost.toml` that
+points into it keeps working (a relative one is written out in full). A
+linked or read-only old folder is copied rather than emptied, and a start
+that cannot move it uses the old folder as it is.
 
 ## Saves
 
@@ -157,13 +168,18 @@ back in. The message, Yes/No and quantity boxes take OK as soon as they are up
 its fade-out. `BBHOST_MENU_FADE_WAIT=1` keeps the game's waits.
 
 The mouse turns the camera the way Dark Souls III's PC version does: by an
-angle for each count the mouse reports, 0.25 degrees at the default
-sensitivity of 5 (0.1 at 0, 0.4 at 10), with no acceleration, no dead zone
-and no top speed, at any frame rate. The right stick turns it as on the
+angle for each count the mouse reports, with no acceleration, no dead zone
+and no top speed, at any frame rate. Mouse sensitivity sets the angle, from
+0.005 degrees a count at 0 to 0.4 at 100, each step about 4.5% further than
+the one below; the default, 50, is 0.045, which suits most mice at 800 to
+1600 DPI. (Dark Souls III's own scale ran from 0.1 to 0.4, too fast for most
+mice at its slowest; a setting saved before v0.2.28 keeps the angle it had,
+unless it was the old default.) The right stick turns it as on the
 console, and while the stick is moving the mouse waits. With a target locked
-on, a quick flick of the mouse switches targets. Mouse sensitivity and
-inverting either axis are on the game's PC Controls page; the game's own
-Camera settings are the stick's.
+on, a quick flick of the mouse switches targets. Mouse Sensitivity and
+inverting either axis are on the game's System > PC Controls page, and
+with the other input settings in F10 and the setup window; the game's own
+Camera Sensitivity, under Controls, is the stick's.
 
 With the mouse, the camera also stays where you put it: it does not turn by
 itself as the character moves - following the character round, or turning
@@ -448,14 +464,28 @@ fixes it:
 KERNEL=="udmabuf", TAG+="uaccess"
 ```
 
-**AMD on Windows, slower in a window.** Play in fullscreen (Fullscreen in PC
-Settings, or Window mode in F10). In a window the desktop composites the
-picture, and AMD's driver then never completes the game's occlusion queries -
-the same as when the window is not focused - so the game, getting no answers,
-stops culling hidden geometry. On a Radeon 8060S at 1920x1080 that is 112 fps
-uncapped in a window against 161 in fullscreen, and at 60 fps the GPU 55% busy
-against 37%. The log's `occlusion:` line, every 300 flips, then says `0 dumps`
-or `left not ready (N queries unavailable)`.
+**The picture stops for seconds in fullscreen on Windows.** The game goes on
+behind it, but the display stops handing the window its images back; the log's
+`slow call: vkWaitForFences ... (the acquired image)` lines say for how long.
+The graphics driver can take Borderless, a window that covers the screen, as
+exclusive fullscreen and switch into and out of it on its own: try
+[Stay borderless](#display-and-frame-rate), which keeps the window a window. A
+`window: keyboard focus` line logged while the picture is stopped says how
+long the presenter had been waiting by then (`the presenter 2.71 s into
+vkWaitForFences, the acquired image`), so the log shows whether switching away
+from the game and back ended the stop or came after it.
+
+<a id="amd-on-windows-slower-in-a-window"></a>
+**AMD on Windows, slower in a window.** Play in Borderless with Stay
+borderless off, or in Fullscreen (Window mode in F10 or the setup window;
+Fullscreen in PC Settings). In a window the desktop composites the picture,
+and AMD's driver then never completes the game's occlusion queries - the same
+as when the window is not focused - so the game, getting no answers, stops
+culling hidden geometry. Stay borderless keeps the game a window for
+the driver, and may be as slow. On a Radeon 8060S at 1920x1080 that is 112
+fps uncapped in a window against 161 in fullscreen, and at 60 fps the GPU 55%
+busy against 37%. The log's `occlusion:` line, every 300 flips, then says
+`0 dumps` or `left not ready (N queries unavailable)`.
 
 **Steam Deck.** Start bbhost from Steam (as a non-Steam game), in Game Mode or
 Desktop Mode; otherwise Steam's desktop controls send keys alongside the pad
@@ -473,15 +503,48 @@ The picture keeps its aspect ratio. The settings offer 16:9 sizes from
 bbhost paces the game to the refresh rate of the display its window is on;
 `[video] vblank_hz` overrides a display that reports the wrong rate.
 
-The frame rate is the game's own speed, chosen when it starts (a change
-applies on the next run): 30 is the game as it shipped; 60, 90, 120, 150, 180,
-240, 360, 480 and 960 run its logic at that rate; Display-Limited is the
-display's refresh rate when the game starts, to the nearest whole frame a
-second (59.94 Hz runs 60), run as that rate - its target, its steps, its code
+Window mode is one of three (the Game page of F10 or of the setup window;
+Fullscreen in the game's PC Settings fills the screen):
+- Windowed is a window you can move and resize.
+- Borderless covers the screen at the desktop's resolution and never changes
+  the display's mode, so switching away is instant. On Windows the graphics
+  driver may still take it as exclusive fullscreen, switching into and out of
+  it on its own.
+- Fullscreen takes the display over at the mode nearest the Resolution, which
+  can change the screen's resolution.
+
+Stay borderless (the row under Window mode in F10 and the setup window while
+Borderless is chosen, Stay Borderless in PC Settings; off by default) keeps
+Borderless a window that the driver never makes exclusive fullscreen, frame
+generation's swapchain too, and applies at once: try it if the picture freezes
+for a few seconds while the game keeps running. Linux and the Steam Deck have
+no such setting: there is no exclusive fullscreen to disallow.
+
+AMD cards on Windows run slower in a window, where the game has to draw hidden
+objects too: use Borderless or Fullscreen, and leave Stay borderless off
+unless you need it - it may do the same
+([AMD on Windows, slower in a window](#amd-on-windows-slower-in-a-window)).
+
+`[video] window_mode` in bbhost.toml is the default: `"Windowed"`,
+`"Borderless"` or `"Fullscreen"`. The log's `present: mode` line says which
+way each swapchain was made: `exclusive fullscreen disallowed (Stay
+borderless)`, or `the driver decides on exclusive fullscreen`.
+
+The frame rate is the game's own speed, and a change applies at once, while
+the game runs: 30 is the game as it shipped; 60, 90, 120, 150, 180, 240, 360,
+480 and 960 run its logic at that rate; Display-Limited is the display's
+refresh rate when the game starts or when it is chosen, to the nearest whole
+frame a second (59.94 Hz runs 60), run as that rate - its target, its steps, its code
 immediates and frame counts, 1/180 s each on a 180 Hz display, V-Sync on or
 off - and 60 when no display says a rate (headless). What counts frames cannot
 follow the frame's time, so a rate that moved with it (the Uncapped of earlier
 builds) ran those too fast or too slow.
+Custom limit, the tick box beside Frame rate (the setup window's Display card
+and F10's alike), runs the game at a number the player types instead, 30 to
+960 (45 runs it at 45, converted as the listed rates are); with frame
+generation on, twice as many frames are shown (45 shows 90). The file keeps it
+as `frame_cap_custom` and `frame_cap_custom_fps`; a rate picked from a list
+(the game's own System menu) unticks it.
 Above 30 the game's step is the frame's measured time (at most 1/30 s), and the
 places that stepped a fixed 1/30 s a frame - physics, enemy AI, ragdolls,
 grass, the camera's easing, momentum, fades - follow it, so the game runs at
@@ -508,34 +571,35 @@ motion's turns and its lag toward what it follows
 Ebrietas's attacks left sparks that never ended - 1/30 s steps at 60, 1/60 s
 steps at 120). The wind's warm-up after a load (the grass and trees settling)
 counts whole steps too (`BBHOST_SFX_WIND_WARMUP_HOLD=0` counts frames as
-before). How the effects keep time is the Effect timing setting (F10's
-DISPLAY page, or the same row on the setup window's Game page; it applies
+before). How the effects keep time is the Effect timing setting (the Game
+page of F10 or of the setup window; it applies
 when the game starts):
-- Smooth, the default, keeps 30's whole steps for what the effects count and
-  moves what they move by time - a particle's path, a motion's turn, the GPU
-  particles' clock, a ribbon's head (its points still inserted once a whole
-  step), the wind sources' gusts - by each frame's own time, in the effects
-  whose every part has been converted for it; the rest run as at 30.
-- Original (30) runs them all on whole 1/30 s steps alone, the cadence the
-  game has at 30: above 30 fps what moves moves less smoothly than with
-  Smooth.
-- 60 a second steps them in whole 1/60 s at every rate above 30 (every frame
-  at 60, every other at 120, every third at 180), so what they count - the
-  flicker, a wobble's turns, a node's states - runs twice as fast as the
-  game's own.
-- Your frame rate steps them once a frame (1/120 s at 120, 1/144 s at 144),
-  with no frames between: what they count runs twice as fast at 60, four
-  times at 120.
+- 30 fps runs them all on whole 1/30 s steps, the cadence the game has at
+  30: above 30 fps they move less smoothly than the rest of the picture.
+- 60 fps, the default, steps them in whole 1/60 s at every rate above 30
+  (every frame at 60, every other at 120, every third at 180), so what they
+  count - the flicker, a wobble's turns, a node's states - runs twice as fast
+  as the game's own.
+- Frame rate-dependent steps them once a frame (1/120 s at 120, 1/144 s at
+  144), with no frames between: what they count runs twice as fast at 60,
+  four times at 120.
+
+Smooth, a fourth choice until 2026-11-04, kept 30's whole steps for what the
+effects count and moved what they move by each frame's own time - but only in
+the effects whose every part had been converted for it, so most effects still
+looked like 30 at 60 fps. It is still read from bbhost.toml or
+`BBHOST_SFX_STEP` (`smooth`, shown as Custom); a saved Smooth choice reads as
+not chosen, the default.
 
 `[video] effect_steps` in bbhost.toml is the setting's default, with the same
-choices as `smooth`, `30`, `auto` and `fps`, and two more: a number of steps
+choices as `30`, `auto` and `fps`, and three more: `smooth`, a number of steps
 a second (`"120"` or `120`, 1 to 960 - below 30 to test them in coarse
 steps, `5` a 1/5 s step five times a second; `60` is auto above 30), and
 `frame`, which steps them by the frame's time. It decides until a choice is
 made in F10 or the setup window: bbhost-options.toml holds Effect timing only
 once it has been chosen, so the file's value stays in force, and a later
 default reaches whoever never chose. The row shows what will run: a value
-none of its four is, from bbhost.toml or `BBHOST_SFX_STEP`, as a fifth entry
+none of its three is, from bbhost.toml or `BBHOST_SFX_STEP`, as a fourth entry
 (Custom: 5 (bbhost.toml)). With smooth and 30 the wind's grass and
 trees step in whole 1/30 s too (every other value leaves the wind on the
 frame's time). A value the frame rate code cannot read runs the default.
@@ -606,8 +670,8 @@ turned it on. `BBHOST_SOUND_CENSUS=1` (a test
 switch, at any rate) counts the sound thread's passes against the frames in
 the 300-flip report: how many frames began between one pass and the next.
 
-`BBHOST_GAME_FPS=30|60|...|960|0` overrides the setting for a run (0 is
-Display-Limited), `BBHOST_UNCAPPED_FPS=N` sets Display-Limited's rate (30-960) whatever
+`BBHOST_GAME_FPS=30|60|...|960|0` overrides the setting for a run (any rate
+from 30 to 960, 0 is Display-Limited), `BBHOST_UNCAPPED_FPS=N` sets Display-Limited's rate (30-960) whatever
 the display says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
 game steps by and values written from it. `BBHOST_TEST_FPS_SWING` (a test
 switch, at the converted rates) moves the target while the game runs:
@@ -649,6 +713,54 @@ flips`). `BBHOST_FLIP_AFTER_GPU=0` completes a flip once the frame is recorded,
 as before: the game could then run several frames ahead of the GPU after a
 loading screen and overwrite what it had not read yet, which could hold the
 GPU for minutes.
+
+## Upscaling
+
+Graphics > Upscaling (F10, the setup window's Graphics page, or System > PC
+Upscaling in the game) runs one of these in place of the game's own
+anti-aliasing:
+
+| Choice | Where it runs |
+|---|---|
+| TAA | bbhost's own temporal anti-aliasing: any GPU, Windows and Linux, the 3D at the Resolution - one below the window keeps the game and its HUD at the window's size, as DLSS and FSR do |
+| DLSS | NVIDIA RTX cards, on Windows and on Linux: DLAA, Quality, Balanced or Performance (the 3D at the full Resolution, two thirds, about 59% or half each way) and its model (DLSS preset K, J, L or M) |
+| FSR 3, FSR 4 | AMD FidelityFX, on Windows: FSR 4 where the GPU and driver run it, FSR 3 on any GPU |
+
+Frame generation (AMD FidelityFX) also runs on Windows only. Sharpness
+sharpens what TAA, FSR or DLSS gives. While one of them runs, the game's own
+Anti-aliasing pass is off: it came after their picture and only softened it
+again.
+
+Character motion (Graphics, or System > PC Upscaling in the game) is where
+the upscalers and frame generation take the motion of the hunter, enemies and
+other moving characters from; the camera's own always comes from the depth.
+Precise, the default, draws each character a second time into the motion,
+with its own position this frame and the last: clean edges and no trail behind
+a running character, for about 1% of the frame rate at 4K, on any GPU. Velocity
+map takes the game's motion blur map alone, 640x360 at any Resolution: a
+little faster, softer at a character's edge, where a faint trail can show.
+
+A plugin can take the anti-aliasing over (plugin API 27, see
+[plugins.md](plugins.md)): while it is on, TAA, FSR and DLSS stay off, the
+Upscaling row names it, and your choice applies again once the plugin is off.
+
+On Windows the package carries the upscalers' files beside `bbhost.exe`:
+Numity1504's Upscaler Bridge (`upscaler_bridge.dll`), which bbhost calls them
+through, NVIDIA's `nvngx_dlss.dll` and AMD's FidelityFX DLLs.
+
+On Linux, DLSS needs an NVIDIA RTX card with NVIDIA's own driver, a recent
+one (the driver brings NVIDIA's NGX, which runs DLSS; Nouveau and NVK cannot).
+The Linux package carries `libbbhost_ngx_bridge.so`, bbhost's NGX bridge (the
+Upscaler Bridge's API over NVIDIA's NGX, MIT), and NVIDIA's DLSS runtime,
+`libnvidia-ngx-dlss.so.310.9.16`, beside the binary; bbhost loads the bridge
+from its own folder at start. On any other GPU the Upscaling list offers Off
+and TAA, and the log's `upscaler:` lines say why DLSS is not available. The
+Steam Deck kit carries neither file (the Deck's GPU is AMD's).
+
+`BBHOST_UPSCALE=dlss|taa|fsr|fsr3` picks the method for a run over the
+setting, and `BBHOST_UPSCALER=0` loads no bridge at all. On Linux,
+`BBHOST_NGX_LOG=1` (2: verbose) has NVIDIA's NGX log into bbhost's log, and
+into its own files in `ngx/` in the settings folder.
 
 ## Online
 

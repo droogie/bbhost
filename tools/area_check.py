@@ -277,6 +277,19 @@ EXTRA_AREAS = (
          looks=(("arena", -508.0, -270.5, 378.0, 58.5, {"dumps": 5, "gap": 2.5}),
                 ("cliff", -508.0, -270.5, 378.0, -105.0),
                 ("feet", -508.0, -270.5, 378.0, 58.5, {"pitch": 0.9, "dumps": 5, "gap": 2.5, "f12": True}))),
+    # The sewers under Central Yharnam (m24_01_00_00's MSB names their pieces 下水トンネル, the pillared tunnel, and
+    # 下水道壁, the sewer's wooden walls; they are in that block alone): four standpoints from Central Yharnam's lamp, each
+    # a warp onto a floor the MSB stands its rats on, facing along the passage. The rats' pit is the heaviest of the four
+    # to draw (~1,030 draws a flip, against 810-870 and 585) and the one the frame-rate checks take; in the tunnel the
+    # player drifts 4-5 m beside the giant pig's body, so a measurement there wanders.
+    Area("sewer-tunnel", "Central Yharnam sewers: the pillared tunnel, facing south-west", "m24_01_00_00", 2412951,
+         stand=(-96.0, -77.6, -5.3, 45.0)),
+    Area("sewer-rats", "Central Yharnam sewers: the passage past the tunnel's end, facing the pit", "m24_01_00_00", 2412951,
+         stand=(-131.0, -77.6, -46.0, 59.3)),
+    Area("sewer-pit", "Central Yharnam sewers: the rats' pit, facing back up the passage", "m24_01_00_00", 2412951,
+         stand=(-182.0, -74.5, -76.0, -120.7)),
+    Area("sewer-west", "Central Yharnam sewers: the upper west passage, facing east", "m24_01_00_00", 2412951,
+         stand=(-230.0, -59.8, -35.0, -64.5)),
 )
 AREA_BY_ID = {a.id: a for a in AREAS + EXTRA_AREAS}
 
@@ -491,6 +504,46 @@ def pass_budget(areas, opts, kind):
             else opts["capture_settle"] + opts["capture_window"] + 60)
     looks = sum(look_seconds(l, opts) + 30 for a in areas for l in a.looks) if kind == "perf" else 0
     return 300 + opts["start"] + per * len(areas) + looks + 60
+
+
+def parse_cpulist(text):
+    """The CPUs a Linux cpulist names ("0-19,40-59")."""
+    cpus = set()
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition("-")
+        cpus.update(range(int(lo), int(hi or lo) + 1))
+    return cpus
+
+
+def numa_nodes():
+    """{node: its CPUs} from /sys/devices/system/node; empty where the system says nothing."""
+    nodes = {}
+    for d in Path("/sys/devices/system/node").glob("node[0-9]*"):
+        try:
+            nodes[int(d.name[4:])] = parse_cpulist((d / "cpulist").read_text())
+        except (OSError, ValueError):
+            pass
+    return nodes
+
+
+def auto_numa_node(allowed=None, nodes=None):
+    """--numa-node auto: the node the game is pinned to. Node 0 where this process may run on every CPU; the node it was
+    confined to by an outer numactl or taskset, where its CPUs are that node's (a lavapipe slot's node 1); none - the game
+    keeps the affinity it is given - where they are only part of a node, or span several (a smaller machine acted out).
+    Pinning to node 0 regardless moved a slot's game off the node it was given."""
+    if allowed is None:
+        allowed = set(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else set()
+    if nodes is None:
+        nodes = numa_nodes()
+    every = set().union(*nodes.values()) if nodes else set()
+    if not nodes or not allowed or allowed >= every:
+        return 0
+    for node, cpus in sorted(nodes.items()):
+        if allowed == cpus:
+            return node
+    return None
 
 
 def estimate(areas, opts, kind):
@@ -2059,7 +2112,7 @@ def resolve_options(args):
         raise ValueError("the seed %s has no saves/ folder (a data folder holding a character in the world)" % seed)
     numa = args.numa_node
     if numa == "auto":
-        numa = 0 if shutil.which("numactl") else None
+        numa = auto_numa_node() if shutil.which("numactl") else None
     elif numa == "none":
         numa = None
     else:
@@ -2282,7 +2335,10 @@ def add_run_options(p):
     p.add_argument("--pipeline-cache", choices=("seed", "off"), default="seed",
                    help="seed: the seed's shader caches and stage manifest, as a player's after an update (default); "
                         "off: BBHOST_PIPELINE_CACHE=0, every shader compiled when first met")
-    p.add_argument("--numa-node", default="auto", help="pin the game to this NUMA node (numactl); auto: node 0 when numactl exists; none")
+    p.add_argument("--numa-node", default="auto",
+                   help="pin the game to this NUMA node (numactl); auto: when numactl exists, the node an outer numactl or "
+                        "taskset confined this harness to, node 0 when it may run anywhere, none when it was confined to part "
+                        "of a node or to several; none: the affinity as given")
     p.add_argument("--p2p-port", type=int, default=9446, help="the run's own P2P port (never the one a player's game uses)")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--height", type=int, default=1080)

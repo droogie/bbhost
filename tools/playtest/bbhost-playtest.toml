@@ -2,7 +2,7 @@
 #
 # Leave this file as it is. The game's paths are not set here: they live in
 # your per-user config (%APPDATA%\bbhost\bbhost.toml on Windows,
-# ~/.config/bbhost/bbhost.toml on Linux), which the first start writes and
+# ~/.local/share/bbhost/bbhost.toml on Linux), which the first start writes and
 # every copy of bbhost reads - see TESTING.md. This file only adds the dev
 # server's settings on top of it.
 

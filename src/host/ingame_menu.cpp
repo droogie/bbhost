@@ -7,10 +7,12 @@
 #include "engine/patch_manifest.h"
 #include "hle/fs.h"
 #include "host/gpu.h"
+#include "host/controls_page.h"
 #include "host/launcher_ui.h"
 #include "host/options.h"
 #include "host/plugin_ui.h"
 #include "host/settings.h"
+#include "host/slow_calls.h"
 #include "log.h"
 
 #include "imgui.h"
@@ -35,7 +37,8 @@ namespace {
 
 namespace ui = launcher_ui;
 
-std::atomic<bool> g_open{false};   // F9's menu; F10's is host_options_open()
+// The menu is open while host_options_open() says so (it saves on closing);
+// F9 opens it at its Patches page, F10 where it was last.
 std::atomic<bool> g_ready{false};  // the Vulkan backend started: F9 and F10 open something
 
 // One input event, translated on the pump thread and applied on the
@@ -112,12 +115,10 @@ void push(Input in) {
     if (g_queue.size() < 512) g_queue.push_back(std::move(in));
 }
 
-void set_open(bool open) {
-    if (g_open.exchange(open) == open) return;
-    host_log("patch and plugin menu: %s", open ? "open" : "closed");
-}
+// F9 asks the presenter (which knows the pages) for the Patches page: -2.
+std::atomic<int> g_jump{-1};
 
-// The time either menu opened (it fades in), and which was up last frame.
+// The time the menu opened (it fades in), and whether it was up last frame.
 double g_shown_at = -100.0;
 bool g_was_up = false;
 
@@ -127,7 +128,7 @@ std::atomic<int> g_test_page{-1};
 std::mutex g_test_mu;
 std::vector<std::pair<std::string, bool>> g_test_clicks;  // under g_test_mu
 
-// ---- The frame both menus share ---------------------------------------------
+// ---- The menu's frame --------------------------------------------------------
 
 struct Page {
     const char* name;
@@ -246,8 +247,8 @@ bool shell(const char* id, const char* caption, const Page* pages, int n, int* p
     ImGui::BeginChild("##foot", ImVec2(w, foot), 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     if (keys) {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 6 * s));
-        ui::key_hint("F9", "Patches & plugins");
-        ui::key_hint("F10", "Settings");
+        ui::key_hint("F9", "Patches");
+        ui::key_hint("F10", "Menu");
         ui::key_hint("Esc", "Close");
         ImGui::PopStyleVar();
         ImGui::Dummy(ImVec2(0, 4 * s));
@@ -538,56 +539,95 @@ void patches_page(PatchMenu& m) {
     ui::card_end();
 }
 
-// ---- The menus ---------------------------------------------------------------
+// ---- The menu ----------------------------------------------------------------
 
-int g_mods_page = 0;
-double g_mods_page_at = -100.0;
-int g_options_page = 0;
-double g_options_page_at = -100.0;
+// Its pages: the settings' (host_options_page_*) - Input's rows on the
+// Controls page, over the bindings - with the patches and the plugins after
+// PC Enhancements.
+int g_page = 0;
+double g_page_at = -100.0;
+int g_patches_page = -1, g_plugins_page = -1, g_controls_page = -1;  // their places among the pages
+std::vector<int> g_options_of;  // each page's settings page, -1 for the menu's own
 
-bool draw_mods() {
-    static const Page kPages[] = {
-        {"Patches", ui::Icon::Patches,
-         "Changes to the game's code. Most turn on or off at once; the rest when the game starts again."},
-        {"Plugins", ui::Icon::Plugins, "Each plugin's settings and actions. Those marked change at once; the rest at the next start."},
+const std::vector<Page>& menu_pages() {
+    static std::vector<Page> pages;
+    if (!pages.empty()) return pages;
+    static const struct {
+        const char* name;
+        ui::Icon icon;
+    } kIcons[] = {{"Game", ui::Icon::Game},       {"Graphics", ui::Icon::Image},     {"PC Enhancements", ui::Icon::Enhance},
+                  {"Settings", ui::Icon::Settings}};
+    auto own = [&](int* at, const Page& p) {
+        *at = static_cast<int>(pages.size());
+        pages.push_back(p);
+        g_options_of.push_back(-1);
     };
-    return shell("##mods", "PATCHES & PLUGINS", kPages, 2, &g_mods_page, &g_mods_page_at, g_mods_page == 0, [] {
-        if (g_mods_page == 0) {
+    auto add_mods = [&] {
+        own(&g_patches_page, {"Patches", ui::Icon::Patches,
+                              "Changes to the game's code. Most turn on or off at once; the rest when the game starts again."});
+        own(&g_plugins_page, {"Plugins", ui::Icon::Plugins, "Each plugin's settings and actions. Those marked change at once; the rest at the next start."});
+    };
+    // The mouse and the prompts with the bindings: one page for input, after
+    // Graphics (Input's own place in the settings is before it).
+    auto add_controls = [&] {
+        own(&g_controls_page, {"Controls", ui::Icon::Keyboard,
+                               "The mouse and the prompts, and every action's key, mouse button and controller button."});
+    };
+    for (int i = 0; i < host_options_page_count(); ++i) {
+        Page p{host_options_page_name(i), ui::Icon::Settings, host_options_page_blurb(i)};
+        if (std::strcmp(p.name, "Input") == 0) continue;
+        for (const auto& k : kIcons) {
+            if (std::strcmp(k.name, p.name) == 0) p.icon = k.icon;
+        }
+        pages.push_back(p);
+        g_options_of.push_back(i);
+        if (std::strcmp(p.name, "Graphics") == 0) add_controls();
+        if (std::strcmp(p.name, "PC Enhancements") == 0) add_mods();
+    }
+    if (g_controls_page < 0) add_controls();  // no Graphics page: at the end
+    if (g_patches_page < 0) add_mods();  // no PC Enhancements page: at the end
+    return pages;
+}
+
+// The settings page a page of the menu shows (-1: the controls, the patches or
+// the plugins).
+int options_page_of(int page) {
+    return page >= 0 && page < static_cast<int>(g_options_of.size()) ? g_options_of[static_cast<std::size_t>(page)] : -1;
+}
+
+bool draw_menu() {
+    const std::vector<Page>& pages = menu_pages();
+    // The plugins' list and details each scroll on their own; the rest in the page.
+    return shell("##menu", "MENU", pages.data(), static_cast<int>(pages.size()), &g_page, &g_page_at, g_page != g_plugins_page, [] {
+        if (g_page == g_patches_page) {
             patches_page(g_patches);
-        } else {
+        } else if (g_page == g_controls_page) {
+            controls_page_draw(false);
+        } else if (g_page == g_plugins_page) {
             ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(14, 12, 34, 190));
             plugin_ui_draw(g_ui, ui::scale(), 0.0f);  // the list and the details fill what is left, each scrolling
             ImGui::PopStyleColor();
+        } else {
+            host_options_draw_page(options_page_of(g_page));
         }
     });
 }
 
-bool draw_options() {
-    static std::vector<Page> pages;
-    if (pages.empty()) {
-        // By name: Display, Input, Graphics, PC Enhancements, Startup, Account, Updates.
-        static const struct {
-            const char* name;
-            ui::Icon icon;
-        } kIcons[] = {{"Display", ui::Icon::Display},   {"Input", ui::Icon::Game},       {"Graphics", ui::Icon::Image},
-                      {"PC Enhancements", ui::Icon::Enhance}, {"Startup", ui::Icon::Play}, {"Account", ui::Icon::User},
-                      {"Updates", ui::Icon::Download}};
-        for (int i = 0; i < host_options_page_count(); ++i) {
-            Page p{host_options_page_name(i), ui::Icon::Settings, host_options_page_blurb(i)};
-            for (const auto& k : kIcons) {
-                if (std::strcmp(k.name, p.name) == 0) p.icon = k.icon;
-            }
-            pages.push_back(p);
-        }
+// F9 (patches) or F10: open the menu - F9 at the patches - or close it when it
+// shows what the key opens.
+void menu_key(bool patches) {
+    const bool open = host_options_open();
+    if (open && (!patches || g_jump.load() == -2 || g_page == g_patches_page)) {
+        host_options_close();
+        return;
     }
-    if (pages.empty()) return false;
-    return shell("##options", "SETTINGS", pages.data(), static_cast<int>(pages.size()), &g_options_page, &g_options_page_at, true,
-                 [] { host_options_draw_page(g_options_page); });
+    if (patches) g_jump.store(-2);
+    if (!open) host_options_set_open(true);
 }
 
 }  // namespace
 
-bool ingame_menu_open() { return g_open.load(std::memory_order_relaxed) || host_options_open(); }
+bool ingame_menu_open() { return host_options_open(); }
 
 bool ingame_menu_event(const SDL_Event& e, float ratio) {
     if (e.type == SDL_EVENT_KEY_DOWN && (e.key.scancode == SDL_SCANCODE_F9 || e.key.scancode == SDL_SCANCODE_F10)) {
@@ -599,15 +639,7 @@ bool ingame_menu_event(const SDL_Event& e, float ratio) {
             return true;
         }
         const bool was = ingame_menu_open();
-        if (e.key.scancode == SDL_SCANCODE_F9) {
-            const bool open = !g_open.load();
-            if (open) host_options_set_open(false);
-            set_open(open);
-        } else {
-            const bool open = !host_options_open();
-            if (open) set_open(false);
-            host_options_set_open(open);
-        }
+        menu_key(e.key.scancode == SDL_SCANCODE_F9);
         if (!was && ingame_menu_open()) {
             // Where the pointer is now: no motion may come before the first click.
             Input focus;
@@ -621,7 +653,12 @@ bool ingame_menu_event(const SDL_Event& e, float ratio) {
         }
         return true;
     }
-    if (!ingame_menu_open()) return false;
+    if (!ingame_menu_open()) {
+        controls_menu_closed();
+        return false;
+    }
+    // A binding being chosen on the Controls page takes the next press first.
+    if (controls_capture_event(e)) return true;
     switch (e.type) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP:
@@ -723,17 +760,10 @@ void ingame_menu_pump() {
     while (next < steps.size() && now >= steps[next].first && g_ready.load(std::memory_order_acquire)) {
         const std::string& step = steps[next++].second;
         host_log("menu test: %.1f s: %s", now, step.c_str());
-        if (step == "f9") {
-            const bool open = !g_open.load();
-            if (open) host_options_set_open(false);
-            set_open(open);
-        } else if (step == "f10") {
-            const bool open = !host_options_open();
-            if (open) set_open(false);
-            host_options_set_open(open);
+        if (step == "f9" || step == "f10") {
+            menu_key(step == "f9");
         } else if (step == "close") {
-            set_open(false);
-            host_options_set_open(false);
+            host_options_close();
         } else if (step.rfind("page:", 0) == 0) {
             g_test_page.store(std::atoi(step.c_str() + 5));
         } else if (step.rfind("patch:", 0) == 0) {
@@ -802,8 +832,7 @@ namespace {
 // neither menu is open (no ImGui frame at all, so a closed menu costs the
 // presenter nothing but this check).
 bool build_frame(VkExtent2D extent) {
-    const bool mods = g_open.load(std::memory_order_relaxed), options = host_options_open();
-    if (!g_vk_ready || (!mods && !options)) {
+    if (!g_vk_ready || !host_options_open()) {
         g_ui.scanned = false;     // read the files again when it next opens
         g_patches.read = false;
         g_was_up = false;
@@ -846,16 +875,14 @@ bool build_frame(VkExtent2D extent) {
         case Input::Focus: io.AddFocusEvent(true); break;
         }
     }
-    if (const int p = g_test_page.exchange(-1); p >= 0) {
-        int& page = mods ? g_mods_page : g_options_page;
-        const int n = mods ? 2 : host_options_page_count();
-        if (p < n) page = p;
-    }
+    const int n = static_cast<int>(menu_pages().size());
+    if (const int p = g_test_page.exchange(-1); p >= 0 && p < n) g_page = p;
+    if (g_jump.exchange(-1) == -2) g_page = g_patches_page;
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     if (!g_was_up) {
         g_shown_at = ImGui::GetTime();
-        g_mods_page_at = g_options_page_at = g_shown_at;
+        g_page_at = g_shown_at;
     }
     g_was_up = true;
     // Escape, the pad's B or Start close it - unless something in it takes
@@ -867,12 +894,9 @@ bool build_frame(VkExtent2D extent) {
     const float k = std::min(1.0f, static_cast<float>(ImGui::GetTime() - g_shown_at) / 0.16f);
     veil(k);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, std::max(0.05f, k));
-    close = (mods ? draw_mods() : draw_options()) || close;
+    close = draw_menu() || close;
     ImGui::PopStyleVar();
-    if (close) {
-        if (mods) set_open(false);
-        else host_options_close();
-    }
+    if (close) host_options_close();
     ImGui::Render();
     // Menu hue and Menu vibrance, on everything the menus draw.
     float hue = 0.0f, vibrance = 0.0f;
@@ -893,9 +917,14 @@ bool build_frame(VkExtent2D extent) {
         for (ImTextureData* tex : *dd->Textures) uploads = uploads || tex->Status != ImTextureStatus_OK;
     }
     if (uploads) {
+        // A submission and a wait for the queue to go idle, inside ImGui's backend.
+        static constexpr slow_calls::Site kMenuUploads{slow_calls::kQueueIdle, "the menus' texture uploads"};
         host_gpu_queue_lock();
-        for (ImTextureData* tex : *dd->Textures) {
-            if (tex->Status != ImTextureStatus_OK) ImGui_ImplVulkan_UpdateTexture(tex);
+        {
+            slow_calls::Scope timed(kMenuUploads);
+            for (ImTextureData* tex : *dd->Textures) {
+                if (tex->Status != ImTextureStatus_OK) ImGui_ImplVulkan_UpdateTexture(tex);
+            }
         }
         host_gpu_queue_unlock();
     }

@@ -41,10 +41,11 @@ enum class WinVmPlace { Anywhere, Exact, NoReplace };
 
 // Maps [offset, offset+len) of `section` (a file-mapping HANDLE) at `at`
 // (Exact: unmapping our own views there first; NoReplace: the range must be
-// a placeholder) or anywhere below `limit` (Anywhere, at ignored) with the
+// a placeholder) or anywhere below `limit` (Anywhere, at ignored; the base a
+// multiple of `align` where that is above the 64 KiB granularity) with the
 // PAGE_* protection. Returns the base or nullptr.
 void* win_vm_map(void* section, void* at, std::uint64_t len, std::uint64_t offset, unsigned long protect,
-                 WinVmPlace place, std::uint64_t limit);
+                 WinVmPlace place, std::uint64_t limit, std::uint64_t align = 0);
 
 // Anonymous memory: a private section of `len`, mapped as above.
 void* win_vm_alloc(void* at, std::uint64_t len, unsigned long protect, WinVmPlace place, std::uint64_t limit);

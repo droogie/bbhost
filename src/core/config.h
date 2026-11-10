@@ -40,9 +40,13 @@ struct HostConfig {
     int height = 1080;         // video.height
     int fps_cap = 30;          // video.fps_cap
     std::string resolution;    // video.resolution: the Resolution setting's default entry ("1280x800"); F10's file has the last word
-    std::string window_mode;   // video.window_mode: the Window mode setting's default ("Windowed" or "Fullscreen")
+    std::string window_mode;   // video.window_mode: the Window mode setting's default ("Windowed", "Borderless" or "Fullscreen")
     std::string model_detail;  // video.model_detail: the Model detail setting's default ("Full", "Normal", "Low", "Lowest")
+    std::string texture_quality;  // video.texture_quality: the Texture quality setting's default ("Lowest", "Low", "Medium", "High")
     std::string shaders;       // video.shaders: the Shaders setting's default ("HLSL" or "Lifted")
+    // video.shader_overrides / BBHOST_SHADER_OVERRIDES=0|1: edited shaders (<data>/bbhost/shaders)
+    // and plugins' shader overrides apply (host/shader_overrides.h); false: none of them does.
+    bool shader_overrides = true;
     int vblank_hz = 0;         // video.vblank_hz: the flip clock's rate; 0 = the display's own
     // video.frame_clock: the Native frame clock setting's default (F10's DISPLAY,
     // the setup window's Game page), off; what they save in bbhost-options.toml
@@ -72,6 +76,14 @@ struct HostConfig {
     // world.skill_issue / BBHOST_SKILL_ISSUE=0|1: the death message reads
     // SKILL ISSUE instead of YOU DIED (engine/menu_assets.h). Off by default.
     bool skill_issue = false;
+    // world.full_phantom_hp / BBHOST_FULL_PHANTOM_HP=0|1: a hunter summoned into
+    // another hunter's world, as a cooperator or an invader, keeps their full
+    // max HP there instead of 70% (engine/phantom_hp.h).
+    bool full_phantom_hp = true;
+    // world.auto_replenish / BBHOST_AUTO_REPLENISH=0|1: twenty more consumables
+    // (Molotovs, knives, pebbles, papers, elixirs...) refill from storage as
+    // Blood Vials and Quicksilver Bullets do (engine/auto_replenish.h).
+    bool auto_replenish = true;
     // [keys] from the config, action name -> SDL key name. Empty unless the
     // player has rebound something; window.cpp holds the defaults and the
     // list of action names.
@@ -89,6 +101,12 @@ struct HostConfig {
     // painting and its motes, the moon's breathing, the Play button's pulse
     // and shine, the page fade, the eased highlights. Off, it stands still.
     bool setup_animations = true;
+    // startup.setup_keep_open: Play starts the game as a process of its own
+    // and the setup window waits minimized, coming back when the game ends.
+    bool setup_keep_open = false;
+    // --no-setup: never the setup window, whatever startup.setup_window says
+    // (the game the setup window starts when it stays open).
+    bool setup_skip = false;
     // startup.setup_text_size: Menu text size's default in percent (100-400;
     // 0 none), for the setup window, F9 and F10 alike; the options file
     // (menu_text_size, host/options.cpp) holds the player's choice.
@@ -152,9 +170,11 @@ struct App0Version {
 App0Version config_app0_version(const std::string& app0);
 // The PC enhancements, the same way: the options file's choices (F10, the
 // System menu's PC Enhancements, the setup window's tab) once it is read. A
-// BBHOST_CHANGE_APPEARANCE, BBHOST_REBIRTH, BBHOST_FIVE_PLAYERS or
-// BBHOST_SKILL_ISSUE of 0 or 1 still wins over the options file.
-void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue);
+// BBHOST_CHANGE_APPEARANCE, BBHOST_REBIRTH, BBHOST_FIVE_PLAYERS,
+// BBHOST_SKILL_ISSUE, BBHOST_FULL_PHANTOM_HP or BBHOST_AUTO_REPLENISH of 0 or 1
+// still wins over the options file.
+void config_set_enhancements(bool change_appearance, bool rebirth, bool five_players, bool skill_issue, bool full_phantom_hp,
+                             bool auto_replenish);
 // The setup window's server, in memory before it is saved: its account calls
 // (net::auth_server_base) go where its dropdown says. Main thread, before
 // the game starts.
@@ -189,20 +209,22 @@ bool config_saves_locally();
 // The folder saves go to when paths.data is not set (the per-user data folder).
 std::string config_default_data_dir();
 // The per-user folder the config and the F10 settings live in: %APPDATA%/bbhost,
-// $XDG_CONFIG_HOME/bbhost or ~/.config/bbhost; BBHOST_CONFIG_DIR replaces it.
+// $XDG_DATA_HOME/bbhost or ~/.local/share/bbhost (an older bbhost's
+// ~/.config/bbhost is moved there at start: core/config_move.h);
+// BBHOST_CONFIG_DIR replaces it.
 std::string config_user_dir();
 // The directory the running executable is in ("." when unknown).
 std::string config_exe_dir();
 // A raw value from the loaded config file by "section.key" (quotes stripped), "" when absent.
 std::string config_value(const std::string& key);
-// The effects' timing above 30 fps when nothing asks for another: Smooth, the
-// Effect timing setting's default (F10's DISPLAY, the setup window's Game
+// The effects' timing above 30 fps when nothing asks for another: 60 fps
+// (auto: 30 at 30, 60 above), the Effect timing setting's default (F10's DISPLAY, the setup window's Game
 // page). One constant: the options file holds the setting only once a player
 // chose it (host/options.cpp), so a new default here reaches everyone else.
-inline constexpr char kEffectTimingDefault[] = "smooth";
+inline constexpr char kEffectTimingDefault[] = "auto";
 // The effects' timing above 30 fps, decided once as the game starts
 // (engine/frame_rate.cpp): BBHOST_SFX_STEP, else `setting` - the Effect timing
-// setting's "smooth", "30", "auto" or "fps" - once the player has chosen one
+// setting's "30", "auto" or "fps" - once the player has chosen one
 // (`chosen`), else [video] effect_steps, else kEffectTimingDefault. What each
 // value means at `fps` frames a second:
 //   smooth  whole 1/30 s steps for what the effects count in updates (a

@@ -51,6 +51,18 @@ struct Target {
     VkImageView view = VK_NULL_HANDLE;
 };
 
+// One picture's own: the sets, the two targets and the source's view. The
+// display buffer's is use 0; frame generation's HUD-less picture, upscaled the
+// same way in the same command buffer, has its own (use 1) - one use's sets
+// rewritten while the other's dispatches are still to run would change them.
+struct FsrUse {
+    VkDescriptorSet easu_set = VK_NULL_HANDLE, rcas_set = VK_NULL_HANDLE;
+    Target upscaled, sharpened;
+    std::uint32_t width = 0, height = 0;
+    VkImageView source_view = VK_NULL_HANDLE;  // made each frame: the display images come and go
+};
+constexpr unsigned kFsrUses = 2;
+
 struct Fsr {
     bool tried = false, ok = false;
     bool half = false;  // the half-precision shaders (fsr_easu_h, fsr_rcas_h)
@@ -59,11 +71,8 @@ struct Fsr {
     VkPipeline easu = VK_NULL_HANDLE, rcas = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
-    VkDescriptorSet easu_set = VK_NULL_HANDLE, rcas_set = VK_NULL_HANDLE;
-    Target upscaled, sharpened;
-    std::uint32_t width = 0, height = 0;
-    VkImageView source_view = VK_NULL_HANDLE;  // made each frame: the display images come and go
-    // GPU time of the two passes, read back a frame later (after the
+    FsrUse use[kFsrUses];
+    // GPU time of the display's two passes, read back a frame later (after the
     // presenter's fence) and logged every 300 frames.
     VkQueryPool queries = VK_NULL_HANDLE;
     bool queried = false;
@@ -126,22 +135,27 @@ bool fsr_init_locked() {
     sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     if (vkCreateSampler(g.device, &sci, nullptr, &g_fsr.sampler) != VK_SUCCESS) return false;
+    // Two sets (EASU's, RCAS's) for each use.
+    constexpr std::uint32_t kSets = 2 * kFsrUses;
     const VkDescriptorPoolSize sizes[3] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2}, {VK_DESCRIPTOR_TYPE_SAMPLER, 2}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2}};
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kSets}, {VK_DESCRIPTOR_TYPE_SAMPLER, kSets}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kSets}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpi.maxSets = 2;
+    dpi.maxSets = kSets;
     dpi.poolSizeCount = 3;
     dpi.pPoolSizes = sizes;
     if (vkCreateDescriptorPool(g.device, &dpi, nullptr, &g_fsr.pool) != VK_SUCCESS) return false;
-    const VkDescriptorSetLayout layouts[2] = {g_fsr.set_layout, g_fsr.set_layout};
+    VkDescriptorSetLayout layouts[kSets];
+    for (VkDescriptorSetLayout& l : layouts) l = g_fsr.set_layout;
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = g_fsr.pool;
-    dai.descriptorSetCount = 2;
+    dai.descriptorSetCount = kSets;
     dai.pSetLayouts = layouts;
-    VkDescriptorSet sets[2] = {};
+    VkDescriptorSet sets[kSets] = {};
     if (vkAllocateDescriptorSets(g.device, &dai, sets) != VK_SUCCESS) return false;
-    g_fsr.easu_set = sets[0];
-    g_fsr.rcas_set = sets[1];
+    for (unsigned u = 0; u < kFsrUses; ++u) {
+        g_fsr.use[u].easu_set = sets[2 * u];
+        g_fsr.use[u].rcas_set = sets[2 * u + 1];
+    }
     VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
     qci.queryCount = 2;
@@ -156,7 +170,8 @@ void note_time() {
     if (vkGetQueryPoolResults(g.device, g_fsr.queries, 0, 2, sizeof(ts), ts, sizeof(ts[0]), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
     g_fsr.total_us += static_cast<double>(ts[1] - ts[0]) * g.timestamp_period_ns / 1000.0;
     if (++g_fsr.frames % 300 == 0 && host_tooling()) {
-        host_log("present: FSR 1 took %.2f ms of GPU time a frame (%ux%u)", g_fsr.total_us / 300.0 / 1000.0, g_fsr.width, g_fsr.height);
+        host_log("present: FSR 1 took %.2f ms of GPU time a frame (%ux%u)", g_fsr.total_us / 300.0 / 1000.0, g_fsr.use[0].width,
+                 g_fsr.use[0].height);
         g_fsr.total_us = 0;
     }
 }
@@ -235,10 +250,11 @@ void image_barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkIma
 // src_w x src_h, in GENERAL) into `area` of `dst` (in TRANSFER_DST_OPTIMAL);
 // false when it cannot, and the caller blits. On the presenter's command
 // buffer, recorded after its fence, so last frame's sets and images are free.
+// `use`: 0 the display buffer, 1 frame generation's HUD-less picture (FsrUse).
 bool fsr_upscale_locked(VkCommandBuffer cmd, VkImage src, VkFormat src_format, std::uint32_t src_w, std::uint32_t src_h,
                         std::uint32_t src_x, std::uint32_t src_y, std::uint32_t sw, std::uint32_t sh, VkImage dst, VkRect2D area,
-                        VkImageView dst_view) {
-    if (!g_wanted || !sw || !sh || !area.extent.width || !area.extent.height) return false;
+                        VkImageView dst_view, unsigned use) {
+    if (!g_wanted || !sw || !sh || !area.extent.width || !area.extent.height || use >= kFsrUses) return false;
     if (!g_fsr.tried) {
         g_fsr.tried = true;
         g_fsr.ok = fsr_init_locked();
@@ -246,38 +262,39 @@ bool fsr_upscale_locked(VkCommandBuffer cmd, VkImage src, VkFormat src_format, s
                  dst_view ? ", into the swapchain image" : "", g_fsr.ok ? "ready" : "unavailable; bilinear");
     }
     if (!g_fsr.ok) return false;
-    note_time();
+    FsrUse& u = g_fsr.use[use];
+    if (use == 0) note_time();
     const std::uint32_t w = area.extent.width, h = area.extent.height;
-    if (w != g_fsr.width || h != g_fsr.height) {
-        destroy_target(g_fsr.upscaled);
-        destroy_target(g_fsr.sharpened);
-        g_fsr.width = g_fsr.height = 0;
-        if (!make_target(g_fsr.upscaled, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) ||
-            !make_target(g_fsr.sharpened, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
-            destroy_target(g_fsr.upscaled);
-            destroy_target(g_fsr.sharpened);
+    if (w != u.width || h != u.height) {
+        destroy_target(u.upscaled);
+        destroy_target(u.sharpened);
+        u.width = u.height = 0;
+        if (!make_target(u.upscaled, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) ||
+            !make_target(u.sharpened, w, h, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+            destroy_target(u.upscaled);
+            destroy_target(u.sharpened);
             return false;
         }
-        g_fsr.width = w;
-        g_fsr.height = h;
-        host_log("present: FSR 1 from %ux%u to %ux%u", sw, sh, w, h);
+        u.width = w;
+        u.height = h;
+        host_log("present: FSR 1 from %ux%u to %ux%u%s", sw, sh, w, h, use ? " (frame generation's HUD-less picture)" : "");
     }
-    if (g_fsr.source_view) vkDestroyImageView(g.device, g_fsr.source_view, nullptr);
-    g_fsr.source_view = VK_NULL_HANDLE;
+    if (u.source_view) vkDestroyImageView(g.device, u.source_view, nullptr);
+    u.source_view = VK_NULL_HANDLE;
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = src;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vci.format = src_format;
     vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(g.device, &vci, nullptr, &g_fsr.source_view) != VK_SUCCESS) {
-        g_fsr.source_view = VK_NULL_HANDLE;
+    if (vkCreateImageView(g.device, &vci, nullptr, &u.source_view) != VK_SUCCESS) {
+        u.source_view = VK_NULL_HANDLE;
         return false;
     }
-    write_set(g_fsr.easu_set, g_fsr.source_view, g_fsr.upscaled.view);
+    write_set(u.easu_set, u.source_view, u.upscaled.view);
     // RCAS straight into the swapchain image when it can take it: no copy of
     // the frame and no blit (on a Steam Deck ~0.1 ms of its GPU a frame).
     const bool direct = dst_view != VK_NULL_HANDLE;
-    write_set(g_fsr.rcas_set, g_fsr.upscaled.view, direct ? dst_view : g_fsr.sharpened.view);
+    write_set(u.rcas_set, u.upscaled.view, direct ? dst_view : u.sharpened.view);
 
     AU1 easu[16] = {};
     FsrEasuConOffset(easu, easu + 4, easu + 8, easu + 12, static_cast<AF1>(sw), static_cast<AF1>(sh), static_cast<AF1>(src_w),
@@ -290,7 +307,9 @@ bool fsr_upscale_locked(VkCommandBuffer cmd, VkImage src, VkFormat src_format, s
     rcas[7] = h;
     const std::uint32_t groups_x = (w + 15) / 16, groups_y = (h + 15) / 16;
 
-    if (g_fsr.queries) {
+    // (The display's alone are timed.)
+    const bool timed = use == 0 && g_fsr.queries;
+    if (timed) {
         vkCmdResetQueryPool(cmd, g_fsr.queries, 0, 2);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_fsr.queries, 0);
         g_fsr.queried = true;
@@ -300,24 +319,24 @@ bool fsr_upscale_locked(VkCommandBuffer cmd, VkImage src, VkFormat src_format, s
     mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    image_barrier(cmd, g_fsr.upscaled.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barrier(cmd, u.upscaled.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.easu);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.layout, 0, 1, &g_fsr.easu_set, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.layout, 0, 1, &u.easu_set, 0, nullptr);
     vkCmdPushConstants(cmd, g_fsr.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(easu), easu);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
-    image_barrier(cmd, g_fsr.upscaled.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barrier(cmd, u.upscaled.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
                   VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     if (direct) {
         // The caller left it a transfer destination (cleared for the bars, maybe).
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                       VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     } else {
-        image_barrier(cmd, g_fsr.sharpened.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
+        image_barrier(cmd, u.sharpened.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.rcas);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.layout, 0, 1, &g_fsr.rcas_set, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_fsr.layout, 0, 1, &u.rcas_set, 0, nullptr);
     vkCmdPushConstants(cmd, g_fsr.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rcas), rcas);
     vkCmdDispatch(cmd, groups_x, groups_y, 1);
     if (direct) {
@@ -326,10 +345,10 @@ bool fsr_upscale_locked(VkCommandBuffer cmd, VkImage src, VkFormat src_format, s
         image_barrier(cmd, dst, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        if (g_fsr.queries) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_fsr.queries, 1);
+        if (timed) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_fsr.queries, 1);
         return true;
     }
-    image_barrier(cmd, g_fsr.sharpened.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
+    image_barrier(cmd, u.sharpened.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT,
                   VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -337,9 +356,9 @@ bool fsr_upscale_locked(VkCommandBuffer cmd, VkImage src, VkFormat src_format, s
     blit.dstSubresource = blit.srcSubresource;
     blit.dstOffsets[0] = {area.offset.x, area.offset.y, 0};
     blit.dstOffsets[1] = {area.offset.x + static_cast<int32_t>(w), area.offset.y + static_cast<int32_t>(h), 1};
-    vkCmdBlitImage(cmd, g_fsr.sharpened.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+    vkCmdBlitImage(cmd, u.sharpened.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                    VK_FILTER_NEAREST);
-    if (g_fsr.queries) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_fsr.queries, 1);
+    if (timed) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_fsr.queries, 1);
     return true;
 }
 

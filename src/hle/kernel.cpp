@@ -1,5 +1,6 @@
 #include "hle/equeue.h"
 #include "hle/sync.h"
+#include "core/dmem_place.h"
 #include "core/futex.h"
 #include "core/host_clock.h"
 #include "core/tls_rewrite.h"
@@ -39,6 +40,7 @@
 #include "core/win_vm.h"
 #include <pthread_time.h>  // winpthreads: clock_gettime and the POSIX clock ids
 #else
+#include "core/linux_vm.h"
 #include <fcntl.h>
 #ifndef SYS_memfd_create
 #define SYS_memfd_create 319
@@ -64,6 +66,15 @@ constexpr std::uint64_t kGnmVaMask = 0xFFFFFFFFFFull;
 // Windows: where the image goes when its preferred slide is taken (memory.cpp).
 constexpr std::uint64_t kImageFallbackBase = 0x300000000ull;
 constexpr std::uint64_t kPage = 0x4000;  // Orbis page
+// A view of the direct memory's backing starts and ends on whole blocks of it
+// (core/dmem_place.h): 64 KiB on Windows, where a view's offset into its
+// section and its base are multiples of the allocation granularity; the
+// page on Linux.
+#if defined(_WIN32)
+constexpr std::uint64_t kViewBlock = 0x10000;
+#else
+constexpr std::uint64_t kViewBlock = 0x1000;
+#endif
 
 // SCE_KERNEL_PROT_*
 constexpr int kProtCpuRead = 1;
@@ -92,6 +103,13 @@ struct MappedRegion {
     int type = 0;
     bool dmem = false;
     std::uintptr_t alias_of = 0;  // non-zero: this is the GPU alias of that CPU va
+    // A direct mapping whose address the kernel chose elsewhere than its
+    // identity (map_va, host_place_dmem) on Windows: the view behind it,
+    // [view, view + view_len), whole 64 KiB blocks no other mapping uses,
+    // the mapping starting inside it. The view goes when nothing of the
+    // mapping is left. 0 for every other mapping.
+    std::uintptr_t view = 0;
+    std::uint64_t view_len = 0;
 };
 std::vector<MappedRegion> g_maps;
 std::atomic<std::uint64_t> g_maps_gen{1};  // bumped on every change to g_maps
@@ -225,6 +243,12 @@ MappedRegion* maps_find_locked(std::uintptr_t a) {
     return nullptr;
 }
 
+// Whether any mapping is recorded in [lo, hi).
+bool range_recorded(std::uintptr_t lo, std::uintptr_t hi) {
+    std::lock_guard<std::mutex> lock(g_dmem_mu);
+    return std::any_of(g_maps.begin(), g_maps.end(), [&](const MappedRegion& r) { return r.start < hi && r.start + r.len > lo; });
+}
+
 int host_prot(int sce_prot) {
 #if defined(_WIN32)
     const bool r = sce_prot & kProtCpuRead, w = sce_prot & kProtCpuWrite, x = sce_prot & kProtCpuExec;
@@ -252,6 +276,15 @@ int host_prot(int sce_prot) {
 
 enum class Fix { None, Exact, NoReplace };
 
+#if !defined(_WIN32)
+// In the guest windows reserved at the start (hle_kernel_reserve_guest_windows,
+// core/linux_vm.h) a fixed mapping takes its part of the reservation and an
+// unmapping gives it back; elsewhere they are the plain calls.
+LinuxVmFix linux_fix(const void* hint, Fix fix) {
+    return !hint || fix == Fix::None ? LinuxVmFix::None : fix == Fix::Exact ? LinuxVmFix::Exact : LinuxVmFix::NoReplace;
+}
+#endif
+
 // Anonymous host memory. `Fix::Exact` replaces whatever is at hint (guest
 // asked for MAP_FIXED on a range it owns); `Fix::NoReplace` fails instead of
 // clobbering host memory (addresses we computed ourselves).
@@ -271,13 +304,8 @@ void* host_map_anon(void* hint, std::uint64_t len, int sce_prot, Fix fix) {
     if (sce_prot == 0) return win_vm_place(hint, round, place, kGnmVaMask);
     return win_vm_alloc(hint, round, static_cast<DWORD>(host_prot(sce_prot)), place, kGnmVaMask);
 #else
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-    if (hint && fix == Fix::Exact) {
-        flags |= MAP_FIXED;
-    } else if (hint && fix == Fix::NoReplace) {
-        flags |= MAP_FIXED_NOREPLACE;
-    }
-    void* p = mmap(hint, static_cast<std::size_t>(len), host_prot(sce_prot), flags, -1, 0);
+    void* p = linux_vm_mmap(hint, static_cast<std::size_t>(len), host_prot(sce_prot),
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0, linux_fix(hint, fix));
     if (p == MAP_FAILED) {
         return nullptr;
     }
@@ -300,19 +328,28 @@ void* host_map_dmem(void* hint, std::uint64_t len, int sce_prot, Fix fix, std::i
     const WinVmPlace place = fix == Fix::Exact ? WinVmPlace::Exact
                              : fix == Fix::NoReplace ? WinVmPlace::NoReplace
                                                      : WinVmPlace::Anywhere;
+    if (place != WinVmPlace::Anywhere && (static_cast<std::uint64_t>(phys) & (kViewBlock - 1)) != 0) {
+        // A view starts on a 64 KiB boundary of the backing and of the
+        // address space alike, so memory 16, 32 or 48 KiB into its block has
+        // no view at an address given in advance (the game's MAP_FIXED or
+        // BatchMap, the identity address, the GPU window). Where the kernel
+        // chooses the address, it keeps that offset (host_place_dmem).
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 8) {
+            host_log("kernel: direct memory 0x%llx cannot be mapped at %p: on Windows a view of it starts on a 64 KiB "
+                     "boundary of the memory and of the address space, and this memory is 0x%llx into its block",
+                     static_cast<unsigned long long>(phys), hint,
+                     static_cast<unsigned long long>(static_cast<std::uint64_t>(phys) & (kViewBlock - 1)));
+        }
+        return nullptr;
+    }
     const std::uint64_t round = (len + 0xffff) & ~std::uint64_t(0xffff);
     if (static_cast<std::uint64_t>(phys) + round > g_dmem_size) return nullptr;
     return win_vm_map(g_dmem_map, hint, round, static_cast<std::uint64_t>(phys),
                       static_cast<DWORD>(host_prot(sce_prot)), place, kGnmVaMask);
 #else
-    int flags = MAP_SHARED;
-    if (hint && fix == Fix::Exact) {
-        flags |= MAP_FIXED;
-    } else if (hint && fix == Fix::NoReplace) {
-        flags |= MAP_FIXED_NOREPLACE;
-    }
-    void* p = mmap(hint, static_cast<std::size_t>(len), host_prot(sce_prot), flags, g_dmem_fd,
-                   static_cast<off_t>(phys));
+    void* p = linux_vm_mmap(hint, static_cast<std::size_t>(len), host_prot(sce_prot), MAP_SHARED, g_dmem_fd, phys,
+                            linux_fix(hint, fix));
     if (p == MAP_FAILED) {
         return nullptr;
     }
@@ -321,6 +358,76 @@ void* host_map_dmem(void* hint, std::uint64_t len, int sce_prot, Fix fix, std::i
         return nullptr;
     }
     return p;
+#endif
+}
+
+// A direct mapping whose address the kernel chooses (core/dmem_place.h):
+// anywhere free, `align`-aligned, in a view no other mapping uses. Windows:
+// below the Gnm address limit, the view whole 64 KiB blocks of the backing
+// and the mapping inside it at phys's offset in its block, the view returned
+// in *view / *view_len (unmapped whole once nothing of the mapping is left);
+// Linux: the mapping is its own view (*view 0). nullptr when it cannot be
+// made.
+void* host_place_dmem(std::uint64_t len, int sce_prot, std::int64_t phys, std::uint64_t align, std::uintptr_t* view,
+                      std::uint64_t* view_len) {
+    *view = 0;
+    *view_len = 0;
+    if (!len || phys < 0 || static_cast<std::uint64_t>(phys) + len > g_dmem_size || !ensure_dmem_backing()) {
+        return nullptr;
+    }
+    const DmemPlacement pl = dmem_placement(static_cast<std::uint64_t>(phys), len, align, kViewBlock);
+    if (!pl.ok || pl.view_offset + pl.view_len > g_dmem_size) {
+        host_log("kernel: direct memory 0x%llx (0x%llx bytes) cannot be placed at a 0x%llx-aligned address: a view of "
+                 "it starts on a 0x%llx boundary of the memory, and this memory is 0x%llx into its block",
+                 static_cast<unsigned long long>(phys), static_cast<unsigned long long>(len),
+                 static_cast<unsigned long long>(align), static_cast<unsigned long long>(kViewBlock),
+                 static_cast<unsigned long long>(pl.va_offset));
+        return nullptr;
+    }
+#if defined(_WIN32)
+    void* base = win_vm_map(g_dmem_map, nullptr, pl.view_len, pl.view_offset, static_cast<DWORD>(host_prot(sce_prot)),
+                            WinVmPlace::Anywhere, kGnmVaMask, pl.base_align);
+    if (!base) {
+        return nullptr;
+    }
+    *view = reinterpret_cast<std::uintptr_t>(base);
+    *view_len = pl.view_len;
+    return reinterpret_cast<void*>(*view + pl.va_offset);
+#else
+    // Room for the alignment reserved, the memory mapped fixed inside it, the
+    // rest given back.
+    const std::uint64_t room = len + pl.base_align;
+    void* raw = mmap(nullptr, static_cast<std::size_t>(room), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (raw == MAP_FAILED) {
+        return nullptr;
+    }
+    const auto r = reinterpret_cast<std::uintptr_t>(raw);
+    const std::uintptr_t at = align_up(r, pl.base_align);
+    void* p = mmap(reinterpret_cast<void*>(at), static_cast<std::size_t>(len), host_prot(sce_prot), MAP_SHARED | MAP_FIXED,
+                   g_dmem_fd, static_cast<off_t>(phys));
+    if (p == MAP_FAILED) {
+        munmap(raw, static_cast<std::size_t>(room));
+        return nullptr;
+    }
+    if (at > r) {
+        munmap(raw, at - r);
+    }
+    if (r + room > at + len) {
+        munmap(reinterpret_cast<void*>(at + len), static_cast<std::size_t>(r + room - (at + len)));
+    }
+    return p;
+#endif
+}
+
+// The view of a placed mapping (host_place_dmem), whole.
+void host_unmap_view(std::uintptr_t view, std::uint64_t view_len) {
+#if defined(_WIN32)
+    if (view && view_len) {
+        win_vm_unmap(reinterpret_cast<void*>(view), view_len);
+    }
+#else
+    (void)view;
+    (void)view_len;
 #endif
 }
 
@@ -333,7 +440,7 @@ void host_unmap(std::uintptr_t p, std::uint64_t len, bool dmem) {
     win_vm_unmap(reinterpret_cast<void*>(p), (len + 0xffff) & ~std::uint64_t(0xffff));
 #else
     (void)dmem;
-    munmap(reinterpret_cast<void*>(p), static_cast<std::size_t>(len));
+    linux_vm_munmap(reinterpret_cast<void*>(p), static_cast<std::size_t>(len));  // in a guest window, the reservation again
 #endif
 }
 
@@ -419,23 +526,56 @@ int unmap_range(std::uintptr_t addr, std::uint64_t len) {
         return sce_err(EINVAL);
     }
     std::vector<MappedRegion> cut;
+    std::vector<MappedRegion> views;  // placed mappings whose views go (host_place_dmem)
     {
         std::lock_guard<std::mutex> lock(g_dmem_mu);
         cut = maps_cut_locked(addr, addr + len);
-        // Direct mappings carry a GPU alias at a fixed offset; drop it too.
-        std::vector<MappedRegion> alias_cut;
+        // A direct mapping's GPU alias (map_gpu_alias) goes with it: the alias
+        // records that point back into what was cut, and only those - another
+        // mapping of the same memory (a placed one) has none of its own, and
+        // the window there is the first mapping's.
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> gpu;
         for (const auto& c : cut) {
-            if (c.dmem && !c.alias_of && c.phys >= 0 &&
-                static_cast<std::uint64_t>(c.phys) + c.len <= 0x100000000ull) {
-                const std::uintptr_t g = static_cast<std::uintptr_t>(kGpuDmemBase + static_cast<std::uint64_t>(c.phys));
-                auto more = maps_cut_locked(g, g + c.len);
-                alias_cut.insert(alias_cut.end(), more.begin(), more.end());
+            if (!c.dmem || c.alias_of) {
+                continue;
+            }
+            for (const auto& r : g_maps) {
+                if (!r.alias_of) {
+                    continue;
+                }
+                const std::uintptr_t lo = std::max<std::uintptr_t>(r.alias_of, c.start);
+                const std::uintptr_t hi = std::min<std::uintptr_t>(r.alias_of + r.len, c.start + c.len);
+                if (lo < hi) {
+                    gpu.emplace_back(r.start + (lo - r.alias_of), r.start + (hi - r.alias_of));
+                }
             }
         }
-        cut.insert(cut.end(), alias_cut.begin(), alias_cut.end());
+        for (const auto& g : gpu) {
+            auto more = maps_cut_locked(g.first, g.second);
+            cut.insert(cut.end(), more.begin(), more.end());
+        }
+        // A placed mapping's view goes once nothing of that mapping is left.
+        for (const auto& c : cut) {
+            if (!c.view) {
+                continue;
+            }
+            const bool left = std::any_of(g_maps.begin(), g_maps.end(), [&](const MappedRegion& r) { return r.view == c.view; });
+            const bool listed = std::any_of(views.begin(), views.end(), [&](const MappedRegion& v) { return v.view == c.view; });
+            if (!left && !listed) {
+                views.push_back(c);
+            }
+        }
     }
     for (const auto& c : cut) {
-        host_unmap(c.start, c.len, c.dmem);
+        if (!c.view) {
+            host_unmap(c.start, c.len, c.dmem);
+        }
+    }
+    for (const auto& v : views) {
+        host_unmap_view(v.view, v.view_len);
+        host_log("munmap: the view at 0x%llx (0x%llx) of a placed mapping of phys 0x%llx unmapped",
+                 static_cast<unsigned long long>(v.view), static_cast<unsigned long long>(v.view_len),
+                 static_cast<unsigned long long>(v.phys));
     }
     return 0;
 }
@@ -693,7 +833,88 @@ bool hle_kernel_reserve_guest_windows() {
     }
     return ok;
 #else
-    return true;
+    // The same windows on Linux (core/linux_vm.h), PROT_NONE and MAP_NORESERVE
+    // - no memory, no commit - before anything else can take those addresses:
+    // NVIDIA's driver reserves 4 GiB at 8 GiB once Vulkan and NGX are up, where
+    // a heap sized for a 2560x1440 display reaches, and with the range taken
+    // the game's map of it failed and the game crashed. A guest mapping in a
+    // window takes its part of the reservation and an unmapping gives it back
+    // (host_map_anon, host_map_dmem, host_unmap). The image's fallback home
+    // needs no reservation: the image is mapped before the game's Vulkan
+    // device and the upscaler bridge come up (core/memory.cpp takes it then).
+    const char* relaunch_env = std::getenv("BBHOST_RELAUNCH");
+    const int relaunches = relaunch_env ? std::atoi(relaunch_env) : 0;
+    const bool cpu = linux_vm_reserve(kDmemVaBase, kDmemMaxSize);
+    const bool gpu = linux_vm_reserve(kGpuDmemBase, 0x100000000ull);
+    bool ok = cpu && gpu;
+    // BBHOST_TEST_RESERVE_FAIL=1: the first process pretends the reservation
+    // lost, to see the relaunch below work.
+    const char* test_fail = std::getenv("BBHOST_TEST_RESERVE_FAIL");
+    if (ok && relaunches == 0 && test_fail && test_fail[0] == '1') {
+        host_log("linux-vm: BBHOST_TEST_RESERVE_FAIL: pretending the reservation lost");
+        ok = false;
+    }
+    if (ok) {
+        char again[48] = {};
+        if (relaunches > 0) std::snprintf(again, sizeof(again), " (relaunch %d of 3)", relaunches);
+        host_log("linux-vm: guest windows [0x%llx, +0x%llx) and [0x%llx, +4 GiB) reserved: no memory until the game maps "
+                 "there%s",
+                 static_cast<unsigned long long>(kDmemVaBase), static_cast<unsigned long long>(kDmemMaxSize),
+                 static_cast<unsigned long long>(kGpuDmemBase), again);
+        return true;
+    }
+    // What has them (before main runs only the loader, the libraries it
+    // loaded and their constructors map anything).
+    const auto taken = [](std::uint64_t base, std::uint64_t len, const char* what) {
+        const std::vector<std::string> in = linux_vm_occupants(base, len);
+        for (std::size_t i = 0; i < in.size() && i < 8; ++i) host_log("linux-vm: the %s window holds %s", what, in[i].c_str());
+        if (in.size() > 8) host_log("linux-vm: ... and %zu more mappings there", in.size() - 8);
+    };
+    if (!cpu) taken(kDmemVaBase, kDmemMaxSize, "direct memory's");
+    if (!gpu) taken(kGpuDmemBase, 0x100000000ull, "GPU alias");
+    host_log("linux-vm: guest windows [0x%llx, +0x%llx) %s and [0x%llx, +4 GiB) %s",
+             static_cast<unsigned long long>(kDmemVaBase), static_cast<unsigned long long>(kDmemMaxSize),
+             cpu ? "reserved" : "NOT reserved", static_cast<unsigned long long>(kGpuDmemBase), gpu ? "reserved" : "NOT reserved");
+    if (relaunches < 3) {
+        // A fresh process is placed anew, so the run starts itself again, up
+        // to three times: in this process (execv), with the same arguments,
+        // environment and descriptors, so whatever waits for it still does.
+        char n[16];
+        std::snprintf(n, sizeof(n), "%d", relaunches + 1);
+        setenv("BBHOST_RELAUNCH", n, 1);
+        host_log("linux-vm: relaunching (%s of 3) so the guest windows are placed anew", n);
+        std::vector<std::string> args;
+        if (FILE* f = std::fopen("/proc/self/cmdline", "re")) {
+            std::string a;
+            for (int c = std::fgetc(f); c != EOF; c = std::fgetc(f)) {
+                if (c) {
+                    a += static_cast<char>(c);
+                } else {
+                    args.push_back(a);
+                    a.clear();
+                }
+            }
+            if (!a.empty()) args.push_back(a);
+            std::fclose(f);
+        }
+        std::vector<char*> argv;
+        for (std::string& a : args) argv.push_back(a.data());
+        argv.push_back(nullptr);
+        std::fflush(nullptr);
+        if (args.size()) execv("/proc/self/exe", argv.data());
+        host_log("linux-vm: relaunch failed: errno %d", errno);
+    } else {
+        host_log("linux-vm: the guest windows were taken in %d launches; giving up", relaunches + 1);
+    }
+    // Their free parts reserved still; the game's maps into the rest fail
+    // where something is, as before the windows were reserved.
+    if (!cpu)
+        host_log("linux-vm: %llu MiB of the direct memory's window reserved",
+                 static_cast<unsigned long long>(linux_vm_reserve_free(kDmemVaBase, kDmemMaxSize) >> 20));
+    if (!gpu)
+        host_log("linux-vm: %llu MiB of the GPU alias window reserved",
+                 static_cast<unsigned long long>(linux_vm_reserve_free(kGpuDmemBase, 0x100000000ull) >> 20));
+    return false;
 #endif
 }
 
@@ -919,15 +1140,35 @@ int map_va(void** addr, std::uint64_t len, int prot, int flags, std::int64_t phy
     if ((flags & 0x10) != 0 && hint != nullptr) {
         fix = Fix::Exact;  // SCE_KERNEL_MAP_FIXED on a range the guest owns
     } else if (dmem && phys >= 0) {
+        // Direct memory goes to its identity address while that is free (and,
+        // on Windows, a view can start there: phys on a 64 KiB boundary).
         const std::uint64_t cpu_va = kDmemVaBase + static_cast<std::uint64_t>(phys);
-        if (cpu_va + len - 1 <= kGnmVaMask) {
+        if (cpu_va + len - 1 <= kGnmVaMask && (static_cast<std::uint64_t>(phys) & (kViewBlock - 1)) == 0 &&
+            !range_recorded(cpu_va, cpu_va + len)) {
             hint = reinterpret_cast<void*>(cpu_va);
             fix = Fix::NoReplace;
         }
     }
     void* p = nullptr;
+    std::uintptr_t view = 0;
+    std::uint64_t view_len = 0;
+    bool placed = false;
     if (dmem) {
-        p = host_map_dmem(hint, len, prot, fix, phys);
+        if (fix != Fix::None) {
+            p = host_map_dmem(hint, len, prot, fix, phys);
+        }
+        if (!p && fix != Fix::Exact) {
+            // Not MAP_FIXED, and the identity address not to be had: the game
+            // maps memory it has mapped already a second time, with another
+            // protection (the allocator behind the AvPlayer's audio buffers
+            // makes 16 KiB of its CPU-only heap GPU-visible so). The game's
+            // kernel puts such a mapping wherever there is room, and so does
+            // this; failing it made the game fall back to a reserved range and
+            // BatchMap, which on Windows cannot map memory off a 64 KiB
+            // boundary.
+            p = host_place_dmem(len, prot, phys, align, &view, &view_len);
+            placed = p != nullptr;
+        }
     } else if (fix == Fix::None && align > 0x1000) {
         // Over-allocate and trim to honour the alignment.
         void* raw = host_map_anon(nullptr, len + align, prot, Fix::None);
@@ -955,7 +1196,13 @@ int map_va(void** addr, std::uint64_t len, int prot, int flags, std::int64_t phy
     }
     std::uintptr_t gpu = 0;
     int type = 0;
-    if (dmem) {
+    // The GPU window's view of the memory (map_gpu_alias). A placed mapping
+    // takes it only where nothing has it yet (another mapping of the same
+    // memory has its alias there, which shows GX the same bytes) and a view
+    // can start there.
+    if (dmem && (!placed || ((static_cast<std::uint64_t>(phys) & (kViewBlock - 1)) == 0 &&
+                             !range_recorded(kGpuDmemBase + static_cast<std::uint64_t>(phys),
+                                             kGpuDmemBase + static_cast<std::uint64_t>(phys) + len)))) {
         gpu = map_gpu_alias(phys, len);
     }
     MappedRegion r{};
@@ -964,6 +1211,8 @@ int map_va(void** addr, std::uint64_t len, int prot, int flags, std::int64_t phy
     r.phys = dmem ? phys : -1;
     r.prot = prot;
     r.dmem = dmem;
+    r.view = view;
+    r.view_len = view_len;
     {
         std::lock_guard<std::mutex> lock(g_dmem_mu);
         if (dmem) {
@@ -979,6 +1228,8 @@ int map_va(void** addr, std::uint64_t len, int prot, int flags, std::int64_t phy
             g.start = gpu;
             g.alias_of = r.start;
             g.prot = kProtCpuRead | kProtCpuWrite;
+            g.view = 0;  // a view of its own, unmapped with the mapping (unmap_range)
+            g.view_len = 0;
             maps_cut_locked(gpu, gpu + len);
             g_maps.push_back(g);
             g_maps_gen.fetch_add(1);
@@ -986,9 +1237,10 @@ int map_va(void** addr, std::uint64_t len, int prot, int flags, std::int64_t phy
     }
     *addr = p;
     if (dmem) {
-        host_log("MapDirectMemory va=%p gpu=0x%llx len=0x%llx phys=0x%llx prot=0x%x flags=0x%x align=0x%llx",
+        host_log("MapDirectMemory va=%p gpu=0x%llx len=0x%llx phys=0x%llx prot=0x%x flags=0x%x align=0x%llx%s",
                  p, static_cast<unsigned long long>(gpu), static_cast<unsigned long long>(len),
-                 static_cast<unsigned long long>(phys), prot, flags, static_cast<unsigned long long>(align));
+                 static_cast<unsigned long long>(phys), prot, flags, static_cast<unsigned long long>(align),
+                 placed ? " (placed: not at its identity address)" : "");
     } else {
         host_log("MapMemory va=%p len=0x%llx prot=0x%x flags=0x%x", p,
                  static_cast<unsigned long long>(len), prot, flags);

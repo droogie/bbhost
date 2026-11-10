@@ -3,6 +3,7 @@
 #include "decomp/decomp.h"
 #include "engine/mouse_camera.h"
 #include "core/config.h"
+#include "core/config_move.h"
 #include "core/host_clock.h"
 #include "core/portable.h"
 #include "core/thunk.h"
@@ -62,6 +63,7 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <io.h>
 #else
 #include <csignal>
 #include <signal.h>
@@ -399,24 +401,57 @@ namespace {
 // is no window, and a console made for an earlier decision (the setup window
 // can change the setting) is let go.
 bool g_log_console = false;  // the console is one this process attached or made
+// The log's lines to that console (host_log_detail::g_console_write): a
+// console shows the bytes it is given in its own code page, and the log is
+// UTF-8, so they go as UTF-16. Pieces of at most 1024 bytes, cut where a
+// character starts, on the stack: a crash's report comes through here too.
+void console_write(const char* p, std::size_t n) {
+    const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stderr)));
+    wchar_t w[1024];
+    while (n) {
+        std::size_t k = n < 1024 ? n : 1024;
+        if (k < n) {
+            while (k > 0 && (static_cast<unsigned char>(p[k]) & 0xC0) == 0x80) --k;  // not inside a character
+            if (k == 0) k = 1024;  // no character starts in it: not UTF-8, cut anywhere
+        }
+        const int m = MultiByteToWideChar(CP_UTF8, 0, p, static_cast<int>(k), w, 1024);
+        DWORD done = 0;
+        if (m > 0) WriteConsoleW(h, w, static_cast<DWORD>(m), &done, nullptr);
+        p += k;
+        n -= k;
+    }
+}
+// A file or a pipe a standard stream was started with is that stream's
+// already; anything else - none, or a handle of a console this process is
+// not attached to - is not.
+bool std_handle_is_file_or_pipe(DWORD which) {
+    const HANDLE h = GetStdHandle(which);
+    const DWORD type = h && h != INVALID_HANDLE_VALUE ? GetFileType(h) : FILE_TYPE_UNKNOWN;
+    return type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE;
+}
 void log_console(bool on) {
+    // stdout goes to the console only when it was started with nowhere of
+    // its own. The setup window's "Compile shaders now" child prints its
+    // progress to a pipe the window reads (host/shader_compile.h): reopening
+    // stdout closed that pipe, and the window heard nothing more of the
+    // compile. Decided once, before a console's handles can replace the
+    // standard ones; a stdout kept is never reopened, so it stays right.
+    static const bool stdout_own = std_handle_is_file_or_pipe(STD_OUTPUT_HANDLE);
     if (on) {
         if (g_log_console) return;
-        // A file or a pipe is the log's already; anything else - none, or a
-        // handle of a console this process is not attached to - is not.
-        const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
-        const DWORD type = h && h != INVALID_HANDLE_VALUE ? GetFileType(h) : FILE_TYPE_UNKNOWN;
-        if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE) return;
+        if (std_handle_is_file_or_pipe(STD_ERROR_HANDLE)) return;
         if (!AttachConsole(ATTACH_PARENT_PROCESS) && !AllocConsole()) return;
         g_log_console = true;
         std::FILE* f = nullptr;
         freopen_s(&f, "CONOUT$", "w", stderr);
-        freopen_s(&f, "CONOUT$", "w", stdout);  // (on_console_ctrl, set at the start, takes this console's close too)
+        if (!stdout_own) freopen_s(&f, "CONOUT$", "w", stdout);  // (on_console_ctrl, set at the start, takes this console's close too)
+        host_log_detail::g_console_write.store(console_write, std::memory_order_release);
     } else if (g_log_console) {
+        host_log_detail::g_console_write.store(nullptr, std::memory_order_release);
         std::fflush(nullptr);
         std::FILE* f = nullptr;
         freopen_s(&f, "NUL", "w", stderr);
-        freopen_s(&f, "NUL", "w", stdout);
+        if (!stdout_own) freopen_s(&f, "NUL", "w", stdout);
         FreeConsole();
         g_log_console = false;
     }
@@ -920,6 +955,12 @@ int main(int argc, char** argv) {
                      static_cast<double>(ms.ullTotalPageFile) / kGiB, static_cast<double>(ms.ullAvailPageFile) / kGiB);
         }
     }
+    // The manifest (res/bbhost.manifest) makes UTF-8 the code page every
+    // narrow path is in; a Windows 10 before version 1903 leaves the old one.
+    if (const UINT cp = GetACP(); cp != CP_UTF8) {
+        host_log("paths: Windows runs bbhost in code page %u, not UTF-8 (that needs Windows 10 version 1903 or later): "
+                 "a user or folder name outside ASCII can stop it", cp);
+    }
     host_timing_init();  // 1 ms timer resolution and no power throttling from here on (core/host_clock.h)
     {
         // The process's standing with Windows' schedulers, left as Windows
@@ -953,6 +994,7 @@ int main(int argc, char** argv) {
         }
     }
 #else
+    hle_kernel_reserve_guest_windows();  // before anything else can take those addresses (Vulkan's drivers, NGX)
     host_log("bbhost %s (%s, Linux x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
     log_cpu();
     std::signal(SIGTERM, on_term);
@@ -992,6 +1034,15 @@ int main(int argc, char** argv) {
     // --compile-shaders (host/shader_compile.h): no window, no game.
     const bool compile_session = shader_compile_take_flag(argc, argv);
     shader_compile_set_args(argc, argv);
+    // --compile-selftest DIR (host/shader_compile.h): the window's side of
+    // that button end to end, with the log on as the setup window has it by
+    // default (on Windows, its console).
+    if (const std::string dir = shader_compile_selftest_dir(argc, argv); !dir.empty()) {
+        decide_log(true);
+        const int rc = shader_compile_selftest(dir);
+        std::fflush(nullptr);
+        std::_Exit(rc);
+    }
 #else
     const bool compile_session = false;
 #endif
@@ -1017,7 +1068,14 @@ int main(int argc, char** argv) {
         // seen yet (or plugins.show_settings): it opens on the Plugins tab.
         const std::string help = config_setup_help(cfg);
         const bool plugins_tab = !cfg.headless && help.empty() && !cfg.setup_requested && plugin_ui_wants_attention();
-        if (!compile_session && !cfg.headless && (cfg.setup_requested || cfg.setup_always || !help.empty() || plugins_tab)) {
+        // The settings moved to their new folder (core/config_move.h): the
+        // window opens to say so until it is dismissed - not for a harness,
+        // which keeps it shut (BBHOST_SETUP_WINDOW=0), nor for the game the
+        // window starts while it stays open (--no-setup).
+        const char* setup_env = std::getenv("BBHOST_SETUP_WINDOW");
+        const bool moved = !(setup_env && std::strcmp(setup_env, "0") == 0) && !config_moves_to_show().empty();
+        if (!compile_session && !cfg.headless && !cfg.setup_skip &&
+            (cfg.setup_requested || cfg.setup_always || !help.empty() || plugins_tab || moved)) {
             std::string reason = help.substr(0, help.find('\n'));
             if (reason.rfind("bbhost: ", 0) == 0) reason = reason.substr(8);
             if (launcher_run(cfg, reason, plugins_tab) == LauncherResult::Quit) return help.empty() ? 0 : 2;
@@ -1034,7 +1092,7 @@ int main(int argc, char** argv) {
     // they are missing, and write a template when there is no file at all.
     if (const std::string help = config_setup_help(cfg); !help.empty()) {
         decide_log(true);
-        std::fputs(help.c_str(), stderr);
+        host_log_detail::write_raw(help.data(), help.size());  // as the log goes: UTF-16 to a console
         std::fflush(stderr);
         return 2;
     }
@@ -1064,10 +1122,13 @@ int main(int argc, char** argv) {
     // next start.
     {
         const HostSettings h = host_settings();
-        config_set_enhancements(h.change_appearance, h.rebirth, h.five_players, h.skill_issue);
+        config_set_enhancements(h.change_appearance, h.rebirth, h.five_players, h.skill_issue, h.full_phantom_hp,
+                                h.auto_replenish);
         const HostConfig& c = config();
-        host_log("pc enhancements: mirror %s, rebirth %s, five players %s, skill issue %s", c.change_appearance ? "on" : "off",
-                 c.rebirth ? "on" : "off", c.five_players ? "on" : "off", c.skill_issue ? "on" : "off");
+        host_log("pc enhancements: mirror %s, rebirth %s, five players %s, skill issue %s, Full Phantom HP %s, "
+                 "Auto-Replenish Items %s",
+                 c.change_appearance ? "on" : "off", c.rebirth ? "on" : "off", c.five_players ? "on" : "off",
+                 c.skill_issue ? "on" : "off", c.full_phantom_hp ? "on" : "off", c.auto_replenish ? "on" : "off");
         // The debug menu was a PC Settings switch before the Debug Menu plugin
         // took its place: a player who had it on gets the plugin turned on,
         // once, and the old switch goes off.
@@ -1120,7 +1181,8 @@ int main(int argc, char** argv) {
     if (image.sha256 != kEboot109Sha256) {
         const char* any = std::getenv("BBHOST_ANY_EBOOT");
         if (!(any && any[0] == '1')) {
-            std::fputs(config_eboot_help(cfg, image.sha256, kEboot109Sha256).c_str(), stderr);
+            const std::string help = config_eboot_help(cfg, image.sha256, kEboot109Sha256);
+            host_log_detail::write_raw(help.data(), help.size());  // as the log goes: UTF-16 to a console
             std::fflush(stderr);
             return 3;
         }

@@ -13,6 +13,7 @@
 #include "host/draw_digest.h"
 #include "host/frame_stats.h"
 #include "host/gpu.h"
+#include "host/slow_calls.h"
 #include "hle/platform.h"
 
 #include <algorithm>
@@ -107,6 +108,13 @@ GUEST_ABI int hle_razor_not_loaded() { return 0; }
 GUEST_ABI void hle_razor_capture(const char*) {}
 
 }  // namespace
+
+namespace {
+// The game's flips so far: the `stall:` line's flip numbers (hle_gnm_flip_calls).
+std::atomic<int> g_flip_calls{0};
+}  // namespace
+
+std::uint64_t hle_gnm_flip_calls() { return static_cast<std::uint64_t>(g_flip_calls.load(std::memory_order_relaxed)); }
 
 void hle_gnm_detach_equeue(HostEqueue* eq) {
     std::lock_guard<std::mutex> lock(g_gnm_mu);
@@ -424,6 +432,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                                           static_cast<unsigned long long>(tl_n), static_cast<double>(t - tl_call) / 1e6, tl_phase_ms(t));
                              }
                              if (draw_digest_on()) draw_digest_frame();  // BBHOST_DRAW_DIGEST: the frame's draws are all made
+                             host_gpu_frame_recorded();  // the frame's end in command order (plugins' shader data latched)
                              hle_video_finish_flip(handle, buffer, arg, true);  // the job's commands are recorded
                              post_gnm_eop();
                          },
@@ -468,8 +477,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
     }
     hle_gnm_arena_flip();  // BBHOST_ARENA_MONITOR
     frame_stats_on_flip();  // BBHOST_FRAME_STATS
-    static std::atomic<int> flip_logs{0};
-    const int n = flip_logs.fetch_add(1);
+    const int n = g_flip_calls.fetch_add(1);
     // A flip that came BBHOST_STALL_MS (100 by default; 0 turns this off) or
     // more after the previous one: what the command processor and the texture
     // cache spent in between, so a hitch (a new area loading) shows whether it
@@ -645,6 +653,8 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
             ph += buf;
         }
         host_log("  cp-thread ms:%s", ph.c_str());
+        // The driver calls of 10, 50 and 200 ms or more since the last report (host/slow_calls.h).
+        if (const std::string sc = slow_calls::window_report(); !sc.empty()) host_log("  %s", sc.c_str());
         host_log("  gnm ops: %s", hle_gnm_op_window().c_str());
         const std::string sources = hle_gx_source_window();
         if (!sources.empty()) host_log("  gnm sources: %s", sources.c_str());

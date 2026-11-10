@@ -48,6 +48,8 @@ void listener_count(const HostSettings& h) {
 
 // What the shader patches link against (host/settings.h), served by this store.
 void host_settings_listen(HostSettingsListener fn) { store().listen(fn); }
+// Motion vectors as the settings have them (host/options.cpp): not rebuilt.
+int host_opt_motion_rebuilt_bits() { return 0; }
 
 int main() {
     // The first snapshot: the defaults, numbered 1.
@@ -74,14 +76,16 @@ int main() {
 
     // The shader patches' mask: listening from the first ask, and following
     // a change made after that at once - nothing polls for it.
+    // (Motion blur is two patches - YEBIS's blur and the camera blur's build
+    // of it - then depth of field: bits 0 and 1, then 2.)
     CHECK(shader_patch_mask() == 0);
     HostSettings blur_off = store().now();
     blur_off.motion_blur = false;
     store().publish(blur_off);
-    CHECK(shader_patch_mask() == 1);
+    CHECK(shader_patch_mask() == 3);
     blur_off.depth_of_field = false;
     store().publish(blur_off);
-    CHECK(shader_patch_mask() == 3);
+    CHECK(shader_patch_mask() == 7);
     store().publish(HostSettings{});
     CHECK(shader_patch_mask() == 0);
 

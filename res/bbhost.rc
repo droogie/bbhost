@@ -1,8 +1,13 @@
-// The Windows exe's icon and version details. Explorer shows the first icon;
-// SDL gives its windows (the setup window and the game's) the same one.
+// The Windows exe's icon, manifest and version details. Explorer shows the
+// first icon; SDL gives its windows (the setup window and the game's) the
+// same one.
 #include "bbhost_version.h"
 
 1 ICON "bbhost.ico"
+
+// The manifest (CREATEPROCESS_MANIFEST_RESOURCE_ID, RT_MANIFEST): UTF-8 as
+// the process's code page.
+1 24 "bbhost.manifest"
 
 // VS_VERSION_INFO, VOS_NT_WINDOWS32 and VFT_APP from winver.h.
 1 VERSIONINFO

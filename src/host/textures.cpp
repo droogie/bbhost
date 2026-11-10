@@ -5,6 +5,8 @@
 #include "host/copy_census.h"
 #include "host/gpu_internal.h"
 #include "host/heap_compact.h"
+#include "host/settings.h"
+#include "host/texture_quality.h"
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
@@ -12,6 +14,7 @@
 #include "core/image_file.h"
 #include "core/portable.h"
 #include "engine/gx_resources.h"
+#include "engine/texture_origin.h"
 #include "host/gxvk.h"
 
 #include "core/write_watch.h"
@@ -536,6 +539,13 @@ struct Surface {
     };
     std::vector<Level> levels;
     std::size_t total_dst = 0;
+    // Texture quality (quality_drop): the guest's first `drop` levels are left out of the image, whose level 0 is
+    // the guest's level `drop` - the guest's level l is the image's l - drop, and the image is width >> drop by
+    // height >> drop. `levels` keeps the guest's whole chain; `src_skip` is where the levels the image has start in
+    // its memory (a level's slices all lie before the next level's), so an upload's copy of the tiled bytes starts
+    // there. Never on a texture the GPU writes: what is about to be is made again at full size (texture_full_size_locked).
+    std::uint32_t drop = 0;
+    std::size_t src_skip = 0;
     std::uint64_t content_hash = 0;   // the sampled hash, checked on every bind
     std::uint64_t exact_hash = 0;     // the whole surface; the slow catch-up
     std::uint64_t exact_at_ms = 0;
@@ -815,11 +825,12 @@ void compute_levels(Surface& sf, std::uint32_t count, std::uint32_t block) {
         lv.dst_off = dst;
         const std::size_t slice_groups = lv.tiling == 19 ? (mem_slices + 3) / 4 * 4 : mem_slices;
         src += lv.src_slice_bytes * slice_groups;
-        dst += lv.dst_slice_bytes * sf.slices;
+        if (l >= sf.drop) dst += lv.dst_slice_bytes * sf.slices;  // a level the image leaves out is not untiled
         sf.levels.push_back(lv);
     }
     sf.total_src = src;
     sf.total_dst = dst;
+    sf.src_skip = sf.drop && sf.drop < sf.levels.size() ? sf.levels[sf.drop].src_off : 0;
 }
 
 // Where texture work goes on the command processor, microseconds: creating a
@@ -867,6 +878,8 @@ struct TexturePrep {
     std::vector<Surface::Level> levels;
     std::uint32_t slices = 1, esize = 0, width = 0, height = 0, tiling = 0;
     std::size_t total_src = 0, total_dst = 0;
+    std::uint32_t drop = 0;     // the surface's (Surface::drop): levels before it are not untiled
+    std::size_t src_skip = 0;   // ... nor copied into src_copy, which starts at the first level untiled
     std::uint64_t content_hash = 0, exact_hash = 0;
     bool hash_only = false;     // the GPU untiles this upload; the prep only hashes the source
     // Window imports (BBHOST_IMPORT_WINDOWS=1): the tiled bytes copied here as
@@ -911,12 +924,12 @@ void upload_hashes(TexturePrep& p) {
 void run_prep(TexturePrep& p) {
     auto t0 = std::chrono::steady_clock::now();
     bool untiled = true;
-    if (p.src_copy) std::memcpy(p.src_copy, p.src, p.total_src);
+    if (p.src_copy) std::memcpy(p.src_copy, p.src + p.src_skip, p.total_src - p.src_skip);
     if (p.hash_only) {
         upload_hashes(p);
         return;
     }
-    for (std::size_t l = 0; l < p.levels.size() && untiled; ++l) {
+    for (std::size_t l = p.drop; l < p.levels.size() && untiled; ++l) {
         const Surface::Level& lv = p.levels[l];
         for (std::uint32_t sl = 0; sl < p.slices && untiled; ++sl) {
             std::uint8_t* dst = p.dst + lv.dst_off + sl * lv.dst_slice_bytes;
@@ -1137,11 +1150,14 @@ std::atomic<std::uint64_t> g_gpu_untiled{0}, g_gpu_untiled_bytes{0}, g_gpu_until
 bool gpu_untile_plan(const Surface& sf, VkDeviceAddress dst, std::vector<UntileGpuPass>& passes, VkDeviceAddress src_copy = 0) {
     if (sf.type == 10 || sf.thick || (sf.esize != 4 && sf.esize != 8 && sf.esize != 16) || (sf.base & 3)) return false;
     // src_copy: the surface's bytes copied whole to device-local memory, the
-    // same layout from there; else read in place through the import.
+    // same layout from there (from its first level untiled: src_skip); else
+    // read in place through the import.
     const VkDeviceAddress src = src_copy ? src_copy : guest_device_address(sf.base, sf.total_src);
     if (!src) return false;
+    const std::size_t skip = src_copy ? sf.src_skip : 0;
     const MacroMode mm = macro_mode_for(sf.esize);
-    for (const Surface::Level& lv : sf.levels) {
+    for (std::size_t l = sf.drop; l < sf.levels.size(); ++l) {
+        const Surface::Level& lv = sf.levels[l];
         UntileGpuPass pass;
         switch (lv.tiling) {
         case 8: case 9: pass.mode = 0; break;
@@ -1156,7 +1172,7 @@ bool gpu_untile_plan(const Surface& sf, VkDeviceAddress dst, std::vector<UntileG
             const std::uint64_t last_tile = static_cast<std::uint64_t>((lv.h_e - 1) / 8) * tpr + (lv.w_e - 1) / 8;
             if ((last_tile + 1) * 64 * es > lv.src_slice_bytes) return false;
         }
-        pass.src = src + lv.src_off;
+        pass.src = src + lv.src_off - skip;
         pass.dst = dst + lv.dst_off;
         pass.src_slice_bytes = lv.src_slice_bytes;
         pass.dst_slice_bytes = lv.dst_slice_bytes;
@@ -1230,7 +1246,7 @@ void record_upload_locked(Surface& sf, const UploadRecord& u, VkImageAspectFlags
         vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &rb, 0, nullptr, 0, nullptr);
         static const std::string fetch_name = "tex-fetch";
         profile_begin_locked(&fetch_name);
-        const VkBufferCopy fetch{u.vram_src.offset, u.vram_off, sf.total_src};
+        const VkBufferCopy fetch{u.vram_src.offset, u.vram_off, sf.total_src - sf.src_skip};
         vkCmdCopyBuffer(g_cmd(), u.vram_src.buffer, u.vram.buffer, 1, &fetch);
         profile_end_locked();
         VkMemoryBarrier fb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1238,7 +1254,7 @@ void record_upload_locked(Surface& sf, const UploadRecord& u, VkImageAspectFlags
         fb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fb, 0, nullptr, 0, nullptr);
         g_untiled_vram.fetch_add(1, std::memory_order_relaxed);
-        g_untiled_vram_bytes.fetch_add(sf.total_src, std::memory_order_relaxed);
+        g_untiled_vram_bytes.fetch_add(sf.total_src - sf.src_skip, std::memory_order_relaxed);
     }
     if (u.on_gpu) {
         if (u.cpu_copy.map) {
@@ -1272,17 +1288,18 @@ void record_upload_locked(Surface& sf, const UploadRecord& u, VkImageAspectFlags
     b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = sf.image;
-    b.subresourceRange = {aspect, 0, nlevels, 0, layers};
+    b.subresourceRange = {aspect, 0, nlevels - sf.drop, 0, layers};
     b.srcAccessMask = undefined ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     std::vector<VkBufferImageCopy> regions;
-    for (std::uint32_t l = 0; l < nlevels; ++l) {
+    // The guest's level l into the image's l - drop, which is its size (Surface::drop).
+    for (std::uint32_t l = sf.drop; l < nlevels; ++l) {
         const Surface::Level& lv = sf.levels[l];
         for (std::uint32_t sl = 0; sl < layers; ++sl) {
             VkBufferImageCopy r{};
             r.bufferOffset = (u.in_vram ? u.vram_off + u.vram_src_span : u.staging_offset) + lv.dst_off + sl * lv.dst_slice_bytes;
-            r.imageSubresource = {aspect, l, sl, 1};
+            r.imageSubresource = {aspect, l - sf.drop, sl, 1};
             r.imageExtent = {std::max(1u, sf.width >> l), (sf.type == 8 || sf.type == 12) ? 1u : std::max(1u, sf.height >> l),
                              sf.type == 10 ? std::max(1u, sf.depth >> l) : 1u};
             regions.push_back(r);
@@ -1315,6 +1332,8 @@ std::shared_ptr<TexturePrep> new_prep(const Surface& sf, const std::uint8_t* src
     prep->tiling = sf.tiling;
     prep->total_src = sf.total_src;
     prep->total_dst = sf.total_dst;
+    prep->drop = sf.drop;
+    prep->src_skip = sf.src_skip;
     return prep;
 }
 
@@ -1379,11 +1398,12 @@ void met_pending(const Surface& sf, const char* where) {
 bool record_pending_upload_locked(Surface& sf, const PendingUpload& p) {
     UploadRecord u;
     u.on_gpu = true;
-    u.vram_src_span = (sf.total_src + 255) & ~std::uint64_t{255};
+    const std::size_t src_bytes = sf.total_src - sf.src_skip;  // what the span holds (from the first level untiled)
+    u.vram_src_span = (src_bytes + 255) & ~std::uint64_t{255};
     if (acquire_scratch_locked(u.vram, u.vram_src_span + sf.total_dst, u.vram_off) &&
         gpu_untile_plan(sf, u.vram.address + u.vram_off + u.vram_src_span, u.passes, u.vram.address + u.vram_off)) {
         u.in_vram = true;
-        u.vram_src = Located{p.chunk.buffer, p.offset, sf.total_src};
+        u.vram_src = Located{p.chunk.buffer, p.offset, src_bytes};
     } else {
         u.passes.clear();
         ahead_defer::g_no_scratch.fetch_add(1, std::memory_order_relaxed);
@@ -1441,7 +1461,7 @@ bool defer_upload_locked(Surface& sf, const std::uint8_t* src) {
     if (!gpu_untile_plan(sf, 256, probe, 256)) return false;  // a layout the GPU untile takes (the addresses come later)
     DevBuffer span;
     VkDeviceSize offset = 0;
-    if (!acquire_staging_locked(span, sf.total_src, offset)) return false;
+    if (!acquire_staging_locked(span, sf.total_src - sf.src_skip, offset)) return false;
     auto p = std::make_shared<PendingUpload>();
     p->chunk = staging_hold_locked(span.buffer);
     if (!p->chunk.buffer) return false;  // (the span goes with this recording, unused)
@@ -1458,7 +1478,7 @@ bool defer_upload_locked(Surface& sf, const std::uint8_t* src) {
     sf.pending = p;
     g_pending_uploads.push_back(std::move(p));
     ahead_defer::g_deferred.fetch_add(1, std::memory_order_relaxed);
-    ahead_defer::g_deferred_bytes.fetch_add(sf.total_src, std::memory_order_relaxed);
+    ahead_defer::g_deferred_bytes.fetch_add(sf.total_src - sf.src_skip, std::memory_order_relaxed);
     if (g_pending_uploads.size() > ahead_defer::g_most.load(std::memory_order_relaxed))
         ahead_defer::g_most.store(g_pending_uploads.size(), std::memory_order_relaxed);
     return true;
@@ -1521,7 +1541,10 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first, bool def
     Located vram_src;
     DevBuffer vram;
     VkDeviceSize vram_off = 0;
-    const std::uint64_t vram_src_span = (sf.total_src + 255) & ~std::uint64_t{255};
+    // The tiled bytes the image's levels come from: all of them, or from the
+    // first a reduced texture keeps (Surface::src_skip).
+    const std::size_t src_bytes = sf.total_src - sf.src_skip;
+    const std::uint64_t vram_src_span = (src_bytes + 255) & ~std::uint64_t{255};
     std::vector<UntileGpuPass> passes;
     bool in_vram = false;
     // Window imports (BBHOST_IMPORT_WINDOWS=1): the tiled bytes reach the GPU
@@ -1545,12 +1568,12 @@ bool upload_surface(Surface& sf, VkImageAspectFlags aspect, bool first, bool def
     if (g_gpu_untile == 1 && g_untile_vram && !g_untile_check && sf.base != tex_probe_base() && untile_gpu_available_locked() &&
         (staged_src || guest_device_address(sf.base, sf.total_src))) {
         if (staged_src) {
-            vram_src = acquire_staging_locked(src_stage, sf.total_src, src_stage_off) ? Located{src_stage.buffer, src_stage_off, sf.total_src}
-                                                                                      : Located{};
+            vram_src = acquire_staging_locked(src_stage, src_bytes, src_stage_off) ? Located{src_stage.buffer, src_stage_off, src_bytes}
+                                                                                   : Located{};
         } else {
-            vram_src = locate(sf.base, sf.total_src);
+            vram_src = locate(sf.base + sf.src_skip, src_bytes);
         }
-        if (vram_src.buffer && vram_src.avail >= sf.total_src && acquire_scratch_locked(vram, vram_src_span + sf.total_dst, vram_off)) {
+        if (vram_src.buffer && vram_src.avail >= src_bytes && acquire_scratch_locked(vram, vram_src_span + sf.total_dst, vram_off)) {
             in_vram = gpu_untile_plan(sf, vram.address + vram_off + vram_src_span, passes, vram.address + vram_off);
             if (!in_vram) passes.clear();
         }
@@ -1960,7 +1983,7 @@ VkImageView rt_copied_view(RtImage& rt, const std::uint32_t* w, std::uint32_t wi
 std::atomic<std::uint64_t> g_rt_unlisted_reads{0};
 
 VkImageView render_target_view(RtImage& r, const std::uint32_t* tsharp, std::uint32_t first_layer, std::uint32_t layer_count,
-                               bool arrayed) {
+                               bool arrayed, std::uint32_t level_count = 1) {
     if (r.view_clear) view_clear_apply_locked(r, kVcwTexture);  // about to be sampled: a clear owed to it goes first (render.cpp lazy clears)
     first_layer = std::min(first_layer, r.layers - 1);
     layer_count = std::max(1u, std::min(layer_count, r.layers - first_layer));
@@ -1989,8 +2012,8 @@ VkImageView render_target_view(RtImage& r, const std::uint32_t* tsharp, std::uin
         }
     }
     const std::uint64_t key = (tsharp[3] & 0xfff) | (static_cast<std::uint64_t>(first_layer) << 12) |
-                              (static_cast<std::uint64_t>(layer_count) << 24) | (arrayed ? 1ull << 40 : 0) |
-                              (static_cast<std::uint64_t>(format) << 41);
+                              (static_cast<std::uint64_t>(layer_count) << 24) | (static_cast<std::uint64_t>(level_count - 1) << 36) |
+                              (arrayed ? 1ull << 40 : 0) | (static_cast<std::uint64_t>(format) << 41);
     auto& views = g_rt_views[r.base];
     if (auto it = views.find(key); it != views.end()) return it->second;
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -2009,8 +2032,8 @@ VkImageView render_target_view(RtImage& r, const std::uint32_t* tsharp, std::uin
         return swizzle(v);
     };
     vci.components = {sel(tsharp[3] & 7), sel((tsharp[3] >> 3) & 7), sel((tsharp[3] >> 6) & 7), sel((tsharp[3] >> 9) & 7)};
-    vci.subresourceRange = {static_cast<VkImageAspectFlags>(r.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1,
-                            first_layer, layer_count};
+    vci.subresourceRange = {static_cast<VkImageAspectFlags>(r.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0,
+                            level_count, first_layer, layer_count};
     if (r.depth) vci.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE};
     VkImageViewUsageCreateInfo narrowed{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     if (!r.depth) narrow_sampled_view_usage(vci, narrowed);
@@ -2022,7 +2045,7 @@ VkImageView render_target_view(RtImage& r, const std::uint32_t* tsharp, std::uin
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = r.format;
     ici.extent = {r.width, r.height, 1};
-    ici.mipLevels = 1;
+    ici.mipLevels = level_count;
     ici.arrayLayers = r.layers;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -2502,7 +2525,7 @@ void refresh_surface_locked(Surface& sf) {
 std::atomic<std::uint64_t> g_surface_carries{0};
 
 bool carry_surface_locked(Surface& dst, const Surface& src) {
-    if (!src.gpu_written || src.block != 1 || src.esize != dst.esize || src.type == 10 || dst.type == 10 || src.thick ||
+    if (!src.gpu_written || src.drop || dst.drop || src.block != 1 || src.esize != dst.esize || src.type == 10 || dst.type == 10 || src.thick ||
         dst.thick || dst.levels.empty() || src.levels.empty() || dst.info.arrayLayers > src.info.arrayLayers) {
         return false;
     }
@@ -2751,7 +2774,7 @@ VkImageView level_alias_view(std::uint64_t base, const std::uint32_t* w, VkForma
     const Surface* owner = nullptr;
     std::uint32_t level = 0;
     auto consider = [&](const Surface& o) {
-        if (owner || !o.gpu_written || o.failed || !o.image || o.thick || o.block != 1 || o.esize != esize || o.type == 10 ||
+        if (owner || !o.gpu_written || o.drop || o.failed || !o.image || o.thick || o.block != 1 || o.esize != esize || o.type == 10 ||
             o.base >= base || o.base + o.total_src <= base) {
             return;
         }
@@ -2853,6 +2876,138 @@ VkImageView level_alias_view(std::uint64_t base, const std::uint32_t* w, VkForma
     return render_target_view(la.img, w, 0, 1, false);
 }
 
+// A T# of several levels over a render target whose smaller levels the game
+// drew as targets of their own, each at its level's address: the reflections'
+// blur pyramid (0x16b3b0000 960x540, then 480x270 at +0x800000, 240x135 at
+// +0xa00000, ... down to 1x1), which the scene's composite samples by the
+// surface's roughness. Bound as the 960x540 target alone (one level), every
+// roughness read the sharp ray march, and rough floors sparkled with the
+// reflected embers where the console shows a soft glow. The levels are found
+// above the target in memory, each exactly half the last (rounded down, not
+// below 1), and copied into the levels of one image at every bind; the view
+// spans as many as were found. BBHOST_RT_MIP_CHAIN=0: the target's one level.
+struct RtMipChain {
+    RtImage img;                   // not in g_rts; img.base is a key of its own for g_rt_views
+    std::vector<VkImage> sources;  // the targets it was made from, level by level
+};
+std::map<std::tuple<std::uint64_t, std::uint32_t, int>, RtMipChain> g_rt_mip_chains;
+std::atomic<std::uint64_t> g_rt_mip_chain_copies{0};
+
+VkImageView rt_mip_chain_view(RtImage& rt, const std::uint32_t* w, std::uint32_t levels) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_RT_MIP_CHAIN");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || levels < 2 || rt.depth || rt.layers != 1) return VK_NULL_HANDLE;
+    // The levels drawn as targets: each above the last, within four times the
+    // top level's bytes of it (the pyramid's allocation, tiling's padding too).
+    std::vector<RtImage*> found{&rt};
+    const std::uint64_t limit = rt.base + 4ull * rt.width * rt.height * std::max<std::uint32_t>(format_bytes_per_pixel(rt.format), 1);
+    for (std::uint32_t l = 1; l < levels; ++l) {
+        const std::uint32_t lw = std::max(1u, rt.width >> l), lh = std::max(1u, rt.height >> l);
+        RtImage* next = nullptr;
+        for (std::uint64_t at = found.back()->base; (next = next_render_target_locked(at, limit));) {
+            if (next->width == lw && next->height == lh) break;
+            at = next->base;
+        }
+        if (!next || next->depth || next->layers != 1 || next->format != rt.format || !next->initialised) break;
+        found.push_back(next);
+    }
+    if (found.size() < 2) return VK_NULL_HANDLE;
+    const std::uint32_t n = static_cast<std::uint32_t>(found.size());
+    const auto key = std::make_tuple(rt.base, n, static_cast<int>(rt.format));
+    auto it = g_rt_mip_chains.find(key);
+    if (it != g_rt_mip_chains.end()) {
+        bool same = it->second.sources.size() == n;
+        for (std::uint32_t l = 0; same && l < n; ++l) same = it->second.sources[l] == found[l]->image;
+        if (!same) {
+            invalidate_rt_views(it->second.img.base);
+            defer_destroy_image(it->second.img.image, it->second.img.memory);
+            g_rt_mip_chains.erase(it);
+            it = g_rt_mip_chains.end();
+        }
+    }
+    if (it == g_rt_mip_chains.end()) {
+        RtMipChain nc;
+        for (RtImage* f : found) nc.sources.push_back(f->image);
+        nc.img.base = (rt.base ^ (0x7ull << 60)) + (static_cast<std::uint64_t>(n) << 44);
+        nc.img.format = rt.format;
+        nc.img.width = rt.width;
+        nc.img.height = rt.height;
+        nc.img.layers = 1;
+        nc.img.depth = false;
+        nc.img.mutable_format = rt.mutable_format;
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.flags = rt.mutable_format ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = rt.format;
+        ici.extent = {rt.width, rt.height, 1};
+        ici.mipLevels = n;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(g.device, &ici, nullptr, &nc.img.image) != VK_SUCCESS) return VK_NULL_HANDLE;
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(g.device, nc.img.image, &req);
+        if (!image_memory_alloc(req, nc.img.memory, true)) {
+            vkDestroyImage(g.device, nc.img.image, nullptr);
+            return VK_NULL_HANDLE;
+        }
+        vkBindImageMemory(g.device, nc.img.image, nc.img.memory.memory, nc.img.memory.offset);
+        it = g_rt_mip_chains.emplace(key, nc).first;
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1) < 16) {
+            host_log("texture: T# of %u levels over render target 0x%llx %ux%u format %d samples %u levels drawn as targets (copied at every bind)",
+                     levels, static_cast<unsigned long long>(rt.base), rt.width, rt.height, static_cast<int>(rt.format), n);
+        }
+    }
+    RtMipChain& mc = it->second;
+    for (RtImage* f : found) {
+        if (f->view_clear) view_clear_apply_locked(*f, kVcwTexture);
+    }
+    begin_recording_locked();
+    render_end_pass_locked();
+    std::vector<VkImageMemoryBarrier> pre;
+    for (RtImage* f : found) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = f->image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        pre.push_back(b);
+    }
+    VkImageMemoryBarrier dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    dst.oldLayout = mc.img.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+    dst.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dst.srcQueueFamilyIndex = dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dst.image = mc.img.image;
+    dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, n, 0, 1};
+    dst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    pre.push_back(dst);
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr,
+                         static_cast<std::uint32_t>(pre.size()), pre.data());
+    mc.img.initialised = true;
+    for (std::uint32_t l = 0; l < n; ++l) {
+        VkImageCopy r{};
+        r.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+        r.extent = {std::max(1u, rt.width >> l), std::max(1u, rt.height >> l), 1};
+        vkCmdCopyImage(g_cmd(), found[l]->image, VK_IMAGE_LAYOUT_GENERAL, mc.img.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    }
+    dst.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dst.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    dst.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &dst);
+    g_rt_mip_chain_copies.fetch_add(1, std::memory_order_relaxed);
+    g_last_view_no_memo = true;
+    return render_target_view(mc.img, w, 0, 1, false, n);
+}
+
 // Whether the target `rt` at `addr` is generation `gen`'s image: 0 already
 // (or no generation to go by), 1 taken now, -1 another resource's. Taken when
 // something drew into it after that resource was made - a draw that names no
@@ -2871,6 +3026,140 @@ int target_taken_by(RtImage& rt, std::uint64_t addr, std::uint64_t gen) {
     rt.dead_ms = rt.dead_after = rt.dead_memory = 0;
     return 1;
 }
+
+// Texture quality (Graphics > Texture quality, HostSettings::texture_quality):
+// how many of a texture's top levels its image leaves out, its own smaller
+// levels - already in its memory - in their place: 0 at High (1.0x), 1 at
+// Medium (0.5x: a 1024x2048 texture is 512x1024, a quarter of the video
+// memory), 2 at Low (0.25x), 3 at Lowest (0.125x).
+// By the folder the texture was loaded from (engine/texture_origin.h): the
+// areas' (map/) and the armour's and weapons' (parts/) every 2D texture and
+// array with the levels to spare, whatever its format and size; the effects'
+// (sfx/) the same by SFX texture quality; the menus', the colour grading
+// tables and the areas' baked lighting and shadows (gi_env: *_gi_*) never;
+// the rest (chr/, obj/, decals, what no file names) only block-compressed and never below kQualityFloor texels on the longer side -
+// what a shader reads texel by texel there (lookup tables, atlases) is
+// uncompressed or a single level. None made as something the GPU draws or
+// stores into (a GX resource bound as a target, depth or UAV; a T# bound for
+// stores; one in g_full_size). Nor cubes: the reflection probes are read at a
+// level the surface's roughness picks, and one without its first level would
+// make every reflection a level blurrier.
+// BBHOST_TEXTURE_QUALITY=1.0|0.5|0.25|0.125 wins over the setting, and
+// BBHOST_SFX_TEXTURE_QUALITY over SFX texture quality.
+namespace {
+constexpr std::uint32_t kQualityFloor = 256;
+std::uint32_t g_quality_drop = 0;  // the setting's, under g.mu (textures_follow_quality_locked)
+std::uint32_t g_sfx_quality_drop = 0;  // SFX texture quality's
+std::uint64_t g_quality_surfaces = 0, g_quality_saved = 0, g_quality_full = 0;  // made reduced, the untiled bytes they left out; made full size again
+
+int quality_forced(const char* name) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return -1;
+    const double scale = std::strtod(e, nullptr);
+    return scale <= 0.125 ? 3 : scale <= 0.25 ? 2 : scale <= 0.5 ? 1 : 0;
+}
+std::uint32_t quality_wanted() {
+    static const int forced = quality_forced("BBHOST_TEXTURE_QUALITY");
+    return static_cast<std::uint32_t>(forced >= 0 ? forced : std::clamp(host_settings_ref().texture_quality, 0, 3));
+}
+std::uint32_t sfx_quality_wanted() {
+    static const int forced = quality_forced("BBHOST_SFX_TEXTURE_QUALITY");
+    return static_cast<std::uint32_t>(forced >= 0 ? forced : std::clamp(host_settings_ref().sfx_texture_quality, 0, 3));
+}
+
+// The resources (by memory, with their generation) whose texture is made at
+// full size for as long as they live, whatever the setting: one the GPU
+// writes - an upload token's rows, a copy into it - or one copied from at a
+// level its reduced image left out. The memory holds what the full image is
+// made from, once; the writes then land on that image.
+std::unordered_map<std::uint64_t, std::uint64_t> g_full_size;
+
+std::uint64_t resource_gen_at(std::uint64_t base) {
+    GxResourceInfo r;
+    return gx_resource_at(base, 1, &r) ? r.gen : 0;
+}
+
+std::uint32_t quality_drop(std::uint64_t base, std::uint32_t block, std::uint32_t type, std::uint32_t tiling, std::uint32_t width,
+                           std::uint32_t height, std::uint32_t nlevels, bool storage) {
+    if ((!g_quality_drop && !g_sfx_quality_drop) || storage || tiling == 19 || (type != 9 && type != 13) || nlevels < 2) return 0;
+    GxResourceInfo r;
+    const bool registered = gx_resource_at(base, 1, &r);
+    if (registered && (r.bind & 0xe0) != 0) return 0;
+    std::uint32_t want = g_quality_drop, floor = kQualityFloor;
+    switch (registered ? r.origin : kOriginUnknown) {
+        case kOriginMap:
+        case kOriginParts: floor = 1; break;
+        case kOriginSfx:
+            want = g_sfx_quality_drop;
+            floor = 1;
+            break;
+        case kOriginMenu:
+        case kOriginGrading:
+        case kOriginLighting: return 0;
+        default:
+            if (block != 4) return 0;
+            break;
+    }
+    const std::uint32_t d = texture_quality::levels_dropped(want, width, height, nlevels, floor);
+    if (!d) return 0;
+    if (const auto f = g_full_size.find(base); f != g_full_size.end() && f->second == (registered ? r.gen : 0)) return 0;
+    return d;
+}
+
+// The texture at `base` made at full size from here on (g_full_size): its
+// next lookup makes it again so if its image is a reduced one.
+void texture_full_size_locked(std::uint64_t base) {
+    if (!g_quality_drop && !g_sfx_quality_drop) {
+        // Nothing is made reduced now; one made before the setting changed
+        // goes at its next lookup anyway.
+        auto it = g_surfaces.find(base);
+        if (it == g_surfaces.end() || !it->second.drop) return;
+    }
+    g_full_size[base] = resource_gen_at(base);
+}
+
+// The setting followed, at each submission and before the first texture is
+// made. A change lets go of every texture whose image is not the size the
+// setting gives it now - its video memory with it, the cached ones too - and
+// moves the view epoch, so each is made again from its memory at its next
+// use (texture_view_uncached), as eviction leaves one. One the GPU wrote
+// keeps its image.
+bool g_quality_started = false;
+void textures_follow_quality_locked() {
+    const std::uint32_t want = quality_wanted(), sfx = sfx_quality_wanted();
+    if (g_quality_started && want == g_quality_drop && sfx == g_sfx_quality_drop) return;
+    static const char* const kName[] = {"High (1.0x)", "Medium (0.5x)", "Low (0.25x)", "Lowest (0.125x)"};
+    const std::uint32_t was = g_quality_drop, sfx_was = g_sfx_quality_drop;
+    g_quality_drop = want;
+    g_sfx_quality_drop = sfx;
+    if (!g_quality_started) {
+        g_quality_started = true;
+        if (want || sfx) host_log("texture: texture quality %s, SFX %s", kName[want], kName[sfx]);
+        return;
+    }
+    std::uint64_t n = 0, freed = 0;
+    for (auto it = g_surfaces.begin(); it != g_surfaces.end();) {
+        Surface& sf = it->second;
+        if (!sf.image || sf.failed || sf.gpu_written || sf.copied_mips ||
+            quality_drop(sf.base, sf.block, sf.type, sf.tiling, sf.width, sf.height, static_cast<std::uint32_t>(sf.levels.size()), false) == sf.drop) {
+            ++it;
+            continue;
+        }
+        ++n;
+        freed += sf.memory.size;
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(sf);
+        it = g_surfaces.erase(it);
+    }
+    host_log("texture: texture quality %s (was %s), SFX %s (was %s): %llu textures let go (%llu MiB), each made again at its next use", kName[want],
+             kName[was], kName[sfx], kName[sfx_was],
+             static_cast<unsigned long long>(n), static_cast<unsigned long long>(freed >> 20));
+    bump_view_epoch();
+}
+
+}  // namespace
 
 // `expect_gen`: the generation of the resource the binding names (its
 // shader-resource view's, gx_view_gen_by_id), or 0: a surface found at the
@@ -2957,6 +3246,9 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
             }
         }
         if (VkImageView v = rt_region_view(*rt, w, width, height)) return v;
+        if (base_level == 0 && last_level > 0 && width == rt->width && height == rt->height) {
+            if (VkImageView v = rt_mip_chain_view(*rt, w, last_level + 1)) return v;
+        }
         if (width > rt->width || height > rt->height) {
             // Memory a target was drawn into and the game has since given to a
             // texture of the T#'s size (the registry's live resource there):
@@ -3144,8 +3436,16 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
                           static_cast<unsigned long long>(expect_gen));
             }
         }
+        // Texture quality: the levels its image would leave out now, at the
+        // levels it has (a view of fewer binds it as it is); one the GPU wrote
+        // keeps its image.
+        const std::uint32_t want_drop =
+            sf.gpu_written || (!g_quality_drop && !sf.drop)
+                ? sf.drop
+                : quality_drop(base, fi.block, type, tiling, width, height, std::max<std::uint32_t>(want_levels, static_cast<std::uint32_t>(sf.levels.size())),
+                               storage);
         if (other_gen || sf.format != image_fmt || sf.width != width || sf.height != height || sf.type != type || sf.layers != layers ||
-            sf.levels.size() < want_levels) {
+            sf.levels.size() < want_levels || sf.drop != want_drop) {
             // Memory re-used for a different image: replace the surface. The
             // old image stays alive until the current submission retires, so
             // this costs nothing - idling the device here was most of a world
@@ -3160,10 +3460,10 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
                 }
             }
             tex_event(base, sf.total_src, "replace 0x%llx: was vkformat %d %ux%u %zu level(s)%s, now vkformat %d %ux%u %u level(s) (T# dfmt %u "
-                      "type %u levels %u..%u%s)",
+                      "type %u levels %u..%u%s)%s",
                       static_cast<unsigned long long>(base), static_cast<int>(sf.format), sf.width, sf.height, sf.levels.size(),
                       sf.gpu_written ? " gpu-written" : "", static_cast<int>(image_fmt), width, height, want_levels, dfmt, type,
-                      base_level, last_level, storage ? " storage" : "");
+                      base_level, last_level, storage ? " storage" : "", sf.drop != want_drop ? ", texture quality" : "");
             replaced = sf;  // its image lives until this submission retires
             have_replaced = true;
             replaced_other_gen = other_gen;
@@ -3195,6 +3495,10 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
         sf.pow2pad = ((w[3] >> 25) & 1) != 0;
         // 3D textures: level 0 only for now.
         const std::uint32_t nlevels = (type == 10 || tiling == 19) ? 1u : std::min<std::uint32_t>(last_level + 1, 16u);
+        // Texture quality: the top levels its image leaves out - none where it
+        // takes the texels the GPU wrote into the image it replaces.
+        if (!g_quality_started) textures_follow_quality_locked();
+        sf.drop = have_replaced && replaced.gpu_written ? 0 : quality_drop(base, fi.block, type, tiling, width, height, nlevels, storage);
         compute_levels(sf, nlevels, fi.block);
         sf.slice_src_bytes = sf.levels[0].src_slice_bytes;
         sf.slice_dst_bytes = sf.levels[0].dst_slice_bytes;
@@ -3207,8 +3511,8 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
         ici.flags = (image_fmt != fi.format || has_srgb_sibling(image_fmt)) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
         ici.imageType = type == 10 ? VK_IMAGE_TYPE_3D : (type == 8 || type == 12) ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
         ici.format = image_fmt;
-        ici.extent = {width, (type == 8 || type == 12) ? 1u : height, type == 10 ? depth : 1u};
-        ici.mipLevels = static_cast<std::uint32_t>(sf.levels.size());
+        ici.extent = {std::max(1u, width >> sf.drop), (type == 8 || type == 12) ? 1u : std::max(1u, height >> sf.drop), type == 10 ? depth : 1u};
+        ici.mipLevels = static_cast<std::uint32_t>(sf.levels.size()) - sf.drop;
         ici.arrayLayers = type == 10 ? 1 : layers;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -3280,6 +3584,17 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
             host_log("texture: uploaded 0x%llx %ux%ux%u dfmt=%u nfmt=%u tiling=%u type=%u (%zu KiB)", static_cast<unsigned long long>(base),
                      width, height, slices, dfmt, nfmt, tiling, type, sf.slice_dst_bytes * slices / 1024);
         }
+        if (sf.drop) {
+            ++g_quality_surfaces;
+            for (std::uint32_t l = 0; l < sf.drop; ++l) g_quality_saved += sf.levels[l].dst_slice_bytes * sf.slices;
+            static int quality_logs = 0;
+            if (quality_logs++ < 8) {
+                host_log("texture: 0x%llx %ux%u x%u dfmt=%u %zu levels made at %ux%u, %zu levels (texture quality)", static_cast<unsigned long long>(base),
+                         width, height, slices, dfmt, sf.levels.size(), ici.extent.width, ici.extent.height, sf.levels.size() - sf.drop);
+            }
+        } else if (have_replaced && replaced.drop) {
+            ++g_quality_full;
+        }
         it = g_surfaces.emplace(base, sf).first;
         note_surface_added(it->second);
         if (!t_force_async) {
@@ -3325,8 +3640,13 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
     vkey = fnv1a(&view_first, 4, vkey);
     vkey = fnv1a(&view_layers, 4, vkey);
     const std::uint32_t nlv = static_cast<std::uint32_t>(sf.levels.size());
-    const std::uint32_t view_base_level = std::min(base_level, nlv - 1);
-    const std::uint32_t view_levels = storage ? 1u : std::max(1u, std::min(nlv - view_base_level, last_level >= base_level ? last_level - base_level + 1 : 1u));
+    std::uint32_t view_base_level = std::min(base_level, nlv - 1);
+    std::uint32_t view_levels = storage ? 1u : std::max(1u, std::min(nlv - view_base_level, last_level >= base_level ? last_level - base_level + 1 : 1u));
+    if (sf.drop) {  // in the image's levels (Surface::drop)
+        const texture_quality::Levels in_image = texture_quality::view_levels(view_base_level, view_levels, sf.drop);
+        view_base_level = in_image.base;
+        view_levels = in_image.count;
+    }
     vkey = fnv1a(&view_base_level, 4, vkey);
     vkey = fnv1a(&view_levels, 4, vkey);
     auto vit = sf.views.find(vkey);
@@ -3524,8 +3844,42 @@ struct IdViewPub {
     std::uint32_t id = 0, epoch = 0;
     VkImageView view = VK_NULL_HANDLE;
     std::uint8_t flags = 0;
+    // What a pool's draw takes of the entry as it was made (the entry itself may hold another id by then).
+    bool target = false;  // no texture surface (a render target's view)
+    bool dims_ok = false, arrayed = false;
+    std::uint32_t dim = 0, slot = 0;
+    std::uint64_t base = 0;
+    std::uint64_t made = 0;  // its publication's number (the older way is published over)
 };
-IdViewPub g_id_views_pub[kIdViewSlots];
+// Two ways an entry's slot: the command processor's entries are direct-mapped
+// by id, and two views whose ids share a slot took turns in it - each time the
+// other was published, a pool's draw of the first found another view there
+// and was refused ('images'). Written under the readers' lock, exclusive.
+constexpr std::size_t kIdViewWays = 2;
+IdViewPub g_id_views_pub[kIdViewSlots][kIdViewWays];
+std::uint64_t g_id_views_pub_made = 0;  // (the command processor's)
+// The way of slot `i` that holds `id`'s publication, or null.
+inline const IdViewPub* id_view_pub(std::uint32_t id) {
+    const IdViewPub* const ways = g_id_views_pub[id & (kIdViewSlots - 1)];
+    for (std::size_t k = 0; k < kIdViewWays; ++k) {
+        if (ways[k].id == id) return &ways[k];
+    }
+    return nullptr;
+}
+// The command processor publishes entry `e` (its id's slot): into the way that holds its id, else the older.
+void id_view_publish(const IdViewPub& e) {
+    IdViewPub* const ways = g_id_views_pub[e.id & (kIdViewSlots - 1)];
+    IdViewPub* to = &ways[0];
+    for (std::size_t k = 0; k < kIdViewWays; ++k) {
+        if (ways[k].id == e.id) {
+            to = &ways[k];
+            break;
+        }
+        if (ways[k].made < to->made) to = &ways[k];
+    }
+    *to = e;
+    to->made = ++g_id_views_pub_made;
+}
 std::uint64_t g_id_view_hits = 0, g_id_view_misses = 0;
 // Stage 2's counts (under g.mu): bindings that skipped the refresh; refreshes run, by why the skip did not apply;
 // compare mode's refreshes the skip would have left out (and of them the hash backstop's catches, which a skip only
@@ -3599,19 +3953,26 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
         // its place (texture_view_splice_ok), and a set that held a view let go
         // is dropped from the cache first.
         return [&]() __attribute__((noinline)) {
-            const IdViewPub& pub = g_id_views_pub[id & (kIdViewSlots - 1)];
-            const VkImageView found = pub.id == id && pub.flags == flags ? pub.view : VK_NULL_HANDLE;
+            const IdViewPub* const pub = id_view_pub(id);
+            const VkImageView found = pub && pub->flags == flags ? pub->view : VK_NULL_HANDLE;
             if (!found || copy_elide_live()) {
                 g_list_image_stops[1].fetch_add(1, std::memory_order_relaxed);
+                // (BBHOST_GXVK_LISTS_TIMES: why - none published in its slot, other views' there, its own with other
+                // flags, or the copies being elided.)
+                if (gxvk_lists::times()) {
+                    const IdViewPub* const ways = g_id_views_pub[id & (kIdViewSlots - 1)];
+                    const int why = pub ? (found ? 3 : 2) : ways[0].id || ways[1].id ? 1 : 0;
+                    g_list_view_stop_why[why].fetch_add(1, std::memory_order_relaxed);
+                }
                 run_part_stop(kRunStopImages);
                 return VkImageView{VK_NULL_HANDLE};
             }
-            t_run_draw->list->note_view(id, flags, found, !e.sf, w);
-            if (slot) *slot = e.slot;
-            if (base) *base = e.base;
-            dims_ok = e.dims_ok;
-            dim = e.dim;
-            arrayed = e.arrayed;
+            t_run_draw->list->note_view(id, flags, found, pub->target, w);
+            if (slot) *slot = pub->slot;
+            if (base) *base = pub->base;
+            dims_ok = pub->dims_ok;
+            dim = pub->dim;
+            arrayed = pub->arrayed;
             return found;
         }();
     }
@@ -3693,7 +4054,20 @@ VkImageView texture_view_by_id(std::uint32_t id, const std::uint32_t* w, bool st
             if (g.bindless) e.slot = bindless_view_slot_locked(view, storage);
             e.base = tsharp_base(w);
         }
-        if (cache_rw::g_readers.load(std::memory_order_relaxed)) g_id_views_pub[id & (kIdViewSlots - 1)] = IdViewPub{e.id, e.epoch, e.view, e.flags};
+        if (cache_rw::g_readers.load(std::memory_order_relaxed)) {
+            IdViewPub pub;
+            pub.id = e.id;
+            pub.epoch = e.epoch;
+            pub.view = e.view;
+            pub.flags = e.flags;
+            pub.target = !e.sf;
+            pub.dims_ok = e.dims_ok;
+            pub.arrayed = e.arrayed;
+            pub.dim = e.dim;
+            pub.slot = e.slot;
+            pub.base = e.base;
+            id_view_publish(pub);
+        }
         if (slot) *slot = e.slot;
         if (base) *base = e.base;
         gxvk_lists::cp_note(gxvk_lists::kLookView, id | static_cast<std::uint64_t>(flags) << 32,
@@ -3755,9 +4129,9 @@ bool texture_view_splice_again(std::uint32_t id, std::uint8_t flags, VkImageView
 // or made; null when it is not made yet (the command processor makes it, and
 // refreshes its surface, in order).
 VkImageView texture_view_find(std::uint32_t id, std::uint8_t flags) {
-    const IdViewPub& e = g_id_views_pub[id & (kIdViewSlots - 1)];
-    if (e.id != id || e.epoch != static_cast<std::uint32_t>(g_view_epoch) || e.flags != flags) return VK_NULL_HANDLE;
-    return e.view;
+    const IdViewPub* const e = id_view_pub(id);
+    if (!e || e->epoch != static_cast<std::uint32_t>(g_view_epoch) || e->flags != flags) return VK_NULL_HANDLE;
+    return e->view;
 }
 
 bool texture_key_dims_by_id(std::uint32_t id, std::uint8_t flags, bool depth, std::uint32_t& dim, bool& arrayed) {
@@ -3952,6 +4326,7 @@ bool sampler_fixes_on() {
 }
 
 std::atomic<std::uint64_t> g_list_image_stops[3] = {};  // stage 4b.1b's list mode: by words, a view by id not found, a sampler
+std::atomic<std::uint64_t> g_list_view_stop_why[4] = {};  // and the views by id not found: none, another view, other flags, elision
 VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     if (t_run_draw && t_run_draw->list) {  // stage 4b.1b's list mode: the reader path (made in order)
         const VkSampler found = sampler_find(s, compare);
@@ -4057,6 +4432,118 @@ VkSampler sampler_for(const std::uint32_t* s, bool compare) {
     }
     if (out) g_sampler_records[out] = sci;
     gxvk_lists::cp_note(gxvk_lists::kLookSampler, key, reinterpret_cast<std::uint64_t>(out));  // stage 4b.1a's compare
+    return out;
+}
+
+VkSampler sampler_with_lod_bias(VkSampler base, float bias) {
+    if (!base || bias == 0.0f) return base;
+    // By the sampler and the bias in 1/256ths (the S#'s own steps). Read by a
+    // run part's draw, written in order (under g.mu).
+    static std::map<std::pair<VkSampler, std::int32_t>, VkSampler> biased;
+    const auto key = std::make_pair(base, static_cast<std::int32_t>(bias * 256.0f + (bias < 0.0f ? -0.5f : 0.5f)));
+    if (const auto it = biased.find(key); it != biased.end()) return it->second;
+    if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order
+    const auto rec = g_sampler_records.find(base);
+    VkSampler out = base;
+    // Only a sampler with mipmaps: the bias picks among them, and a lookup
+    // table or a screen-space target has none to pick.
+    if (rec != g_sampler_records.end() && rec->second.maxLod > 0.25f) {
+        VkSamplerCreateInfo sci = rec->second;
+        sci.mipLodBias = std::clamp(sci.mipLodBias + bias, -g.max_lod_bias, g.max_lod_bias);
+        if (vkCreateSampler(g.device, &sci, nullptr, &out) == VK_SUCCESS)
+            g_sampler_records[out] = sci;
+        else
+            out = base;
+    }
+    biased[key] = out;
+    return out;
+}
+
+VkSampler sampler_anisotropic(VkSampler base, int level) {
+    if (!base || level < 2) return base;
+    // The answer for this thread's last few, in front of the map (samplers
+    // are never destroyed, so an entry never goes stale).
+    struct Memo {
+        VkSampler base = VK_NULL_HANDLE, out = VK_NULL_HANDLE;
+        int level = 0;
+    };
+    static thread_local Memo memo[64];
+    Memo& m = memo[(reinterpret_cast<std::uintptr_t>(base) >> 4) & 63];
+    if (m.base == base && m.level == level) return m.out;
+    // Read by a run part's draw, written in order.
+    static std::map<std::pair<VkSampler, int>, VkSampler> made;
+    const auto key = std::make_pair(base, level);
+    VkSampler out = base;
+    if (const auto it = made.find(key); it != made.end()) {
+        out = it->second;
+    } else {
+        if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order
+        const auto rec = g_sampler_records.find(base);
+        const float want = std::min(static_cast<float>(level), g.max_anisotropy);
+        // A texture's: filtered smoothly, with mipmaps to blend, no depth
+        // comparison - not a target read texel for texel or a lookup table.
+        if (rec != g_sampler_records.end() && !rec->second.compareEnable && rec->second.minFilter == VK_FILTER_LINEAR &&
+            rec->second.maxLod > 0.25f && !(rec->second.anisotropyEnable && rec->second.maxAnisotropy >= want) && want > 1.0f) {
+            VkSamplerCreateInfo sci = rec->second;
+            sci.anisotropyEnable = VK_TRUE;
+            sci.maxAnisotropy = want;
+            sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;  // trilinear under it, as anisotropic filtering wants
+            if (vkCreateSampler(g.device, &sci, nullptr, &out) == VK_SUCCESS)
+                g_sampler_records[out] = sci;
+            else
+                out = base;
+        }
+        cache_rw::Write cw(cache_rw::kSamplers);
+        made[key] = out;
+    }
+    m.base = base;
+    m.out = out;
+    m.level = level;
+    return out;
+}
+
+VkSampler sampler_nearest(VkSampler base) {
+    if (!base) return base;
+    // The answer for this thread's last few, in front of the map (samplers
+    // are never destroyed, so an entry never goes stale).
+    struct Memo {
+        VkSampler base = VK_NULL_HANDLE, out = VK_NULL_HANDLE;
+    };
+    static thread_local Memo memo[64];
+    Memo& m = memo[(reinterpret_cast<std::uintptr_t>(base) >> 4) & 63];
+    if (m.base == base) return m.out;
+    // Read by a run part's draw and by stage 4b.1b's list mode (under
+    // cache_rw's shared lock), written in order.
+    static std::map<VkSampler, VkSampler> made;
+    VkSampler out = base;
+    if (const auto it = made.find(base); it != made.end()) {
+        out = it->second;
+    } else {
+        if (t_run_draw && t_run_draw->list) g_list_image_stops[2].fetch_add(1, std::memory_order_relaxed);
+        if (run_part_stop(kRunStopImages)) return VK_NULL_HANDLE;  // made in order
+        const auto rec = g_sampler_records.find(base);
+        // A depth comparison (the shadows' PCF) keeps its filter: nearest
+        // would take the hardware's four-sample blend away.
+        if (rec != g_sampler_records.end() && !rec->second.compareEnable) {
+            const VkSamplerCreateInfo& was = rec->second;
+            if (was.magFilter != VK_FILTER_NEAREST || was.minFilter != VK_FILTER_NEAREST || was.mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST ||
+                was.anisotropyEnable) {
+                VkSamplerCreateInfo sci = was;
+                sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+                sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                sci.anisotropyEnable = VK_FALSE;
+                sci.maxAnisotropy = 1.0f;
+                if (vkCreateSampler(g.device, &sci, nullptr, &out) == VK_SUCCESS)
+                    g_sampler_records[out] = sci;
+                else
+                    out = base;
+            }
+        }
+        cache_rw::Write cw(cache_rw::kSamplers);  // stage 4b.1b's readers see it whole
+        made[base] = out;
+    }
+    m.base = base;
+    m.out = out;
     return out;
 }
 
@@ -4256,6 +4743,16 @@ bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsha
                                    std::uint32_t y, std::uint32_t w, std::uint32_t h, const void* data, std::size_t bytes, std::uint32_t row_bytes) {
     const ResolveKind resolve_kind("upload token");
     auto it = g_surfaces.find(base);
+    // Texture quality: the rows land on a texture at full size, made so for
+    // good (texture_full_size_locked); a reduced one is made again from its
+    // memory first.
+    if (it == g_surfaces.end() || it->second.drop) texture_full_size_locked(base);
+    if (it != g_surfaces.end() && it->second.drop && tsharp) {
+        bool dims_ok = true, arrayed = false;
+        std::uint32_t dim = 0;
+        texture_view_uncached(tsharp, false, dims_ok, dim, arrayed, false, false);
+        it = g_surfaces.find(base);
+    }
     if (it == g_surfaces.end() && tsharp) {
         if (textures_create_ahead_locked(tsharp)) g_region_created.fetch_add(1, std::memory_order_relaxed);
         it = g_surfaces.find(base);
@@ -4278,7 +4775,8 @@ bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsha
     if (sf.failed) return false;
     const std::uint32_t layers = sf.type == 10 ? 1 : sf.layers;
     const std::uint32_t mw = std::max(1u, sf.width >> mip), mh = std::max(1u, sf.height >> mip);
-    if (mip >= sf.levels.size() || layer >= layers || !w || !h || x + w > mw || y + h > mh || (x % sf.block) || (y % sf.block) ||
+    // (Still reduced: no T# to make it again at full size from.)
+    if (sf.drop || mip >= sf.levels.size() || layer >= layers || !w || !h || x + w > mw || y + h > mh || (x % sf.block) || (y % sf.block) ||
         (w % sf.block && x + w != mw) || (h % sf.block && y + h != mh)) {
         g_region_out_of_range.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -4339,6 +4837,7 @@ struct CopySide {
     VkImage image = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     std::uint32_t width = 0, height = 0, levels = 1, layers = 1, block = 1;
+    std::uint32_t drop = 0;  // the surface's (Surface::drop): its level l is the image's l - drop
     std::size_t esize = 0;
     Surface* surface = nullptr;
     RtImage* rt = nullptr;
@@ -4392,6 +4891,7 @@ bool copy_side_locked(const std::uint32_t* w, CopySide& out, std::uint64_t gen =
     out.levels = static_cast<std::uint32_t>(sf.levels.size());
     out.layers = sf.type == 10 ? 1 : sf.layers;
     out.block = sf.block;
+    out.drop = sf.drop;
     out.esize = sf.esize;
     out.surface = &sf;
     return true;
@@ -4417,7 +4917,7 @@ bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, 
     auto it = g_surfaces.find(base);
     if (it == g_surfaces.end()) return false;
     const Surface& sf = it->second;
-    if (!sf.gpu_written || sf.failed || !sf.image || sf.block != 1 || sf.esize != bytes_per_pixel || sf.width != width ||
+    if (!sf.gpu_written || sf.drop || sf.failed || !sf.image || sf.block != 1 || sf.esize != bytes_per_pixel || sf.width != width ||
         sf.height != height || sf.type == 10 || sf.thick) {
         return false;
     }
@@ -4484,12 +4984,30 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
         copy_elide_touch_locked(tsharp_base(c.src_tsharp), copy_elide::kReadOther);
         copy_elide_touch_locked(tsharp_base(c.dst_tsharp), copy_elide::kWrite);
     }
+    // Texture quality: the copy lands on a texture at full size, made so for
+    // good (texture_full_size_locked), and a source whose reduced image left
+    // out the level it is copied from is made again at full size from its
+    // memory, which holds that level; from a level it has, the copy reads
+    // that level's place in the image (CopySide::drop).
+    texture_full_size_locked(tsharp_base(c.dst_tsharp));
     if (!copy_side_locked(c.src_tsharp, src, c.src_gen)) {
         g_image_copy_no_src.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    if (src.drop > c.src_mip) {
+        texture_full_size_locked(tsharp_base(c.src_tsharp));
+        if (!copy_side_locked(c.src_tsharp, src, c.src_gen)) {
+            g_image_copy_no_src.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
     if (!copy_side_locked(c.dst_tsharp, dst, c.dst_gen)) {
         g_image_copy_no_dst.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (src.drop > c.src_mip || dst.drop) {  // (not made again: a reduced image the GPU wrote, which keeps its size)
+        g_image_copy_range.fetch_add(1, std::memory_order_relaxed);
+        refused("a reduced texture (texture quality)");
         return false;
     }
     // vkCmdCopyImage wants size-compatible formats: the same one, or the same
@@ -4557,7 +5075,7 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     const VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageCopy r{};
-    r.srcSubresource = {aspect, c.src_mip, c.src_layer, 1};
+    r.srcSubresource = {aspect, c.src_mip - src.drop, c.src_layer, 1};
     r.srcOffset = {static_cast<std::int32_t>(c.src_x), static_cast<std::int32_t>(c.src_y), 0};
     r.dstSubresource = {aspect, c.dst_mip, c.dst_layer, 1};
     r.dstOffset = {static_cast<std::int32_t>(c.dst_x), static_cast<std::int32_t>(c.dst_y), 0};
@@ -4625,6 +5143,7 @@ int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std:
     Surface& from = si->second;
     if (!from.gpu_written) return out(2);
     if (!dst_gen) return out(3);
+    if (from.drop) return out(5);  // (a reduced image the GPU wrote, which keeps its size: never made so)
     VkImage to_image = VK_NULL_HANDLE;
     VkFormat to_format = VK_FORMAT_UNDEFINED;
     std::uint32_t to_w = 0, to_h = 0, to_levels = 1, to_layers = 1;
@@ -4647,9 +5166,11 @@ int textures_copy_resource_locked(std::uint64_t src, std::uint64_t src_gen, std:
         if (!gx_resource_tsharp(dst, t)) return out(3);
         bool dims_ok = true, arrayed = false;
         std::uint32_t dim = 0;
+        texture_full_size_locked(dst);  // texture quality: what the GPU writes is at full size, for good
         texture_view_uncached(t, false, dims_ok, dim, arrayed, false, false, dst_gen);
         auto di = g_surfaces.find(dst);
         if (di == g_surfaces.end() || di->second.failed || !di->second.image || di->second.gx_gen != dst_gen) return out(4);
+        if (di->second.drop) return out(5);
         to_surface = &di->second;
         to_image = to_surface->image;
         to_format = to_surface->format;
@@ -4779,8 +5300,13 @@ struct RetireEntry {
     std::size_t bytes;
     std::uint64_t after;
     std::uint64_t gen;  // the resource that died (GxResourceInfo::gen); 0: whatever no live resource covers
+    bool rebuild;       // it died in a size change's rebuild (textures_rebuild_window)
 };
 std::mutex g_retire_mu;
+// Set while a resolution or render-size change makes the game's targets
+// again (host_gpu_targets_rebuild): the resources that die meanwhile are the
+// old size's.
+std::atomic<bool> g_targets_rebuild{false};
 std::vector<RetireEntry> g_retire_pending;  // under g_retire_mu
 std::atomic<std::uint64_t> g_retired_surfaces{0}, g_retired_bytes{0}, g_retire_kept_live{0}, g_retire_kept_other_gen{0},
     g_retired_by_gen{0}, g_retired_by_gen_live{0}, g_retire_kept_written{0}, g_retire_taken_next{0};
@@ -4792,10 +5318,35 @@ std::uint64_t gx_successor_gen(std::uint64_t dead_memory, std::uint64_t image_ba
     return 0;
 }
 
-void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {
-    std::lock_guard<std::mutex> lk(g_retire_mu);
-    g_retire_pending.push_back({base, bytes, after_submitted, gen});
+// Every image made from [lo, hi) goes now (host/gpu.h host_gpu_forget_region:
+// a region given back whole, nothing new made in it yet). Retired the usual
+// way they would wait for the work in flight and then find the next YEBIS's
+// resources over the memory and stay - a shader-written image the next
+// resource takes - overlapping that YEBIS's own textures ("STALE? ... a
+// GPU-written texture holds").
+std::uint64_t textures_forget_region_locked(std::uint64_t lo, std::uint64_t hi) {
+    std::uint64_t n = 0;
+    for (auto it = g_surfaces.lower_bound(lo); it != g_surfaces.end() && it->first < hi;) {
+        Surface& sf = it->second;
+        drop_level_aliases_locked(sf.base);
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        if (sf.image) defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(it->second);
+        it = g_surfaces.erase(it);
+        ++n;
+    }
+    if (n) bump_view_epoch();
+    return n;
 }
+
+void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen) {
+    const bool rebuild = g_targets_rebuild.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(g_retire_mu);
+    g_retire_pending.push_back({base, bytes, after_submitted, gen, rebuild});
+}
+
+void textures_rebuild_window(bool on) { g_targets_rebuild.store(on, std::memory_order_relaxed); }
 
 // Textures GX mapped for the CPU to write (none has been, in any run so far):
 // their surfaces go dirty, drained under the renderer's lock before a surface
@@ -4846,7 +5397,7 @@ void retire_surfaces_locked() {
     }
     bool any = false;
     for (const RetireEntry& e : due) {
-        if (res_identity_on() && e.gen) render_retire_generation_locked(e.base, e.bytes, e.gen, e.after);
+        if (res_identity_on() && e.gen) render_retire_generation_locked(e.base, e.bytes, e.gen, e.after, e.rebuild);
         for (auto it = g_surfaces.lower_bound(e.base); it != g_surfaces.end() && it->first < e.base + e.bytes;) {
             Surface& sf = it->second;
             // By identity: the dead resource's image goes, whatever has taken
@@ -4855,7 +5406,8 @@ void retire_surfaces_locked() {
             // texels and a texture made over the memory without data takes it
             // (below); the image of another generation stays. A surface with
             // no generation (on no resource at its last upload) goes when no
-            // live resource covers it, as before.
+            // live resource covers it and nothing wrote it after the resource
+            // died.
             if (res_identity_on() && e.gen && sf.gx_gen) {
                 if (sf.gx_gen != e.gen) {
                     g_retire_kept_other_gen.fetch_add(1, std::memory_order_relaxed);
@@ -4888,6 +5440,19 @@ void retire_surfaces_locked() {
                 }
                 g_retired_by_gen.fetch_add(1, std::memory_order_relaxed);
                 if (gx_resource_at(sf.base, std::max<std::size_t>(sf.total_src, 1), nullptr)) g_retired_by_gen_live.fetch_add(1, std::memory_order_relaxed);
+            } else if (sf.written_seq > e.after) {
+                // Written by a submission made after the resource died, as
+                // above: the image is the memory's newer owner's, whether or not
+                // the registry knows that owner. A shader's texels are nowhere
+                // else, and retired, the next bind made the surface again from
+                // memory that never had them - the Hunter's Dream's colour
+                // grading table (16x256, e2c27f0c), written in the submission
+                // after a graphics change freed the old table at its address
+                // and read from that stale memory every frame after: the Dream
+                // black or dim until a restart.
+                g_retire_kept_written.fetch_add(1, std::memory_order_relaxed);
+                ++it;
+                continue;
             } else if (gx_resource_at(sf.base, std::max<std::size_t>(sf.total_src, 1), nullptr)) {
                 g_retire_kept_live.fetch_add(1, std::memory_order_relaxed);
                 ++it;
@@ -4936,6 +5501,7 @@ void textures_record_ahead_locked() {
 
 void textures_before_submit() {
     g_coarse_ms = now_ms();
+    textures_follow_quality_locked();
     for (const std::shared_ptr<TexturePrep>& p : g_batch_preps) {
         if (prep_census::on() && !prep_done(*p)) prep_census::blocked(prep_census::kBatch);
         prep_census::timed_wait(*p, 0);
@@ -5827,6 +6393,7 @@ bool texture_dump_locked(std::uint64_t base, const char* path, std::uint32_t lev
     record_pending_locked(sf, ahead_defer::kAtDump);
     if (sf.failed) return false;
     if (level >= sf.levels.size() || layer >= std::max(1u, sf.info.arrayLayers)) return false;
+    level = std::max(level, sf.drop);  // a reduced image's first level stands for those it left out (Surface::drop)
     const std::uint32_t lw = std::max(1u, sf.width >> level), lh = std::max(1u, sf.height >> level);
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
@@ -5867,7 +6434,7 @@ bool texture_dump_locked(std::uint64_t base, const char* path, std::uint32_t lev
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     VkImageBlit blit{};
-    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - sf.drop, layer, 1};
     blit.srcOffsets[1] = {static_cast<std::int32_t>(lw), static_cast<std::int32_t>(lh), 1};
     blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.dstOffsets[1] = {static_cast<std::int32_t>(lw), static_cast<std::int32_t>(lh), 1};
@@ -5962,7 +6529,11 @@ void textures_forget_target_memos_locked(std::uint64_t a, std::uint64_t b) {
         IdViewEntry& e = g_id_views[i];
         if (e.epoch == static_cast<std::uint32_t>(g_view_epoch) && !e.sf && at(e.base)) {
             e.epoch = 0;
-            if (cache_rw::g_readers.load(std::memory_order_relaxed)) g_id_views_pub[i].epoch = 0;
+            if (cache_rw::g_readers.load(std::memory_order_relaxed)) {
+                for (IdViewPub& w : g_id_views_pub[i]) {
+                    if (w.id == e.id) w.epoch = 0;
+                }
+            }
         }
     }
 }
@@ -6330,6 +6901,35 @@ void textures_report() {
              static_cast<unsigned long long>(g_region_uploads.load()), static_cast<unsigned long long>(g_region_bytes.load() >> 20),
              static_cast<unsigned long long>(g_region_created.load()), static_cast<unsigned long long>(g_region_no_surface.load()),
              static_cast<unsigned long long>(g_region_out_of_range.load()));
+    {
+        std::uint64_t now_reduced = 0, now_saved = 0;
+        std::uint64_t by_origin[kOriginCount][2] = {};  // surfaces of each origin, and of them reduced
+        for (const auto& [base, sf] : g_surfaces) {
+            GxResourceInfo r;
+            const std::uint8_t o = gx_resource_at(base, 1, &r) && r.origin < kOriginCount ? r.origin : 0;
+            ++by_origin[o][0];
+            if (sf.drop) ++by_origin[o][1];
+            if (!sf.drop) continue;
+            ++now_reduced;
+            for (std::uint32_t l = 0; l < sf.drop; ++l) now_saved += sf.levels[l].dst_slice_bytes * sf.slices;
+        }
+        host_log("texture: texture quality %s: textures made reduced %llu, leaving out %llu MiB of levels; made at full size again (written by the "
+                 "GPU, or the setting raised) %llu; reduced now %llu, leaving out %llu MiB; full size for good %zu",
+                 g_quality_drop == 3 ? "Lowest (0.125x)" : g_quality_drop == 2 ? "Low (0.25x)" : g_quality_drop == 1 ? "Medium (0.5x)" : "High (1.0x)", static_cast<unsigned long long>(g_quality_surfaces),
+                 static_cast<unsigned long long>(g_quality_saved >> 20), static_cast<unsigned long long>(g_quality_full),
+                 static_cast<unsigned long long>(now_reduced), static_cast<unsigned long long>(now_saved >> 20), g_full_size.size());
+        std::string by;
+        for (int o = 0; o < kOriginCount; ++o) {
+            char b[64];
+            std::snprintf(b, sizeof(b), " %s %llu (%llu reduced)", texture_origin_name(static_cast<std::uint8_t>(o)),
+                          static_cast<unsigned long long>(by_origin[o][0]), static_cast<unsigned long long>(by_origin[o][1]));
+            by += b;
+        }
+        std::uint64_t placed = 0, packs = 0, us = 0;
+        texture_origin_stats(&placed, &packs, &us);
+        host_log("texture: textures by the folder they came from:%s; %llu placed (%llu TPFs looked up, %.1f ms in all)", by.c_str(),
+                 static_cast<unsigned long long>(placed), static_cast<unsigned long long>(packs), us / 1000.0);
+    }
     host_log("texture: copy-image tokens' sides by their resources: their own target %llu, their own surface %llu, a dead resource's target "
              "taken (made over it without data) %llu, another resource's target not used %llu, no generation %llu; binds of a view whose "
              "memory holds another resource's target: taken (made over it without data) %llu, not aliased %llu",

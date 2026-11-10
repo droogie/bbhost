@@ -8,6 +8,7 @@
 
 #include "host/overlay_font.h"
 #include "host/overlay_spv.h"
+#include "host/slow_calls.h"
 
 #include <atomic>
 #include <cstring>
@@ -205,9 +206,15 @@ bool upload_atlas(VkDevice device, VkPhysicalDevice phys, VkQueue queue, std::ui
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
+    static constexpr slow_calls::Site kAtlasSubmit{slow_calls::kQueueSubmit, "the overlay's atlas"};
+    static constexpr slow_calls::Site kAtlasIdle{slow_calls::kQueueIdle, "the overlay's atlas"};
     host_gpu_queue_lock();
-    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
+    {
+        slow_calls::Scope timed(kAtlasSubmit);
+        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+        timed.next(kAtlasIdle);
+        vkQueueWaitIdle(queue);
+    }
     host_gpu_queue_unlock();
     vkDestroyCommandPool(device, pool, nullptr);
     vkDestroyBuffer(device, staging, nullptr);

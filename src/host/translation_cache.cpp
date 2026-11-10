@@ -6,6 +6,8 @@
 #include "translator_fingerprint.h"
 #include "gcn/hlsl.h"
 #include "host/dxc.h"
+#include "host/options.h"
+#include "host/shader_overrides.h"
 
 #ifdef BBHOST_HAVE_SPIRV_TOOLS
 #include <spirv-tools/libspirv.hpp>
@@ -33,6 +35,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace gpu {
@@ -163,6 +166,7 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     h.flag(o.vertex_formats_from_params);
     h.flag(o.force_dispatcher);
     h.flag(o.invariant_position);
+    h.flag(o.capture_position);
     h.u32(o.descriptor_set);
     h.i32(o.cb_descriptor_set);
     h.u32(o.cb_binding_base);
@@ -713,8 +717,9 @@ std::string hlsl_stable_name(const std::string& gx) {
     }
     return name;
 }
-// "ps", "vs", "hs", "ds", "cs": the lift's stage, from its entry point's
-// execution model.
+// "ps", "vs", "hs", "ds", "gs", "cs": the lift's stage, from its entry
+// point's execution model - the dump's file names' (its profile's first two
+// letters), so an edited file finds its stage.
 std::string lift_stage_tag(const std::vector<std::uint32_t>& spirv) {
     for (std::size_t i = 5; i < spirv.size();) {
         const std::uint32_t len = spirv[i] >> 16, op = spirv[i] & 0xffff;
@@ -724,6 +729,7 @@ std::string lift_stage_tag(const std::vector<std::uint32_t>& spirv) {
                 case 0: return "vs";
                 case 1: return "hs";
                 case 2: return "ds";
+                case 3: return "gs";
                 case 4: return "ps";
                 case 5: return "cs";
                 default: return "xx";
@@ -739,6 +745,14 @@ std::string lift_hash_hex(const std::vector<std::uint32_t>& lifted) {
     char buf[24];
     std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(n.a));
     return buf;
+}
+// A dumped file's text: the printed source with the lift's hash on the
+// second line - the dump's own check, and an edited file's fallback match.
+std::string hlsl_dump_text(const std::string& source, const std::string& hash16) {
+    const std::size_t nl = source.find('\n');
+    if (nl == std::string::npos) return source + "\n// lift " + hash16 + "\n";
+    return source.substr(0, nl + 1) + "// lift " + hash16 + " (this build's lift; the name above is what a translator update keeps)\n" +
+           source.substr(nl + 1);
 }
 // Whether the dumped file at `p` was written for the lift `hash16` (its second
 // line says "// lift <hash>").
@@ -772,18 +786,10 @@ std::string hlsl_dump(const std::vector<std::uint32_t>& lifted, const gcn::HlslR
     }
     const std::filesystem::path base = std::filesystem::path(dir) / name;
     if (std::filesystem::exists(base.string() + ".hlsl", ec)) return base.string();  // written already
-    if (!h.source.empty()) {
-        // The lift's hash on the second line: the dump's own check, and an
-        // edited file's fallback match.
-        const std::size_t nl = h.source.find('\n');
-        std::ofstream out(base.string() + ".hlsl", std::ios::binary);
-        if (nl == std::string::npos) {
-            out << h.source << "\n// lift " << hash16 << "\n";
-        } else {
-            out << h.source.substr(0, nl + 1) << "// lift " << hash16 << " (this build's lift; the name above is what a translator update keeps)\n"
-                << h.source.substr(nl + 1);
-        }
-    }
+    if (!h.source.empty()) std::ofstream(base.string() + ".hlsl", std::ios::binary) << hlsl_dump_text(h.source, hash16);
+    // bbhost.hlsli beside them, the helpers an edited shader can include (host/shader_overrides.h).
+    static std::atomic<bool> helpers{false};
+    if (!helpers.exchange(true)) std::ofstream(std::filesystem::path(dir) / "bbhost.hlsli", std::ios::binary) << override_include_text();
     std::ofstream(base.string() + ".lift.spv", std::ios::binary)
         .write(reinterpret_cast<const char*>(lifted.data()), static_cast<std::streamsize>(lifted.size() * 4));
     return base.string();
@@ -882,14 +888,17 @@ struct HlslLiftOf {
         Key lift_key{};  // the lift's entry in this cache
         bool cached = false;
         std::vector<std::uint32_t> words;  // the lift itself, when it was made without the cache
+        std::shared_ptr<const OverrideSource> override;  // an edited shader's module: its source (hlsl_note_override_refused)
     };
     std::mutex mu;
     std::unordered_map<Key, From, KeyHash> by_module;  // under mu: DXC's module (module_identity) -> its lift
     std::map<std::string, std::uint64_t> refused;      // under mu: pipelines the driver refused with DXC's modules, by what was built
     std::atomic<std::uint64_t> refusals{0}, stages{0}, rebuilt{0}, refused_again{0}, lift_again{0};
 } g_hlsl_lift_of;
-void hlsl_remember_lift(const std::vector<std::uint32_t>& dxc_module, const Key* lift_key, const std::vector<std::uint32_t>& lift) {
+void hlsl_remember_lift(const std::vector<std::uint32_t>& dxc_module, const Key* lift_key, const std::vector<std::uint32_t>& lift,
+                        std::shared_ptr<const OverrideSource> override = nullptr) {
     HlslLiftOf::From from;
+    from.override = std::move(override);
     if (lift_key) {
         from.lift_key = *lift_key;
         from.cached = true;
@@ -920,6 +929,24 @@ bool hlsl_lift_of(const std::vector<std::uint32_t>& module, std::vector<std::uin
     if (!lookup(from.lift_key, [&](Reader& r) { return read_lift(r, l); }) || !l.ok()) return false;
     lift = std::move(l.spirv);
     return true;
+}
+
+void hlsl_note_override_refused(const std::vector<std::uint32_t>& module) {
+    if (!override_gen() || module.empty()) return;
+    std::shared_ptr<const OverrideSource> src;
+    {
+        const Key id = module_identity(module);
+        std::lock_guard<std::mutex> lk(g_hlsl_lift_of.mu);
+        const auto it = g_hlsl_lift_of.by_module.find(id);
+        if (it == g_hlsl_lift_of.by_module.end()) return;
+        src = it->second.override;
+    }
+    if (!src) return;
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 8)
+        host_log("render: HLSL override %s: the driver refused a pipeline holding it; that pipeline draws with the lift's own module",
+                 override_label(*src).c_str());
+    override_outcome(*src, false, "the driver refused a pipeline holding it, which draws with the lift's own module");
 }
 
 void hlsl_note_refused(const char* what, int stages, bool rebuilt) {
@@ -981,6 +1008,8 @@ namespace {
 // from a lane before its own moves up to it.
 thread_local int t_hlsl_lane = kHlslLaneDrawn;
 thread_local std::string t_hlsl_name;  // hlsl_name_next
+thread_local std::uint64_t t_hlsl_salt = 0;   // and its salt (host/shader_overrides.h)
+thread_local bool t_hlsl_took_override = false;  // hlsl_took_override
 constexpr int kLanes = 4;
 struct HlslBehind {
     struct Job {
@@ -1155,22 +1184,33 @@ void hlsl_defer(const Key& key, const std::vector<std::uint32_t>& lifted, const 
     g_hlsl_behind.cv.notify_one();
 }
 
-// ---- Edited HLSL: <data>/bbhost/shaders/<name>.hlsl ----
-// A player's own source for a stage, named as BBHOST_HLSL_DUMP names it:
-// compiled with DXC at the stage's first use and taken in place of the lift's
-// module when it declares the same interface and validates; otherwise the
-// stage keeps its own module (the lift's, or DXC's of it). For a lift, the
-// files tried in order are <stable>.<stage>~<lift hash> (that one variant),
-// <stable>.<stage> (every variant of the program and stage whose interface it
-// matches - the name a translator update keeps), then <lift hash>.<stage>
-// (the fallback, this build's lift only). Every outcome is logged once.
+// ---- Edited HLSL (host/shader_overrides.h) ----
+// A source for a stage, named as BBHOST_HLSL_DUMP names its files: compiled
+// with DXC where its stage is built and taken in place of the lift's module
+// when it declares the same interface and validates; otherwise the stage
+// keeps its own module (the lift's, or DXC's of it). Which source a stage
+// compiles is its salt's (hlsl_name_next): the registry's set, never changed
+// once named, so a stage's key and its module agree whatever changed since.
+// A module is compiled once a run for each lift, source and owner - a return
+// to an earlier source compiles nothing - and never kept in this cache.
 struct HlslOverrides {
+    struct Id {
+        std::uint64_t lift = 0, source = 0;
+        int owner = 0;
+        bool operator==(const Id& o) const { return lift == o.lift && source == o.source && owner == o.owner; }
+    };
+    struct IdHash {
+        std::size_t operator()(const Id& k) const {
+            return static_cast<std::size_t>(k.lift ^ (k.source * 0x9e3779b97f4a7c15ull) ^ static_cast<std::uint64_t>(k.owner));
+        }
+    };
+    struct Done {
+        std::vector<std::uint32_t> spirv;  // empty: refused
+        std::string why;
+    };
     std::mutex mu;
-    std::string dir;                                      // under mu
-    std::unordered_map<std::string, std::string> files;   // under mu: name without .hlsl -> file
-    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> compiled;  // under mu: this run's results by lift (empty: refused)
-    std::atomic<std::uint64_t> taken{0}, refused{0};
-    std::atomic<bool> any{false};
+    std::unordered_map<Id, Done, IdHash> compiled;  // under mu
+    std::atomic<std::uint64_t> taken{0}, refused{0}, compiles{0}, compile_us{0};
 } g_hlsl_overrides;
 
 std::uint64_t lift_hash(const std::vector<std::uint32_t>& lifted) {
@@ -1179,43 +1219,38 @@ std::uint64_t lift_hash(const std::vector<std::uint32_t>& lifted) {
     return n.a;
 }
 
-// The override's module for `l`, compiled once a run; false when there is no
-// override for it (or it was refused: logged, and the caller goes on as without it).
-bool hlsl_override(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptions& hopt, const Dxc& dxc, std::vector<std::uint32_t>& out) {
-    if (!g_hlsl_overrides.any.load(std::memory_order_acquire)) return false;
-    const std::uint64_t hash = lift_hash(lifted);
+// `src`'s module for the lift `lifted` (`hash` its lift_hash), compiled once
+// a run; false when it was refused (logged once, and the caller goes on as
+// without it). The outcome of each stage that asks is the source's state.
+bool hlsl_override_module(const std::vector<std::uint32_t>& lifted, std::uint64_t hash, const gcn::HlslOptions& hopt, const Dxc& dxc,
+                          const OverrideSource& src, std::vector<std::uint32_t>& out) {
+    const HlslOverrides::Id id{hash, src.identity, src.owner};
+    // (The outcome is told out of the lock: the registry's is taken after this one, never inside.)
+    const auto kept = [&](std::string why_kept) {
+        override_outcome(src, !out.empty(), why_kept);
+        return !out.empty();
+    };
     {
-        std::lock_guard<std::mutex> lk(g_hlsl_overrides.mu);
-        if (const auto it = g_hlsl_overrides.compiled.find(hash); it != g_hlsl_overrides.compiled.end()) {
-            out = it->second;
-            return !out.empty();
+        std::unique_lock<std::mutex> lk(g_hlsl_overrides.mu);
+        if (const auto it = g_hlsl_overrides.compiled.find(id); it != g_hlsl_overrides.compiled.end()) {
+            out = it->second.spirv;
+            std::string why_kept = it->second.why;
+            lk.unlock();
+            return kept(std::move(why_kept));
         }
     }
-    const std::string hash16 = lift_hash_hex(lifted), stage = lift_stage_tag(lifted), stable = hlsl_stable_name(hopt.title);
-    std::vector<std::string> names;
-    if (!stable.empty()) {
-        names.push_back(stable + "." + stage + "~" + hash16);
-        names.push_back(stable + "." + stage);
-    }
-    names.push_back(hash16 + "." + stage);
-    std::string file;
-    {
-        std::lock_guard<std::mutex> lk(g_hlsl_overrides.mu);
-        for (const std::string& n : names) {
-            if (const auto it = g_hlsl_overrides.files.find(n); it != g_hlsl_overrides.files.end()) {
-                file = it->second;
-                break;
-            }
-        }
-    }
-    if (file.empty()) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    char hash16[24];
+    std::snprintf(hash16, sizeof(hash16), "%016llx", static_cast<unsigned long long>(hash));
+    const std::string stable = hlsl_stable_name(hopt.title);
     std::vector<std::uint32_t> spirv;
-    std::string why;
+    std::string why, source;
     gcn::HlslResult h = gcn::emit_hlsl(lifted, hopt);  // the profile, entry point and arguments the lift needs
-    std::string source;
-    {
-        std::ifstream in(file, std::ios::binary);
-        source.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    if (!override_read(src, source, why)) {
+        // A file changed since it was listed: nothing kept - the listing moved
+        // on, and the stage's next build compiles what the file holds now.
+        out.clear();
+        return false;
     }
     if (h.profile.empty()) {
         why = "the printer does not take this lift, so its profile and arguments are unknown" +
@@ -1227,7 +1262,221 @@ bool hlsl_override(const std::vector<std::uint32_t>& lifted, const gcn::HlslOpti
     } else if (h.validate_offsets && !kHlslValidator) {
         why = "the lift takes a run-time sample offset, and this build has no SPIR-V validator to check it";
     } else {
-        h.source = source;
+        h.source = override_dxc_text(src, source);
+        h.errors.clear();
+        // Its owner's shader data at a device address the module keeps (bbhost.hlsli).
+        if (const std::uint64_t data = override_data_address(src.owner)) {
+            char define[48];
+            std::snprintf(define, sizeof(define), "BBHOST_DATA=0x%016llxull", static_cast<unsigned long long>(data));
+            h.arguments.push_back("-D");
+            h.arguments.push_back(define);
+        }
+        DxcOptions o;
+        o.optimize = hlsl_level();
+        std::string error;
+        if (!dxc.compile(h, o, spirv, error)) {
+            why = "DXC: " + error.substr(0, 400);
+        } else if (std::string d = gcn::hlsl_interface_diff(lifted, spirv); !d.empty()) {
+            why = "another interface than the lift's: " + d;
+        } else if (std::string v = hlsl_validate(spirv); !v.empty()) {
+            why = "invalid SPIR-V: " + v;
+        }
+        if (!why.empty()) spirv.clear();
+    }
+    const std::uint64_t compile_us = us_since(t0);
+    g_hlsl_overrides.compiles.fetch_add(1, std::memory_order_relaxed);
+    g_hlsl_overrides.compile_us.fetch_add(compile_us, std::memory_order_relaxed);
+    override_note_compile(compile_us);
+    {
+        // Two threads can meet the same stage at once: the first result is
+        // kept, counted and logged; the other takes it.
+        std::unique_lock<std::mutex> lk(g_hlsl_overrides.mu);
+        const auto [it, fresh] = g_hlsl_overrides.compiled.try_emplace(id, HlslOverrides::Done{spirv, why});
+        if (!fresh) {
+            out = it->second.spirv;
+            std::string why_kept = it->second.why;
+            lk.unlock();
+            return kept(std::move(why_kept));
+        }
+    }
+    const std::string label = override_label(src);
+    if (spirv.empty()) {
+        g_hlsl_overrides.refused.fetch_add(1, std::memory_order_relaxed);
+        host_log("render: HLSL override %s refused for %s (lift %s), the stage keeps its own module: %s", label.c_str(),
+                 stable.empty() ? "a lift of no known program" : stable.c_str(), hash16, why.c_str());
+    } else {
+        g_hlsl_overrides.taken.fetch_add(1, std::memory_order_relaxed);
+        host_log("render: HLSL override %s compiled and taken for %s (lift %s, %zu words)", label.c_str(),
+                 stable.empty() ? "a lift of no known program" : stable.c_str(), hash16, spirv.size());
+    }
+    override_outcome(src, !spirv.empty(), why);
+    out = std::move(spirv);
+    return !out.empty();
+}
+
+// The module of the source `salt` names for this lift (override_pick), in
+// `out` with `src` the source; false for none or a refusal.
+bool hlsl_override(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptions& hopt, const Dxc& dxc, std::uint64_t salt,
+                   std::vector<std::uint32_t>& out, std::shared_ptr<const OverrideSource>& src) {
+    if (!salt) return false;
+    const std::uint64_t hash = lift_hash(lifted);
+    char hash16[24];
+    std::snprintf(hash16, sizeof(hash16), "%016llx", static_cast<unsigned long long>(hash));
+    if (!override_pick(salt, hlsl_stable_name(hopt.title), lift_stage_tag(lifted), hash16, src)) return false;
+    return hlsl_override_module(lifted, hash, hopt, dxc, *src, out);
+}
+
+// ---- The lifts met: what a changed edited shader is compiled ahead for ----
+// Every lift the HLSL path meets while edited shaders apply, by its program
+// and stage, the first met first: its entry in this cache (or its words,
+// without one) and the options it was printed with. A new or changed source
+// is compiled for each one its name applies to on bb-hlsl-ahead before it
+// takes effect (override_prepare), so the draws keep the source they had
+// until then and the change compiles nothing on the thread that draws.
+struct HlslMet {
+    struct Lift {
+        Key key{};
+        bool cached = false;
+        std::vector<std::uint32_t> words;  // the lift itself, when it was made without the cache
+        std::uint64_t hash = 0;            // its lift_hash, for one made without the cache
+        gcn::HlslOptions hopt;             // its title and tessellation fields
+    };
+    std::mutex mu;
+    std::unordered_map<std::string, std::vector<std::shared_ptr<const Lift>>> by_program;  // "<program>.<stage>"
+};
+HlslMet& g_hlsl_met = *new HlslMet;  // never destroyed: bb-hlsl-ahead reads it until the process ends
+
+void hlsl_note_met(const std::vector<std::uint32_t>& lifted, const Key* lift_key, const gcn::HlslOptions& hopt) {
+    if (hopt.title.empty() || !overrides_on()) return;
+    const std::uint64_t hash = lift_key ? 0 : lift_hash(lifted);
+    const std::string id = hopt.title + "." + lift_stage_tag(lifted);
+    std::lock_guard<std::mutex> lk(g_hlsl_met.mu);
+    std::vector<std::shared_ptr<const HlslMet::Lift>>& met = g_hlsl_met.by_program[id];
+    for (const std::shared_ptr<const HlslMet::Lift>& m : met) {  // a program's few variants: met already?
+        if (lift_key ? m->cached && m->key == *lift_key : !m->cached && m->hash == hash) return;
+    }
+    auto m = std::make_shared<HlslMet::Lift>();
+    if (lift_key) {
+        m->key = *lift_key;
+        m->cached = true;
+    } else {
+        m->words = lifted;
+        m->hash = hash;
+    }
+    m->hopt.title = hopt.title;
+    m->hopt.tess_quads = hopt.tess_quads;
+    m->hopt.tess_spacing = hopt.tess_spacing;
+    m->hopt.tess_cw = hopt.tess_cw;
+    met.push_back(std::move(m));
+}
+
+bool hlsl_met_words(const HlslMet::Lift& m, std::vector<std::uint32_t>& words) {
+    if (!m.cached) {
+        words = m.words;
+        return !words.empty();
+    }
+    gcn::LiftResult l;
+    if (!lookup(m.key, [&](Reader& r) { return read_lift(r, l); }) || !l.ok()) return false;
+    words = std::move(l.spirv);
+    return true;
+}
+
+struct HlslAhead {
+    struct Job {
+        std::shared_ptr<const OverrideSource> src;
+        std::vector<std::shared_ptr<const HlslMet::Lift>> lifts;
+        std::string hash16;  // a variant's or a lift hash's name: that lift's alone
+        bool by_lift = false;  // a lift hash's: the programs whose lift it is are tied to it
+    };
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<Job> jobs;  // under mu
+    bool started = false;  // under mu
+    std::atomic<std::uint64_t> sources{0}, compiles{0};
+};
+HlslAhead& g_hlsl_ahead = *new HlslAhead;
+
+void hlsl_ahead_thread() {
+    host_thread_set_name("bb-hlsl-ahead");
+    host_thread_background();
+    for (;;) {
+        HlslAhead::Job job;
+        {
+            std::unique_lock<std::mutex> lk(g_hlsl_ahead.mu);
+            g_hlsl_ahead.cv.wait(lk, [] { return !g_hlsl_ahead.jobs.empty(); });
+            job = std::move(g_hlsl_ahead.jobs.front());
+            g_hlsl_ahead.jobs.pop_front();
+        }
+        const Dxc& dxc = hlsl_dxc();
+        for (const std::shared_ptr<const HlslMet::Lift>& m : job.lifts) {
+            std::vector<std::uint32_t> words;
+            if (!hlsl_met_words(*m, words)) continue;
+            const std::uint64_t hash = lift_hash(words);
+            char hex[24];
+            std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(hash));
+            if (!job.hash16.empty() && job.hash16 != hex) continue;
+            if (job.by_lift) override_attribute(hash, m->hopt.title);
+            std::vector<std::uint32_t> out;
+            (void)hlsl_override_module(words, hash, m->hopt, dxc, *job.src, out);
+            g_hlsl_ahead.compiles.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_hlsl_ahead.sources.fetch_add(1, std::memory_order_relaxed);
+        override_install(job.src);
+    }
+}
+
+// ---- Rebuilt motion vectors (host/options.h host_opt_motion_rebuilt_bits) ----
+// The game's moving meshes draw their motion into motion blur's velocity map
+// with GXFlver_*_Velo pixel shaders, from each vertex where it is (attr0) and
+// where it was a frame ago (attr1), clip space, skinned with this frame's and
+// the last's bones. The blur wants that scaled by its strength, clamped to
+// [0, 1] and packed to 16 bits in the shader. Rebuilt, the same shaders keep
+// their discards and write the exact NDC motion instead - now minus then -
+// alpha 0.5 marking a mesh's texel (the camera's pass writes 1, the clear 0):
+// as it is at 16 and 32 bits, at 8 as x 2 + 0.5 (+-0.25 of the screen, steps
+// of about 2 pixels at 1080p). host/upscale_pass.cpp reads it.
+bool velo_rebuilt(const std::vector<std::uint32_t>& lifted, const gcn::HlslOptions& hopt, const Dxc& dxc, std::vector<std::uint32_t>& out) {
+    const int bits = host_opt_motion_rebuilt_bits();
+    if (!bits) return false;
+    static const char* const kVelo[] = {"749e4f9e", "b25e4fae", "34bc187c", "d79de945"};  // GXFlver_{Col,Col_[A],Emi,Water}_Velo
+    bool velo = false;
+    for (const char* v : kVelo) velo |= hopt.title == v;
+    if (!velo || lift_stage_tag(lifted) != "ps") return false;
+    static std::mutex mu;
+    static std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> done;
+    // Each bit depth its own module: the setting changes while the game runs,
+    // and render.cpp keys the velocity shaders' pipelines by it.
+    const std::uint64_t hash = lift_hash(lifted) ^ (0x9e3779b97f4a7c15ull * static_cast<std::uint64_t>(bits));
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (const auto it = done.find(hash); it != done.end()) {
+            out = it->second;
+            return !out.empty();
+        }
+    }
+    gcn::HlslResult h = gcn::emit_hlsl(lifted, hopt);
+    std::string why;
+    std::vector<std::uint32_t> spirv;
+    const std::size_t body = h.source.find("void lifted_main()");
+    const std::size_t end = body == std::string::npos ? body : h.source.find("\n    return;\n}\n", body);
+    if (h.profile.empty() || end == std::string::npos) {
+        why = "its HLSL has no lifted_main to end";
+    } else if (!dxc.loaded()) {
+        why = "DXC not found";
+    } else {
+        // (16 and 32 bits: the fragment's view distance, clip w, in blue -
+        // upscale_pass.cpp's motion takes a mesh's motion only where it is
+        // the surface seen.)
+        const char* write = bits == 8 ? "    mrt0 = float4(saturate((attr0.xy / attr0.w - attr1.xy / attr1.w) * 2.0f + 0.5f), 0.0f, 0.5f);\n"
+                                      : "    mrt0 = float4(attr0.xy / attr0.w - attr1.xy / attr1.w, attr0.w, 0.5f);\n";
+        h.source.insert(end + 1, write);
+        // No discards: an alpha-tested mesh's motion over its cards' whole
+        // area, the gaps between a cape's fur strands too - its motion a
+        // solid silhouette, as BBNextGenSuite gives FSR, not the strands
+        // alone over the background's (each strand then crossed pixels whose
+        // history was the wall's, and left trails).
+        for (std::size_t at = h.source.find("discard;", body); at != std::string::npos; at = h.source.find("discard;", at))
+            h.source.replace(at, 8, "{}");
         h.errors.clear();
         DxcOptions o;
         o.optimize = hlsl_level();
@@ -1242,32 +1491,222 @@ bool hlsl_override(const std::vector<std::uint32_t>& lifted, const gcn::HlslOpti
         if (!why.empty()) spirv.clear();
     }
     {
-        // Two threads can meet the same stage at once: the first result is
-        // kept, counted and logged; the other takes it.
-        std::lock_guard<std::mutex> lk(g_hlsl_overrides.mu);
-        const auto [it, fresh] = g_hlsl_overrides.compiled.try_emplace(hash, spirv);
-        if (!fresh) {
-            out = it->second;
-            return !out.empty();
-        }
+        std::lock_guard<std::mutex> lk(mu);
+        done.emplace(hash, spirv);
     }
-    if (spirv.empty()) {
-        g_hlsl_overrides.refused.fetch_add(1, std::memory_order_relaxed);
-        host_log("render: HLSL override %s refused for %s (lift %s), the stage keeps its own module: %s", file.c_str(),
-                 stable.empty() ? "a lift of no known program" : stable.c_str(), hash16.c_str(), why.c_str());
-    } else {
-        g_hlsl_overrides.taken.fetch_add(1, std::memory_order_relaxed);
-        host_log("render: HLSL override %s compiled and taken for %s (lift %s, %zu words)", file.c_str(),
-                 stable.empty() ? "a lift of no known program" : stable.c_str(), hash16.c_str(), spirv.size());
-    }
+    host_log("render: rebuilt motion vectors (%d-bit) %s for velocity shader %s%s%s", bits, spirv.empty() ? "refused" : "taken", hopt.title.c_str(),
+             why.empty() ? "" : ": ", why.c_str());
     out = std::move(spirv);
     return !out.empty();
 }
 
+// ---- The cloth's last positions (host/render.cpp velo_cloth_twin_locked) ----
+// The game rewrites a cloth mesh's vertex records every frame - its
+// simulation's positions - and its velocity vertex shader makes both of its
+// clip positions from them: where the vertex is (param 0) and, with last
+// frame's bones, where it was (param 1). So the cloth's own swing was in
+// neither. Here the shader reads its inputs 0 and 1 a second time, at
+// locations 14 and 15, and param 1 is made from those: each value that
+// depends on the inputs and reaches param 1 is computed again from the twins,
+// next to the original. render.cpp binds the twins to last frame's copy of
+// the records. The lift's own SPIR-V stays (no HLSL compile), so the rewrite
+// meets the lifter's form: SSA values, one load an input, whole stores.
+bool velo_cloth_prev(std::vector<std::uint32_t>& spirv, const std::string& name) {
+    if (!velo_cloth_vs(name) || spirv.size() < 5 || lift_stage_tag(spirv) != "vs") return false;
+    const std::vector<std::uint32_t>& w = spirv;
+    struct Ins {
+        std::size_t at;
+        std::uint32_t op, n;
+    };
+    std::vector<Ins> ins;
+    for (std::size_t i = 5; i < w.size();) {
+        const std::uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (!n || i + n > w.size()) return false;
+        ins.push_back({i, op, n});
+        i += n;
+    }
+    // The inputs at locations 0 and 1, param 1 (its location 1), their types.
+    std::unordered_map<std::uint32_t, std::uint32_t> location, var_class, var_type;
+    for (const Ins& x : ins) {
+        if (x.op == 71 && x.n == 4 && w[x.at + 2] == 30) location[w[x.at + 1]] = w[x.at + 3];  // OpDecorate Location
+        if (x.op == 59 && x.n >= 4) {                                                       // OpVariable
+            var_type[w[x.at + 2]] = w[x.at + 1];
+            var_class[w[x.at + 2]] = w[x.at + 3];
+        }
+    }
+    std::uint32_t in_var[2] = {}, out_prev = 0;
+    for (const auto& [id, loc] : location) {
+        const auto c = var_class.find(id);
+        if (c == var_class.end()) continue;
+        if (c->second == 1 && loc < 2) in_var[loc] = id;  // Input
+        if (c->second == 3 && loc == 1) out_prev = id;    // Output
+    }
+    if (!in_var[0] || !out_prev) return false;
+    // The body's values: each one's operands that are ids (an opcode's literal
+    // words left out), for the ops the lifter writes; another op stops it.
+    const auto value_op = [](std::uint32_t op) {
+        switch (op) {
+            case 12: case 61: case 65: case 66: case 77: case 78: case 79: case 80: case 81: case 82: case 83:
+            case 109: case 110: case 111: case 112: case 113: case 114: case 115: case 116: case 124: case 126: case 127:
+            case 128: case 129: case 130: case 131: case 132: case 133: case 134: case 135: case 136: case 137: case 138:
+            case 139: case 140: case 141: case 142: case 143: case 144: case 145: case 146: case 147: case 148: case 149:
+            case 150: case 151: case 152: case 154: case 155: case 156: case 157: case 164: case 165: case 166: case 167:
+            case 168: case 169: case 170: case 171: case 172: case 173: case 174: case 175: case 176: case 177: case 178:
+            case 179: case 180: case 181: case 182: case 183: case 184: case 185: case 186: case 187: case 188: case 189:
+            case 190: case 191: case 194: case 195: case 196: case 197: case 198: case 199: case 200: case 201: case 202:
+            case 203: case 204: case 205: case 245:
+                return true;
+            default:
+                return false;
+        }
+    };
+    // Its id operands' word range [first, end) (OpExtInst: the set and the
+    // operands, not the instruction's number - handled by `is_id` below).
+    const auto id_words = [&](const Ins& x, std::size_t& first, std::size_t& end) {
+        first = 3;
+        end = x.n;
+        if (x.op == 81) end = 4;                    // OpCompositeExtract: indices
+        if (x.op == 82 || x.op == 79) end = 5;      // OpCompositeInsert, OpVectorShuffle
+        if (x.op == 61) end = 4;                    // OpLoad: a memory access mask
+    };
+    const auto is_id = [](const Ins& x, std::size_t k) { return !(x.op == 12 && k == 4); };  // OpExtInst's number
+    std::size_t body = ins.size(), body_end = ins.size();
+    for (std::size_t i = 0; i < ins.size(); ++i) {
+        if (ins[i].op == 54 && body == ins.size()) body = i;  // OpFunction
+        if (ins[i].op == 56) body_end = i;                    // OpFunctionEnd
+    }
+    if (body == ins.size() || body_end == ins.size() || body_end < body) return false;
+    std::unordered_map<std::uint32_t, std::size_t> def;
+    std::vector<std::uint32_t> stores;  // param 1's values
+    for (std::size_t i = body + 1; i < body_end; ++i) {
+        const Ins& x = ins[i];
+        if (value_op(x.op)) {
+            if (x.n < 3) return false;
+            def[w[x.at + 2]] = i;
+        } else if (x.op == 62) {  // OpStore
+            if (x.n < 3) return false;
+            if (w[x.at + 1] == out_prev) stores.push_back(w[x.at + 2]);
+        } else if (x.op != 248 && x.op != 249 && x.op != 250 && x.op != 247 && x.op != 253 && x.op != 8 && x.op != 317 && x.op != 0) {
+            return false;  // (labels, branches, merges, return, line info)
+        }
+    }
+    if (stores.empty()) return false;
+    // What depends on the inputs (to a fixed point: a phi takes values from below).
+    std::unordered_set<std::uint32_t> tainted;
+    std::uint32_t loads[2] = {};
+    for (const auto& [id, i] : def) {
+        const Ins& x = ins[i];
+        for (int k = 0; k < 2; ++k)
+            if (x.op == 61 && in_var[k] && w[x.at + 3] == in_var[k]) {
+                if (loads[k]) return false;  // (one load an input)
+                loads[k] = id;
+                tainted.insert(id);
+            }
+    }
+    for (bool more = true; more;) {
+        more = false;
+        for (std::size_t i = body + 1; i < body_end; ++i) {
+            const Ins& x = ins[i];
+            if (!value_op(x.op) || tainted.count(w[x.at + 2])) continue;
+            std::size_t first = 0, end = 0;
+            id_words(x, first, end);
+            for (std::size_t k = first; k < end; ++k) {
+                if (is_id(x, k) && tainted.count(w[x.at + k])) {
+                    tainted.insert(w[x.at + 2]);
+                    more = true;
+                    break;
+                }
+            }
+        }
+    }
+    // What param 1's values come from, of that: the values to compute again.
+    std::unordered_set<std::uint32_t> again;
+    std::vector<std::uint32_t> todo(stores);
+    while (!todo.empty()) {
+        const std::uint32_t id = todo.back();
+        todo.pop_back();
+        const auto d = def.find(id);
+        if (d == def.end() || !tainted.count(id) || !again.insert(id).second) continue;
+        const Ins& x = ins[d->second];
+        std::size_t first = 0, end = 0;
+        id_words(x, first, end);
+        for (std::size_t k = first; k < end; ++k)
+            if (is_id(x, k)) todo.push_back(w[x.at + k]);
+    }
+    if (again.empty()) return false;
+    std::uint32_t bound = w[3];
+    std::unordered_map<std::uint32_t, std::uint32_t> twin;  // value -> its twin
+    for (const std::uint32_t id : again) twin[id] = bound++;
+    std::uint32_t twin_var[2] = {};
+    for (int k = 0; k < 2; ++k)
+        if (loads[k] && again.count(loads[k])) twin_var[k] = bound++;
+    std::vector<std::uint32_t> out(w.begin(), w.begin() + 5);
+    out[3] = bound;
+    for (std::size_t i = 0; i < ins.size(); ++i) {
+        const Ins& x = ins[i];
+        const std::size_t at = out.size();
+        out.insert(out.end(), w.begin() + static_cast<std::ptrdiff_t>(x.at), w.begin() + static_cast<std::ptrdiff_t>(x.at + x.n));
+        if (x.op == 15) {  // OpEntryPoint: the twins in its interface
+            for (const std::uint32_t v : twin_var)
+                if (v) out.push_back(v);
+            out[at] = static_cast<std::uint32_t>(out.size() - at) << 16 | 15;
+        } else if (x.op == 71 && x.n == 4 && w[x.at + 2] == 30) {
+            for (int k = 0; k < 2; ++k)
+                if (twin_var[k] && w[x.at + 1] == in_var[k]) out.insert(out.end(), {4u << 16 | 71, twin_var[k], 30u, 14u + k});
+        } else if (x.op == 59 && x.n >= 4) {
+            for (int k = 0; k < 2; ++k)
+                if (twin_var[k] && w[x.at + 2] == in_var[k]) out.insert(out.end(), {4u << 16 | 59, var_type[in_var[k]], twin_var[k], 1u});
+        } else if (x.op == 62 && i > body && i < body_end && w[x.at + 1] == out_prev) {
+            if (const auto t = twin.find(w[x.at + 2]); t != twin.end()) out[at + 2] = t->second;
+        } else if (i > body && i < body_end && value_op(x.op) && again.count(w[x.at + 2])) {
+            // The twin, next to the value: its operands' twins, an input's load
+            // from the input's twin.
+            const std::size_t t = out.size();
+            out.insert(out.end(), w.begin() + static_cast<std::ptrdiff_t>(x.at), w.begin() + static_cast<std::ptrdiff_t>(x.at + x.n));
+            out[t + 2] = twin[w[x.at + 2]];
+            std::size_t first = 0, end = 0;
+            id_words(x, first, end);
+            for (std::size_t k = first; k < end; ++k) {
+                if (!is_id(x, k)) continue;
+                if (const auto o = twin.find(w[x.at + k]); o != twin.end()) out[t + k] = o->second;
+            }
+            for (int k = 0; k < 2; ++k)
+                if (x.op == 61 && w[x.at + 2] == loads[k]) out[t + 3] = twin_var[k];
+        }
+    }
+    host_log("render: cloth velocity shader %s takes last frame's positions (%zu values computed again)", name.c_str(), again.size());
+    spirv = std::move(out);
+    return true;
+}
+
+// An edited shader the host's own rewrite of this lift sets aside: refused, why.
+void hlsl_override_set_aside(const std::vector<std::uint32_t>& lifted, const std::string& title, std::uint64_t salt, const char* why) {
+    char hash16[24];
+    std::snprintf(hash16, sizeof(hash16), "%016llx", static_cast<unsigned long long>(lift_hash(lifted)));
+    std::shared_ptr<const OverrideSource> src;
+    if (!override_pick(salt, hlsl_stable_name(title), lift_stage_tag(lifted), hash16, src)) return;
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 8) host_log("render: HLSL override %s not used: %s", override_label(*src).c_str(), why);
+    override_outcome(*src, false, why);
+}
+
 void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOptions* to) {
     t_last_deferred = nullptr;
+    t_hlsl_took_override = false;
     std::string name = std::move(t_hlsl_name);  // taken by this lift, whatever happens to it
     t_hlsl_name.clear();
+    const std::uint64_t salt = t_hlsl_salt;  // and the edited shaders its stage's key names (hlsl_name_next)
+    t_hlsl_salt = 0;
+    // An edited shader named by a lift's hash: the program the lift is met for.
+    if (l.ok() && override_fallback_wanted()) override_lift_seen(lift_hash(l.spirv), name);
+    // A cloth's velocity shader keeps its lift, rewritten (no HLSL compile).
+    if (l.ok() && velo_cloth_vs(name)) {
+        const std::vector<std::uint32_t> lift = salt ? l.spirv : std::vector<std::uint32_t>();
+        if (velo_cloth_prev(l.spirv, name)) {
+            if (salt) hlsl_override_set_aside(lift, name, salt, "the host rewrites this shader's lift for the cloth's last positions");
+            return;
+        }
+    }
     if (!hlsl_on() || !l.ok()) return;
     gcn::HlslOptions hopt;
     hopt.title = std::move(name);
@@ -1276,14 +1715,25 @@ void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOpt
         hopt.tess_spacing = to->tess_spacing;
         hopt.tess_cw = to->tess_cw;
     }
+    hlsl_note_met(l.spirv, lift_key, hopt);  // what a changed edited shader is compiled ahead for
     const Dxc& dxc = hlsl_dxc();
     if (!dxc.loaded()) {
         hlsl_keep("DXC not found");
         return;
     }
-    if (std::vector<std::uint32_t> own; hlsl_override(l.spirv, hopt, dxc, own)) {
+    if (std::vector<std::uint32_t> own; velo_rebuilt(l.spirv, hopt, dxc, own)) {
+        if (salt) hlsl_override_set_aside(l.spirv, hopt.title, salt, "rebuilt motion vectors (the Motion vectors setting) replace this shader");
         g_hlsl.taken.fetch_add(1, std::memory_order_relaxed);
         hlsl_remember_lift(own, lift_key, l.spirv);
+        l.spirv = std::move(own);
+        return;
+    }
+    std::shared_ptr<const OverrideSource> src;
+    if (std::vector<std::uint32_t> own; hlsl_override(l.spirv, hopt, dxc, salt, own, src)) {
+        g_hlsl.taken.fetch_add(1, std::memory_order_relaxed);
+        hlsl_remember_lift(own, lift_key, l.spirv, src);
+        t_hlsl_took_override = true;
+        override_note_stage();
         l.spirv = std::move(own);
         return;
     }
@@ -1351,6 +1801,14 @@ void hlsl_stage(gcn::LiftResult& l, const Key* lift_key, const gcn::TranslateOpt
 }
 }  // namespace
 
+bool velo_cloth_vs(const std::string& name) {
+    // GXFlver's cloth _Velo vertex shaders (their matrices in constant buffer 6).
+    static const char* const kCloth[] = {"8bc6ea32", "2b6c1d92", "6242b6f6", "40c7002a", "be79c622"};
+    for (const char* c : kCloth)
+        if (name == c) return true;
+    return false;
+}
+
 void hlsl_counts(std::uint64_t& taken, std::uint64_t& compiled, std::uint64_t& kept, std::string& reasons) {
     taken = g_hlsl.taken.load();
     compiled = g_hlsl.compiled.load();
@@ -1359,7 +1817,91 @@ void hlsl_counts(std::uint64_t& taken, std::uint64_t& compiled, std::uint64_t& k
     for (const auto& [why, n] : g_hlsl.reasons) reasons += why + " x" + std::to_string(n) + "\n";
 }
 void hlsl_lane(int lane) { t_hlsl_lane = lane; }
-void hlsl_name_next(std::string name) { t_hlsl_name = std::move(name); }
+void hlsl_name_next(std::string name, std::uint64_t salt) {
+    t_hlsl_name = std::move(name);
+    t_hlsl_salt = salt;
+}
+bool hlsl_took_override() {
+    const bool took = t_hlsl_took_override;
+    t_hlsl_took_override = false;
+    return took;
+}
+std::string hlsl_file_name(const std::string& program) { return hlsl_stable_name(program); }
+
+int hlsl_override_source(const std::string& shader, std::string& out) {
+    std::string stable, stage, hash16;
+    if (!overrides_on()) return 2;
+    if (!override_parse(shader, stable, stage, hash16)) return 1;
+    std::vector<std::shared_ptr<const HlslMet::Lift>> lifts;
+    {
+        std::lock_guard<std::mutex> lk(g_hlsl_met.mu);
+        if (!stable.empty()) {
+            const auto it = g_hlsl_met.by_program.find(stable.substr(stable.rfind('@') + 1) + "." + stage);
+            if (it != g_hlsl_met.by_program.end()) lifts = it->second;
+        } else {
+            const std::string tail = "." + stage;
+            for (const auto& [id, met] : g_hlsl_met.by_program) {
+                if (id.size() > tail.size() && id.compare(id.size() - tail.size(), tail.size(), tail) == 0)
+                    lifts.insert(lifts.end(), met.begin(), met.end());
+            }
+        }
+    }
+    // The first met of the program's (its bundle entry the name's), or the
+    // variant whose lift's hash the name gives.
+    for (const std::shared_ptr<const HlslMet::Lift>& m : lifts) {
+        if (!stable.empty() && hlsl_stable_name(m->hopt.title) != stable) continue;
+        std::vector<std::uint32_t> words;
+        if (!hlsl_met_words(*m, words)) continue;
+        const std::string hex = lift_hash_hex(words);
+        if (!hash16.empty() && hex != hash16) continue;
+        gcn::HlslOptions titled = m->hopt;
+        titled.title = hlsl_title(m->hopt.title);
+        const gcn::HlslResult h = gcn::emit_hlsl(words, titled);
+        if (!h.ok()) return 1;
+        out = hlsl_dump_text(h.source, hex);
+        return 0;
+    }
+    return 1;
+}
+
+bool override_prepare(const std::shared_ptr<const OverrideSource>& s) {
+    std::string stable, stage, hash16;
+    if (!overrides_on() || !override_parse(s->name, stable, stage, hash16)) return false;
+    HlslAhead::Job job;
+    {
+        std::lock_guard<std::mutex> lk(g_hlsl_met.mu);
+        if (!stable.empty()) {
+            // Its program, by GX's name (after the bundle entry's '@').
+            const auto it = g_hlsl_met.by_program.find(stable.substr(stable.rfind('@') + 1) + "." + stage);
+            if (it != g_hlsl_met.by_program.end()) job.lifts = it->second;
+        } else {
+            // A lift hash's: the stage's lifts of every program, the one with that hash found by its words.
+            const std::string tail = "." + stage;
+            for (const auto& [id, lifts] : g_hlsl_met.by_program) {
+                if (id.size() > tail.size() && id.compare(id.size() - tail.size(), tail.size(), tail) == 0)
+                    job.lifts.insert(job.lifts.end(), lifts.begin(), lifts.end());
+            }
+        }
+    }
+    // Only lifts of the program the name is for (a bundle entry of another name is not its).
+    if (!stable.empty()) {
+        job.lifts.erase(std::remove_if(job.lifts.begin(), job.lifts.end(),
+                                       [&](const std::shared_ptr<const HlslMet::Lift>& m) { return hlsl_stable_name(m->hopt.title) != stable; }),
+                        job.lifts.end());
+    }
+    if (job.lifts.empty()) return false;
+    job.src = s;
+    job.hash16 = hash16;
+    job.by_lift = stable.empty();
+    std::lock_guard<std::mutex> lk(g_hlsl_ahead.mu);
+    g_hlsl_ahead.jobs.push_back(std::move(job));
+    if (!g_hlsl_ahead.started) {
+        g_hlsl_ahead.started = true;
+        std::thread(hlsl_ahead_thread).detach();
+    }
+    g_hlsl_ahead.cv.notify_one();
+    return true;
+}
 void hlsl_set_name_lookup(std::string (*lookup)(const std::string& name)) { g_hlsl_name_lookup.store(lookup); }
 int hlsl_lane_now() { return t_hlsl_lane; }
 void hlsl_set_busy_probe(bool (*busy)()) { g_hlsl_busy.store(busy); }
@@ -1380,27 +1922,29 @@ void hlsl_note_drawn(std::uint64_t stage_key) {
     g_hlsl_behind.by_stage.erase(it);
 }
 
+namespace {
+// The off switch (hlsl_set_overrides): video.shader_overrides, BBHOST_SHADER_OVERRIDES.
+bool g_overrides_switch = true;
+std::string g_overrides_why;
+}  // namespace
+
+void hlsl_set_overrides(bool on, const std::string& why_off) {
+    g_overrides_switch = on;
+    g_overrides_why = why_off;
+}
+
 void hlsl_set_folders(const std::string& bbhost_dir) {
-    if (bbhost_dir.empty() || !hlsl_on()) return;
+    if (bbhost_dir.empty()) return;
+    if (!hlsl_on()) {
+        // The lift alone: edited shaders are listed for the report, never applied.
+        overrides_start(false, "the HLSL path is off (the Shaders setting at Lifted, BBHOST_HLSL=0 or BBHOST_OOB_COUNT)", bbhost_dir);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(g_hlsl_dump_mu);
         g_hlsl_dump_default = (std::filesystem::path(bbhost_dir) / "hlsl-dump").string();
     }
-    const std::string dir = (std::filesystem::path(bbhost_dir) / "shaders").string();
-    std::unordered_map<std::string, std::string> files;
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
-        if (!e.is_regular_file(ec)) continue;
-        const std::string name = e.path().filename().string();
-        if (name.size() <= 5 || name.compare(name.size() - 5, 5, ".hlsl") != 0) continue;
-        files[name.substr(0, name.size() - 5)] = e.path().string();
-    }
-    std::lock_guard<std::mutex> lk(g_hlsl_overrides.mu);
-    g_hlsl_overrides.dir = dir;
-    if (!files.empty()) host_log("render: HLSL overrides: %zu edited shader%s in %s, each compiled at its stage's first use", files.size(),
-                                 files.size() == 1 ? "" : "s", dir.c_str());
-    g_hlsl_overrides.files = std::move(files);
-    g_hlsl_overrides.any.store(!g_hlsl_overrides.files.empty(), std::memory_order_release);
+    overrides_start(g_overrides_switch, g_overrides_why, bbhost_dir);  // <bbhost_dir>/shaders, the player's (host/shader_overrides.h)
 }
 
 gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) {
@@ -1476,7 +2020,7 @@ gcn::LiftResult lift_gs_cached(TranslationUse use, const gcn::Program& prog, con
     h.u32(static_cast<std::uint32_t>(use));
     hash_program(h, prog);
     hash_options(h, o);
-    for (const std::uint32_t v : {gs.es_dwords, gs.max_vertices, gs.vertex_dwords, gs.out_prim}) h.u32(v);
+    for (const std::uint32_t v : {gs.es_dwords, gs.max_vertices, gs.vertex_dwords, gs.out_prim, gs.in_vertices}) h.u32(v);
     h.u32(static_cast<std::uint32_t>(gs.copy.size()));
     for (const gcn::GsCopyOut& c : gs.copy) {
         h.u32(static_cast<std::uint32_t>(c.target) | static_cast<std::uint32_t>(c.comp) << 8 | (c.constant ? 1u << 16 : 0u));
@@ -1684,11 +2228,11 @@ void translation_cache_report() {
                           static_cast<unsigned long long>(g_hlsl_behind.failed.load()), waiting);
             behind = b;
         }
-        if (g_hlsl_overrides.any.load()) {
-            char b[160];
-            std::snprintf(b, sizeof(b), "; edited HLSL (shaders/): %llu files taken, %llu refused",
+        if (override_gen()) {
+            char b[200];
+            std::snprintf(b, sizeof(b), "; edited HLSL: %llu modules compiled and taken, %llu refused (%.1f s compiling)",
                           static_cast<unsigned long long>(g_hlsl_overrides.taken.load()),
-                          static_cast<unsigned long long>(g_hlsl_overrides.refused.load()));
+                          static_cast<unsigned long long>(g_hlsl_overrides.refused.load()), g_hlsl_overrides.compile_us.load() / 1e6);
             behind += b;
         }
         // The pipelines a driver refused while they held DXC's modules, which
@@ -1710,6 +2254,7 @@ void translation_cache_report() {
                  static_cast<unsigned long long>(g_hlsl_lift_of.refused_again.load()),
                  static_cast<unsigned long long>(g_hlsl_lift_of.lift_again.load()));
     }
+    for (const std::string& line : overrides_report()) host_log("%s", line.c_str());  // every edited shader and what became of it
     if (!g_tc_enabled) return;
     std::size_t entries = 0;
     std::uint64_t bytes = 0;
