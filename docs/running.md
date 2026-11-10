@@ -538,13 +538,17 @@ frame a second (59.94 Hz runs 60), run as that rate - its target, its steps, its
 immediates and frame counts, 1/180 s each on a 180 Hz display, V-Sync on or
 off - and 60 when no display says a rate (headless). What counts frames cannot
 follow the frame's time, so a rate that moved with it (the Uncapped of earlier
-builds) ran those too fast or too slow.
+builds) ran those too fast or too slow. With frame generation on (Windows), the
+game's own frames are held to half the refresh rate at most and the frames
+between them are generated: Display-Limited then runs the game at half the
+refresh rate and shows the refresh rate (90 + 90 at 180 Hz), and a listed or
+Custom rate above half comes down to it as frame generation turns on.
 Custom limit, the tick box beside Frame rate (the setup window's Display card
 and F10's alike), runs the game at a number the player types instead, 30 to
 960 (45 runs it at 45, converted as the listed rates are); with frame
-generation on, twice as many frames are shown (45 shows 90). The file keeps it
-as `frame_cap_custom` and `frame_cap_custom_fps`; a rate picked from a list
-(the game's own System menu) unticks it.
+generation on (Windows), twice as many frames are shown (45 shows 90). The
+file keeps it as `frame_cap_custom` and `frame_cap_custom_fps`; a rate picked
+from a list (the game's own System menu) unticks it.
 Above 30 the game's step is the frame's measured time (at most 1/30 s), and the
 places that stepped a fixed 1/30 s a frame - physics, enemy AI, ragdolls,
 grass, the camera's easing, momentum, fades - follow it, so the game runs at
@@ -672,7 +676,9 @@ the 300-flip report: how many frames began between one pass and the next.
 
 `BBHOST_GAME_FPS=30|60|...|960|0` overrides the setting for a run (any rate
 from 30 to 960, 0 is Display-Limited), `BBHOST_UNCAPPED_FPS=N` sets Display-Limited's rate (30-960) whatever
-the display says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
+the display says, `BBHOST_TEST_REFRESH_HZ=<hz>` (a test switch, 20-1000) makes every refresh rate asked read
+that rate - the desktop's and the window's display's - so Display-Limited, frame generation's half-refresh
+limit and the flip clock run as on such a monitor (an RDP session's display says 32 Hz), and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
 game steps by and values written from it. `BBHOST_TEST_FPS_SWING` (a test
 switch, at the converted rates) moves the target while the game runs:
 `square:LO:HI:S` alternates LO and HI fps every S seconds, `random:LO:HI:S` picks

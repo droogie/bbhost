@@ -235,8 +235,14 @@ Setting g_set[kSettingCount] = {
     // game's own 30 the game is converted then, and a converted game taken to
     // 30 stays converted.
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "150", "180", "240", "360", "480", "960", "Display-Limited"}, 0,
+#if defined(_WIN32)
+     "30 is the game's own pace; the others run its logic at that rate. Display-Limited runs it at your monitor's refresh "
+     "rate (180 on a 180 Hz monitor); with Frame generation on, at half of it, the frames between generated (90 + 90 at "
+     "180 Hz). Changes at once.",
+#else
      "30 is the game's own pace; the others run its logic at that rate. Display-Limited runs it at your monitor's refresh "
      "rate (180 on a 180 Hz monitor). Changes at once.",
+#endif
      true},
     // Frame rate's Custom limit, its tick box and its number, drawn in Frame
     // rate's row (frame_rate_control) and not rows of their own: ticked, the
@@ -542,7 +548,7 @@ Setting g_set[kSettingCount] = {
     {"frame_generation", "Frame generation", {"Off", "On"}, 0,
      "AMD FidelityFX frame generation: a frame made between each two of the game's, from the 3D alone - "
      "the HUD and the menus are never interpolated. Works with any Upscaling choice, Off included, on any GPU. "
-     "While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Loading screens stay uncapped. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
+     "While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Display-Limited runs the game at half the refresh rate and generates the frames between. Loading screens stay uncapped. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
      false},
     // Where the upscaler's motion for what moves of itself comes from
     // (host/upscale_pass.cpp): the game's motion blur velocity map, or the
@@ -2129,13 +2135,21 @@ bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
     static std::vector<std::string>* names = new std::vector<std::string>();
     static std::vector<const char*> items, tips;
     if (items.empty()) {
+        // Display-Limited's own; frame generation's half on Windows alone,
+        // where frame generation is (no row elsewhere).
+        static const char* const kDisplayLimitedTip =
+            "Caps the frame rate at your monitor's refresh rate, read when the game starts: 180 fps on a 180 Hz monitor, "
+            "144 on a 144 Hz one."
+#if defined(_WIN32)
+            " With Frame generation on, the game runs at half of it and the frames between are generated: 90 + 90 at "
+            "180 Hz."
+#endif
+            ;
         const Setting& f = g_set[kFrameCap];
         for (const char* v : f.values) names->push_back(fps_from_label(v) ? std::string(v) + " fps" : std::string(v));
         for (std::size_t v = 0; v < f.values.size(); ++v) {
             items.push_back((*names)[v].c_str());
-            tips.push_back(fps_from_label(f.values[v]) ? nullptr
-                                                       : "Caps the frame rate at your monitor's refresh rate, read when the game "
-                                                         "starts: 180 fps on a 180 Hz monitor, 144 on a 144 Hz one.");
+            tips.push_back(fps_from_label(f.values[v]) ? nullptr : kDisplayLimitedTip);
         }
     }
     const ImGuiStyle& st = ImGui::GetStyle();
@@ -2630,10 +2644,12 @@ const char* const kHostShaderModeTips[2] = {
 };
 
 const char* const kHostFrameRateCustomNote =
-    "Tick to type your own frame rate, 10 to 960: the game is capped at exactly that rate (45 runs it at 45). With "
-    "Frame generation on, twice as many frames are shown (45 shows 90), so the rate is at most half your refresh rate "
-    "(90 at 180 Hz). Unticked, Frame rate's list is used. Changes at once between rates above 30; to or from 30 needs "
-    "a restart.";
+    "Tick to type your own frame rate, 10 to 960: the game is capped at exactly that rate (45 runs it at 45). "
+#if defined(_WIN32)
+    "With Frame generation on, twice as many frames are shown (45 shows 90), so the rate is at most half your refresh "
+    "rate (90 at 180 Hz). "
+#endif
+    "Unticked, Frame rate's list is used. Changes at once between rates above 30; to or from 30 needs a restart.";
 const char* const kHostEffectTimingLabels[3] = {"30 fps", "60 fps", "Frame rate-dependent"};
 const char* const kHostEffectTimingNote =
     "How fire, blood, magic and the flicker of lamps and candles keep time above 30 fps. Changes at once.";
