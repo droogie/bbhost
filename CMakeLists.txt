@@ -244,12 +244,12 @@ add_custom_target(bbhost_translator_fingerprint
   BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/translator_fingerprint.h)
 add_dependencies(bbhost bbhost_translator_fingerprint)
 
-# The Windows exe's icon and version details.
+# The Windows exe's icon, manifest (UTF-8 as its code page) and version details.
 if(WIN32)
   enable_language(RC)
   target_sources(bbhost PRIVATE res/bbhost.rc)
   set_source_files_properties(res/bbhost.rc PROPERTIES
-    OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/res/bbhost.ico;${CMAKE_BINARY_DIR}/gen/bbhost_version.h")
+    OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/res/bbhost.ico;${CMAKE_SOURCE_DIR}/res/bbhost.manifest;${CMAKE_BINARY_DIR}/gen/bbhost_version.h")
 endif()
 
 # The example plugins (examples/plugins, include/bbhost_plugin.h): built beside

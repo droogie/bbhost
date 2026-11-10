@@ -932,6 +932,12 @@ int main(int argc, char** argv) {
                      static_cast<double>(ms.ullTotalPageFile) / kGiB, static_cast<double>(ms.ullAvailPageFile) / kGiB);
         }
     }
+    // The manifest (res/bbhost.manifest) makes UTF-8 the code page every
+    // narrow path is in; a Windows 10 before version 1903 leaves the old one.
+    if (const UINT cp = GetACP(); cp != CP_UTF8) {
+        host_log("paths: Windows runs bbhost in code page %u, not UTF-8 (that needs Windows 10 version 1903 or later): "
+                 "a user or folder name outside ASCII can stop it", cp);
+    }
     host_timing_init();  // 1 ms timer resolution and no power throttling from here on (core/host_clock.h)
     {
         // The process's standing with Windows' schedulers, left as Windows
