@@ -9801,6 +9801,10 @@ GpuHandles host_gpu_handles() {
 void host_gpu_lock() { g.mu.lock(); }
 bool host_gpu_device_lost() { return g_device_lost.load(std::memory_order_acquire); }
 void host_gpu_unlock() { g.mu.unlock(); }
+std::string host_gpu_lock_holder() {
+    void* const site = gpu::g.mu.holder();
+    return site ? GpuMutex::name_of(site) : std::string("none");
+}
 void host_gpu_queue_lock() {
     slow_calls::Scope timed(kHostQueueLockSite);
     queue_drain();
@@ -12479,7 +12483,13 @@ std::string host_gpu_video_memory_report(bool at_exit) {
     return gpu::video_memory_report_locked(at_exit);
 }
 
-void host_gpu_memory_census_refresh() { (void)host_gpu_video_memory_report(false); }
+bool host_gpu_memory_census_refresh() {
+    if (!gpu::g.ok || !gpu::vram_report_on()) return true;  // nothing to run
+    std::unique_lock<GpuMutex> lock(gpu::g.mu, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    (void)gpu::video_memory_report_locked(false);
+    return true;
+}
 
 bool host_gpu_memory_glance(GpuMemoryGlance& out) {
     using namespace gpu;

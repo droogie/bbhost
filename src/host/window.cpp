@@ -2630,16 +2630,17 @@ bool host_window_pump() {
         // counts as shared GPU memory, so the two read beside Task Manager's
         // dedicated and shared columns (docs/running.md). Read once a second;
         // the cache from the video memory census, run here every 30 s (2-3 ms
-        // under the renderer's lock).
+        // under the renderer's lock) - when that lock is free: this thread
+        // never waits for it, and tries again the next second.
         static char text[96] = "";
         static std::uint64_t read_at = 0, census_at = 0;
         const std::uint64_t now = host_clock_monotonic_ns();
         if (!read_at || now - read_at >= 1'000'000'000ull) {
             read_at = now;
-            const bool census = !census_at || now - census_at >= 30'000'000'000ull;
+            bool census = !census_at || now - census_at >= 30'000'000'000ull;
             if (census) {
-                census_at = now;
-                host_gpu_memory_census_refresh();
+                census = host_gpu_memory_census_refresh();
+                if (census) census_at = now;
             }
             GpuMemoryGlance m;
             text[0] = '\0';

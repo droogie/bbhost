@@ -58,7 +58,7 @@ bool host_gpu_counter_copy(std::uint64_t, std::uint64_t, std::size_t) { return f
 bool host_gpu_counter_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 void host_gpu_import_prefetch(std::uint64_t, std::uint64_t, std::uint8_t, std::uint8_t) {}
 bool host_gpu_memory_glance(GpuMemoryGlance&) { return false; }
-void host_gpu_memory_census_refresh() {}
+bool host_gpu_memory_census_refresh() { return false; }
 void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us) {
     if (n) *n = 0;
     if (us) *us = 0;
@@ -137,4 +137,5 @@ void host_gpu_set_compile_session(bool) {}
 HostShaderCompileProgress host_gpu_compile_progress() { return {}; }
 void host_gpu_compile_cancel() {}
 std::string host_gpu_device_identity() { return {}; }
+std::string host_gpu_lock_holder() { return "none"; }
 int host_gpu_stream_selftest(int) { return 2; }  // no Vulkan: nothing to test

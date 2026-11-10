@@ -3,6 +3,8 @@
 #include "core/portable.h"
 #include "core/thunk.h"
 #include "hle/modules.h"
+#include "host/framegen.h"
+#include "host/gpu.h"
 #include "log.h"
 
 #include <algorithm>
@@ -288,6 +290,8 @@ void sampler_recover() {
 }
 
 void sampler_note_main_thread() { g_main_tid.store(static_cast<int>(syscall(SYS_gettid))); }
+void sampler_note_pump() {}
+void sampler_note_exit(const char*) {}
 
 namespace {
 // The SIGPROF handler, installed once for the sampler and the watchdog, with
@@ -932,6 +936,21 @@ void log_all_threads(const char* why) {
 void sampler_recover() {}
 void sampler_note_main_thread() { g_main_tid.store(GetCurrentThreadId()); }
 
+namespace {
+// When the window's thread last pumped its messages (GetTickCount64, ms); 0
+// before the first.
+std::atomic<std::uint64_t> g_pump_ms{0};
+// The exit's step now and since when (sampler_note_exit); null before the exit.
+std::atomic<const char*> g_exit_step{nullptr};
+std::atomic<std::uint64_t> g_exit_step_ms{0};
+}  // namespace
+
+void sampler_note_pump() { g_pump_ms.store(GetTickCount64(), std::memory_order_relaxed); }
+void sampler_note_exit(const char* step) {
+    g_exit_step_ms.store(GetTickCount64(), std::memory_order_relaxed);
+    g_exit_step.store(step, std::memory_order_release);
+}
+
 static int g_watchdog_ticks = 0;  // the watchdog thread's alone
 void sampler_watchdog_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {
     if (!g_guest_lo) {
@@ -948,6 +967,10 @@ void sampler_watchdog_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {
         host_thread_set_name("bb-watchdog");
         std::uint64_t last_flip = hle_video_flip_count();
         int still_s = 0, dumps = 0;
+        bool pump_told = false;
+        const char* exit_told = nullptr;  // the exit's step last told stalled, and since when
+        std::uint64_t exit_told_ms = 0;
+        bool exit_dumped = false;
         // BBHOST_STACKS_FILE=<path>: when that file appears, every thread's
         // stack goes to the log and the file is deleted - for a hang that
         // still draws frames, which the no-flip check below never sees.
@@ -959,6 +982,55 @@ void sampler_watchdog_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {
                 log_all_threads("requested");
             }
             if (stacks_file && ++g_watchdog_ticks % 4) continue;
+            // The window's thread: 4 s without its messages looked at, a
+            // second before Windows says "Not Responding" (sampler_note_pump).
+            const std::uint64_t pumped = g_pump_ms.load(std::memory_order_relaxed);
+            const std::uint64_t now_ms = GetTickCount64();
+            // Ending: the window is pumped between the exit's steps (main.cpp
+            // exit_step), so a stall is one step standing still - one line for
+            // it, the stacks only past 30 s.
+            if (const char* const step = g_exit_step.load(std::memory_order_acquire)) {
+                const std::uint64_t moved = std::max(pumped, g_exit_step_ms.load(std::memory_order_relaxed));
+                if (now_ms > moved + 4000) {
+                    if (step != exit_told || moved != exit_told_ms) {
+                        exit_told = step;
+                        exit_told_ms = moved;
+                        double present_s = 0.0;
+                        const char* const present = host_present_step(present_s);
+                        host_log("watchdog: the exit at %s for %.1f s, the window's messages not looked at meanwhile (the presenting thread "
+                                 "is %s; the renderer's lock is held by %s)",
+                                 step, static_cast<double>(now_ms - moved) / 1000.0, present, host_gpu_lock_holder().c_str());
+                    }
+                    if (now_ms > moved + 30000 && !exit_dumped) {
+                        exit_dumped = true;
+                        log_all_threads("the exit stood still for 30 s");
+                    }
+                }
+                continue;
+            }
+            if (pumped && now_ms > pumped + 4000) {
+                if (!pump_told && dumps < 6) {
+                    ++dumps;
+                    // What the presenting thread is in, in AMD's frame
+                    // generation swapchain or not, and who holds the
+                    // renderer's lock: the threads a stopped window most
+                    // likely waits behind.
+                    double present_s = 0.0, amd_s = 0.0;
+                    const char* const step = host_present_step(present_s);
+                    const char* const amd = framegen_in_call(amd_s);
+                    char in_amd[96] = "";
+                    if (amd) std::snprintf(in_amd, sizeof(in_amd), "; in AMD's swapchain %s for %.1f s", amd, amd_s);
+                    host_log("watchdog: the window's messages not looked at for %.1f s (flip %llu): the presenting thread is %s (%.1f s)%s; "
+                             "the renderer's lock is held by %s",
+                             static_cast<double>(now_ms - pumped) / 1000.0, static_cast<unsigned long long>(hle_video_flip_count()), step,
+                             present_s, in_amd, host_gpu_lock_holder().c_str());
+                    log_all_threads("the window's messages not looked at");
+                }
+                pump_told = true;
+            } else if (pump_told && pumped) {
+                host_log("watchdog: the window's messages looked at again");
+                pump_told = false;
+            }
             const std::uint64_t flip = hle_video_flip_count();
             if (flip != last_flip) {
                 if (still_s >= stall_s) host_log("watchdog: flips again after %d s (flip %llu)", still_s, static_cast<unsigned long long>(flip));
@@ -970,7 +1042,13 @@ void sampler_watchdog_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {
             // A stall: said every 5 s, and every thread's stack at its start
             // and 30 s on (at most six dumps a run).
             if (still_s >= stall_s && (still_s - stall_s) % 5 == 0) {
-                host_log("watchdog: no flip for %d s (flip %llu)", still_s, static_cast<unsigned long long>(flip));
+                double present_s = 0.0, amd_s = 0.0;
+                const char* const step = host_present_step(present_s);
+                const char* const amd = framegen_in_call(amd_s);
+                char in_amd[96] = "";
+                if (amd) std::snprintf(in_amd, sizeof(in_amd), "; in AMD's swapchain %s for %.1f s", amd, amd_s);
+                host_log("watchdog: no flip for %d s (flip %llu): the presenting thread is %s (%.1f s)%s; the renderer's lock is held by %s",
+                         still_s, static_cast<unsigned long long>(flip), step, present_s, in_amd, host_gpu_lock_holder().c_str());
             }
             if ((still_s == stall_s || still_s == stall_s + 30) && dumps < 6) {
                 ++dumps;
