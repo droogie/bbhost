@@ -1,5 +1,6 @@
 #include "hle/common.h"
 #include "hle/np.h"
+#include "hle/np_score.h"
 #include "hle/fs.h"
 #include "hle/platform.h"
 #if !defined(_WIN32)
@@ -1191,7 +1192,25 @@ GUEST_ABI int hle_score_offline() {
     }
     return kScoreErrOffline;
 }
-GUEST_ABI int hle_score_comment_ok(int, const char*) { return 0; }
+// sceNpScoreCensorComment(reqId, comment, option): 0, nothing to censor. The
+// game asks it of a new character's name (sub_10d0720 refuses the name on
+// SCE_NP_COMMUNITY_SERVER_ERROR_CENSORED); the private server has no word
+// filter, so every name passes.
+GUEST_ABI int hle_score_censor_comment(int, const char* comment, void*) {
+    return comment ? 0 : np_score::kErrInvalidArgument;
+}
+// sceNpScoreSanitizeComment(reqId, comment, sanitizedComment, option): the
+// text back in sanitizedComment (hle/np_score.h). The game's own character
+// name goes through it before it is sent to the other players, who show it
+// when Player Name Display is "Name": an answer that leaves the buffer empty
+// sends the name empty, and they show this player blank.
+GUEST_ABI int hle_score_sanitize_comment(int, const char* comment, char* sanitized, void*) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        host_log("HLE fake: sceNpScoreSanitizeComment gives the text back as it came (the private server has no word filter)");
+    }
+    return np_score::sanitize_copy(comment, sanitized);
+}
 
 // Mouse: no device yet. Open hands out a handle; Read reports no data.
 GUEST_ABI int hle_mouse_init() { return 0; }
@@ -2262,8 +2281,8 @@ void hle_register_system() {
     REG("sceNpScoreRecordScore", hle_score_offline);
     REG("sceNpScoreGetBoardInfo", hle_score_offline);
     REG("sceNpScoreRecordGameData", hle_score_offline);
-    REG("sceNpScoreCensorComment", hle_score_comment_ok);
-    REG("sceNpScoreSanitizeComment", hle_score_comment_ok);
+    REG("sceNpScoreCensorComment", hle_score_censor_comment);
+    REG("sceNpScoreSanitizeComment", hle_score_sanitize_comment);
     REG("sceMouseInit", hle_mouse_init);
     REG("sceMouseOpen", hle_mouse_open);
     REG("sceMouseClose", hle_mouse_close);
