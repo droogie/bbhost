@@ -83,12 +83,64 @@ namespace {
 // window's thread (g_exit_pumps set there) the window is pumped between them,
 // so a long exit reads "Not Responding" only while one step is stuck.
 std::atomic<bool> g_exit_pumps{false};
+std::atomic<const char*> g_exit_at{nullptr};  // the exit's step now, for its deadline's line
 void exit_step(const char* step) {
+    g_exit_at.store(step, std::memory_order_relaxed);
     sampler_note_exit(step);
     if (g_exit_pumps.load(std::memory_order_relaxed)) {
         sampler_note_pump();
         host_window_pump();
     }
+}
+
+// Saves first: an exit waits while the game has a save mounted for writing
+// (its threads keep running, so the write ends), up to 30 s - a mount still
+// open then is a save thread stuck itself. Nothing here waits on the
+// renderer, the GPU or the driver. `pump`: on the window's thread, its
+// messages go on being read (exit_step).
+void exit_wait_for_saves(bool pump) {
+    for (int i = 0; i < 300 && hle_save_writable_mounts() > 0; ++i) {
+        if (pump) exit_step("waiting for a save to be written");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (hle_save_writable_mounts() > 0) host_log("exit: a save still mounted for writing after 30 s; ending without waiting more");
+}
+
+// The exit's deadline. A present stuck in the graphics driver holds the
+// renderer's lock, the presenting thread and the driver's own lock for good
+// (a freeze on a laptop, 11-10: AMD's frame generation presenter inside
+// NVIDIA's present), and the exit's later steps wait on one of them - the
+// pipeline cache's save (the driver), the reports (the renderer's lock), the
+// window's end (the presenting thread, AMD's swapchain, the device). Past
+// `seconds` the rest is skipped: a helper waits for saves once more and ends
+// the process. What a skip loses: the pipeline cache since its last periodic
+// save (written whole or not at all), the reports, the window's orderly end.
+void exit_deadline(int code, double seconds) {
+    std::thread([code, seconds] {
+        std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+        const char* at = g_exit_at.load(std::memory_order_relaxed);
+        host_log("exit: not done %.0f s on, at %s - the rest skipped (the renderer, the GPU or the driver is stuck), saves first, then the end",
+                 seconds, at ? at : "its start");
+        exit_wait_for_saves(false);
+        std::fflush(nullptr);
+#if defined(_WIN32)
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
+        _exit(code);
+    }).detach();
+}
+
+// BBHOST_TEST_EXIT_STALL=1 (a test switch): the exit's start takes the
+// renderer's lock on a thread of its own and keeps it - as a present stuck in
+// the driver does - so the deadline has steps to skip.
+void exit_test_stall() {
+    if (!std::getenv("BBHOST_TEST_EXIT_STALL")) return;
+    host_log("exit: BBHOST_TEST_EXIT_STALL - the renderer's lock taken for good (a test switch)");
+    std::thread([] {
+        host_gpu_lock();
+        for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+    }).detach();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 }
 }  // namespace
 
@@ -164,6 +216,9 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
             if (windowed) sampler_note_pump();  // the watchdog's "Not Responding" stacks (host/sampler.h)
             if (windowed && !host_window_pump()) {
                 host_log("window closed");
+                exit_wait_for_saves(true);
+                exit_deadline(0, 15.0);
+                exit_test_stall();
                 exit_step("perf_meter_exit (the window closed)");
                 perf_meter_exit();
                 exit_step("saving the pipeline cache (the window closed)");
@@ -174,6 +229,12 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 host_window_stop();
                 exit_step("write_pgo_profile (the window closed)");
                 write_pgo_profile();
+                std::fflush(nullptr);
+#if defined(_WIN32)
+                // Not ExitProcess (what _exit is here): it detaches every DLL
+                // under the loader lock, and a driver thread inside one hangs it.
+                TerminateProcess(GetCurrentProcess(), 0);
+#endif
                 _exit(0);
             }
             if (fault_flip && hle_video_flip_count() >= fault_flip) {
@@ -199,6 +260,9 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 // processor may hold), the process just ends.
                 host_log("exit: flip %llu reached (BBHOST_EXIT_FLIP)", static_cast<unsigned long long>(exit_flip));
                 g_exit_pumps.store(windowed);
+                exit_wait_for_saves(windowed);
+                exit_deadline(0, 30.0);
+                exit_test_stall();
                 exit_reports();
                 // The cache save takes the GPU lock, which the command
                 // processor (still running) may hold for good: a helper
@@ -364,11 +428,10 @@ void device_lost_exit(bool windowed) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
-    // A save being written finishes first (up to 10 s).
-    for (int i = 0; i < 100 && hle_save_writable_mounts() > 0; ++i) {
-        exit_step("waiting for a save to be written");
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+    // A save being written finishes first.
+    exit_wait_for_saves(windowed);
+    exit_deadline(3, 20.0);
+    exit_test_stall();
     exit_reports();
     // The pipelines built so far, for a quicker next start: the save takes the
     // GPU lock a stuck thread may hold, so a helper does it, waited for 5 s.

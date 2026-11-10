@@ -280,6 +280,8 @@ const bool g_present_on_arrival = [] {
 //                         anything in the world, however late it arrives
 //   exit                  end the run as BBHOST_EXIT_SECONDS does (the exit
 //                         reports, then the caches saved): a harness's tour is done
+//   quit                  close the window as the game's Quit Game does (the
+//                         player's way out: main.cpp's window-closed exit)
 // A thread of its own (bb-test-req) reads the folder ten times a second and
 // queues what it finds; the flips carry the queue out. Read on the flip, the
 // folder held the flip clock whenever the file system was slow to answer: on
@@ -413,6 +415,9 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
         } else if (verb == "exit") {
             host_log("test: exit asked for at flip %llu", static_cast<unsigned long long>(count));
             g_test_exit.store(true);
+        } else if (verb == "quit") {
+            host_log("test: the window's close asked for at flip %llu", static_cast<unsigned long long>(count));
+            host_window_request_quit();
         } else if (verb == "capture" && !arg.empty()) {
             const int n = std::atoi(arg.c_str());
             host_gpu_capture_arm(n, arg2.c_str());
