@@ -14,6 +14,7 @@
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/overlay.h"
+#include "host/trophy_toast.h"
 #include "host/perf_meter.h"
 #include "host/present_pass.h"
 #include "host/ingame_menu.h"
@@ -2888,6 +2889,9 @@ bool host_window_pump() {
         float mx = 0.0f, my = 0.0f;
         if (ours && host_mouse_position(mx, my)) host_overlay_cursor(mx, my);
     }
+    // Trophy popups (host/trophy_toast.h), in the display buffer's pixels.
+    host_trophy_toast_draw(g_display_w ? static_cast<float>(g_display_w) : 1920.0f,
+                           g_display_h ? static_cast<float>(g_display_h) : 1080.0f);
     // The frame's overlay, whole, to the presenter: a present never sees one
     // half rebuilt. Nothing on it (no counter, pointer, box or screen) and the
     // presenter's pass draws nothing over the picture.

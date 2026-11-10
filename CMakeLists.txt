@@ -103,6 +103,7 @@ add_executable(bbhost
   src/engine/image_text.cpp
   src/core/sha256.cpp
   src/core/sfo.cpp
+  src/core/trophy_pack.cpp
   src/core/image_file.cpp
   src/host/tess_lds.cpp
   src/host/gs_emit_gate.cpp
@@ -167,6 +168,7 @@ add_executable(bbhost
   src/host/window.cpp
   src/host/text_entry.cpp
   src/host/overlay.cpp
+  src/host/trophy_toast.cpp
   src/host/present_pass.cpp
   src/host/ingame_menu.cpp
   src/host/controls_page.cpp
@@ -815,6 +817,26 @@ if(UNIX)
   target_include_directories(image_file_test PRIVATE src)
   target_link_libraries(image_file_test PRIVATE ZLIB::ZLIB)
   add_test(NAME image_file_test COMMAND image_file_test)
+  # core/trophy_pack.cpp against a made-up trophy00.trp (tests/make_trophy_test_pack.py).
+  add_executable(trophy_pack_test tests/trophy_pack_test.cpp src/core/trophy_pack.cpp)
+  target_include_directories(trophy_pack_test PRIVATE src tests)
+  target_link_libraries(trophy_pack_test PRIVATE ZLIB::ZLIB)
+  add_test(NAME trophy_pack_test COMMAND trophy_pack_test)
+  # host/trophy_toast.cpp's text and drawing against a recording stand-in for the
+  # overlay, a scenario to a run (the popup shows one trophy at a time).
+  if(TARGET Vulkan::Headers)
+    add_executable(trophy_toast_test tests/trophy_toast_test.cpp src/host/trophy_toast.cpp src/core/trophy_pack.cpp)
+    target_include_directories(trophy_toast_test PRIVATE src tests)
+    target_link_libraries(trophy_toast_test PRIVATE ZLIB::ZLIB Vulkan::Headers)
+    add_test(NAME trophy_toast_nopack COMMAND trophy_toast_test nopack)
+    add_test(NAME trophy_toast_pack COMMAND trophy_toast_test pack)
+    add_test(NAME trophy_toast_noicon COMMAND trophy_toast_test noicon)
+    add_test(NAME trophy_toast_testmode COMMAND trophy_toast_test testmode)
+    add_test(NAME trophy_toast_testmode_nopack COMMAND trophy_toast_test testmode_nopack)
+    foreach(room 100000 1700 1000)
+      add_test(NAME trophy_toast_room_${room} COMMAND trophy_toast_test room ${room})
+    endforeach()
+  endif()
   add_executable(config_test tests/config_test.cpp src/core/config.cpp src/core/config_move.cpp src/core/sfo.cpp)
   target_include_directories(config_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_compile_definitions(config_test PRIVATE CONFIG_MUTANTS)  # the play-log migration's mutants

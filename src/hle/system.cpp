@@ -17,11 +17,13 @@
 #include "host/ingame_menu.h"
 #include "host/options.h"
 #include "host/settings.h"
+#include "host/trophy_toast.h"
 #include "host/window.h"
 #include "net/account.h"
 #include "net/session.h"
 #include "core/config.h"
 #include "core/sfo.h"
+#include "core/trophy_pack.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1055,6 +1057,27 @@ GUEST_ABI int hle_save_dialog_open(const void*) {
 }
 GUEST_ABI int hle_save_dialog_update() { return 3; }  // SCE_COMMON_DIALOG_STATUS_FINISHED
 
+// The trophy names come from the game's own trophy00.trp. Its text is
+// encrypted with a key the player supplies: BBHOST_TROPHY_KEY, or the file
+// <data>/trophy_key.txt (next to trophies.txt). No key is bundled.
+std::string trophy_key_hex() {
+    if (const char* e = std::getenv("BBHOST_TROPHY_KEY"); e && *e) return e;
+    std::FILE* f = std::fopen(hle_fs_map_path("/data/trophy_key.txt").c_str(), "r");
+    if (!f) return {};
+    char buf[128] = {};
+    const std::size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    return std::string(buf, n);
+}
+void trophy_pack_load_for_game() {
+    std::string err;
+    if (trophy_pack_load(hle_fs_map_path("/app0/sce_sys/trophy/trophy00.trp"),
+                         hle_fs_map_path("/app0/sce_sys/npbind.dat"), trophy_key_hex(), &err)) {
+        host_log("trophies: %zu trophy names read from the game's trophy00.trp", trophy_pack_count());
+    } else {
+        host_log("trophies: no trophy names (%s); popups only say a trophy was unlocked", err.c_str());
+    }
+}
 int g_trophy_ctx = 1;
 int g_trophy_handle = 1;
 GUEST_ABI int hle_trophy_ctx(int* ctx, int, unsigned, std::uint64_t) {
@@ -1110,6 +1133,7 @@ GUEST_ABI int hle_trophy_unlock(int ctx, int handle, int id, int* platinum_id) {
         std::fclose(f);
     }
     host_log("sceNpTrophyUnlockTrophy ctx=%d handle=%d id=%d", ctx, handle, id);
+    host_trophy_toast_push(id);
     return 0;
 }
 // SceNpTrophyGameDetails { size, numGroups, numTrophies, numPlatinum, numGold, numSilver, numBronze, title[128], description[1024] }
@@ -1140,12 +1164,25 @@ GUEST_ABI int hle_trophy_game_info(int, int, std::uint8_t* details, std::uint8_t
 // SceNpTrophyData { size, trophyId, unlocked, reserved[3], timestamp }
 GUEST_ABI int hle_trophy_info(int, int, int id, std::uint8_t* details, std::uint8_t* data) {
     if (details) {
+        TrophyInfo ti;
+        const bool have = trophy_pack_find(id, &ti);
+        std::uint64_t size = 0;
+        std::memcpy(&size, details, 8);  // the game's own size for its struct
         std::memset(details + 8, 0, 0x490 - 8);
         std::int32_t* d = reinterpret_cast<std::int32_t*>(details + 8);
         d[0] = id;
-        d[1] = 4;  // bronze
+        d[1] = have ? trophy_grade_code(ti.grade) : 4;  // 1 platinum .. 4 bronze
         d[2] = 0;
-        std::snprintf(reinterpret_cast<char*>(details + 24), 127, "Trophy %d", id);
+        details[20] = have && ti.hidden ? 1 : 0;
+        if (have) {
+            std::snprintf(reinterpret_cast<char*>(details + 24), 128, "%s", ti.name.c_str());
+            if (size > 152) {
+                const std::size_t room = static_cast<std::size_t>(std::min<std::uint64_t>(1024, size - 152));
+                std::snprintf(reinterpret_cast<char*>(details + 152), room, "%s", ti.detail.c_str());
+            }
+        } else {
+            std::snprintf(reinterpret_cast<char*>(details + 24), 127, "Trophy %d", id);
+        }
     }
     if (data) {
         std::int64_t when = 0;
@@ -1247,6 +1284,7 @@ GUEST_ABI int hle_npauth_get_code(int, const void*, char* code, int* issuer) {
 
 GUEST_ABI int hle_trophy_register(int ctx, int, std::uint64_t, void*) {
     host_log("sceNpTrophyRegisterContext ctx=%d", ctx);
+    trophy_pack_find(0, nullptr);  // reads the trophy pack now, so its log line shows at start
     return 0;
 }
 
@@ -2135,6 +2173,7 @@ void hle_np_set_online_id(const char* id) {
 }
 
 void hle_register_system() {
+    trophy_pack_set_loader(trophy_pack_load_for_game);
 #define REG(name, fn) register_hle_fn(name, reinterpret_cast<void*>(fn))
     REG("sceSysmoduleLoadModule", hle_sysmodule_load);
     REG("sceSysmoduleUnloadModule", hle_sysmodule_unload);
