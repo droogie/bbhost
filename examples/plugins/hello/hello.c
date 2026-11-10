@@ -6,8 +6,9 @@
  * on_frame and, once the params have loaded, reads a field of one by the
  * game's own name; with version 3, once a character is loaded, its level and
  * echoes and an event flag; with version 4, the first flags the world
- * changes; with version 5, where the player and the camera are. Built as
- * build/plugins/hello.so (hello.dll).
+ * changes; with version 5, where the player and the camera are. Built beside
+ * bbhost as build/hello.so (hello.dll), never into build/plugins/: copy it
+ * into a plugins/ folder to load it.
  *
  * A host only ever appends to its API: check that `version` is at least the
  * one whose calls you make, not that it is equal. */

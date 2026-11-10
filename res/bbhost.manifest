@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!-- bbhost.exe's manifest (res/bbhost.rc). UTF-8 as the process's code page
+       (Windows 10 version 1903 and later): the narrow strings Windows hands
+       bbhost - the environment, the command line, the exe's own path - are
+       UTF-8, and so are the ones it hands back to Windows, as std::filesystem
+       and every text bbhost keeps (its config, SDL's) take them to be. Without
+       it a user or folder name outside ASCII stopped bbhost at its start. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

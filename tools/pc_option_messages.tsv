@@ -36,7 +36,7 @@
 110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Additions to the game, each for the next start: the mirror, rebirth, five players and more.
-110014	PC Upscaling	TAA, FSR, DLSS and frame generation: the upscaler, its quality and sharpness, and reflection quality.
+110014	PC Upscaling	TAA, FSR, DLSS and frame generation: the upscaler, quality, sharpness, character motion, reflections.
 116000	Vertical Sync	Wait for the display. Off can tear.
 116001	Fullscreen	Fill the screen: Borderless, or Fullscreen where Window mode (F10) says so.
 116009	Stay Borderless	Borderless never turns into exclusive fullscreen. AMD cards: may lower the frame rate.
@@ -64,7 +64,7 @@
 116035	Display-Limited
 117000	Ambient Occlusion	Screen-space ambient occlusion.
 117005	Motion Blur	The blur on fast camera and character movement.
-117001	Anti-Aliasing	The game's own anti-aliasing pass. Off while TAA or a plugin's anti-aliasing takes its place.
+117001	Anti-Aliasing	The game's own anti-aliasing. Off while TAA, FSR, DLSS or a plugin's anti-aliasing replaces it.
 117002	Depth of Field	Blurs distant scenery. Off keeps far views sharp.
 117020	PC Graphics	
 117003	Chromatic Aberration	The colour fringing at the edges of the frame.
@@ -187,6 +187,7 @@
 125003	Upscaling	Replaces the game's AA: TAA or FSR 3 (any GPU), FSR 4 (AMD, where offered) or DLSS (NVIDIA RTX).
 125004	Upscaling Quality	The 3D's drawn size: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
 125005	TAA Strength	How much TAA smooths: higher is steadier but may leave a faint trail, lower crisper. Default 5.
+125006	Character Motion	Precise: each character's own motion, clean edges, about 1% at 4K. Velocity Map: softer edges.
 125030	Quarter	
 125031	Half	
 125032	Off	
@@ -198,3 +199,5 @@
 125038	Quality	
 125039	Native AA	
 125040	TAA	
+125041	Precise	
+125042	Velocity Map	

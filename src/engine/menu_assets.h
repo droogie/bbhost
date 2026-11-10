@@ -36,13 +36,13 @@ constexpr int kPcSettingSlots = 6;
 
 // System > PC Upscaling's slots (engine/option_menu.cpp's pc_upscale_handler):
 // the movie's PCUpscale section has this many rows, one for each row the
-// handler builds, and the Defaults label below them. On Windows six, the
-// donor's six, Frame generation's among them; elsewhere five, Frame generation
-// having no row there.
+// handler builds, and the Defaults label below them. On Windows seven - the
+// donor's six and one added, Frame generation's among them; elsewhere six,
+// Frame generation having no row there.
 #if defined(_WIN32)
-constexpr int kPcUpscaleSlots = 6;
+constexpr int kPcUpscaleSlots = 7;
 #else
-constexpr int kPcUpscaleSlots = 5;
+constexpr int kPcUpscaleSlots = 6;
 #endif
 
 // Makes the assets if they are missing or stale and registers the directory

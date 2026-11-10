@@ -4,9 +4,9 @@
  * from the plugin's shader data (bbhost.hlsli's bb_data_float) - and hands it
  * back (shader_override); then turns the tint on and off by turns, and pulses
  * the strength every frame, which builds nothing. Every state change of the
- * override is logged. A test of the host, not a mod: built beside the tests
- * (CMake target shader_tint_probe, shader_tint.so / .dll), never into
- * plugins/ and never packaged, and opt-in should it be put there.
+ * override is logged. An example and a test of the host, not a mod: built
+ * beside the tests (CMake target shader_tint_probe, shader_tint.so / .dll),
+ * never into plugins/ and never packaged, and opt-in should it be put there.
  *
  *   [plugins] shader_tint = true
  *   [shader_tint]

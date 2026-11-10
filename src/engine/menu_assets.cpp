@@ -44,7 +44,7 @@ using Bytes = std::vector<std::uint8_t>;
 
 // Bumped whenever a generator or the recipe changes, so installs remake their
 // assets instead of keeping the last generation.
-constexpr int kGeneratorVersion = 20;  // 20: every PC section's rows stacked top-down, a row's pick list over the rows after it; 19: PC Upscaling's sixth row on Windows (five rows elsewhere); 18: PC Settings' seventh row on Windows alone; 17: PC Settings' seventh row, Stay Borderless; 16: PC Enhancements' sixth row, Auto-Replenish Items; 15: PC Enhancements' fifth row, Full Phantom HP; 14: PC Settings' Texture Quality row's text; 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
+constexpr int kGeneratorVersion = 21;  // 21: PC Upscaling's Character Motion row (seven rows on Windows, six elsewhere); 20: every PC section's rows stacked top-down, a row's pick list over the rows after it; 19: PC Upscaling's sixth row on Windows (five rows elsewhere); 18: PC Settings' seventh row on Windows alone; 17: PC Settings' seventh row, Stay Borderless; 16: PC Enhancements' sixth row, Auto-Replenish Items; 15: PC Enhancements' fifth row, Full Phantom HP; 14: PC Settings' Texture Quality row's text; 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
 
 const char kMessagesTsv[] =
 #include "pc_option_messages.inc"
@@ -847,9 +847,8 @@ Bytes build_option_movie(const Bytes& src) {
     section("PCCamera", 121020, 388, 4, 0, {"Item_4_0", "Item_5_0"});
     section("PCDeck", 123020, 389, 2, 0, {"Item_2_0", "Item_3_0", "Item_4_0", "Item_5_0"});
     section("PCEnhance", 124020, 390, 6, 0, {});
-    // On Windows the donor's six rows, the label below them; elsewhere five, the label in the sixth's place.
-    section("PCUpscale", 125020, 391, kPcUpscaleSlots, 0,
-            kPcUpscaleSlots < 6 ? std::vector<std::string>{"Item_5_0"} : std::vector<std::string>{});
+    // On Windows seven rows - the donor's six, one added - the label below them; elsewhere the donor's six.
+    section("PCUpscale", 125020, 391, kPcUpscaleSlots, kPcUpscaleSlots - 6, {});
     return add_scrollbar(m, "Top", 1290, 354.5);
 }
 

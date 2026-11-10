@@ -147,6 +147,7 @@ enum SettingId {
     kSharpness,
     kFrameGeneration,
     kMotionVectors,
+    kCharMotion,
     kResolution,
     kShaders,
     kSkipLogos,
@@ -353,8 +354,8 @@ Setting g_set[kSettingCount] = {
     {"motion_blur", "Motion blur", {"Off", "On"}, 1,
      "The blur on fast camera and character movement.", false},
     {"anti_alias", "Anti-aliasing", {"Off", "On"}, 1,
-     "The game's own anti-aliasing pass, over the finished picture. Off while TAA, or a plugin's own anti-aliasing, takes its "
-     "place.",
+     "The game's own anti-aliasing pass, over the finished picture. Off while TAA, FSR, DLSS or a plugin's own anti-aliasing "
+     "takes its place: they do the anti-aliasing, and this pass after them would only soften the picture again.",
      false},
     {"depth_of_field", "Depth of field", {"Off", "On"}, 1,
      "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
@@ -558,6 +559,21 @@ Setting g_set[kSettingCount] = {
      "resolution, in 8, 16 or 32 bits per channel - more bits are more accurate and cost more memory and bandwidth. Rebuilt "
      "turns the game's own motion blur off (it reads the map). Changes at once.",
      false},
+    // Where the upscalers' motion for the characters comes from
+    // (host/upscale_pass.cpp): their own vertex shaders' positions, this frame's
+    // and the last, drawn into the motion (the capture), or the game's motion
+    // blur velocity map alone. The capture's cost measured at 4K: about 1%.
+    {"char_motion", "Character motion", {"Precise", "Velocity map"}, 0,
+#if defined(_WIN32)
+     "Where TAA, FSR, DLSS and frame generation take the motion of the hunter, enemies and other moving characters from "
+#else
+     "Where TAA and DLSS take the motion of the hunter, enemies and other moving characters from "
+#endif
+     "(the camera's own always comes from the depth). Precise: each character's own position this frame and the last, "
+     "for every pixel - clean edges and no trail behind a running character; it draws those characters a second time "
+     "into the motion, about 1% of the frame rate at 4K. Velocity map: the game's motion blur map, 640x360 at any "
+     "Resolution - a little faster, softer at a character's edge, where a faint trail can show. Any GPU. Changes at once.",
+     false},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
     // see engine/graphics_patch.cpp. The game's pick list shows six entries
@@ -735,6 +751,7 @@ const Row g_rows[] = {
     // 3D back to above them, Sharpness over the upscaler's picture below.
     {Row::Option, nullptr, kDlssPreset},
     {Row::Option, nullptr, kSharpness},
+    {Row::Option, nullptr, kCharMotion},  // (shown while an upscaler or frame generation takes the motion: row_hidden)
     {Row::Option, nullptr, kBloom},
     {Row::Option, nullptr, kShadowDistance},
     {Row::Option, nullptr, kAoStrength},
@@ -1529,6 +1546,7 @@ void rebuild_settings() {
         h.taa_strength = static_cast<float>(std::clamp(index_of(kTaaStrength), 0, 100)) / 100.0f;
         h.frame_generation = on_of(kFrameGeneration);
         h.motion_vectors = std::clamp(index_of(kMotionVectors), 0, 3);
+        h.char_motion = index_of(kCharMotion) != 1;  // Precise, Velocity map
     }
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
@@ -2510,29 +2528,31 @@ const char* upscaler_note() {
     return note.c_str();
 }
 
-// The Anti-aliasing row's note: its own, or that it is off while TAA or a
-// plugin's own anti-aliasing takes its place (engine/graphics_patch.cpp).
+// The Anti-aliasing row's note: its own, or that it is off while an upscaler
+// or a plugin's own anti-aliasing takes its place (engine/graphics_patch.cpp).
 const char* anti_alias_note() {
     static std::string note;
     if (const std::string who = aa_taker(); !who.empty()) {
         note = "Off while the " + who + " plugin is on: it does the anti-aliasing itself.";
         return note.c_str();
     }
-    // (In game TAA as it runs - a Vulkan layer beside bbhost can keep it off -
-    // in the setup window as chosen.)
-    if (g_setup_page ? shown_index(kUpscaler) == 1 : upscaler_method() == kUpscaleTaa) return "Off while TAA runs: TAA takes its place.";
+    // (In game the upscaler as it runs - a Vulkan layer beside bbhost can keep
+    // TAA off, DLSS and FSR need their files - in the setup window as chosen.)
+    if (g_setup_page ? shown_index(kUpscaler) != 0 : upscaler_method() != 0)
+        return "Off while TAA, FSR or DLSS runs: it does the anti-aliasing, and this pass after it would only soften the picture again.";
     return g_set[kAntiAlias].note;
 }
 
 // Rows that only mean something under another setting, left out while it is
-// off: the upscaler's preset with Upscaling off, the motion vectors with
-// Upscaling and Frame generation both off, HD motion blur quality with HD
-// motion blur off.
+// off: the upscaler's preset with Upscaling off, the motion vectors and
+// Character motion with Upscaling and Frame generation both off, HD motion
+// blur quality with HD motion blur off.
 bool row_hidden(int id) {
     if (id == kHdMotionBlurRes) return !reads_on(g_set[kHdMotionBlur], shown_index(kHdMotionBlur));
     if (id == kDlssPreset) return shown_index(kUpscaler) <= 1;  // (Off, TAA: no preset)
     if (id == kTaaStrength) return shown_index(kUpscaler) != 1;  // (TAA's alone)
-    if (id == kMotionVectors) return shown_index(kUpscaler) == 0 && !reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration));
+    if (id == kMotionVectors || id == kCharMotion)
+        return shown_index(kUpscaler) == 0 && !reads_on(g_set[kFrameGeneration], shown_index(kFrameGeneration));
     if (id == kStayBorderless) return shown_index(kWindowMode) != 1;  // (Borderless's alone)
     return false;
 }

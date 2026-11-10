@@ -25,6 +25,7 @@
 #include <timeapi.h>
 #else
 #include <dirent.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -565,6 +566,33 @@ void host_page_guard(void* p, std::size_t size) {
     VirtualProtect(p, size, PAGE_NOACCESS, &old);
 #else
     mprotect(p, size, PROT_NONE);
+#endif
+}
+
+const void* host_map_file(const char* path, std::size_t* size) {
+#if defined(_WIN32)
+    // The sharing fopen's "rb" gives, so a file another program has open still maps.
+    const HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    LARGE_INTEGER n{};
+    const HANDLE m = GetFileSizeEx(f, &n) && n.QuadPart > 0 ? CreateFileMappingA(f, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
+    CloseHandle(f);
+    if (!m) return nullptr;
+    const void* p = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(m);  // the view keeps the mapping
+    if (p) *size = static_cast<std::size_t>(n.QuadPart);
+    return p;
+#else
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return nullptr;
+    struct stat st{};
+    void* p = MAP_FAILED;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) p = mmap(nullptr, static_cast<std::size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return nullptr;
+    *size = static_cast<std::size_t>(st.st_size);
+    return p;
 #endif
 }
 

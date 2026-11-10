@@ -2722,6 +2722,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     if (look) gxvk_lists::cp_look_begin(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
                     const bool flags_needed = host_gpu_segment_flags_needed();
                     if (flags_needed) host_gpu_segment_follows(segment_follows_next(b + n));
+                    if (gxvk_lists::splice_compare()) host_gpu_splice_compare_begin(token_id);
                     native_draw(in, "native");
                     if (flags_needed) host_gpu_segment_follows(false);
                     if (gxvk_lists::splice_compare()) host_gpu_splice_compare(token_id);
@@ -3587,7 +3588,9 @@ void hle_gnm_submit_async(int queue_id, const std::vector<std::pair<const void*,
     // (the bottleneck meter's back-pressure, host/perf_meter.h).
     const std::uint64_t t0 = host_clock_monotonic_ns();
     q->drained.wait(lk, room);
-    perf_meter_backlog_wait(host_clock_monotonic_ns() - t0);
+    const std::uint64_t held = host_clock_monotonic_ns() - t0;
+    perf_meter_backlog_wait(held);
+    gxvk_lists::cp_held(held);  // the draw pool's duty: whether the command processor in order holds the game back
 }
 
 void hle_gnm_cp_drain() {

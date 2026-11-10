@@ -63,6 +63,7 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <io.h>
 #else
 #include <csignal>
 #include <signal.h>
@@ -400,6 +401,26 @@ namespace {
 // is no window, and a console made for an earlier decision (the setup window
 // can change the setting) is let go.
 bool g_log_console = false;  // the console is one this process attached or made
+// The log's lines to that console (host_log_detail::g_console_write): a
+// console shows the bytes it is given in its own code page, and the log is
+// UTF-8, so they go as UTF-16. Pieces of at most 1024 bytes, cut where a
+// character starts, on the stack: a crash's report comes through here too.
+void console_write(const char* p, std::size_t n) {
+    const HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stderr)));
+    wchar_t w[1024];
+    while (n) {
+        std::size_t k = n < 1024 ? n : 1024;
+        if (k < n) {
+            while (k > 0 && (static_cast<unsigned char>(p[k]) & 0xC0) == 0x80) --k;  // not inside a character
+            if (k == 0) k = 1024;  // no character starts in it: not UTF-8, cut anywhere
+        }
+        const int m = MultiByteToWideChar(CP_UTF8, 0, p, static_cast<int>(k), w, 1024);
+        DWORD done = 0;
+        if (m > 0) WriteConsoleW(h, w, static_cast<DWORD>(m), &done, nullptr);
+        p += k;
+        n -= k;
+    }
+}
 // A file or a pipe a standard stream was started with is that stream's
 // already; anything else - none, or a handle of a console this process is
 // not attached to - is not.
@@ -424,7 +445,9 @@ void log_console(bool on) {
         std::FILE* f = nullptr;
         freopen_s(&f, "CONOUT$", "w", stderr);
         if (!stdout_own) freopen_s(&f, "CONOUT$", "w", stdout);  // (on_console_ctrl, set at the start, takes this console's close too)
+        host_log_detail::g_console_write.store(console_write, std::memory_order_release);
     } else if (g_log_console) {
+        host_log_detail::g_console_write.store(nullptr, std::memory_order_release);
         std::fflush(nullptr);
         std::FILE* f = nullptr;
         freopen_s(&f, "NUL", "w", stderr);
@@ -932,6 +955,12 @@ int main(int argc, char** argv) {
                      static_cast<double>(ms.ullTotalPageFile) / kGiB, static_cast<double>(ms.ullAvailPageFile) / kGiB);
         }
     }
+    // The manifest (res/bbhost.manifest) makes UTF-8 the code page every
+    // narrow path is in; a Windows 10 before version 1903 leaves the old one.
+    if (const UINT cp = GetACP(); cp != CP_UTF8) {
+        host_log("paths: Windows runs bbhost in code page %u, not UTF-8 (that needs Windows 10 version 1903 or later): "
+                 "a user or folder name outside ASCII can stop it", cp);
+    }
     host_timing_init();  // 1 ms timer resolution and no power throttling from here on (core/host_clock.h)
     {
         // The process's standing with Windows' schedulers, left as Windows
@@ -1063,7 +1092,7 @@ int main(int argc, char** argv) {
     // they are missing, and write a template when there is no file at all.
     if (const std::string help = config_setup_help(cfg); !help.empty()) {
         decide_log(true);
-        std::fputs(help.c_str(), stderr);
+        host_log_detail::write_raw(help.data(), help.size());  // as the log goes: UTF-16 to a console
         std::fflush(stderr);
         return 2;
     }
@@ -1152,7 +1181,8 @@ int main(int argc, char** argv) {
     if (image.sha256 != kEboot109Sha256) {
         const char* any = std::getenv("BBHOST_ANY_EBOOT");
         if (!(any && any[0] == '1')) {
-            std::fputs(config_eboot_help(cfg, image.sha256, kEboot109Sha256).c_str(), stderr);
+            const std::string help = config_eboot_help(cfg, image.sha256, kEboot109Sha256);
+            host_log_detail::write_raw(help.data(), help.size());  // as the log goes: UTF-16 to a console
             std::fflush(stderr);
             return 3;
         }

@@ -157,7 +157,10 @@ const unsigned g_rest_cycle = [] {
     return e && std::strncmp(e, "cycle:", 6) == 0 ? static_cast<unsigned>(std::max(1L, std::strtol(e + 6, nullptr, 10))) : 0u;
 }();
 std::atomic<u64> g_cp_busy_ns{0};  // bb-cp0's jobs' time (one writer)
+std::atomic<u64> g_cp_held_ns{0};  // the game's waits for the command processor's backlog (cp_held)
 std::atomic<u64> g_rests{0}, g_rested_ns{0};  // the rests begun, and their time (ended ones)
+// The rests by why they began (gxvk_rest.h Why: a cap, GPU-bound, a probe), and the probes that kept it resting.
+std::atomic<u64> g_rests_by[5] = {}, g_probes_rested{0}, g_rechecks{0};
 
 // ---- the answers -----------------------------------------------------------
 // One record per token slot (the slot ring's size and index).
@@ -486,7 +489,11 @@ void report_line(bool at_exit) {
         }
         if (g_rest_on && (g_rests.load(std::memory_order_relaxed) || at_exit)) {
             const u64 rests = g_rests.load(std::memory_order_relaxed);
-            host_log("gxvk-lists (%s): the pool rested %llu times at a frame cap, %.1f s in the ended ones%s", what, static_cast<ull>(rests),
+            const auto by = [](int k) { return static_cast<ull>(g_rests_by[k].load(std::memory_order_relaxed)); };
+            host_log("gxvk-lists (%s): the pool rested %llu times (at a frame cap %llu, GPU-bound %llu, a probe %llu of which %llu rested on; "
+                     "%llu asked anew), %.1f s in the ended ones%s",
+                     what, static_cast<ull>(rests), by(gxvk_rest::kWhyCap), by(gxvk_rest::kWhyGpu), by(gxvk_rest::kWhyProbe),
+                     static_cast<ull>(g_probes_rested.load(std::memory_order_relaxed)), static_cast<ull>(g_rechecks.load(std::memory_order_relaxed)),
                      static_cast<double>(g_rested_ns.load(std::memory_order_relaxed)) / 1e9, resting() ? "; resting now" : "");
         }
         return;
@@ -541,7 +548,7 @@ void settle(bool homes_bind, const char* homes_why) {
     std::call_once(once, [&] {
         const int env = pool_mode_from_env();
         const int n = pool_threads();
-        const unsigned hw = std::thread::hardware_concurrency();
+        const unsigned hw = host_cpu_threads();
         int mode = env < 0 ? 0 : env;
         if (env < 0) {
             // Unset: stage 4b.2's segments where the homes bind by handle (their spliced share needs them), off elsewhere.
@@ -578,8 +585,9 @@ void keep_off_pool_cpus() {
 std::atomic<bool> g_resting{false};
 
 void cp_busy(std::uint64_t ns) { g_cp_busy_ns.store(g_cp_busy_ns.load(std::memory_order_relaxed) + ns, std::memory_order_relaxed); }
+void cp_held(std::uint64_t ns) { g_cp_held_ns.fetch_add(ns, std::memory_order_relaxed); }
 
-void frame_paced(std::uint64_t wait_ns, float cap_fps) {
+void frame_paced(std::uint64_t wait_ns, float cap_fps, bool loading) {
     if (!g_rest_on || !pool_mode()) return;
     if (g_rest_cycle) {
         static u64 n = 0;
@@ -591,48 +599,98 @@ void frame_paced(std::uint64_t wait_ns, float cap_fps) {
         return;
     }
     // The main thread's alone: windows of half a second (or 120 frames), each decided by host/gxvk_rest.h.
-    static u64 last = 0, win_ns = 0, win_wait = 0, frames = 0, cp_at = 0;
+    static u64 last = 0, win_ns = 0, win_wait = 0, frames = 0, cp_at = 0, held_at = 0, gpu_at = 0;
+    static bool win_loading = false, gpu_known = false;
     static gxvk_rest::State state;
     static int logs = 0;
     const u64 now = host_clock_monotonic_ns();
     if (!last) {
         last = now;
         cp_at = g_cp_busy_ns.load(std::memory_order_relaxed);
+        held_at = g_cp_held_ns.load(std::memory_order_relaxed);
+        const GpuBusy b = host_gpu_busy();
+        gpu_known = b.on;
+        gpu_at = b.busy_ns;
         return;
     }
     win_ns += now - last;
     last = now;
     win_wait += wait_ns;
+    win_loading = win_loading || loading;
     ++frames;
     if (win_ns < 500'000'000ull && frames < 120) return;
     gxvk_rest::Window w;
-    w.slack = static_cast<double>(win_wait) / static_cast<double>(win_ns);
+    const double span = static_cast<double>(win_ns);
+    w.slack = static_cast<double>(win_wait) / span;
     const u64 cp_now = g_cp_busy_ns.load(std::memory_order_relaxed);
-    w.cp = static_cast<double>(cp_now - cp_at) / static_cast<double>(win_ns);
+    w.cp = static_cast<double>(cp_now - cp_at) / span;
+    const u64 held_now = g_cp_held_ns.load(std::memory_order_relaxed);
+    w.held = static_cast<double>(held_now - held_at) / span;
+    const GpuBusy b = host_gpu_busy();
+    if (b.on && gpu_known) w.gpu = static_cast<double>(b.busy_ns - gpu_at) / span;
+    gpu_known = b.on;
+    gpu_at = b.busy_ns;
     w.cap_fps = cap_fps;
-    const double fps = static_cast<double>(frames) * 1e9 / static_cast<double>(win_ns);
+    w.loading = win_loading;
+    const double fps = static_cast<double>(frames) * 1e9 / span;
+    w.fps = fps;
     cp_at = cp_now;
+    held_at = held_now;
     win_ns = win_wait = frames = 0;
+    win_loading = false;
     const u64 rest_at = state.rest_at;
+    const gxvk_rest::Why was = state.why;
+    const int probe_left = state.probe_left;
     switch (gxvk_rest::step(state, w, now)) {
     case gxvk_rest::kRest:
         g_resting.store(true, std::memory_order_relaxed);
         g_rests.fetch_add(1, std::memory_order_relaxed);
-        if (logs++ < 16)
-            host_log("gxvk-lists: the pool rests - the frame waits %.0f%% of its time for its cap (%.0f fps at %.0f), the command "
-                     "processor busy %.0f%%: its draws are drawn in order (BBHOST_GXVK_LISTS_REST=0: never)",
-                     100.0 * w.slack, fps, static_cast<double>(cap_fps), 100.0 * w.cp);
+        g_rests_by[state.why].fetch_add(1, std::memory_order_relaxed);
+        if (logs++ < 96) {
+            if (state.why == gxvk_rest::kWhyCap)
+                host_log("gxvk-lists: the pool rests - the frame waits %.0f%% of its time for its cap (%.0f fps at %.0f), the command "
+                         "processor busy %.0f%%: its draws are drawn in order (BBHOST_GXVK_LISTS_REST=0: never)",
+                         100.0 * w.slack, fps, static_cast<double>(cap_fps), 100.0 * w.cp);
+            else if (state.why == gxvk_rest::kWhyGpu)
+                host_log("gxvk-lists: the pool rests - the frame is the GPU's (busy %.0f%% of the window, %.0f fps): its draws are drawn in "
+                         "order (BBHOST_GXVK_LISTS_REST=0: never)",
+                         100.0 * w.gpu, fps);
+            else
+                host_log("gxvk-lists: the pool rests for a probe (%.0f fps, the command processor busy %.0f%%): whether the command "
+                         "processor drawing in order holds the game back (BBHOST_GXVK_LISTS_REST=0: never rests)",
+                         fps, 100.0 * w.cp);
+        }
         break;
     case gxvk_rest::kWake:
         g_resting.store(false, std::memory_order_relaxed);
         g_rested_ns.fetch_add(now - rest_at, std::memory_order_relaxed);
-        if (logs++ < 16)
-            host_log("gxvk-lists: the pool works again after %.1f s - the frame waits %.0f%% of its time (%.0f fps, cap %.0f), the command "
-                     "processor busy %.0f%%; the next rest no sooner than %.0f s on",
-                     static_cast<double>(now - rest_at) / 1e9, 100.0 * w.slack, fps, static_cast<double>(cap_fps), 100.0 * w.cp,
-                     static_cast<double>(state.backoff_ns) / 1e9);
+        if (state.recheck_left) {
+            g_rechecks.fetch_add(1, std::memory_order_relaxed);
+            if (logs++ < 96)
+                host_log("gxvk-lists: the pool works again to ask anew after %.1f s at rest (%.0f fps, the game held back %.0f%%): %d windows, "
+                         "then a probe",
+                         static_cast<double>(now - rest_at) / 1e9, fps, 100.0 * w.held, gxvk_rest::kRecheckWindows);
+        } else if (logs++ < 96)
+            host_log("gxvk-lists: the pool works again after %.1f s%s - the frame waits %.0f%% of its time (%.0f fps, cap %.0f), the "
+                     "command processor busy %.0f%%, the game held back by it %.0f%%; the next probe in %.0f s%s",
+                     static_cast<double>(now - rest_at) / 1e9, was == gxvk_rest::kWhyProbe ? " (a probe)" : "", 100.0 * w.slack, fps,
+                     static_cast<double>(cap_fps), 100.0 * w.cp, 100.0 * w.held, static_cast<double>(state.probe_ns) / 1e9,
+                     was == gxvk_rest::kWhyCap ? (" (a rest at a cap: the next no sooner than " +
+                                                   std::to_string(static_cast<int>(state.backoff_ns / 1'000'000'000ull)) + " s on)").c_str()
+                                               : "");
         break;
-    case gxvk_rest::kStay: break;
+    case gxvk_rest::kStay:
+        if (probe_left == 1 && !w.loading && state.resting && was == gxvk_rest::kWhyProbe) {
+            g_probes_rested.fetch_add(1, std::memory_order_relaxed);
+            if (logs++ < 96)
+                host_log("gxvk-lists: the probe rests on - the game held back by the command processor %.0f%% (it wakes the pool from "
+                         "%.0f%%), %.0f fps against %.0f while the pool worked: the pool's work would not shorten the frame here; asked "
+                         "anew in %.0f s",
+                         100.0 * gxvk_rest::detail::median(state.probe_held, state.probe_counted), 100.0 * gxvk_rest::kWorkHeld,
+                         gxvk_rest::detail::median(state.probe_fps, state.probe_counted), state.probe_ref,
+                         static_cast<double>(state.probe_ns) / 1e9);
+        }
+        break;
     }
 }
 

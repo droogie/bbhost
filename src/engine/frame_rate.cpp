@@ -1602,7 +1602,8 @@ void fg_pace_note(std::uint64_t now_ns, std::uint64_t wait_ns, float rate_target
         const std::uint64_t key = static_cast<std::uint64_t>(h.upscaler) | static_cast<std::uint64_t>(h.upscale_quality) << 8 |
                                   static_cast<std::uint64_t>(h.frame_generation) << 16 |
                                   static_cast<std::uint64_t>(h.sharpness * 100.0f + 0.5f) << 24 |
-                                  static_cast<std::uint64_t>(h.taa_strength * 100.0f + 0.5f) << 40;
+                                  static_cast<std::uint64_t>(h.taa_strength * 100.0f + 0.5f) << 40 |
+                                  static_cast<std::uint64_t>(h.char_motion) << 48;
         if (key != p.settings_key) {
             if (p.settings_key && p.held_s > 0.0f)
                 host_log("frame rate: frame generation's held pace %.1f fps let go: the upscaler's settings changed", 1.0 / p.held_s);
@@ -1953,7 +1954,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
         const float cap_fps = g_fast_target ? 0.0f : target > 0.0f ? 1.0f / target : !converted ? 30.0f : 0.0f;
         perf_meter_limiter(waited_ns, static_cast<std::uint64_t>(clock.spun_us) * 1000, cap_fps);
         fg_pace_note(waited_t1, waited_ns, g_fast_target ? 0.0f : fg_cap_target());
-        gxvk_lists::frame_paced(waited_ns, cap_fps);  // the draw pool rests while the cap holds the frame (host/gxvk_lists.h)
+        gxvk_lists::frame_paced(waited_ns, cap_fps, loading_screen_up());  // the draw pool's duty (host/gxvk_lists.h resting)
         g_fast_target = false;
         host_fps_frame_start();  // the FPS counter: the frame starts as the limiter lets it go (host/window.h)
         if (converted) each_frame(f);

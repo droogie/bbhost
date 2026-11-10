@@ -127,6 +127,10 @@ struct HostSettings {
     // The upscaler's motion for what moves of itself (host/upscale_pass.cpp):
     // 0 the game's velocity map, 1-3 rebuilt at 8, 16 or 32 bits. Read once.
     int motion_vectors = 0;
+    // Character motion (host/upscale_pass.cpp's capture): true Precise - each
+    // character's own positions this frame and the last drawn into the
+    // motion; false the game's velocity map alone. Followed live.
+    bool char_motion = true;
 
     // Startup (read once by the loader)
     bool skip_logos = false;

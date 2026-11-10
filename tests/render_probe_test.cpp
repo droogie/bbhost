@@ -1,4 +1,4 @@
-// tools/render_probe on a host of our own and a pretend Vulkan device: no
+// examples/plugins/render_probe on a host of our own and a pretend Vulkan device: no
 // game, no GPU, no Vulkan loader. The probe is loaded as the host loads
 // plugins and handed the calls plugin API 27's render hooks make - frame
 // info from a known camera (host/render_api.h, as the host makes it), the

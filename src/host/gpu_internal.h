@@ -1398,6 +1398,12 @@ struct RunDigest {
     bool part_first = false;  // a part's draw whose part had bound nothing yet (t_part_recorded empty)
     std::uint64_t flip = 0;   // the flip it was committed at
     char name[48] = {};       // its pipeline's name (its programs' ids)
+    // The table and user-data read masks each stage built its user data with
+    // (BBHOST_GX_SKIP_TABLES: its lean variant's, ~0 while that is not known):
+    // the splice compare tells a mask that arrived between the pool's commit
+    // and the draw in order from a difference (splice_compare_locked).
+    std::uint32_t masks[2][2] = {{~0u, ~0u}, {~0u, ~0u}};
+    bool user_skipped[2] = {false, false};  // and whether it built none of a stage's user data (its lean variant reads none)
 };
 extern thread_local constinit RunDigest t_run_digest;  // the drawing thread's last draw's
 // The flip of the world's first frame (host_gpu_world_reached), 0 before it: the

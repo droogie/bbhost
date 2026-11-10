@@ -834,21 +834,43 @@ each draw of a segment that would have been spliced with its commit. On an RTX
 0.35-0.5 us a spliced draw, and the frame rate rose 5-11% at Old Yharnam,
 where the command processor had been the limit.
 
-**On by default above 60 fps (`BBHOST_GXVK_HOMES` unset).** The constant
-buffers' homes - and with them the segments, and the run batching
-(`BBHOST_RUN_BATCH`) and copy-back captures they take - are on by default only
-where the frame rate can gain from them: a graphics card with room, or one
-with small video memory that has 6,144 MiB or more free at the start (the
-homes' own rule below: not an integrated GPU, no tight memory), 16 hardware
-threads or more that the process may run on (its CPU affinity, so a
-`taskset` counts), and a frame rate above 60 (a fixed rate above 60, or
-Display-Limited on a display above 60 Hz). At 60 and below the frame waits
-for its limit anyway, and the pool's two threads would cost about a core more
-for nothing, so everything there is as it was before them. On a card with
+**On by default above 60 fps, and on Windows at any rate (`BBHOST_GXVK_HOMES`
+unset).** The constant buffers' homes - and with them the segments, and the
+run batching (`BBHOST_RUN_BATCH`) and copy-back captures they take - are on by
+default only where the frame rate can gain from them: a graphics card with
+room, or one with small video memory that has 5,000 MiB or more free at the
+start (the homes' own rule below: not an integrated GPU, no tight memory), and
+a frame rate above 60 (a fixed rate above 60, or Display-Limited on a display
+above 60 Hz). The pool takes its threads from the CPUs the process may run on
+(its CPU affinity, so a `taskset` counts): two from 16 hardware threads, one
+from 8, none under 8, where the homes go on alone. With fewer threads the old
+path's command processor competes with the game's own, and the homes win
+more: with the game confined to 8, 6 and 4 hardware threads of an RTX 4070's
+Xeon (uncapped, alternating runs) they ran Old Yharnam 51%, 9.0% and 1.4%
+faster than the old path, Central Yharnam 5.1%, 5.5% and 2.8%, the sewer pit
+6.7%, 4.2% and 5.1%, the slowest frames no slower. Under
+Windows on an RTX 3070 Ti Laptop GPU with the game on 8 hardware threads
+(`start /affinity FF`) the default ran Old Yharnam 42% faster than the run
+commit and the other four places 3.2-6.3%, the process 19-51 points of CPU
+lower but at Old Yharnam. On Linux at 60 and below the frame
+waits for its limit anyway, and the command processor draws in order as it
+did before them. On Windows, where the run commit is on by default, the
+homes take its place at any frame rate: the run commit gives way to them and
+the pool rests while a cap holds the frame (its duty rule, below). At a true
+60 on an RTX 3070 Ti Laptop GPU (1080p, alternating runs) they took 15-33
+points of CPU less than the run commit at Old Yharnam, the Nightmare of
+Mensis, Cainhurst's courtyard, Central Yharnam and the sewers under it, the
+frame rate (59.7-59.8) and the slowest frames the same. On a card with
 small video memory the homes take the pool's budget (128 MiB, as on a card
 with room) and the game's memory is still imported a window at a time; under
-6,144 MiB free they stay off (on a 4 GB card the pool pushed images into host
-memory), unless `BBHOST_GXVK_HOMES_BUDGET_MB` gives a budget.
+5,000 MiB free they stay off (on a 4 GB card the pool pushed images into host
+memory), unless `BBHOST_GXVK_HOMES_BUDGET_MB` gives a budget. A 6 GB card has
+more: acted out at 5,000 MiB free (`BBHOST_TEST_VRAM_MB=5000`, the
+device-local types held to it too) the homes ran Old Yharnam 36.5% faster
+than the run commit under Windows on an RTX 3070 Ti Laptop GPU (the other four
+places 2.6-4.7%, the GPU's time no longer) and 24% faster than the old path
+on an RTX 4070 under Linux (the Nightmare of Mensis 6.3%, Central Yharnam
+level, the GPU's time 2.6% longer), no image pushed to host memory.
 
 The pool's splices give way to the run commit (`BBHOST_RUN_COMMIT`). Turned
 on by its setting, it keeps the homes off by default. On by Windows' default
@@ -865,7 +887,7 @@ segments without the run commit against the run commit:
 
 As shipped, the shared GPU memory stayed at 2.1 GB (whole imports, on the
 second row, pinned 4.95 GB). Where the rule does not hold - an integrated GPU,
-fewer threads, 60 fps and below, a card under 6,144 MiB free - the run commit
+a card under 5,000 MiB free - the run commit
 stays on by Windows' default, as before. The homes are made as
 their buffers are, so the choice is made once, with the device at start: a
 frame rate changed in play (it changes at once, 30 included) leaves the
@@ -873,8 +895,11 @@ choice as it was until the next start. Off, one line says why (`gxvk homes: off 
 default here (...)`); on, the homes' line says what decided it, and on
 Windows the run commit's line (`list-resolve: run commit ...`) says whether
 it gave way. `BBHOST_GXVK_HOMES=1` turns the homes on anywhere they can be
-made (where the rest of the rule holds, Windows' run commit gives way as with
-the default), `=0` keeps the path before them with the run commit as it was;
+made, and Windows' run commit gives way to them there as it does to the
+default - kept beside them at 60 fps, the pool committed 86% of the draws for
+nothing on the RTX 3070 Ti Laptop GPU, 106-152 points of CPU over the run
+commit alone, where the homes without it took 9-34 points less than the run
+commit at a true 60; `=0` keeps the path before them with the run commit as it was;
 `BBHOST_RUN_COMMIT` set decides the run commit either way, and
 `BBHOST_GXVK_LISTS` the segments alone.
 
@@ -1080,9 +1105,9 @@ as today, runs the proof over the sources as 1 would, and compares each
 version with its source at its batch.
 
 **Constant buffers in device-local homes made at their creation, bound by
-handle (`BBHOST_GXVK_HOMES`, on by default above 60 fps with 16 hardware
-threads or more and a card with room or 6,144 MiB free, the run commit giving
-way on Windows: "On by default above 60 fps" above).** A
+handle (`BBHOST_GXVK_HOMES`, on by default above 60 fps - on Windows at any
+rate - with a card with room or 5,000 MiB free, the run commit giving way on
+Windows: "On by default above 60 fps, and on Windows at any rate" above).** A
 constant buffer's own memory is written only by GX's GPU copies: every
 UpdateSubresource of one, and every Map of a dynamic one, writes a renamed
 copy, and the map resolves copy the renames back. With `BBHOST_GXVK_HOMES=1`
@@ -1105,10 +1130,10 @@ finds it by address; a CPU copy of its stale guest bytes is refused; a
 page-table walk that reads it gets it copied back to its memory first, and
 it stays the home. A home ends with its buffer, and a buffer made past the
 pool's budget (128 MiB, `BBHOST_GXVK_HOMES_BUDGET_MB`) takes today's path for
-its life. Off on an integrated GPU, and with small video memory under 6,144
+its life. Off on an integrated GPU, and with small video memory under 5,000
 MiB free at the start unless a budget is given (on a 4 GB card the pool's ~80
-MiB pushed images into host memory); from 6,144 MiB free the pool's budget is
-the same 128 MiB. `BBHOST_GXVK_HOMES=compare` keeps today's path bound, keeps
+MiB pushed images into host memory); from 5,000 MiB free (a 6 GB card) the
+pool's budget is the same 128 MiB. `BBHOST_GXVK_HOMES=compare` keeps today's path bound, keeps
 the homes beside it with a CPU mirror of each, and checks each binding of a
 home against its mirror (and each capture against the bytes today's copy
 takes at the token); `=twins` keeps the homes as device-local twins
@@ -1134,4 +1159,5 @@ another thread before the capture read it.
 | `BBHOST_VK_VALIDATE=1` | runs with the Vulkan validation layer |
 | `BBHOST_VA_TRACE=1` | logs every guest-memory import made, put in place, retired and freed, every window whose page-table entries move, every device buffer made through `create_dev_buffer` with its owner and every staging or scratch chunk freed (`va:` lines, the wall clock in seconds and microseconds, to match `journalctl -k -o short-unix`); a device fault report then looks its addresses up in them. `=2` adds the driver's own binds and unbinds where it reports them (VK_EXT_device_address_binding_report) |
 | `BBHOST_GPU_PROFILE=1` | per-pass GPU timings |
+| `BBHOST_UPSCALE_CHECK=4` + `tools/upscale_check.py` | the upscalers' reprojection check, with an upscaler on and `BBHOST_UPSCALE_JITTER=0`: in place of the upscaler's picture, green where the motion explains how the scene changed since the last frame, red where it does not, blue where a surface came from off the screen; every 30 frames the log has red's share of what changed, over the picture and in sixteen bands of its width, and the tool sums it over the windows where the picture moved |
 | `bbhost --stream-selftest[=N]` | checks the command stream headless against a CPU model, N rounds (16 by default), and exits with 0 when it matched; run it with `BBHOST_VK_VALIDATE=1` too |

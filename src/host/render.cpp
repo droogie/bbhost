@@ -747,6 +747,12 @@ struct GxRing {
     bool failed = false;
 };
 GxRing g_gx_ring;
+// Whether [base, +bytes) lies in the ring: a table a draw's user data placed there (gx_ring_place), whose bytes that
+// draw's commit wrote. (The base is set once, under the ring's lock, before any placement is handed out.)
+bool gx_ring_holds(std::uint64_t base, std::uint64_t bytes) {
+    const std::uint64_t lo = g_gx_ring.base;
+    return lo && base >= lo && base + bytes <= lo + g_gx_ring.size;
+}
 std::atomic<std::uint64_t> g_vertex_tables{0}, g_gx_user_stages{0}, g_gx_user_fallbacks{0};
 // BBHOST_GX_COST=1: the renderer's GX work timed per
 // draw, and sampled constant buffers checked against their contents at the
@@ -17148,6 +17154,10 @@ thread_local constinit int t_ring_cb_stage = -1;      // the stage draw_impl res
 // for words the variant never reads, or bound the lean variant where the part
 // bound its fallback - the same draw, but not the same digest.
 thread_local constinit bool t_compare_recommit = false;
+// The splice compare's draw in order of a committed token (host_gpu_splice_compare_begin): its commit's digest, whose
+// read masks - each stage's table and user-data masks - and user data left out the draw builds its own with in place of
+// what its pipeline's lean variant says now (draw_impl). Null otherwise.
+thread_local constinit const RunDigest* t_compare_commit = nullptr;
 void run_digest_ring_cb(std::size_t slot, std::uint64_t at, std::uint64_t base, std::uint64_t bytes) {
     if (t_ring_cb_stage < 0 || slot >= 16) return;
     RingCbNote& n = t_ring_cb[t_ring_cb_stage];
@@ -17461,6 +17471,16 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             known = gxvk::heap_snap_mode() == gxvk::HeapSnap::kOn;
             check = !known;
         }
+        // A table in GX's ring (gx_ring_place) - read through a pointer pair
+        // when the pipeline's lean variant is not built yet and the draw builds
+        // all of its user data's tables - holds bytes this draw's own build
+        // wrote, final at that build: nothing copies into the ring, no GPU write
+        // lands on it and no twin covers it. Its lookups' answers are known
+        // (none), so it is copied as the draw records, in order and in the
+        // pool's list mode alike - which stopped at it (kBsCbLookups) and left
+        // 74-90% of the draws to the command processor in the first session
+        // after each update, until the lean variants were built.
+        if (!known && !in_heap && outcome == kUnmapped && base && !b.written && gx_ring_holds(base, bytes)) known = true;
         // A run part's draw (BBHOST_RUN_COMMIT) stops at a binding the shader
         // stores to - the store changes what later draws are answered - and at
         // copies to put in place.
@@ -25364,6 +25384,21 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
     }
+    // The splice compare's draw in order of a committed token: the masks its commit built with (a read mask that arrived
+    // between the two would leave out of this draw user data and tables the commit built for words the variant never
+    // reads - the same draw, but not the same digest).
+    if (t_compare_commit && !part) {
+        for (int st = 0; st < 2; ++st) {
+            table_masks[st] = t_compare_commit->masks[st][0];
+            read_masks[st] = t_compare_commit->masks[st][1];
+        }
+    }
+    if (digest) {
+        for (int st = 0; st < 2; ++st) {
+            t_run_digest.masks[st][0] = table_masks[st];
+            t_run_digest.masks[st][1] = read_masks[st];
+        }
+    }
     draw_stamp.to(kRenderCostSetup);
     // A geometry-shader draw as one vertex stage reads its indirect arguments
     // at their device address, which the GS's params hold.
@@ -25417,6 +25452,8 @@ static bool draw_impl(const GpuDraw& d) {
             // below builds it all then.
             const GfxPipeline* lean = lean_of(pl);
             user_skipped[st] = lean && !lean->failed && !lean->user_reads[st] && stage_plan(meta, *gx_stage[st]).all_records;
+            if (t_compare_commit && !part) user_skipped[st] = t_compare_commit->user_skipped[st];  // (the splice compare: as its commit)
+            if (digest) t_run_digest.user_skipped[st] = user_skipped[st];
             if (!part) ++(user_skipped[st] ? g_ud_skipped : g_ud_built);
         }
         if (gx_stage[st] && (st == 0 || d.gx_objects->shader[4]) && !user_skipped[st]) {
@@ -28543,6 +28580,9 @@ void names_of(const RunTargets& m, std::uint32_t (&n)[kTargetNames]) {
 std::atomic<std::uint64_t> g_lc_committed{0}, g_lc_why[kListWhys] = {}, g_lc_ns{0}, g_lc_looked{0};
 std::atomic<std::uint64_t> g_sp_spliced{0}, g_sp_why[kSpliceWhys] = {}, g_sp_ns{0}, g_sp_timed{0};
 std::atomic<std::uint64_t> g_sp_compared{0}, g_sp_differed{0}, g_sp_field_diff[kCmpFields] = {};
+// Compared draws whose draw in order built its user data with read masks, or left out a stage's, other than its commit -
+// none, since the draw in order takes the commit's (host_gpu_splice_compare_begin): a check of that.
+std::atomic<std::uint64_t> g_sp_masks_moved{0};
 std::atomic<int> g_sp_diff_logs{0};
 thread_local std::uint64_t t_splice_would = 0;  // splice-compare: the token whose commit passed every check
 // segments-compare (stage 4b.2): the would-be segment's members, compared as they are drawn in order
@@ -28891,6 +28931,8 @@ void splice_compare_locked(const ListCommit& c) {
         diff[kCmpBuffers] = a.buffers != b.buffers;
     }
     g_sp_compared.fetch_add(1, std::memory_order_relaxed);
+    if (std::memcmp(a.masks, b.masks, sizeof(a.masks)) != 0 || a.user_skipped[0] != b.user_skipped[0] || a.user_skipped[1] != b.user_skipped[1])
+        g_sp_masks_moved.fetch_add(1, std::memory_order_relaxed);
     std::string which;
     for (int f = 0; f < kCmpFields; ++f) {
         if (!diff[f]) continue;
@@ -29243,7 +29285,18 @@ std::string host_gpu_lists_times_report(int part, std::uint64_t parked_ticks, st
 
 // splice-compare: after the draw of token `id` drawn in order (its digest in
 // t_run_digest), the pool's commit of it compared with that.
+void host_gpu_splice_compare_begin(std::uint64_t id) {
+    t_compare_commit = nullptr;
+    ListCommit* const all = g_list_commits;
+    if (!all) return;
+    if (t_splice_would != id && !(t_seg_would_at < t_seg_would_n && t_seg_would[t_seg_would_at] == id)) return;
+    const ListCommit& c = all[id & (kListCommits - 1)];
+    const std::uint64_t w = c.word.load(std::memory_order_acquire);
+    if (lc_id(w) != id || (lc_state(w) != kLcCommitted && lc_state(w) != kLcSegment)) return;
+    t_compare_commit = &c.digest;
+}
 void host_gpu_splice_compare(std::uint64_t id) {
+    t_compare_commit = nullptr;
     ListCommit* const all = g_list_commits;
     if (!all) return;
     if (t_splice_would == id) {
@@ -29326,6 +29379,9 @@ std::string host_gpu_splice_report(bool window) {
                       static_cast<unsigned long long>(g_sp_compared.load()), static_cast<unsigned long long>(g_sp_differed.load()));
         out += buf;
         out += fields + ")";
+        std::snprintf(buf, sizeof(buf), "; read masks or user data left out other than the commit's %llu",
+                      static_cast<unsigned long long>(g_sp_masks_moved.load()));
+        out += buf;
     }
     return out;
 }

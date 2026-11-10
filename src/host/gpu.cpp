@@ -4138,7 +4138,7 @@ bool init_locked() {
                               : hm == gxvk_homes::Mode::kTwins   ? "the constant buffers' homes are twins (BBHOST_GXVK_HOMES=twins)"
                               : g.integrated                     ? "the homes are off on an integrated GPU"
                               : g.tight                          ? "the homes are off with tight memory"
-                                                                 : "the homes are off with small video memory, under 6 GiB free";
+                                                                 : "the homes are off with small video memory, under 5,000 MiB free";
             gxvk_lists::settle(hb, why);
         }
 #if !defined(_WIN32)

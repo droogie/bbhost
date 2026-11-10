@@ -398,6 +398,9 @@ int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uin
 bool host_gpu_splice(std::uint64_t id);
 bool host_gpu_list_committed(std::uint64_t id);  // its commit is made: the pool reads its slot no more
 void host_gpu_splice_compare(std::uint64_t id);
+// Before that draw in order (gnm_exec.cpp): a token whose commit will be compared is drawn with the read masks its
+// commit built its user data with, so a mask that arrived between the two changes nothing the digests compare.
+void host_gpu_splice_compare_begin(std::uint64_t id);
 std::string host_gpu_splice_report(bool window = false);
 // BBHOST_GXVK_LISTS_TIMES (host/gxvk_lists.h times): the command processor
 // arrives at GX-native draw token `id`, before anything takes it; the line,

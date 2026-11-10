@@ -123,11 +123,28 @@ std::uint8_t* g_dyn_cleared[16] = {};
 // renderer is given the values once a generation (render_view_hook). 0: never
 // changed - the game's.
 std::atomic<std::uint32_t> g_flags_gen{0};
-// The renderers given them, and the generation each was given (render_view_hook,
+// An upscaler that runs - TAA, FSR or DLSS - takes the AA's place: FXAA over
+// its picture, after the tone map, only softened it again. Whether one runs
+// changes with no setting changing - DLSS and FSR are known once the device is
+// up, and a failed evaluate stops them - so each view looks (render_view_hook)
+// and a change bumps g_aa_gen, which gives every renderer its AA flag again.
+// BBHOST_UPSCALE_GAME_AA=1 keeps the AA under FSR and DLSS, as before (TAA
+// alone took it), to compare.
+bool upscaler_takes_aa() {
+    static const bool game_aa = [] {
+        const char* e = std::getenv("BBHOST_UPSCALE_GAME_AA");
+        return e && e[0] == '1';
+    }();
+    const int m = upscaler_method();
+    return game_aa ? m == kUpscaleTaa : m != 0;
+}
+std::atomic<std::uint32_t> g_aa_gen{0};
+std::atomic<bool> g_upscaler_took{false};  // what the last view saw (render_view_hook)
+// The renderers given them, and the generations each was given (render_view_hook,
 // the render thread alone).
 struct GivenRenderer {
     std::uint8_t* renderer;
-    std::uint32_t gen;
+    std::uint32_t gen, aa_gen;
 };
 GivenRenderer g_given[16] = {};
 unsigned g_given_next = 0;
@@ -446,11 +463,10 @@ void settings_changed(const HostSettings& hs) {
     // pixels again, so it is off while it is.
     // Performance mode clears both (its patch's constructor writes until
     // 2026-11-05), and with it on or off while the game runs they follow.
-    // TAA (Graphics > Upscaling) takes the AA's place: FXAA over its picture
-    // only blurred it again. So does a plugin's own anti-aliasing (plugin API
-    // 27, host/plugins.h: aa_claim's BB_AA_TAKE).
-    const bool aa = hs.anti_alias && !scene_look_scale() && !hs.performance_mode && upscaler_method() != kUpscaleTaa &&
-                    plugins_aa_claim() != kAaTake;
+    // A plugin's own anti-aliasing takes the AA's place (plugin API 27,
+    // host/plugins.h: aa_claim's BB_AA_TAKE), and so does an upscaler that runs
+    // (upscaler_takes_aa, applied each view).
+    const bool aa = hs.anti_alias && !scene_look_scale() && !hs.performance_mode && plugins_aa_claim() != kAaTake;
     const bool ssao = hs.ssao && !hs.performance_mode;
     if (ssao != ssao_was || aa != aa_was || velocity != velocity_was || hs.hd_motion_blur != camera_blur_was) {
         ssao_was = ssao;
@@ -1290,7 +1306,14 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
     // "Enable SSAO" and "Enable AntiAliasing" (the same bytes) keep what they
     // set. Held every view until 2026-10-14, the PC graphics settings off
     // included, which turned the debug menu's switches back on.
-    const std::uint32_t gen = g_flags_gen.load(std::memory_order_acquire);
+    // (An upscaler starting or stopping: the AA flag given again.)
+    const bool took = upscaler_takes_aa();
+    if (g_upscaler_took.exchange(took, std::memory_order_relaxed) != took) {
+        g_aa_gen.fetch_add(1, std::memory_order_release);
+        host_log("graphics: the game's anti-aliasing %s", took ? "off: an upscaler runs and does the anti-aliasing itself"
+                                                               : "as its setting says: no upscaler runs");
+    }
+    const std::uint32_t gen = g_flags_gen.load(std::memory_order_acquire), aa_gen = g_aa_gen.load(std::memory_order_acquire);
     if (g_made_any.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lk(g_made_mu);
         for (const std::uint64_t c : g_made) {
@@ -1326,17 +1349,18 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
         std::memcpy(&caps, r + kCapabilities, sizeof(caps));
         if ((caps & kBlurCapability) && !r[kVelocityFlag]) r[kVelocityFlag] = 1;
     }
-    if (r && gen) {
+    if (r && (gen || aa_gen)) {
         GivenRenderer* g = nullptr;
         for (GivenRenderer& c : g_given) g = c.renderer == r ? &c : g;
-        if (!g || g->gen != gen) {
-            if (!g) g = &g_given[g_given_next++ % 16];
-            g->renderer = r;
-            g->gen = gen;
-            std::uint64_t caps = 0;
-            std::memcpy(&caps, r + kCapabilities, sizeof(caps));
+        if (!g) {
+            g = &g_given[g_given_next++ % 16];
+            *g = GivenRenderer{r, ~0u, ~0u};
+        }
+        std::uint64_t caps = 0;
+        std::memcpy(&caps, r + kCapabilities, sizeof(caps));
+        const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && !took && (caps & kAaCapability);
+        if (gen && g->gen != gen) {
             const std::uint8_t ssao = g_ssao.load(std::memory_order_relaxed) && (caps & kSsaoCapability);
-            const std::uint8_t aa = g_aa.load(std::memory_order_relaxed) && (caps & kAaCapability);
             const std::uint8_t velocity = g_velocity.load(std::memory_order_relaxed) && (caps & kBlurCapability);
             const std::uint8_t camera_blur = g_camera_blur.load(std::memory_order_relaxed) && (caps & kBlurCapability);
             static std::atomic<int> logs{0};
@@ -1349,7 +1373,14 @@ GUEST_ABI std::int64_t render_view_hook(std::uint64_t, const std::uint64_t* save
             r[kAaFlag] = aa;
             r[kVelocityFlag] = velocity;
             r[kCameraBlur] = camera_blur;
+        } else if (g->aa_gen != aa_gen) {
+            // An upscaler started or stopped, no setting changed since this
+            // renderer's last flags (or none ever did - the rest the game's):
+            // its AA flag alone.
+            r[kAaFlag] = aa;
         }
+        g->gen = gen;
+        g->aa_gen = aa_gen;
     }
     return 0;  // and the view renders as it would
 }

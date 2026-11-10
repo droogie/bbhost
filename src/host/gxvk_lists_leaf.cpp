@@ -3,12 +3,12 @@
 // thread-locals, no stack protector (CMakeLists.txt) - and the switch.
 #include "host/gxvk_lists.h"
 #include "host/gxvk_lists_internal.h"
+#include "core/portable.h"
 
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 
 #include <x86intrin.h>
 
@@ -37,8 +37,7 @@ int pool_threads() {
             const int k = std::atoi(t);
             return k < 0 ? 0 : k > 4 ? 4 : k;
         }
-        const unsigned hw = std::thread::hardware_concurrency();
-        return hw >= 16 ? 2 : hw >= 8 ? 1 : 0;
+        return pool_threads_for(host_cpu_threads());
     }();
     return n;
 }

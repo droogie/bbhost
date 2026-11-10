@@ -78,6 +78,12 @@ while IFS= read -r exe; do
         [ -f "$b/licenses/$l" ] || fail "${b#"$work"/}: no licenses/$l"
     done
 done < <(find "$work" -mindepth 3 -maxdepth 3 -type f -name bbhost.exe)
+# Each Windows executable runs in UTF-8 (res/bbhost.manifest): without it a
+# user or folder name outside ASCII stops bbhost at its start.
+while IFS= read -r exe; do
+    grep -aqF '<activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>' "$exe" \
+        || fail "${exe#"$work"/}: no UTF-8 code page in its manifest (res/bbhost.manifest)"
+done < <(find "$work" -mindepth 3 -maxdepth 3 -type f -name bbhost.exe)
 # DLSS on Linux beside each Linux executable: bbhost's NGX bridge and NVIDIA's
 # pinned runtime, with their licences (tools/fetch_ngx.sh; without them the
 # release has no DLSS on Linux) - and none of it in a Steam Deck kit, whose GPU
@@ -115,4 +121,4 @@ for b in "$d"/bbhost "$d"/bbhost.exe; do
     done
 done
 if [ -n "$list_sha" ]; then listmsg="and the pinned pipeline list (${list_sha:0:12}) beside each executable"; else listmsg="beside each executable (no pipeline list pinned yet)"; fi
-echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg; the Windows ones with FidelityFX, DLSS and the upscaler bridge; the Linux ones with DLSS and the NGX bridge, the Steam Deck's without"
+echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg; the Windows ones in UTF-8 with FidelityFX, DLSS and the upscaler bridge; the Linux ones with DLSS and the NGX bridge, the Steam Deck's without"

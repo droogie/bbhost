@@ -10,7 +10,9 @@
 // changed. Pure colours, so the post chain's exposure cannot hide or invent
 // an error. Blue: the surface came from off the screen. Run with the jitter
 // off (BBHOST_UPSCALE_JITTER=0); the gain sets how big a change counts
-// (0.6 / gain of the brighter value).
+// (0.6 / gain of the brighter value). Each pixel's class is also counted, in
+// sixteen bands of the width from the left, into `counts` (the host reads it
+// back and logs the shares every 30 frames).
 //
 // Compiled offline (tools/build_shaders.sh) into motion_check.spv.h.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -20,6 +22,9 @@ layout(set = 0, binding = 1) uniform texture2D prev_scene;  // the last frame's
 layout(set = 0, binding = 2) uniform texture2D motion;      // R16G16_SFLOAT, render pixels
 layout(set = 0, binding = 3) uniform sampler any_sampler;
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dst;
+// The classes counted: band b's black, green, red and blue at 4 b .. 4 b + 3.
+layout(set = 0, binding = 5) buffer Counts { uint n[64]; } counts;
+shared uint group_n[4];
 
 layout(push_constant) uniform Params {
     vec4 size;  // the output's width and height, then the render size
@@ -45,9 +50,9 @@ float apart(vec3 a, vec3 b) {
     return max(d.r, max(d.g, d.b));
 }
 
-void main() {
-    const ivec2 o = ivec2(gl_GlobalInvocationID.xy);
-    if (o.x >= int(size.x) || o.y >= int(size.y)) return;
+// The output pixel `o` checked and written; its class (0 black, 1 green,
+// 2 red, 3 blue) returned.
+uint check(const ivec2 o) {
     const ivec2 p = clamp(ivec2((vec2(o) + 0.5) * size.zw / size.xy), ivec2(0), ivec2(size.zw) - 1);
     // k.z (BBHOST_UPSCALE_CHECK_BOX): the three compared as averages over the
     // (2 k.z + 1)^2 render pixels around, each fetched by its own motion - the
@@ -66,16 +71,15 @@ void main() {
             stayed += max(texel(q), vec3(0.0));
         }
     }
-    vec3 c = vec3(0.0, 0.0, 1.0);
+    uint cls = 3u;
     if (inside) {
         const float n = float((2 * r + 1) * (2 * r + 1));
         const float m = apart(now / n, moved / n);
         const float s = apart(now / n, stayed / n);
         const float t = 0.6 / max(k.x, 0.01);
-        c = vec3(0.0);
-        if (m > t && m > 0.7 * s) c = vec3(1.0, 0.0, 0.0);
-        else if (s > t && m < 0.5 * s) c = vec3(0.0, 1.0, 0.0);
+        cls = m > t && m > 0.7 * s ? 2u : s > t && m < 0.5 * s ? 1u : 0u;
     }
+    vec3 c = cls == 3u ? vec3(0.0, 0.0, 1.0) : cls == 2u ? vec3(1.0, 0.0, 0.0) : cls == 1u ? vec3(0.0, 1.0, 0.0) : vec3(0.0);
     // k.w (BBHOST_UPSCALE_CHECK_OVERLAY): the picture itself, dimmed, with the
     // motion's size over it in red (8 render pixels full) - where the motion
     // lies against what moved.
@@ -89,4 +93,18 @@ void main() {
     // had last frame's matrices, white; 1 not, grey), for an A/B in one run.
     if (k.y > 0.5 && o.x < 24 && o.y < 24) c = vec3(k.y > 1.5 ? 1.0 : 0.3);
     imageStore(dst, o, vec4(c, 1.0));
+    return cls;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex < 4u) group_n[gl_LocalInvocationIndex] = 0u;
+    barrier();
+    const ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x < int(size.x) && o.y < int(size.y)) atomicAdd(group_n[check(o)], 1u);
+    barrier();
+    // One add a class a group: its band is its first column's.
+    if (gl_LocalInvocationIndex < 4u && group_n[gl_LocalInvocationIndex] != 0u) {
+        const uint band = min(15u, gl_WorkGroupID.x * 8u * 16u / uint(size.x));
+        atomicAdd(counts.n[band * 4u + gl_LocalInvocationIndex], group_n[gl_LocalInvocationIndex]);
+    }
 }

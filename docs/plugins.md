@@ -31,8 +31,11 @@ settings. In game, F9 opens the patch and plugin menu over the game.
 
 ## A first plugin
 
-`plugins/hello/hello.c` is the example. bbhost's own build produces it as
-`build/plugins/hello.so` (or `hello.dll`). A plugin needs only the header:
+`examples/plugins/hello/hello.c` is the example, and `examples/plugins/` holds
+the others. bbhost's own build compiles it as `build/hello.so` (or
+`hello.dll`), beside bbhost and not in `build/plugins/`, so no run loads or
+lists it until you copy it into a `plugins/` folder. A plugin needs only the
+header:
 
 ```sh
 # Linux
@@ -397,9 +400,9 @@ back with the flip it went at; `BBHOST_SHADER_WATCH=1` reads the plugins' folder
 and the player's again while the game runs; `video.shader_overrides = false` or
 `BBHOST_SHADER_OVERRIDES=0` turns all of them off. Not yet: textures or
 samplers of an override's own, and an override for some draws of a shader and
-not others. `tools/shader_tint_plugin.c` is a worked example: a test plugin
-that tints one shader live, on and off, its strength pulsing through its
-shader data (built beside the tests, in no package).
+not others. `examples/plugins/shader_tint` is a worked example: a plugin that
+tints one shader live, on and off, its strength pulsing through its shader
+data (built beside the tests, in no package).
 
 **Online rules** (v10)
 
@@ -417,8 +420,9 @@ fog, a colour pass - from the frame bbhost describes and the images it hands
 over, in the Vulkan command buffer the frame is recorded into. It needs only
 Vulkan's headers (`#define VK_NO_PROTOTYPES` before `vulkan/vulkan.h`): every
 function comes from the device it is given, so it never links the Vulkan
-loader. `tools/render_probe` is a working example: it registers both hooks,
-writes a marker into each, and checks everything below on the GPU.
+loader. `examples/plugins/render_probe` is a working example: it registers
+both hooks, writes a marker into each, and checks everything below on the
+GPU.
 
 ### The frame: `frame_info`
 

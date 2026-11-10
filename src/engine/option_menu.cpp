@@ -229,11 +229,12 @@ constexpr std::uint32_t kSystemDeckRowId = 110012;
 constexpr std::uint32_t kSystemEnhanceRowId = 110013;
 constexpr std::uint32_t kSystemUpscaleRowId = 110014;
 // PC Upscaling, 125000: frame generation, sharpness, TAA strength (125005),
-// reflection quality (its two entries 125030 Quarter, 125031 Half), then the
-// two pick lists - Upscaling (125032..125035, TAA 125040) and its quality
+// reflection quality (its two entries 125030 Quarter, 125031 Half), character
+// motion (125006; 125041 Precise, 125042 Velocity Map), then the two pick
+// lists - Upscaling (125032..125035, TAA 125040) and its quality
 // (125036..125039).
 constexpr std::uint32_t kUpFrameGen = 125000, kUpSharpness = 125001, kUpReflection = 125002, kUpScaler = 125003,
-                        kUpQuality = 125004, kUpTaaStrength = 125005;
+                        kUpQuality = 125004, kUpTaaStrength = 125005, kUpCharMotion = 125006;
 // PC Enhancements, 124000: six toggles, each for the next start (124000
 // was The Old Hunters, part of bbhost since: engine/patch_manifest.cpp).
 constexpr std::uint32_t kEnhMirror = 124001, kEnhRebirth = 124002, kEnhFivePlayers = 124003, kEnhSkillIssue = 124004;
@@ -769,6 +770,9 @@ Slider g_up_sharpness{"sharpness", kUpSharpness, 0, 0xff};
 Slider g_up_taa_strength{"taa_strength", kUpTaaStrength, 0, 0xff};
 const Choice kReflectionQualities[2] = {{0, 125030}, {1, 125031}};
 std::uint8_t g_up_reflection = 0, g_up_reflection_last = 0xff;
+// Character motion: Precise or Velocity Map, a pair as Reflection quality is.
+const Choice kCharMotions[2] = {{0, 125041}, {1, 125042}};
+std::uint8_t g_up_char_motion = 0, g_up_char_motion_last = 0xff;
 // Off, TAA, FSR 3, FSR 4, DLSS: the option's own order (host/options.cpp), TAA's message after the list's.
 const Choice kUpscalers[] = {{0, 125032}, {1, 125040}, {2, 125033}, {3, 125034}, {4, 125035}};
 const Choice kUpscaleQualities[] = {{0, 125036}, {1, 125037}, {2, 125038}, {3, 125039}};  // Performance .. Native AA
@@ -777,9 +781,9 @@ std::int32_t g_up_quality = 2, g_up_quality_last = -1;
 // The rows pc_upscale_handler builds: as many as the section's slots
 // (engine/menu_assets.h kPcUpscaleSlots), which the generator makes.
 #if defined(_WIN32)
-constexpr int kUpscaleRows = 6;
+constexpr int kUpscaleRows = 7;
 #else
-constexpr int kUpscaleRows = 5;  // no Frame generation
+constexpr int kUpscaleRows = 6;  // no Frame generation
 #endif
 // Six rows in five slots (Windows, until the section had six) drew Upscaling
 // Quality in the Defaults label's place, with no value and no list to open,
@@ -841,6 +845,7 @@ void seed_upscale() {
     seed(g_up_sharpness);
     seed(g_up_taa_strength);
     g_up_reflection = g_up_reflection_last = static_cast<std::uint8_t>(std::max(0, host_opt_index("ssr_quality")) == 1 ? 1 : 0);
+    g_up_char_motion = g_up_char_motion_last = static_cast<std::uint8_t>(host_opt_index("char_motion") == 1 ? 1 : 0);
     g_up_scaler = g_up_scaler_last = std::max(0, host_opt_index("upscaler"));
     g_up_quality = g_up_quality_last = std::max(0, host_opt_index("upscale_quality"));
 }
@@ -866,6 +871,10 @@ void push_upscale() {
     pick("ssr_quality", reflection, reflection_last);
     g_up_reflection = static_cast<std::uint8_t>(reflection);
     g_up_reflection_last = static_cast<std::uint8_t>(reflection_last);
+    std::int32_t char_motion = g_up_char_motion, char_motion_last = g_up_char_motion_last;
+    pick("char_motion", char_motion, char_motion_last);
+    g_up_char_motion = static_cast<std::uint8_t>(char_motion);
+    g_up_char_motion_last = static_cast<std::uint8_t>(char_motion_last);
     pick("upscaler", g_up_scaler, g_up_scaler_last);
     pick("upscale_quality", g_up_quality, g_up_quality_last);
 }
@@ -898,14 +907,15 @@ constexpr int kSectionSlots = 6, kKeysSlots = 8;
 constexpr int kGraphicsSlots = 7;
 // PC Settings has one more too on Windows (Stay Borderless's, after
 // Texture Quality's list took the sixth): engine/menu_assets.h's
-// kPcSettingSlots, which the generator makes.
+// kPcSettingSlots, which the generator makes; and PC Upscaling (Character
+// Motion's, its seventh on Windows): kPcUpscaleSlots.
 
 // The port's rows: its toggles plus the Texture Quality and frame-cap pick
 // lists, and in the graphics section its toggles plus the resolution list.
 constexpr int kRowCount = kToggleCount + 2;
 static_assert(kRowCount <= kPcSettingSlots && kGraphicsRows <= kGraphicsSlots && kControlsRows <= kSectionSlots &&
                   kCameraRows <= kSectionSlots && kDeckRows <= kSectionSlots && kEnhanceRows <= kSectionSlots &&
-                  kEffectsRows <= kSectionSlots && kUpscaleRows <= kSectionSlots && 1 + kBindPerPage <= kKeysSlots,
+                  kEffectsRows <= kSectionSlots && kUpscaleRows <= kPcUpscaleSlots && 1 + kBindPerPage <= kKeysSlots,
               "more rows than the section sprite has slots: the extra ones have nowhere to draw. "
               "Add slots in engine/menu_assets.cpp (build_option_movie), or split into a second section.");
 
@@ -1028,10 +1038,10 @@ GUEST_ABI void pc_effects_handler(void* dialog, void* params) {
     log_rows("PCEffects", dialog, kEffectsRows, kEffectsRows);
 }
 
-// PC Upscaling: a toggle (Windows: Frame generation), two sliders and a pair,
-// then Upscaling and its quality as the two pick lists last (the quality's
-// list opens over the Defaults caption, Upscaling's over the quality's row -
-// as PC Settings' two).
+// PC Upscaling: a toggle (Windows: Frame generation), two sliders and two
+// pairs, then Upscaling and its quality as the two pick lists last (the
+// quality's list opens over the Defaults caption, Upscaling's over the
+// quality's row - as PC Settings' two).
 GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
     host_log("pc-options: PCUpscale opened, dialog=%p params=%p", dialog, params);
     alignas(16) std::uint8_t scratch[0x100]{};
@@ -1044,6 +1054,8 @@ GUEST_ABI void pc_upscale_handler(void* dialog, void* params) {
     add_slider_row(dialog, &g_up_taa_strength.value, g_up_taa_strength.id, default_of(g_up_taa_strength));
     add_pair_row(dialog, &g_up_reflection, kUpReflection, kReflectionQualities,
                  static_cast<std::uint8_t>(std::max(0, host_opt_default_index("ssr_quality")) == 1 ? 1 : 0));
+    add_pair_row(dialog, &g_up_char_motion, kUpCharMotion, kCharMotions,
+                 static_cast<std::uint8_t>(host_opt_default_index("char_motion") == 1 ? 1 : 0));
     // The upscalers this platform offers, and the one chosen (host/upscaler.h upscaler_offered).
     Choice upscalers[sizeof(kUpscalers) / sizeof(kUpscalers[0])];
     int n_upscalers = 0;
