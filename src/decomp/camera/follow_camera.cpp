@@ -56,6 +56,7 @@
 // camera's hook in the game's code against our mouse step.
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
+#include "engine/camera_target.h"
 #include "engine/frame_rate_step.h"
 #include "engine/mouse_camera.h"
 #include "engine/mouse_camera_step.h"
@@ -1595,17 +1596,25 @@ void follow_cam_step(u8* cam_bytes, u8* chr, void* world, float dt, float frames
     if (const u8* row = lock_cam_row(camera_param_id(cam))) ease_toward_lock_cam_param(cam, row, frames30);  // P1, P2
     ease_distance_and_speeds(cam);                                                                         // P3
     if (!chr) return;                                                                                      // P4
+    const auto* target = static_cast<const u8*>(camera_target::get(chr));
+    const u8* floor_chr = chr;
+    const u8* model_chr = chr;
+    if (target) {
+        const u64 owner = load<u64>(reinterpret_cast<u64>(target) + 0x58);
+        if (owner && load<u64>(owner + 0x8)) floor_chr = target;
+        if (load<u64>(reinterpret_cast<u64>(target) + 0x3b0)) model_chr = target;
+    }
     Step step{};
     step.dt = dt;
     step.dt4 = _mm_set1_ps(dt);
     step.frames = frames;
     step.world = world;
     step.hold = held_turns();
-    ride_moving_floor(cam, chr, step);                                       // P5
+    ride_moving_floor(cam, floor_chr, step);                                 // P5
     take_wanted_distance(cam, step);                                         // P6
     step.stick = read_stick(cam, chr);                                       // P7
     step.stick_turns = stick_turns_camera(cam, step.stick, dt);
-    place_origins(cam, follow_character_frame(cam, chr, step), step);        // P8, P9
+    place_origins(cam, follow_character_frame(cam, model_chr, step), step);  // P8, P9
     chase_wanted_point(cam, step);                                           // P10
     const bool auto_turning = choose_angles(cam, step);                      // P11
     run_return_timers(cam, step);                                            // P12

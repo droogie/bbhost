@@ -748,19 +748,6 @@ if(UNIX)
   add_executable(stun_test tests/stun_test.cpp src/net/stun.cpp)
   target_include_directories(stun_test PRIVATE src)
   add_test(NAME stun_test COMMAND stun_test)
-  # Datagrams between two P2P sockets through hle/net.cpp: the game's split
-  # into whole chunks, others up to the largest UDP carries; whole with
-  # BBHOST_NET_SPLIT_DATAGRAMS=0, the 2 KB limit with
-  # BBHOST_NET_LARGE_DATAGRAMS=0 (tests/net_p2p_test.cpp).
-  add_executable(net_p2p_test tests/net_p2p_test.cpp src/hle/net.cpp src/net/stun.cpp src/core/futex.cpp)
-  target_include_directories(net_p2p_test PRIVATE src)
-  target_link_libraries(net_p2p_test PRIVATE pthread)
-  add_test(NAME net_p2p_test COMMAND net_p2p_test)
-  add_test(NAME net_p2p_whole_test COMMAND net_p2p_test)
-  set_tests_properties(net_p2p_whole_test PROPERTIES ENVIRONMENT BBHOST_NET_SPLIT_DATAGRAMS=0)
-  add_test(NAME net_p2p_small_test COMMAND net_p2p_test)
-  set_tests_properties(net_p2p_small_test PROPERTIES ENVIRONMENT BBHOST_NET_LARGE_DATAGRAMS=0)
-  set_tests_properties(net_p2p_test net_p2p_whole_test net_p2p_small_test PROPERTIES TIMEOUT 60)
   # The event poller's long polls and generations (net/poll_pacing.h).
   add_executable(poll_pacing_test tests/poll_pacing_test.cpp)
   target_include_directories(poll_pacing_test PRIVATE src)

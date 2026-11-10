@@ -932,6 +932,7 @@ void log_all_threads(const char* why) {
 void sampler_recover() {}
 void sampler_note_main_thread() { g_main_tid.store(GetCurrentThreadId()); }
 
+static int g_watchdog_ticks = 0;  // the watchdog thread's alone
 void sampler_watchdog_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {
     if (!g_guest_lo) {
         g_guest_lo = guest_lo;
@@ -947,8 +948,17 @@ void sampler_watchdog_start(std::uint64_t guest_lo, std::uint64_t guest_hi) {
         host_thread_set_name("bb-watchdog");
         std::uint64_t last_flip = hle_video_flip_count();
         int still_s = 0, dumps = 0;
+        // BBHOST_STACKS_FILE=<path>: when that file appears, every thread's
+        // stack goes to the log and the file is deleted - for a hang that
+        // still draws frames, which the no-flip check below never sees.
+        static const char* stacks_file = std::getenv("BBHOST_STACKS_FILE");
         for (;;) {
-            Sleep(1000);
+            Sleep(stacks_file ? 250 : 1000);
+            if (stacks_file && GetFileAttributesA(stacks_file) != INVALID_FILE_ATTRIBUTES) {
+                DeleteFileA(stacks_file);
+                log_all_threads("requested");
+            }
+            if (stacks_file && ++g_watchdog_ticks % 4) continue;
             const std::uint64_t flip = hle_video_flip_count();
             if (flip != last_flip) {
                 if (still_s >= stall_s) host_log("watchdog: flips again after %d s (flip %llu)", still_s, static_cast<unsigned long long>(flip));

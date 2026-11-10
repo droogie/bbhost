@@ -5,6 +5,7 @@
 // own traffic starts.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "net/stun.h"
@@ -30,3 +31,11 @@ bool hle_net_p2p_relay(std::uint32_t* server, std::uint16_t* vport);
 // relay gets none: the relay needs no hole.
 void hle_net_p2p_punch(const char* label, std::uint32_t addr, std::uint16_t port, std::uint32_t local_addr,
                        std::uint16_t local_port);
+
+// NpSignaling's control datagrams between two bbhost instances (activation,
+// its acknowledgement, close): sent from the P2P port to addr (network
+// order):port (host order), through the relay when the peer is behind it.
+// They start with kSignalMagic; the receiving port hands them to
+// hle_np_signaling_control (hle/np.h) and the game never sees them.
+constexpr std::uint8_t kSignalMagic[4] = {0xfe, 'b', 'b', 's'};
+void hle_net_p2p_signal(std::uint32_t addr, std::uint16_t port, const void* data, std::size_t len);

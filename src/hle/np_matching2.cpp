@@ -23,8 +23,10 @@
 #define REG(name, fn) register_hle_fn(name, reinterpret_cast<void*>(fn))
 #include <atomic>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <vector>
 
 namespace {
@@ -214,6 +216,17 @@ struct M2 {
     RequestOptParam leave_opt{};
     std::vector<std::unique_ptr<Held>> held;
     std::string npid;  // our handle
+    // Players left at our LeaveRoom whose NpSignaling connection the game
+    // still has open: their DEAD goes out when the game closes it, as
+    // shadPS4's StopMatching2 leaves such a transport up (online id ->
+    // room, member).
+    std::map<std::string, std::pair<std::uint64_t, std::uint16_t>> dead_on_close;
+    // Members whose Matching2 ESTABLISHED (0x5102) went out: once their
+    // transport has been up a second (hle_np_matching2_transport_up).
+    std::set<std::uint16_t> m2_established;
+    // Members whose Matching2 DEAD went out when their connection closed
+    // (hle_np_matching2_transport_dead): our LeaveRoom does not send it again.
+    std::set<std::uint16_t> m2_dead_sent;
 };
 M2 g;
 
@@ -305,15 +318,11 @@ std::vector<net::Peer> room_peers() {
     return v;
 }
 
-// The ESTABLISHED event for every member the game must see before
-// signalingPoll runs (ConnObj+0xd8), self included.
-void schedule_established_for_all(int delay_ms) {
-    std::vector<std::uint16_t> ids;
-    for (const net::Peer& p : room_peers()) ids.push_back(p.member_id);
-    ids.push_back(g.member_id);
-    net::dispatch_after(delay_ms, net::Prio::Signaling, [ids] {
-        for (std::uint16_t m : ids) fire_signaling(m, kEvSignalingEstablished, 0);
-    });
+// Matching2 signaling to every other member (never our own), as shadPS4's
+// StartMatching2: NpSignaling's transport to each, its handshake started;
+// ESTABLISHED (0x5102) for a member once that transport is up.
+void connect_signaling_for_all() {
+    for (const net::Peer& p : room_peers()) hle_np_signaling_m2_connect(p.online_id);
 }
 
 // Members gone for good: the signaling DEAD for each first, then the room
@@ -420,9 +429,12 @@ void forget_room_locked() {
     g.room_id = 0;
     g.owner_id = 0;
     g.max_slot = 0;
+    g.m2_established.clear();
+    g.m2_dead_sent.clear();
     net::peers_clear();
     net::room_clear();
-    hle_np_signaling_reset();
+    // NpSignaling's connections are the game's: it closes them itself
+    // (shadPS4's StopMatching2 leaves a transport with one up).
 }
 
 // Our LeaveRoom (or the context going away): out of the server's room,
@@ -444,7 +456,15 @@ void end_session_locked(const char* why) {
         });
     }
     std::vector<std::uint16_t> ids;
-    for (const net::Peer& p : room_peers()) ids.push_back(p.member_id);
+    for (const net::Peer& p : room_peers()) {
+        if (g.m2_dead_sent.count(p.member_id)) continue;
+        if (hle_np_signaling_live(p.online_id)) {
+            g.dead_on_close[p.online_id] = {g.room_id, p.member_id};
+        } else {
+            ids.push_back(p.member_id);
+            hle_np_signaling_m2_stop(p.online_id);
+        }
+    }
     schedule_dead(ids, kErrTerminatedByMyself, g.room_id, 0);
     if (g.leave_pending) {
         const unsigned req = g.leave_req;
@@ -648,10 +668,7 @@ void on_server_event(const json::Value& ev) {
             }
             c.run();
         });
-        net::dispatch_after(800, net::Prio::Signaling, [mid] {
-            fire_signaling(mid, kEvSignalingEstablished, 0);
-            fire_signaling(g.member_id, kEvSignalingEstablished, 0);
-        });
+        hle_np_signaling_m2_connect(p.online_id);
         return;
     }
     if (name == "room_member_left") {
@@ -672,6 +689,7 @@ void on_server_event(const json::Value& ev) {
         // with it, and the host's game summoned into a room the server no
         // longer had (dev, 2026-10-05).
         schedule_dead({mid}, kErrTerminatedByPeer, g.room_id, 0);
+        g.m2_established.erase(mid);
         net::dispatch_after(100, net::Prio::RoomEvent, [p, cause] {
             M2Call c;
             {
@@ -910,7 +928,7 @@ GUEST_ABI int m2_create_join_room(unsigned ctx, const std::uint8_t* reqp, const 
         });
         if (!error) {
             std::lock_guard<std::mutex> lk2(g.mu);
-            schedule_established_for_all(800);
+            connect_signaling_for_all();
         }
     });
     return 0;
@@ -977,7 +995,7 @@ GUEST_ABI int m2_join_room(unsigned ctx, const std::uint8_t* reqp, const Request
                             [req, o, error, resp] { fire_request(o.cbFunc, o.cbFuncArg, req, kEvJoinRoom, error, resp); });
         if (!error) {
             std::lock_guard<std::mutex> lk2(g.mu);
-            schedule_established_for_all(500);
+            connect_signaling_for_all();
         }
     });
     return 0;
@@ -1009,14 +1027,25 @@ GUEST_ABI int m2_leave_room(unsigned ctx, const void*, const RequestOptParam* op
 GUEST_ABI int m2_signaling_get_connection_status(unsigned ctx, std::uint64_t room, std::uint16_t member,
                                                   int* status, std::uint32_t* addr, std::uint16_t* port) {
     if (ctx != g.ctx_id) return kErrContext;
+    // As shadPS4's SyncMatching2Peers: the transport's status, pending until
+    // ESTABLISHED went out for that member.
     net::Peer p;
-    const bool known = net::peers_get(member, &p) && p.addr != 0;
-    if (status) *status = known ? 2 : 0;
-    if (addr) *addr = known ? p.addr : 0;
-    if (port) *port = known ? static_cast<std::uint16_t>((p.port << 8) | (p.port >> 8)) : 0;
+    int st = 0;
+    if (net::peers_get(member, &p)) {
+        bool sent = false;
+        {
+            std::lock_guard<std::mutex> lk(g.mu);
+            sent = g.m2_established.count(member) != 0;
+        }
+        const int transport = hle_np_signaling_transport_status(p.online_id);
+        st = transport == 0 ? 0 : sent && transport == 2 ? 2 : 1;
+    }
+    if (status) *status = st;
+    if (addr) *addr = st == 2 ? p.addr : 0;
+    if (port) *port = st == 2 ? static_cast<std::uint16_t>((p.port << 8) | (p.port >> 8)) : 0;
     if (g_trace) {
         host_log("sceNpMatching2SignalingGetConnectionStatus room %llu member %u -> %d",
-                 static_cast<unsigned long long>(room), member, known ? 2 : 0);
+                 static_cast<unsigned long long>(room), member, st);
     }
     return 0;
 }
@@ -1171,4 +1200,57 @@ void hle_register_np_matching2() {
     REG("sceNpMatching2SetRoomDataExternal", m2_set_room_data_external);
     REG("sceNpMatching2SetRoomMemberDataInternal", m2_set_room_member_data_internal);
     REG("sceNpMatching2SignalingGetPingInfo", m2_signaling_get_ping_info);
+}
+
+void hle_np_matching2_peer_closed(const std::string& online_id) {
+    std::uint64_t room = 0;
+    std::uint16_t member = 0;
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        auto it = g.dead_on_close.find(online_id);
+        if (it == g.dead_on_close.end()) return;
+        room = it->second.first;
+        member = it->second.second;
+        g.dead_on_close.erase(it);
+    }
+    // Ahead of NpSignaling's own DEAD on the same queue.
+    net::dispatch_after(0, net::Prio::Signaling, [room, member] { fire_signaling(member, kEvSignalingDead, kErrTerminatedByMyself, room); });
+}
+
+// The member's ESTABLISHED, once its transport has been up a second (as
+// shadPS4's SyncMatching2Peers with kMatching2EstablishDelay).
+void hle_np_matching2_transport_up(const std::string& online_id) {
+    std::uint16_t member = 0;
+    std::uint64_t room = 0;
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        if (!g.in_room) return;
+        for (const net::Peer& p : room_peers()) {
+            if (p.online_id == online_id) member = p.member_id;
+        }
+        if (!member || g.m2_established.count(member)) return;
+        if (hle_np_signaling_transport_status(online_id) != 2) return;
+        g.m2_established.insert(member);
+        room = g.room_id;
+    }
+    fire_signaling(member, kEvSignalingEstablished, 0, room);
+}
+
+// The member's DEAD when its transport gave up (shadPS4's
+// QueueMatching2DeadForTransport on a timeout).
+void hle_np_matching2_transport_dead(const std::string& online_id, int error) {
+    std::uint16_t member = 0;
+    std::uint64_t room = 0;
+    {
+        std::lock_guard<std::mutex> lk(g.mu);
+        if (!g.in_room) return;
+        for (const net::Peer& p : room_peers()) {
+            if (p.online_id == online_id) member = p.member_id;
+        }
+        if (!member || g.m2_dead_sent.count(member)) return;
+        g.m2_dead_sent.insert(member);
+        g.m2_established.erase(member);
+        room = g.room_id;
+    }
+    fire_signaling(member, kEvSignalingDead, error, room);
 }
