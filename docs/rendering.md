@@ -903,6 +903,40 @@ commit at a true 60; `=0` keeps the path before them with the run commit as it w
 `BBHOST_RUN_COMMIT` set decides the run commit either way, and
 `BBHOST_GXVK_LISTS` the segments alone.
 
+**The pool's duty (`BBHOST_GXVK_LISTS_REST`).** The pool works only where it
+shortens the frame; resting, it is given no draw and the command processor
+draws them all in order with the homes, as with `BBHOST_GXVK_LISTS=0`. It rests
+while a frame cap holds the frame (two half-second windows in a row with the
+limiter waiting 15% of the time; it works again once the command processor,
+drawing everything, is busy 85% of a window at the cap, or the frame misses the
+cap with the game held back by the command processor's backlog 20% of the
+time), while the frame is the GPU's (busy 90% of two windows, until it is under
+80% over six), and wherever resting costs the frame nothing. That last is
+measured at each place, both ways: 10 s after the pool began to work there, an
+experiment rests it for 5.5 s and lets it work for 5.5 s more, and compares the
+frame rate resting with the windows on either side of it; under 0.5% slower
+resting, the pool rests, and an ask now and then (work, then rest again,
+compared the same way) looks again, twice as far apart each time (to 4
+minutes). An 8% difference decides in 3 s and puts the next experiment four
+times as far away. Where resting holds the game back by the command processor's
+backlog under 10% of the time, the pool has nothing to shorten: it rests unless
+resting is 8% slower, and no ask is made while that lasts (the frame rate
+alone, a few seconds each way, can be 2-3% off at such a place). Each switch
+takes 1-2 s to settle either way, and the first 1.5 s of each phase are not
+counted. On an RTX 4070 with two Xeon Gold 6230 (1080p, uncapped) the pool is
+worth 9-13% at Old Yharnam and 7-11% at Cainhurst's courtyard, and costs 1-3.5%
+in the sewers under Central Yharnam, where its two threads beside the game's
+slow the game's own code; under Windows on an RTX 3070 Ti Laptop GPU (16
+hardware threads) it is worth 24-32% at Old Yharnam, 2-4% at the Nightmare of
+Mensis and Cainhurst's courtyard, about 4% in the sewer pit, and 0-4% at
+Central Yharnam from one sitting to the next. Each place after a loading screen
+starts working, and a rest at a cap ends once the frame is under 85% of the cap
+for 3 s (the title's menus meet an uncapped game's 960 cap).
+`BBHOST_GXVK_LISTS_REST=0`: the pool never rests; `=always`: it always does
+(what resting costs against the pool off); `=cycle:N` rests and works N frames
+each in turn (a check); `BBHOST_GXVK_LISTS_REST_LOG=1`: every window of the
+rule in the log.
+
 ### GX's objects as Vulkan objects (a design note)
 
 GX - the engine's Direct3D 11-shaped layer - keeps its buffers and textures in
