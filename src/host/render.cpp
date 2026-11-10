@@ -44,6 +44,7 @@
 #include "host/gxvk_homes.h"
 #include "host/gxvk_lists.h"
 #include "host/gxvk_lists_internal.h"
+#include "host/list_cb_memo.h"
 #include "host/gxvk_table.h"
 #include "host/draw_capture.h"
 #include "host/shaders/particleargs.spv.h"
@@ -17200,6 +17201,7 @@ struct ListCbArena {
     std::atomic<std::uint64_t> lap[kSegments] = {};         // its takes so far
     std::uint32_t next = 0;                               // where the next take looks first (under mu)
     std::atomic<std::uint64_t> takes{0}, full{0}, shared{0};
+    std::atomic<std::uint64_t> changed{0};  // copies of the same address and flip not shared: the guest's bytes had changed
 };
 ListCbArena g_list_arena;
 struct ListCbCursor {  // a pool thread's segment
@@ -17826,20 +17828,23 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         }
                         VkDeviceSize at = 0;
                         // A buffer copied again for a draw of the same frame (its GX
-                        // call's flip) binds its first copy, as the command processor's
-                        // memo shares one within a recording: a renamed copy's bytes are
-                        // final at its call, and its block is not handed out again
-                        // before the GPU has run the frame that reads it.
-                        struct ArenaMemo {
-                            std::uint64_t base = 0, bytes = 0, flip = 0, lap = 0;
-                            std::uint32_t seg = 0;
-                            VkDeviceSize at = 0;
-                        };
-                        static thread_local ArenaMemo memo_tab[512];
+                        // call's flip) binds its first copy while the guest's bytes are
+                        // the ones that copy took (host/list_cb_memo.h: the address alone
+                        // does not say so). At 720p and 120 fps on an RTX 4070, 2,193 of
+                        // 12.9 million shares in 150 s were of a copy the game's frame
+                        // before had made at the address, and 48 of the 49 one-frame
+                        // flickers in the frames came right after one: a frame drawn with
+                        // another frame's constants - the Hunter's Dream's ground mist
+                        // gone, a dark frame, a stretched sprite. `changed` counts the
+                        // shares turned away.
+                        static thread_local list_cb_memo::Entry memo_tab[512];
                         ListNotes& ln = *t_run_draw->list;
-                        ArenaMemo& am = memo_tab[((copy_from >> 4) ^ (copy_from >> 13)) & 511];
-                        if (am.base == copy_from && am.bytes >= copy_bytes && am.flip == ln.call_flip &&
-                            g_list_arena.lap[am.seg].load(std::memory_order_acquire) == am.lap && list_cb_keep(am.seg, am.lap, ln)) {
+                        list_cb_memo::Entry& am = memo_tab[((copy_from >> 4) ^ (copy_from >> 13)) & 511];
+                        const list_cb_memo::Share share =
+                            list_cb_memo::shares(am, copy_from, bytes, copy_bytes, ln.call_flip,
+                                                 [](std::uint32_t seg) { return g_list_arena.lap[seg].load(std::memory_order_acquire); });
+                        if (share == list_cb_memo::Share::kChanged) bump(g_list_arena.changed);
+                        if (share == list_cb_memo::Share::kYes && list_cb_keep(am.seg, am.lap, ln)) {
                             at = am.at;
                             bump(g_list_arena.shared);  // (into the commit's sink: one locked add per draw no more)
                         } else {
@@ -17849,7 +17854,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                             }
                             std::memcpy(static_cast<std::uint8_t*>(g_list_arena.ring->map) + g_list_arena.base + at,
                                         reinterpret_cast<const void*>(static_cast<std::uintptr_t>(copy_from)), copy_bytes);
-                            am = ArenaMemo{copy_from, copy_bytes, ln.call_flip, t_list_cb.lap, t_list_cb.seg, at};
+                            am = list_cb_memo::make(copy_from, copy_bytes, bytes, ln.call_flip, t_list_cb.lap, t_list_cb.seg, at);
                         }
                         const bool whole = whole_ring;
                         const VkDeviceSize in_ring = g_list_arena.base + at;  // (the arena lies in the ring's buffer)
@@ -29364,10 +29369,13 @@ std::string host_gpu_splice_report(bool window) {
         std::snprintf(buf, sizeof(buf), " %s %llu;", kSpliceWhyName[k], static_cast<unsigned long long>(v));
         out += buf;
     }
-    std::snprintf(buf, sizeof(buf), " | targets published %llu; arena segments taken %llu, none free %llu, copies shared %llu; image stops: by "
-                  "words %llu, a view by id not made %llu, a sampler %llu; ",
+    std::snprintf(buf, sizeof(buf), " | targets published %llu; arena segments taken %llu, none free %llu, copies shared %llu (%llu not: "
+                  "the bytes had changed)",
                   static_cast<unsigned long long>(g_pub_writes.load()), static_cast<unsigned long long>(g_list_arena.takes.load()),
                   static_cast<unsigned long long>(g_list_arena.full.load()), static_cast<unsigned long long>(g_list_arena.shared.load()),
+                  static_cast<unsigned long long>(g_list_arena.changed.load()));
+    out += buf;
+    std::snprintf(buf, sizeof(buf), "; image stops: by words %llu, a view by id not made %llu, a sampler %llu; ",
                   static_cast<unsigned long long>(g_list_image_stops[0].load()),
                   static_cast<unsigned long long>(g_list_image_stops[1].load()), static_cast<unsigned long long>(g_list_image_stops[2].load()));
     out += buf;
