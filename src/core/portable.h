@@ -114,3 +114,7 @@ void* host_page_alloc(std::size_t size, bool exec);
 void host_page_free(void* p, std::size_t size);
 // Makes [p, p+size) inaccessible: a guard below a stack.
 void host_page_guard(void* p, std::size_t size);
+// A file mapped read-only for the rest of the process, its size in *size: only
+// what is read of it is resident, and the system can drop that again. nullptr
+// when it cannot be opened or mapped, or is empty.
+const void* host_map_file(const char* path, std::size_t* size);

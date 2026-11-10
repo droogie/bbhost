@@ -1,5 +1,6 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/launcher_ui.h"
+#include "core/portable.h"
 
 #include "log.h"
 
@@ -17,6 +18,8 @@
 #include <filesystem>
 #include <initializer_list>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <random>
 #include <vector>
 
@@ -154,6 +157,25 @@ void draw_switch(ImDrawList* dl, ImVec2 p, float k, bool hovered) {
     dl->AddCircleFilled(ImVec2(x, p.y + r), kr, c(mix(kTextDim, IM_COL32(250, 251, 255, 255), 0.4f + 0.6f * k)));
 }
 
+// A font file mapped once for the process (core/portable.h), not read in: the
+// atlas reads its tables and the glyphs drawn, and only those pages are
+// resident - Windows' three CJK fonts are 47 MB, which read in were 45 MiB more
+// in the setup window and again in the game. load_fonts runs again for the
+// in-game menus and finds it mapped.
+const void* mapped_font(const std::string& path, std::size_t* size) {
+    static std::mutex mu;
+    static std::map<std::string, std::pair<const void*, std::size_t>> files;
+    const std::lock_guard<std::mutex> lock(mu);
+    auto it = files.find(path);
+    if (it == files.end()) {
+        std::size_t n = 0;
+        const void* p = host_map_file(path.c_str(), &n);
+        it = files.emplace(path, std::make_pair(p, n)).first;
+    }
+    *size = it->second.second;
+    return it->second.first;
+}
+
 // Fonts: the first of `names` that exists - under %WINDIR%\Fonts on
 // Windows, whole paths elsewhere - as a font of its own, or with `merge` into
 // the last one added, for the letters that one lacks.
@@ -167,10 +189,15 @@ ImFont* add_font(std::initializer_list<const char*> names, bool merge = false) {
 #endif
         std::error_code ec;
         if (!std::filesystem::is_regular_file(path, ec)) continue;
-        // 1.92's atlas adds glyphs as they are drawn: no ranges.
+        std::size_t size = 0;
+        const void* data = mapped_font(path, &size);
+        if (!data || size > 0x7fffffff) continue;
+        // 1.92's atlas adds glyphs as they are drawn: no ranges. It is lent
+        // the mapping, which outlives it, and never frees it.
         ImFontConfig cfg;
         cfg.MergeMode = merge;
-        if (ImFont* f = ImGui::GetIO().Fonts->AddFontFromFileTTF(path.c_str(), 0.0f, &cfg)) return f;
+        cfg.FontDataOwnedByAtlas = false;
+        if (ImFont* f = ImGui::GetIO().Fonts->AddFontFromMemoryTTF(const_cast<void*>(data), static_cast<int>(size), 0.0f, &cfg)) return f;
     }
     return nullptr;
 }

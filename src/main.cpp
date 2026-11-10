@@ -1092,7 +1092,7 @@ int main(int argc, char** argv) {
     // they are missing, and write a template when there is no file at all.
     if (const std::string help = config_setup_help(cfg); !help.empty()) {
         decide_log(true);
-        std::fputs(help.c_str(), stderr);
+        host_log_detail::write_raw(help.data(), help.size());  // as the log goes: UTF-16 to a console
         std::fflush(stderr);
         return 2;
     }
@@ -1181,7 +1181,8 @@ int main(int argc, char** argv) {
     if (image.sha256 != kEboot109Sha256) {
         const char* any = std::getenv("BBHOST_ANY_EBOOT");
         if (!(any && any[0] == '1')) {
-            std::fputs(config_eboot_help(cfg, image.sha256, kEboot109Sha256).c_str(), stderr);
+            const std::string help = config_eboot_help(cfg, image.sha256, kEboot109Sha256);
+            host_log_detail::write_raw(help.data(), help.size());  // as the log goes: UTF-16 to a console
             std::fflush(stderr);
             return 3;
         }
