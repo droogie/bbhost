@@ -44,7 +44,7 @@ using Bytes = std::vector<std::uint8_t>;
 
 // Bumped whenever a generator or the recipe changes, so installs remake their
 // assets instead of keeping the last generation.
-constexpr int kGeneratorVersion = 20;  // 20: every PC section's rows stacked top-down, a row's pick list over the rows after it; 19: PC Upscaling's sixth row on Windows (five rows elsewhere); 18: PC Settings' seventh row on Windows alone; 17: PC Settings' seventh row, Stay Borderless; 16: PC Enhancements' sixth row, Auto-Replenish Items; 15: PC Enhancements' fifth row, Full Phantom HP; 14: PC Settings' Texture Quality row's text; 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
+constexpr int kGeneratorVersion = 21;  // 21: a mod's own menu bundle gets the port's text too; 20: every PC section's rows stacked top-down, a row's pick list over the rows after it; 19: PC Upscaling's sixth row on Windows (five rows elsewhere); 18: PC Settings' seventh row on Windows alone; 17: PC Settings' seventh row, Stay Borderless; 16: PC Enhancements' sixth row, Auto-Replenish Items; 15: PC Enhancements' fifth row, Full Phantom HP; 14: PC Settings' Texture Quality row's text; 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
 
 const char kMessagesTsv[] =
 #include "pc_option_messages.inc"
@@ -1243,6 +1243,18 @@ bool menu_assets_ensure() {
         host_log("menu assets: the dump has no %s/*/%s", kMessageDir, kMessageFile);
         return false;
     }
+    // A mod that ships its own menu bundle (the player's mods folder) is read
+    // ahead of everything generated, so the port's text, added to the dump's
+    // bundle above, never reached the game: its rows showed as "(122000)". Such
+    // a bundle gets the port's text added too, written to a layer of its own that
+    // hle_fs_set_patched_root puts ahead of the mods.
+    const fs::path out_mod = fs::path(data) / "bbhost" / "menu-assets-mod";
+    std::map<std::string, Bytes> mod_src;  // relative path -> the mod's bundle
+    for (const auto& [rel, src] : langs) {
+        const std::string p = hle_fs_mods_file(rel);
+        if (!p.empty())
+            if (auto b = read_file(p)) mod_src.emplace(rel, std::move(*b));
+    }
     // What these were made from: the generator, the strings and every source.
     std::uint64_t h = fnv1a(&kGeneratorVersion, sizeof(kGeneratorVersion));
     h = fnv1a(kMessagesTsv, sizeof(kMessagesTsv), h);
@@ -1252,6 +1264,10 @@ bool menu_assets_ensure() {
     for (const auto& [rel, src] : langs) {
         h = fnv1a(rel.data(), rel.size(), h);
         h = fnv1a(src.data(), src.size(), h);
+        const auto m = mod_src.find(rel);
+        const std::uint8_t has_mod = m != mod_src.end() ? 1 : 0;
+        h = fnv1a(&has_mod, 1, h);
+        if (has_mod) h = fnv1a(m->second.data(), m->second.size(), h);
     }
     std::vector<std::pair<std::string, Bytes>> titles;
     for (const char* rel : kTitleMovies)
@@ -1264,9 +1280,14 @@ bool menu_assets_ensure() {
     const auto have = read_file(out / "stamp");
     bool fresh = have && std::string(have->begin(), have->end()) == stamp && fs::exists(out / kMovie);
     for (const auto& [rel, src] : langs) fresh = fresh && fs::exists(out / rel);
+    for (const auto& [rel, src] : mod_src) fresh = fresh && fs::exists(out_mod / rel);
     for (const auto& [rel, src] : titles) fresh = fresh && fs::exists(out / rel);
     if (!fresh) {
         try {
+            // Nothing left from an earlier run: a mod taken out of the mods folder
+            // must not leave its patched copy ahead of the game's own file.
+            std::error_code rm_ec;
+            fs::remove_all(out_mod, rm_ec);
             const Bytes movie = build_option_movie(*movie_src);
             if (!write_file(out / kMovie, movie)) {
                 host_log("menu assets: cannot write %s", out.string().c_str());
@@ -1284,6 +1305,21 @@ bool menu_assets_ensure() {
                     host_log("menu assets: %s not made: %s", rel.c_str(), f.why.c_str());
                 }
             }
+            int made_mod = 0;
+            for (const auto& [rel, src] : mod_src) {
+                try {
+                    if (write_file(out_mod / rel, build_menu_messages(src, skill_issue))) {
+                        ++made_mod;
+                    } else {
+                        host_log("menu assets: cannot write %s", (out_mod / rel).string().c_str());
+                    }
+                } catch (const Fail& f) {
+                    host_log("menu assets: the mod's %s was not given the port's text: %s", rel.c_str(), f.why.c_str());
+                }
+            }
+            if (!mod_src.empty())
+                host_log("menu assets: %d of %zu menu bundles in the mods folder given the port's text in %s", made_mod,
+                         mod_src.size(), out_mod.string().c_str());
             for (const auto& [rel, src] : titles) {
                 try {
                     if (!write_file(out / rel, add_list_slot(src, "CommandList")))
@@ -1307,5 +1343,6 @@ bool menu_assets_ensure() {
         }
     }
     hle_fs_set_generated_root(out.string().c_str());
+    hle_fs_set_patched_root(mod_src.empty() ? "" : out_mod.string().c_str());
     return true;
 }

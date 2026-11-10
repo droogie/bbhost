@@ -95,6 +95,9 @@ const bool g_overlay_index_on = [] {
 std::atomic<std::uint64_t> g_app0_lookups{0}, g_overlay_probes{0}, g_overlay_skips{0};
 std::string g_generated;  // hle_fs_set_generated_root
 OverlayIndex g_generated_index;
+// hle_fs_set_patched_root: tried before the player's mods.
+std::string g_patched;
+OverlayIndex g_patched_index;
 // hle_fs_add_generated_root: fixed slots published by the count, as the
 // plugins' layers are.
 constexpr int kMaxGeneratedLayers = 4;
@@ -121,7 +124,9 @@ struct OverlayLayer {
 };
 thread_local bool t_without_plugins = false;  // hle_fs_map_path_base
 std::vector<OverlayLayer> overlay_layers() {
-    std::vector<OverlayLayer> v{{&g_mods, nullptr}};
+    std::vector<OverlayLayer> v;
+    if (!g_patched.empty()) v.push_back({&g_patched, &g_patched_index});  // a mod's file with the port's text added
+    v.push_back({&g_mods, nullptr});
     if (!t_without_plugins) {
         const int n = g_plugin_layer_count.load(std::memory_order_acquire);
         for (int i = 0; i < n; ++i) v.push_back({&g_plugin_layers[static_cast<std::size_t>(i)], nullptr});
@@ -1312,6 +1317,13 @@ std::string hle_fs_game_file(const std::string& rel) {
     }
     return join_path(g_app0, r);
 }
+std::string hle_fs_mods_file(const std::string& rel) {
+    if (g_mods.empty()) return {};
+    const std::string r = !rel.empty() && rel[0] == '/' ? rel.substr(1) : rel;
+    const std::string p = join_path(g_mods, r);
+    if (path_exists(p.c_str())) return p;
+    return resolve_nocase(g_mods, r);  // empty when it is not there
+}
 
 namespace {
 
@@ -1359,6 +1371,15 @@ void hle_fs_set_generated_root(const char* dir) {
         g_allowed_roots.push_back(g_generated);
         index_layer(g_generated, g_generated_index);
         log_generated_layer(g_generated, g_generated_index);
+    }
+}
+void hle_fs_set_patched_root(const char* dir) {
+    g_patched = dir && *dir && is_dir_path(dir) ? canonical_dir(dir) : std::string();
+    if (!g_patched.empty()) {
+        g_allowed_roots.push_back(g_patched);  // under <data>, as the generated one is
+        index_layer(g_patched, g_patched_index);
+        host_log("FS patched overlay=%s (ahead of the mods overlay: the mod's own files with the port's text added; %zu files and folders)",
+                 g_patched.c_str(), g_patched_index.paths.size());
     }
 }
 void hle_fs_add_generated_root(const char* dir) {

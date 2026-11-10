@@ -23,6 +23,8 @@ const char* hle_fs_app0_root() { return ""; }
 const char* hle_fs_update_root() { return ""; }
 std::string hle_fs_game_file(const std::string& rel) { return rel; }
 void hle_fs_set_generated_root(const char*) {}
+std::string hle_fs_mods_file(const std::string&) { return {}; }  // no mods folder here
+void hle_fs_set_patched_root(const char*) {}
 
 static int g_failures = 0;
 #define CHECK(cond)                                                                        \
