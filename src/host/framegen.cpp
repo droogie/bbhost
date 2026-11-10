@@ -2,6 +2,7 @@
 
 #include "core/config.h"
 #include "engine/loading.h"
+#include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/settings.h"
 #include "log.h"
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -305,7 +307,28 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
         // over every frame it shows.
         // Not while a loading screen is up: its frames run uncapped to load
         // faster, and there is nothing to smooth.
-        const bool on = g_present_ready && !loading_screen_up();
+        const bool ready = g_present_ready && !loading_screen_up();
+        // Switched on only after that many such flips in a row, off at the
+        // first without (BBHOST_FG_DEBOUNCE=N; 0: on at the first, as
+        // v0.2.30). A switch waits inside AMD's configure for all it has in
+        // flight and starts or stops its presenting threads; at a loading
+        // screen's end that was the world's first flip, its frame times still
+        // uneven, where a player saw "Not Responding" (Display-Limited with
+        // frame generation). Now the switch on comes 30 steady flips later. (A
+        // loading screen still makes one switch off and one on: the flips that
+        // show a display buffer again fall inside it, generation off already.)
+        static const int need = [] {
+            const char* e = std::getenv("BBHOST_FG_DEBOUNCE");
+            const int n = e && *e ? std::atoi(e) : 30;
+            if (n > 1)
+                host_log("framegen: generation switched on after %d new frames in a row (BBHOST_FG_DEBOUNCE=0: at the first, as v0.2.30)", n);
+            else
+                host_log("framegen: BBHOST_FG_DEBOUNCE=%s - generation switched on at the first new frame, as v0.2.30", e ? e : "");
+            return n > 1 ? n : 0;
+        }();
+        static int in_a_row = 0;
+        in_a_row = ready ? std::min(in_a_row + 1, need) : 0;  // held at need: no overflow in a long session
+        const bool on = ready && (g_generating_now || in_a_row >= need);
         ffxConfigureDescFrameGeneration cfg{};
         cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
         cfg.swapChain = g_swapchain;
@@ -349,9 +372,11 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
             static int said = 0;
             if (said < 24) {
                 ++said;
-                host_log("framegen: generation switched %s at frame %llu (%s), AMD's configure %.1f ms", on ? "on" : "off",
-                         static_cast<unsigned long long>(g_present_id),
-                         on ? "prepared, with its HUD-less picture" : (loading_screen_up() ? "a loading screen" : "no fresh HUD-less picture"), ms);
+                host_log("framegen: generation switched %s at flip %llu, frame %llu (%s), AMD's configure %.1f ms", on ? "on" : "off",
+                         static_cast<unsigned long long>(hle_video_flip_count()), static_cast<unsigned long long>(g_present_id),
+                         on ? (need ? "the new frames in a row" : "prepared, with its HUD-less picture")
+                            : (loading_screen_up() ? "a loading screen" : "no fresh HUD-less picture"),
+                         ms);
             }
         }
         if (rc != FFX_API_RETURN_OK) {

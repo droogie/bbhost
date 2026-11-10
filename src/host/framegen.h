@@ -18,7 +18,9 @@
 // picture, the display buffer copied before the HUD's first draw; and that
 // picture brought to the swapchain's size as the presenter brings the frame.
 // A flip missing one - no upscaler, no HUD-less copy, a flip skipped - is
-// presented as it is.
+// presented as it is, generation switched off for it in AMD's swapchain; it is
+// switched on again only after 30 flips in a row with all three
+// (BBHOST_FG_DEBOUNCE; host/framegen.cpp framegen_present).
 
 #include <vulkan/vulkan.h>
 
