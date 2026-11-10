@@ -155,8 +155,9 @@ void draw_switch(ImDrawList* dl, ImVec2 p, float k, bool hovered) {
 }
 
 // Fonts: the first of `names` that exists - under %WINDIR%\Fonts on
-// Windows, whole paths elsewhere.
-ImFont* add_font(std::initializer_list<const char*> names) {
+// Windows, whole paths elsewhere - as a font of its own, or with `merge` into
+// the last one added, for the letters that one lacks.
+ImFont* add_font(std::initializer_list<const char*> names, bool merge = false) {
     for (const char* n : names) {
 #if defined(_WIN32)
         const char* windir = std::getenv("WINDIR");
@@ -167,7 +168,9 @@ ImFont* add_font(std::initializer_list<const char*> names) {
         std::error_code ec;
         if (!std::filesystem::is_regular_file(path, ec)) continue;
         // 1.92's atlas adds glyphs as they are drawn: no ranges.
-        if (ImFont* f = ImGui::GetIO().Fonts->AddFontFromFileTTF(path.c_str())) return f;
+        ImFontConfig cfg;
+        cfg.MergeMode = merge;
+        if (ImFont* f = ImGui::GetIO().Fonts->AddFontFromFileTTF(path.c_str(), 0.0f, &cfg)) return f;
     }
     return nullptr;
 }
@@ -176,6 +179,12 @@ void load_fonts() {
 #if defined(_WIN32)
     g_body = add_font({"segoeui.ttf"});
     if (!g_body) g_body = ImGui::GetIO().Fonts->AddFontDefault();
+    // Japanese, Chinese and Korean in the body font, for a path or a name in
+    // them: Windows' own fonts for those scripts, of which the atlas draws
+    // only the glyphs shown.
+    add_font({"YuGothR.ttc", "YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"}, true);
+    add_font({"msyh.ttc", "simsun.ttc"}, true);
+    add_font({"malgun.ttf", "gulim.ttc"}, true);
     g_strong = add_font({"seguisb.ttf", "segoeuib.ttf"});
     g_title = add_font({"pala.ttf", "georgia.ttf", "constan.ttf"});
 #else
@@ -186,6 +195,13 @@ void load_fonts() {
                        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
                        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf"});
     if (!g_body) g_body = ImGui::GetIO().Fonts->AddFontDefault();
+    // Japanese, Chinese and Korean in the body font, as under Windows: the
+    // first CJK font the system has.
+    add_font({"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+              "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
+              "/usr/share/fonts/droid/DroidSansFallbackFull.ttf", "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+              "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc", "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"},
+             true);
     g_strong = add_font({"/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf", "/usr/share/fonts/noto/NotoSans-SemiBold.ttf",
                          "/usr/share/fonts/google-noto/NotoSans-SemiBold.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
                          "/usr/share/fonts/noto/NotoSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",

@@ -31,9 +31,19 @@ constexpr std::size_t kHoldBytes = 32768;
 inline char g_hold[kHoldBytes];
 inline std::size_t g_hold_n = 0;
 inline std::atomic_flag g_hold_lock = ATOMIC_FLAG_INIT;
+#if defined(_WIN32)
+// Set while stderr is a console this process attached or made (main.cpp's
+// log_console): it writes the lines as UTF-16, so the console shows the UTF-8
+// log right whatever its code page, and that code page is left as it was.
+inline std::atomic<void (*)(const char*, std::size_t)> g_console_write{nullptr};
+#endif
 
 inline void write_raw(const char* p, std::size_t left) {
 #if defined(_WIN32)
+    if (const auto console = g_console_write.load(std::memory_order_acquire)) {
+        console(p, left);
+        return;
+    }
     std::fwrite(p, 1, left, stderr);
 #else
     // write(2), not stdio: async-signal-safe (the fault handler logs) and no
