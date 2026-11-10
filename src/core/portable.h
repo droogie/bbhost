@@ -65,6 +65,13 @@ bool host_desktop_primary_size(int* w, int* h);
 // the Uncapped frame rate's (engine/frame_rate.cpp). 0 when nothing says: a
 // headless run, or a build without SDL off Windows.
 float host_desktop_refresh_hz();
+// BBHOST_TEST_REFRESH_HZ=<hz> (a test switch, 20 to 1000; 59.94 allowed): the
+// refresh rate every question about one answers - the desktop's (above) and
+// the window's display's (host/window.h host_window_refresh_hz) - so a display
+// that says another rate or none (RDP's 32 Hz, a headless run) runs
+// Display-Limited, frame generation's half-refresh limit and the flip clock
+// as a monitor of that rate would. 0 when unset.
+float host_test_refresh_hz();
 // Whether this run opens no window (main, once the configuration is final):
 // host_desktop_max_size and host_desktop_refresh_hz then ask no display server.
 void host_set_headless(bool headless);

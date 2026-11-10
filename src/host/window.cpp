@@ -2066,12 +2066,28 @@ void host_window_set_stay_borderless(bool on) {
 #endif
 }
 
+namespace {
+// Set as the window shell starts (host_window_start): from then on SDL's
+// video is the window thread's, and host_desktop_refresh_hz - which brings
+// it up and down - is not asked from any other thread. The primary
+// display's desktop rate as the window shell started, which a display that
+// does not say its rate falls back to.
+std::atomic<bool> g_shell_started{false};
+std::atomic<float> g_desktop_hz_at_start{0.0f};
+}  // namespace
+
 float host_display_refresh_hz() {
-    const float hz = host_window_refresh_hz();
-    return hz > 0.0f ? hz : host_desktop_refresh_hz();
+    if (const float hz = host_window_refresh_hz(); hz > 0.0f) return hz;
+    // Before the window shell, on the thread that starts it (the frame rate
+    // is chosen as the game's code is patched); after, from any thread - the
+    // game's main loop asks when Display-Limited is chosen while it runs, and
+    // frame generation's half-refresh limit each frame.
+    if (!g_shell_started.load(std::memory_order_acquire)) return host_desktop_refresh_hz();
+    return g_desktop_hz_at_start.load(std::memory_order_relaxed);
 }
 
 float host_window_refresh_hz() {
+    if (const float t = host_test_refresh_hz(); t > 0.0f) return t;  // BBHOST_TEST_REFRESH_HZ (core/portable.h)
 #if defined(BBHOST_HAVE_SDL3)
     if (!g_active.load() || !g_window) return 0.0f;
     // Cached: the flip clock asks once a second, and this walks SDL's display
@@ -2139,6 +2155,7 @@ bool window_start_impl(int width, int height, const char* title);
 // Windows 11 laptop, every run), while the game ran on without it; the
 // caller is the thread that pumps it (run_guest_start).
 bool host_window_start(int width, int height, const char* title) {
+    g_shell_started.store(true, std::memory_order_release);  // host_display_refresh_hz
 #if defined(BBHOST_HAVE_SDL3) && defined(_WIN32)
     return window_start_impl(width, height, title);
 #elif defined(BBHOST_HAVE_SDL3)
@@ -2190,6 +2207,11 @@ bool window_start_impl(int width, int height, const char* title) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         host_log("SDL_Init failed: %s", SDL_GetError());
         return false;
+    }
+    // What a display that does not say its rate stands for from now on
+    // (host_display_refresh_hz): the primary display's, where the window opens.
+    if (const SDL_DisplayID id = SDL_GetPrimaryDisplay()) {
+        if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(id)) g_desktop_hz_at_start.store(m->refresh_rate, std::memory_order_relaxed);
     }
     // The options are read before the window exists, so a saved Borderless
     // or Fullscreen is only a wish until here (host_window_set_mode). Both
