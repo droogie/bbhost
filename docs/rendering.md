@@ -908,10 +908,20 @@ shortens the frame; resting, it is given no draw and the command processor
 draws them all in order with the homes, as with `BBHOST_GXVK_LISTS=0`. It rests
 while a frame cap holds the frame (two half-second windows in a row with the
 limiter waiting 15% of the time; it works again once the command processor,
-drawing everything, is busy 85% of a window at the cap, or the frame misses the
-cap with the game held back by the command processor's backlog 20% of the
-time), while the frame is the GPU's (busy 90% of two windows, until it is under
-80% over six), and wherever resting costs the frame nothing. That last is
+drawing everything, is busy 85% with the frame meeting its cap narrowly - the
+limiter waiting under 15%, the medians of three windows in a row at the cap -
+or the frame misses the cap with the game held back by the command processor's
+backlog 20% of the time; until 2026-11-10 any one window 85% busy woke it, and
+at Old Yharnam at a 90 cap on the RTX 4070 below, with Windows' default acted
+out, the pool then worked 27-28 s of each 28 s window, 1.2-1.3 cores, for a frame
+the cap held with the limiter waiting 15-21%; resting there now, the frame keeps
+its 89.9 fps with the command processor busy 94%, the game's CPU 0.9 of a core
+lower and the 99th percentile frame 1 ms longer; near a cap (the limiter
+waiting 8-15%), where it used to work on for good, it tries a rest - the
+switch's 1.5 s, then 1-1.5 s counted - and keeps it where the cap holds the
+frame without it, else it works again and the next trial waits the cap's
+backoff), while the frame is the GPU's (busy 90% of two windows, until it is
+under 80% over six), and wherever resting costs the frame nothing. That last is
 measured at each place, both ways: 10 s after the pool began to work there, an
 experiment rests it for 5.5 s and lets it work for 5.5 s more, and compares the
 frame rate resting with the windows on either side of it; under 0.5% slower
