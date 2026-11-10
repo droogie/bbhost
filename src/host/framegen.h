@@ -46,6 +46,10 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info);
 // Frames shown for each of the game's, measured over the last 60 presents:
 // about 2 while generating, 1 otherwise (the FPS counter's factor).
 float framegen_shown_per_frame();
+// The call into AMD's swapchain the presenting thread is in ("presenting",
+// "configuring frame generation", "ending its swapchain") and for how long, or
+// null when it is in none: the watchdog's lines (host/sampler.h).
+const char* framegen_in_call(double& seconds);
 // The contexts and AMD's swapchain gone; the presenter makes a swapchain anew.
 void framegen_destroy_swapchain(VkDevice device);
 
