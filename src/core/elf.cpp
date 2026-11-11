@@ -108,7 +108,7 @@ std::string nid_from_strtab(const std::uint8_t* dynlib, std::size_t dynlib_size,
 
 }  // namespace
 
-bool load_orbis_elf(const char* path, ElfImage* image) {
+bool load_orbis_elf(const char* path, ElfImage* image, std::size_t arena) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         host_log("cannot open %s", path);
@@ -160,7 +160,9 @@ bool load_orbis_elf(const char* path, ElfImage* image) {
     constexpr std::uint64_t kTail = 4ull << 20;
     image->tail_va = (max_va + 0xfff) & ~0xfffull;
     image->tail_size = kTail;
-    const std::size_t span = static_cast<std::size_t>(image->tail_va + kTail);
+    image->arena_va = image->tail_va + kTail;
+    image->arena_size = (arena + 0xfff) & ~std::size_t{0xfff};
+    const std::size_t span = static_cast<std::size_t>(image->arena_va + image->arena_size);
     // BBHOST_SLIDE=0x...: load at another slide (what a Windows boot does when
     // 0x400000 is taken), to prove the address-based patches on Linux.
     std::uint64_t slide = kPreferredSlide;

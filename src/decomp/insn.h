@@ -22,6 +22,8 @@ struct X86Insn {
         Loop,  // loop, loope, loopne, jrcxz: rel8 only, with no rel32 form to widen to
     } kind = Plain;
     std::uint8_t cc = 0;
+    std::uint8_t modrm_at = 0;  // where its ModRM byte sits, 0 if it has none
+    std::uint8_t rex = 0;       // REX's bits (or VEX's, as REX would give them): 0x40 | W R X B, 0 for none
 };
 
 // The instruction at p, reading at most `avail` bytes.

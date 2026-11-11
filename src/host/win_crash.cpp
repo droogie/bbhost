@@ -2,6 +2,7 @@
 
 #if defined(_WIN32)
 
+#include "core/legacy_cpu.h"
 #include "core/portable.h"
 #include "engine/fmod_ring.h"
 #include "engine/sf_text_layout.h"
@@ -97,10 +98,13 @@ void report(EXCEPTION_POINTERS* ep) {
         kind = r->ExceptionInformation[0] == 0 ? " (read)" : r->ExceptionInformation[0] == 1 ? " (write)" : " (execute)";
     }
     // The first line is the same shape as Linux's, so the log readers match.
+    // A pc in a legacy-CPU routine (inside the image's range) is given as the
+    // game instruction's it stands for, and named on a line of its own.
     host_log("SIGSEGV pc=0x%llx addr=0x%llx (guest pc 0x%llx) [%s 0x%lx%s, thread %u]",
              static_cast<unsigned long long>(pc), static_cast<unsigned long long>(addr),
-             static_cast<unsigned long long>(in_guest(pc) ? guest_pc(pc) : pc), code_name(r->ExceptionCode),
+             static_cast<unsigned long long>(in_guest(pc) ? guest_pc(legacy_cpu_guest_pc(pc)) : pc), code_name(r->ExceptionCode),
              static_cast<unsigned long>(r->ExceptionCode), kind, static_cast<unsigned>(GetCurrentThreadId()));
+    legacy_cpu_crash_line(pc);
     host_log("  rax=%llx rdi=%llx rsi=%llx rdx=%llx rcx=%llx r8=%llx r13=%llx r15=%llx rsp=%llx rbp=%llx",
              static_cast<unsigned long long>(c->Rax), static_cast<unsigned long long>(c->Rdi),
              static_cast<unsigned long long>(c->Rsi), static_cast<unsigned long long>(c->Rdx),
