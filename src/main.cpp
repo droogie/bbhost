@@ -1199,6 +1199,16 @@ int main(int argc, char** argv) {
             std::_Exit(rc);  // the recorder and submission threads run on: no static destructors under them
         }
     }
+    // --options-selftest DIR (host/options.h): an older options file read and
+    // written back as a run does, in DIR's own file, before any configuration;
+    // the exit code says.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--options-selftest") == 0) {
+            const int rc = host_options_selftest(argv[i + 1]);
+            std::fflush(nullptr);
+            std::_Exit(rc);
+        }
+    }
 #if defined(BBHOST_HAVE_SDL3)
     // The setup window's "Compile shaders now" starts bbhost again with
     // --compile-shaders (host/shader_compile.h): no window, no game.

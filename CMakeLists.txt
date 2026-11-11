@@ -1371,6 +1371,12 @@ if(UNIX)
     add_test(NAME shader_compile_e2e COMMAND bbhost --compile-selftest ${CMAKE_BINARY_DIR}/shader-compile-e2e)
     set_tests_properties(shader_compile_e2e PROPERTIES TIMEOUT 120)
   endif()
+  # An older options file read and written back by bbhost itself
+  # (host/options.h host_options_selftest), in a folder of its own: Character
+  # motion's Velocity map, Off's name until 2026-11-10, reads as Off and is
+  # written back as Off.
+  add_test(NAME options_file_test COMMAND bbhost --options-selftest ${CMAKE_BINARY_DIR}/options-selftest)
+  set_tests_properties(options_file_test PROPERTIES TIMEOUT 60)
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)

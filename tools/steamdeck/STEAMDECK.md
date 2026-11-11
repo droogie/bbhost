@@ -74,7 +74,12 @@ and keyboard instead, pick the Gamepad layout in its controller settings
   costs the Deck's GPU about 6 ms a frame at 1280x800, more than drawing
   fewer pixels saves: at 60 fps only its Performance setting (640x400
   rendered) stays close to 60, so the profile keeps FSR 1. At 30 fps FSR 3
-  Quality holds 30 at the same power as the full 1280x800.
+  Quality holds 30 at the same power as the full 1280x800. Character Motion
+  in the same section is Precise by default, clean edges on the hunter and
+  enemies under FSR 3 and TAA; Off saves 0.2-0.4 ms of the GPU's frame here
+  (1-2.5% of the frame rate where the GPU sets it), with softer edges and a
+  faint trail behind running characters. At 30 fps both hold 30 at the same
+  power.
 - The Deck's memory is shared with its GPU and tight for this game, so
   bbhost keeps less in reserve here: resolutions up to 1920x1080 change at
   once; larger ones (for a big screen on a dock) apply at the next start,
