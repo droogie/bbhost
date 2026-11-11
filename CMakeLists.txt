@@ -588,7 +588,7 @@ if(UNIX AND NOT APPLE AND Vulkan_FOUND)
       # -fms-extensions, src/ffx_vk/ffx_linux.h the rest; its MSVC pragmas and
       # deprecations are AMD's. A float handed to int abs() fails the build
       # (ffx_linux.h says why).
-      target_compile_options(bbhost_fidelityfx_vk PRIVATE -fms-extensions -include ${CMAKE_SOURCE_DIR}/src/ffx_vk/ffx_linux.h
+      target_compile_options(bbhost_fidelityfx_vk PRIVATE -fms-extensions -fext-numeric-literals -include ${CMAKE_SOURCE_DIR}/src/ffx_vk/ffx_linux.h
         -Wno-unknown-pragmas -Wno-unknown-warning-option -Wno-deprecated-declarations -Werror=absolute-value)
       target_link_libraries(bbhost_fidelityfx_vk PRIVATE Vulkan::Vulkan ZLIB::ZLIB Threads::Threads m)
       # The five API functions out, libstdc++ and libgcc inside, nothing left
@@ -1451,7 +1451,7 @@ if(UNIX)
       target_link_libraries(indirect_clamp_test PRIVATE Vulkan::Vulkan)
       add_test(NAME indirect_clamp_test COMMAND indirect_clamp_test)
       set_tests_properties(indirect_clamp_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
-      add_executable(fsr_hardware_test tests/fsr_hardware_test.cpp src/host/upscaler.cpp src/host/pe_loader.cpp)
+      add_executable(fsr_hardware_test tests/fsr_hardware_test.cpp src/host/upscaler.cpp src/host/upscaler_ffx.cpp src/host/pe_loader.cpp)
       target_include_directories(fsr_hardware_test PRIVATE src include ${CMAKE_BINARY_DIR}/gen third_party/upscaler_bridge third_party/fidelityfx)
       target_link_libraries(fsr_hardware_test PRIVATE Vulkan::Vulkan)
       add_dependencies(fsr_hardware_test bbhost_version)
