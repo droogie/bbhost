@@ -504,8 +504,8 @@ Setting g_set[kSettingCount] = {
 #else
      // (host/upscaler.h upscaler_offered: FSR 4, FSR 3 and DLSS where they run.)
      "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 "
-     "(AMD's, any GPU: the same FSR 3.1.6 as on Windows) or DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of the "
-     "game's own anti-aliasing. FSR 4 and FSR 3 run on Windows and Linux (via upscaler_bridge.dll or native libbbhost_fidelityfx_vk.so). "
+     "(AMD's, any GPU) or DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of the game's own anti-aliasing. FSR and "
+     "DLSS need their libraries beside bbhost; without them they stay off. FSR 4 runs as FSR 3 where it cannot run. "
      "Frame generation runs on Windows only. Changes at once.",
 #endif
      false},
@@ -2055,12 +2055,8 @@ const char* const* value_tips(int id, bool dlss) {
         "The game's own anti-aliasing; the 3D at the Resolution.",
         "TAA: bbhost's own temporal anti-aliasing - steadier edges and less shimmer, a little softer. Any GPU, the 3D at the "
         "Resolution; one below the window keeps the HUD at the window's size. The fastest of these.",
-#if defined(_WIN32)
         "AMD FSR 3: any GPU.",
-#else
-        "AMD FSR 3: any GPU, the same FSR 3.1.6 as on Windows. Frame generation runs on Windows only.",
-#endif
-        "AMD FSR 4: AMD's newest, runs on Windows and Linux where the GPU and driver run it; FSR 3 where they do not. Frame generation runs on Windows only.",
+        "AMD FSR 4: AMD's newest, where the GPU and driver run it; FSR 3 where they do not.",
         "NVIDIA DLSS: RTX cards only.",
     };
     static const char* const kFsrTips[] = {
@@ -2579,7 +2575,7 @@ const char* upscaler_note() {
         note = "FSR 3 is not available here" + (caps.fsr_reason.empty() ? std::string() : " (" + caps.fsr_reason + ")") +
                ": the game's own anti-aliasing runs instead.";
     } else if (!dlss && u == 3) {
-        note = "FSR 4 is not available on this GPU or driver: FSR 3 runs here instead. (FSR 4 runs on Windows and Linux; Frame generation runs on Windows only.)";
+        note = "FSR 4 is not available on this GPU or driver: FSR 3 runs here instead.";
     } else if (!dlss) {
         return g_set[kUpscaler].note;
     } else if (!caps.loaded) {
