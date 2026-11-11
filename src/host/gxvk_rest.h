@@ -195,6 +195,9 @@ struct State {
     bool travelled = false;           // a loading screen since the rest under way began: the backoff starts over at its end
     std::uint64_t next_at = 0;        // the next experiment (0: not set yet - the interval from the next window of the place)
     std::uint64_t interval_ns = kProbeFirstNs;
+    // Whether the frame rate's experiments decide (the pool's duty). Without them (the run commit's, list_resolve.h)
+    // only a cap holding the frame or a GPU-bound frame rests it, and it works anywhere else, as it did before a duty.
+    bool experiments = true;
 };
 
 // A window: the limiter's wait, the command processor's busy time, the main
@@ -426,6 +429,7 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
             s.event = kEvAskBack;
             return rest(s, kWhyProbe, now);
         }
+        if (!s.experiments) return kStay;
         own_window(s, w);
         if (!s.next_at) s.next_at = now + s.interval_ns;
         if (now < s.next_at || s.own_n < kPhase) return kStay;

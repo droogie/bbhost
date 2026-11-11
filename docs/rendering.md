@@ -915,7 +915,7 @@ segments without the run commit against the run commit:
 As shipped, the shared GPU memory stayed at 2.1 GB (whole imports, on the
 second row, pinned 4.95 GB). Where the rule does not hold - an integrated GPU,
 a card under 5,000 MiB free - the run commit
-stays on by Windows' default, as before. The homes are made as
+stays on by Windows' default, and works by the pool's duty rule (below). The homes are made as
 their buffers are, so the choice is made once, with the device at start: a
 frame rate changed in play (it changes at once, 30 included) leaves the
 choice as it was until the next start. Off, one line says why (`gxvk homes: off by
@@ -980,6 +980,24 @@ for 3 s (the title's menus meet an uncapped game's 960 cap).
 (what resting costs against the pool off); `=cycle:N` rests and works N frames
 each in turn (a check); `BBHOST_GXVK_LISTS_REST_LOG=1`: every window of the
 rule in the log.
+
+**The run commit's duty (`BBHOST_RUN_COMMIT_REST`).** Where Windows' default
+keeps the run commit - an integrated GPU, tight memory, a card under 5,000 MiB
+free - the same rule decides when it forks a run's parts, without the
+frame-rate experiments: it rests while a cap holds the frame and while the
+frame is the GPU's, and works anywhere else, as it did. Resting, no run is
+forked: the command processor draws every draw in order and the run commit's
+workers sleep (a run forked before the rest began is taken as it was). At a
+true 60 under Windows on an RTX 3070 Ti Laptop GPU held to a 4 GB card's 2,950
+MiB that took Central Yharnam from 235% of CPU to 207% and ran the GPU-bound
+Nightmare of Mensis at 38.8 fps against 35.5; on the laptop's Radeon 680M,
+GPU-bound at 30-34 fps, it took 21-31 points; with Windows' small-card default
+acted out on an RTX 4070 under Linux, 80-105 points at five places, the frame
+the same. An experiment (the other state for a few seconds) cannot see what
+its rests cost later: on that 4 GB card a working run commit came back slower
+after them. Its lines say `list-resolve:` where the pool's say `gxvk-lists:`.
+`BBHOST_RUN_COMMIT_REST=0`: it never rests (as before); `=always`: it always
+does; `BBHOST_RUN_COMMIT` set keeps its own answer.
 
 ### GX's objects as Vulkan objects (a design note)
 

@@ -95,6 +95,36 @@ bool commit_by_default();
 // in order but for the pool's splices; log_commit_default says why. Nothing
 // where BBHOST_RUN_COMMIT is set.
 void commit_give_way();
+// The run commit's duty (host/gxvk_rest.h, the draw pool's rule, driven once a
+// frame by gxvk_lists::frame_paced): where it is on by the platform's default
+// and has not given way - Windows with the constant buffers' homes off, on an
+// integrated GPU, with tight memory or a card under 5,000 MiB free - it forks a
+// run's parts only where that shortens the frame. Resting, no run is forked:
+// the command processor draws every draw in order and the workers sleep (a run
+// forked before the rest began is taken as it was). It rests while a frame cap
+// holds the frame, while the frame is the GPU's, and wherever an experiment
+// finds resting costs the frame nothing; it works where the command processor
+// in order holds the game back. Under Windows on an RTX 3070 Ti Laptop GPU held
+// to a 4 GB card's 2,950 MiB (BBHOST_TEST_VRAM_MB; 1080p, a true 60) the run
+// commit took 29 points of CPU more than none at Central Yharnam, which met its
+// cap either way, and ran the GPU-bound Nightmare of Mensis 12.6% slower (29.3
+// against 33.0 fps), while at Old Yharnam - the command processor 99% busy and
+// the game held back by it 60% of the time - it held 53.5 fps against 49.3.
+// BBHOST_RUN_COMMIT set keeps its own answer (no duty); BBHOST_RUN_COMMIT_REST=0:
+// it never rests (as before 2026-11-11), =always: it rests from the first frame;
+// BBHOST_GXVK_LISTS_REST_LOG=1 logs every window of the rule.
+extern std::atomic<bool> g_run_resting;
+inline bool run_resting() { return g_run_resting.load(std::memory_order_relaxed); }
+// Whether the duty decides the run commit: the default on and not given way,
+// BBHOST_RUN_COMMIT unset, BBHOST_RUN_COMMIT_REST not 0. Fixed once the device
+// is made (commit_give_way comes before any draw).
+bool duty_on();
+// duty_on's rule: on by the platform's default alone (commit_by_default), still
+// forking runs (commit_draws: not given way to the homes), and the switch's
+// mode (BBHOST_RUN_COMMIT_REST: 0 never rests, 1 the rule, 2 always) not 0.
+constexpr bool duty_wanted(bool by_default, bool forking, int rest_mode) { return by_default && forking && rest_mode != 0; }
+// BBHOST_RUN_COMMIT_REST=always.
+bool duty_always();
 // Whether draws are committed off the order at all: a run's parts (the
 // commit on or compare) or stage 4b.1b's pool committing draws ahead of the
 // command processor (BBHOST_GXVK_LISTS=splice or splice-compare,
