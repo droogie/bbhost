@@ -158,7 +158,7 @@ if [ "$fsr" = 1 ] || [ "$dlss" = 1 ]; then
 "
     fi
     upscale_text="${upscale_text}  Where one cannot run it is not offered, and the log's upscaler: lines say
-  why. FSR 4 and frame generation run on Windows only.
+  why. FSR 4 runs on Windows and Linux where supported; frame generation runs on Windows only.
 
 "
 fi

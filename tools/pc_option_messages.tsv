@@ -181,10 +181,10 @@
 14000335	Accept Rebirth	
 14000336	Undo Rebirth	
 125020	PC Upscaling	
-125000	Frame Generation	A frame made between each two of the game's. The game runs at half your refresh rate, or less.
+125000	Frame Generation	A frame made between each two of the game's. The game runs at half your refresh rate, or less. (Windows only)
 125001	Sharpness	Sharpens the 3D after TAA, FSR or DLSS; 0 leaves it as it is. Needs Upscaling on.
 125002	Reflection Quality	Reflection resolution: Quarter is about four times cheaper; Half is the game's own, sharper.
-125003	Upscaling	Replaces the game's AA: TAA or FSR 3 (any GPU), FSR 4 (AMD, Windows only) or DLSS (NVIDIA RTX).
+125003	Upscaling	Replaces the game's AA: TAA or FSR 3 (any GPU), FSR 4 (AMD, Windows & Linux) or DLSS (NVIDIA RTX). Frame Gen is Windows only.
 125004	Upscaling Quality	The 3D's drawn size: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
 125005	TAA Strength	How much TAA smooths: higher is steadier but may leave a faint trail, lower crisper. Default 5.
 125006	Character Motion	Precise (default): clean edges, about 1% at 4K. Off: a bit faster, softer edges, a faint trail.
