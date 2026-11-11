@@ -1203,6 +1203,10 @@ if(UNIX)
   add_executable(clip_control_test tests/clip_control_test.cpp)
   target_include_directories(clip_control_test PRIVATE src)
   add_test(NAME clip_control_test COMMAND clip_control_test)
+  # A texture made after the fill its resource was cleared with, which met no image (tests/fill_pending_test.cpp).
+  add_executable(fill_pending_test tests/fill_pending_test.cpp)
+  target_include_directories(fill_pending_test PRIVATE src)
+  add_test(NAME fill_pending_test COMMAND fill_pending_test)
   # The engine's per-view block found at every screen shape and field of view (tests/view_block_test.cpp).
   add_executable(view_block_test tests/view_block_test.cpp)
   target_include_directories(view_block_test PRIVATE src)
