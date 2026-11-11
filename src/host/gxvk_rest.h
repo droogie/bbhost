@@ -15,12 +15,17 @@
 //    command processor, drawing everything, is busy 85% with the frame meeting
 //    its cap narrowly (the limiter waiting under 15%; the medians of the last
 //    three windows at the cap, a window just off it in between not starting
-//    the count again - with more the cap holds the frame with room,
-//    however busy the command processor: at Old Yharnam at a 90 cap on two Xeon
-//    Gold 6230 with Windows' default acted out it was 90-98% busy at rest, the
-//    frame waiting 15-21% and the game held back 0-2%, and until 2026-11-10 its
-//    one busy window woke the pool for good - 27-28 s of each 28 s, 1.2-1.3
-//    cores, for a frame the cap held either way),
+//    the count again - with more the cap holds the frame with room: until
+//    2026-11-10 any one window 85% busy woke the pool, and at Central Yharnam
+//    at a 90 cap on two Xeon Gold 6230 with Windows' default acted out, the
+//    command processor 71-75% busy at rest, one such window kept it working
+//    through a measure window the cap held either way, 1.2 cores), or busy 92%
+//    (the medians of the same three windows) however long the limiter waits: a
+//    command processor that saturated drops frames resting - at Old Yharnam at
+//    the same 90 cap, 92-97% busy at rest with the limiter waiting 15-21%,
+//    resting left 4-15 frames of a 30 s window over 16.7 ms against 2 working,
+//    and the 99th percentile frame 1.7 ms longer (15.4 against 13.7 ms), for
+//    0.8 of a core and 4 W saved,
 //    or the limiter waits under 8% and the main loop is held back by the command
 //    processor's backlog 20% of the time or more (a frame that misses its cap
 //    for the main loop's own work or the GPU's gains nothing from the pool); a
@@ -111,6 +116,7 @@ namespace gxvk_rest {
 constexpr double kRestSlack = 0.15;  // the limiter's wait, as a share of a window, that counts toward a rest at a cap
 constexpr double kWakeSlack = 0.08;  // under it the cap no longer holds the frame
 constexpr double kWakeCp = 0.85;     // the command processor busy this share of a window ends a rest at a cap
+constexpr double kSaturated = 0.92;  // ... and this share over three windows' medians, however long the limiter waits
 constexpr double kWorkHeld = 0.20;   // the main loop held back by the command processor this share (the median of six windows)
 constexpr double kFar = 0.85;        // a rest at a cap with the frame under this share of the cap (six windows): the cap holds nothing
 constexpr double kCost = 0.005;      // resting no more than this much slower than working costs nothing: the pool rests
@@ -238,8 +244,8 @@ inline void own_again(State& s) {
     s.cap_n = 0;
 }
 // At a cap: whether the command processor's busy share wakes a rest, over windows' medians - kWakeCp or more with
-// the frame meeting its cap narrowly (the limiter waiting under kRestSlack).
-inline bool cap_wakes(double cp, double slack) { return cp >= kWakeCp && slack < kRestSlack; }
+// the frame meeting its cap narrowly (the limiter waiting under kRestSlack), or kSaturated or more however it waits.
+inline bool cap_wakes(double cp, double slack) { return (cp >= kWakeCp && slack < kRestSlack) || cp >= kSaturated; }
 // Whether a rest at the cap holds over windows' medians: the frame at its cap (the limiter waiting kWakeSlack or more)
 // and the command processor's share not waking it.
 inline bool cap_holds(double cp, double slack) { return slack >= kWakeSlack && !cap_wakes(cp, slack); }
@@ -442,14 +448,14 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
         }
         s.trial_cp[s.trial_n] = w.cp;
         s.trial_slack[s.trial_n++] = w.cap_fps > 0 ? w.slack : 0.0;
-        // Two counted windows that agree fix the medians of three (cp31's review): both off the cap, both busy at a narrow
+        // Two counted windows that agree fix the medians of three: both off the cap, both busy at a narrow
         // cap, or both with room - the third would not change the verdict. Half a second less per trial.
         int decided = 0;  // 1 holds, -1 fails
         if (s.trial_n == 2) {
             const double c0 = s.trial_cp[0], c1 = s.trial_cp[1], w0 = s.trial_slack[0], w1 = s.trial_slack[1];
             if (w0 < kWakeSlack && w1 < kWakeSlack) decided = -1;
             else if (cap_wakes(c0, w0) && cap_wakes(c1, w1)) decided = -1;
-            else if (w0 >= kRestSlack && w1 >= kRestSlack) decided = 1;
+            else if (w0 >= kRestSlack && w1 >= kRestSlack && c0 < kSaturated && c1 < kSaturated) decided = 1;
         }
         if (!decided && s.trial_n < kTrialWindows) return kStay;
         s.why = kWhyCap;

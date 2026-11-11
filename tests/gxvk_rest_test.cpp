@@ -118,12 +118,12 @@ int main() {
         // medians of the last three windows at the cap - not with the wait at 15% or more: the cap holds the frame with
         // room there (Old Yharnam at a 90 cap on two Xeon Gold 6230: 90-98% busy at rest, the frame waiting 15-21%, the
         // game held back 0-2%).
-        for (int k = 0; k < 6; ++k) check(step(s, win(0.3, 60.0f, 0.96), t += kWin) == kStay && s.resting, "woken at 96% busy, a 30% wait", k);
+        for (int k = 0; k < 6; ++k) check(step(s, win(0.3, 60.0f, 0.91), t += kWin) == kStay && s.resting, "woken at 91% busy, a 30% wait", k);
         check(step(s, win(0.149, 60.0f, 0.86), t += kWin) == kStay && s.resting, "woken by one window at a 14.9% wait", 4);
         check(step(s, win(0.149, 60.0f, 0.86), t += kWin) == kWake && !s.resting && s.event == gxvk_rest::kEvCapWake,
               "not woken at 86% busy, a 14.9% wait", 4);
         // A frame hovering at the 8% line is one at the cap: two busy windows, one just off the cap (a 5% wait) and one busy
-        // one end it (cp31's review: 12%/5% alternating at 95% busy rested on for good with the count started again at each
+        // one end it (12%/5% alternating at 95% busy rested on for good with the count started again at each
         // window off the cap); a window with no cap at all (no limiter) starts the count again.
         State r;
         step(r, win(0.3), t += kWin);
@@ -152,13 +152,18 @@ int main() {
         for (int k = 0; k < 2; ++k) step(l, win(0.12, 60.0f, 0.9), t += kWin);
         step(l, loading_window(), t += kWin);
         check(step(l, win(0.12, 60.0f, 0.9), t += kWin) == kStay && l.resting, "woken by busy windows across a loading screen", 9);
-        // Old Yharnam's rest at a 90 cap: 90-98% busy, waits of 15-21% a window - and one of 14% - rest on.
+        // Old Yharnam's waits at a 90 cap (15-21% a window, one of 14%) rest on with the command processor 85-91% busy;
+        // 92% or more over the medians ends the rest however long the limiter waits - a saturated command processor drops
+        // frames resting (Old Yharnam at 90, 92-97% busy at rest: 4-15 frames of 30 s over 16.7 ms against 2 working).
         State o;
         step(o, win(0.19, 90.0f, 0.70), t += kWin);
         check(step(o, win(0.21, 90.0f, 0.69), t += kWin) == kRest, "no rest at Old Yharnam's 90 cap", 7);
         const double waits[] = {0.20, 0.17, 0.15, 0.19, 0.14, 0.21, 0.18, 0.16, 0.19, 0.20};
         for (int k = 0; k < 40; ++k)
-            check(step(o, win(waits[k % 10], 90.0f, 0.90 + 0.02 * (k % 5)), t += kWin) == kStay && o.resting, "woken at Old Yharnam's 90 cap", k);
+            check(step(o, win(waits[k % 10], 90.0f, 0.85 + 0.015 * (k % 5)), t += kWin) == kStay && o.resting, "woken at Old Yharnam's 90 cap, 85-91% busy", k);
+        check(step(o, win(0.20, 90.0f, 0.94), t += kWin) == kStay && step(o, win(0.17, 90.0f, 0.96), t += kWin) == kWake && !o.resting &&
+                  o.event == gxvk_rest::kEvCapWake,
+              "not woken by a saturated command processor (the medians 92% or more)", 8);
     }
     // At a 15% wait two windows rest the pool as at any cap (no trial there).
     {
@@ -278,6 +283,26 @@ int main() {
         step(w, win(0.10), t += kWin);
         step(w, loading_window(), t += kWin);
         check(step(w, win(0.10), t += kWin) == kStay && !w.resting, "a trial across a loading screen's windows", 16);
+        // A trial whose two counted windows leave the frame room (a 20% wait) with the command processor saturated (95%)
+        // works again at once: a saturated command processor ends a cap's rest however long the limiter waits.
+        State g;
+        step(g, win(0.12), t += kWin);
+        check(step(g, win(0.12), t += kWin) == kRest && g.why == gxvk_rest::kWhyNear, "no trial at 12%", 17);
+        for (int k = 0; k < gxvk_rest::kSkip; ++k) step(g, win(0.12), t += kWin);
+        check(step(g, win(0.20, 60.0f, 0.95), t += kWin) == kStay && g.why == gxvk_rest::kWhyNear, "a trial decided on one window", 18);
+        check(step(g, win(0.20, 60.0f, 0.95), t += kWin) == kWake && !g.resting && g.event == gxvk_rest::kEvNearWorks,
+              "a trial with the command processor saturated rested on", 19);
+        // Two counted windows with room that disagree on saturation (95%, then 80%) decide nothing; the third does (95%:
+        // the medians saturated).
+        State m2;
+        step(m2, win(0.12), t += kWin);
+        check(step(m2, win(0.12), t += kWin) == kRest && m2.why == gxvk_rest::kWhyNear, "no trial at 12%", 20);
+        for (int k = 0; k < gxvk_rest::kSkip; ++k) step(m2, win(0.12), t += kWin);
+        check(step(m2, win(0.20, 60.0f, 0.95), t += kWin) == kStay && step(m2, win(0.20, 60.0f, 0.80), t += kWin) == kStay &&
+                  m2.why == gxvk_rest::kWhyNear,
+              "a trial decided by two windows that disagree on saturation", 21);
+        check(step(m2, win(0.20, 60.0f, 0.95), t += kWin) == kWake && !m2.resting && m2.event == gxvk_rest::kEvNearWorks,
+              "a trial whose medians are saturated rested on", 22);
     }
     // A window without the wait between two with it starts the count again.
     {
