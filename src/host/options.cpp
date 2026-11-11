@@ -119,6 +119,7 @@ enum SettingId {
     kMouseAutoRotation,
     kDrawCursor,
     kButtonPrompts,
+    kControllerPrompts,
     kLeftStickInner,
     kLeftStickOuter,
     kRightStickInner,
@@ -338,6 +339,11 @@ Setting g_set[kSettingCount] = {
     // (engine/key_prompts.h). Auto follows the device last used (host_input_device).
     {"button_prompts", "Button prompts", {"Auto", "Keyboard", "Controller"}, 0,
      "What the game's own prompts show. Auto follows the device you last used, keys or controller.", false},
+    // The controller's own glyphs in the prompts, made at start (engine/prompt_glyphs.h).
+    {"controller_prompts", "Controller prompts", {"Auto", "Xbox", "Default (PS4)"}, 0,
+     "The buttons a controller's prompts show, in the menus and in play. Auto matches the controller connected when the game "
+     "starts; Default keeps the game's own PS4 buttons.",
+     true},
     // The controller's sticks (host/window.cpp stick_deadzone): radial, from
     // the centre - inside the inner deadzone the stick reads as at rest, from
     // the outer one out as pushed all the way, and between them the travel is
@@ -729,6 +735,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kMouseAutoRotation},
     {Row::Option, nullptr, kDrawCursor},
     {Row::Option, nullptr, kButtonPrompts},
+    {Row::Option, nullptr, kControllerPrompts},
     {Row::Option, nullptr, kLeftStickInner},
     {Row::Option, nullptr, kLeftStickOuter},
     {Row::Option, nullptr, kRightStickInner},
@@ -1316,6 +1323,7 @@ void apply(int id) {
         case kMouseAutoRotation:
         case kDrawCursor:
         case kButtonPrompts:
+        case kControllerPrompts:  // read at the next start (engine/prompt_glyphs.cpp)
         case kLeftStickInner:
         case kLeftStickOuter:
         case kRightStickInner:
@@ -1521,6 +1529,7 @@ void rebuild_settings() {
     h.mouse_auto_rotation = on_of(kMouseAutoRotation);
     h.draw_cursor = on_of(kDrawCursor);
     h.button_prompts = index_of(kButtonPrompts) < 0 ? 0 : index_of(kButtonPrompts);
+    h.controller_prompts = std::max(index_of(kControllerPrompts), 0);
     h.stick_inner[0] = static_cast<float>(std::max(index_of(kLeftStickInner), 0)) / 100.0f;
     h.stick_outer[0] = static_cast<float>(50 + std::max(index_of(kLeftStickOuter), 0)) / 100.0f;
     h.stick_inner[1] = static_cast<float>(std::max(index_of(kRightStickInner), 0)) / 100.0f;

@@ -1,5 +1,6 @@
 #include "engine/frame_pool.h"
 #include "engine/key_prompts.h"
+#include "engine/prompt_glyphs.h"
 #include "decomp/decomp.h"
 #include "engine/mouse_camera.h"
 #include "core/config.h"
@@ -1400,6 +1401,7 @@ int main(int argc, char** argv) {
             host_options_apply();  // the display settings, now that there is one
         }
     }
+    prompt_glyphs_install();  // after the window opened the pads
     host_log("calling _start 0x%llx (CRT runs _init, stack=0x%zx)",
              static_cast<unsigned long long>(image.entry), kGuestMainStack);
     run_guest_start(reinterpret_cast<GuestStart>(image.entry), stack.data(), windowed);

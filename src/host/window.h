@@ -186,6 +186,18 @@ void host_pad_rumble(std::uint8_t small, std::uint8_t large);
 // A gamepad is open. What the port shows for a button prompt follows it when
 // the setting is on Auto (engine/key_prompts.h).
 bool host_pad_present();
+// Which kind of controller the first open pad is, for the glyphs the game's
+// prompts are drawn with (engine/prompt_glyphs.h).
+enum PadFamily : int {
+    kPadFamilyNone = 0,
+    kPadFamilyPlayStation,
+    kPadFamilyXbox,
+    kPadFamilySteamDeck,
+    kPadFamilySteamController,
+    kPadFamilyOther,
+};
+int host_pad_family();
+const char* host_pad_family_name(int family);  // "an Xbox pad", ... for a log
 // The device the player last used (DS3's switch): the latest key, click,
 // wheel or mouse movement makes it the keyboard and mouse, the latest pad
 // button or stick or trigger past its dead zone a controller. The serial

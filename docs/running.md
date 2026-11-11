@@ -131,7 +131,18 @@ to delete: the next start builds them again.
 
 ## Controls
 
-A controller works as on the console. Without one, the keyboard and mouse
+A controller works as on the console, and its button prompts show its own
+buttons: *Controller prompts* (F10, Input) is Auto by default, which draws
+the game's prompts with Xbox, Steam Deck or Steam Controller glyphs when one
+of those is connected as the game starts, or the game's own for a DualShock
+or DualSense. Xbox draws Xbox buttons always, and Default (PS4) keeps the
+game's own. The glyphs keep the game's style - its own button caps, only
+the symbols changed. The symbols (Kenney's Input Prompts, CC0) are
+written into a copy of the dump's `menu/common.tpf.dcx` under the data
+folder's `bbhost/prompt-glyphs`, so a change shows from the next start;
+`BBHOST_PROMPT_GLYPHS=0` keeps the game's own.
+
+Without a controller, the keyboard and mouse
 take over and the button prompts follow: the mouse turns the camera and works
 in the menus, and every action can be rebound (F10 or the game's Key Bindings
 menu) - to a key, any of five mouse buttons, or the wheel turned up or down

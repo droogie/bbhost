@@ -137,6 +137,8 @@ add_executable(bbhost
   src/engine/menu_close.cpp
   src/engine/matching_region.cpp
   src/engine/key_prompts.cpp
+  src/engine/prompt_glyphs.cpp
+  src/engine/prompt_glyphs_tpf.cpp
   src/engine/yebis.cpp
   src/engine/yebis_bind.cpp
   src/engine/graphics_patch.cpp
@@ -1102,6 +1104,11 @@ if(UNIX)
     target_link_libraries(menu_keys_test PRIVATE SDL3::SDL3)
   endif()
   add_test(NAME menu_keys_test COMMAND menu_keys_test)
+  # The controller prompts' texture writes and Auto's choice (engine/prompt_glyphs.h).
+  add_executable(prompt_glyphs_test tests/prompt_glyphs_test.cpp src/engine/prompt_glyphs_tpf.cpp)
+  target_include_directories(prompt_glyphs_test PRIVATE src)
+  target_link_libraries(prompt_glyphs_test PRIVATE ZLIB::ZLIB)
+  add_test(NAME prompt_glyphs_test COMMAND prompt_glyphs_test)
   # The settings' publication and two of its listeners: applied on a change,
   # never asked for per frame (host/settings_store.h).
   add_executable(settings_store_test tests/settings_store_test.cpp src/host/shader_patch.cpp)

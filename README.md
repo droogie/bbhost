@@ -49,7 +49,8 @@ to run on a PC - it needs a place to live. bbhost provides that place:
   corrected so physics, animation and cutscenes run at the right speed at each,
   and its effects keeping the pace they have at 30 while they move smoothly.
 - **Keyboard and mouse**: mouse camera, a pointer in every menu, rebindable
-  keys, and button prompts that show the keys.
+  keys, and button prompts that show the keys - or the Xbox, Steam Deck or
+  Steam Controller buttons for those controllers.
 - **PC enhancements** that can be switched off for the game as it shipped: the
   Hunter's Dream mirror opens the character appearance editor (a feature cut
   from the release), "Rebirth in the Nightmare" at the Altar of

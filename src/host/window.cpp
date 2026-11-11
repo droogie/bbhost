@@ -3271,6 +3271,40 @@ bool host_pad_present() {
 #endif
 }
 
+int host_pad_family() {
+#if defined(BBHOST_HAVE_SDL3)
+    std::lock_guard<std::mutex> lock(g_pads_mu);
+    if (g_pads.empty()) return kPadFamilyNone;
+    SDL_Gamepad* g = g_pads.front();
+    // Valve's hardware by USB id. Steam Input's virtual pad (11ff) carries the
+    // real controller's type, except on a Deck, where it is the Deck's own.
+    constexpr Uint16 kValve = 0x28de;
+    const Uint16 vendor = SDL_GetGamepadVendor(g), product = SDL_GetGamepadProduct(g);
+    const SDL_GamepadType type = SDL_GetGamepadType(g);
+    const bool playstation =
+        type == SDL_GAMEPAD_TYPE_PS3 || type == SDL_GAMEPAD_TYPE_PS4 || type == SDL_GAMEPAD_TYPE_PS5;
+    if (vendor == kValve && product == 0x1205) return kPadFamilySteamDeck;
+    if (vendor == kValve && (product == 0x1102 || product == 0x1142 || product == 0x1106)) return kPadFamilySteamController;
+    if (vendor == kValve && product == 0x11ff && host_steam_deck() && !playstation) return kPadFamilySteamDeck;
+    if (playstation) return kPadFamilyPlayStation;
+    if (type == SDL_GAMEPAD_TYPE_XBOX360 || type == SDL_GAMEPAD_TYPE_XBOXONE) return kPadFamilyXbox;
+    return kPadFamilyOther;
+#else
+    return kPadFamilyNone;
+#endif
+}
+
+const char* host_pad_family_name(int family) {
+    switch (family) {
+        case kPadFamilyPlayStation: return "a PlayStation pad";
+        case kPadFamilyXbox: return "an Xbox pad";
+        case kPadFamilySteamDeck: return "the Steam Deck's controls";
+        case kPadFamilySteamController: return "a Steam Controller";
+        case kPadFamilyOther: return "another pad";
+        default: return "none";
+    }
+}
+
 void host_pad_rumble(std::uint8_t small, std::uint8_t large) {
 #if defined(BBHOST_HAVE_SDL3)
     std::lock_guard<std::mutex> lock(g_pads_mu);

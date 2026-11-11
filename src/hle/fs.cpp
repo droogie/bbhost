@@ -97,7 +97,7 @@ std::string g_generated;  // hle_fs_set_generated_root
 OverlayIndex g_generated_index;
 // hle_fs_add_generated_root: fixed slots published by the count, as the
 // plugins' layers are.
-constexpr int kMaxGeneratedLayers = 4;
+constexpr int kMaxGeneratedLayers = 8;
 std::array<std::string, kMaxGeneratedLayers> g_generated_more;
 std::array<OverlayIndex, kMaxGeneratedLayers> g_generated_more_index;
 std::atomic<int> g_generated_more_count{0};
