@@ -126,7 +126,7 @@ class TourTest(unittest.TestCase):
         cy = ac.AREA_BY_ID["central-yharnam"]
         self.assertEqual(cy.block_hex(), "18010000")
         self.assertIsNone(cy.view())
-        rom = ac.AREA_BY_ID["moonside-lake"]
+        rom = ac.AREA_BY_ID["byrgenwerth-balcony"]
         x, y, z, yaw = rom.view()
         fx, fy, fz, deg = rom.fog
         # Behind the wall by the stand-off, facing as the wall does.
@@ -169,15 +169,15 @@ class TourTest(unittest.TestCase):
             ac.pick_areas("central,central-yharnam")
 
     def test_perf_tour(self):
-        areas = ac.pick_areas("central-yharnam,moonside-lake")
+        areas = ac.pick_areas("central-yharnam,byrgenwerth-balcony")
         text = ac.tour(areas, dict(ac.DEFAULTS), "perf")
         steps = [l.split()[0] for l in text.splitlines() if l and not l.startswith("#")]
         # Each place begins with its travel: what a failed travel skips to.
         self.assertEqual(steps.count("travel"), 2)
         first = text.splitlines().index(next(l for l in text.splitlines() if l.startswith("travel 2412951")))
         self.assertIn("travel 2412951 18010000 central-yharnam", text)
-        self.assertIn("travel 3202950 20000000 moonside-lake 13200040 13200120\n", text)
-        self.assertIn("warp moonside-lake:view", text)
+        self.assertIn("travel 3202950 20000000 byrgenwerth-balcony 13200040 13200120\n", text)
+        self.assertIn("warp byrgenwerth-balcony:view", text)
         self.assertNotIn("warp central-yharnam:view", text)
         self.assertIn("mark central-yharnam:measure", text)
         self.assertIn("dump central-yharnam-a", text)
@@ -239,10 +239,10 @@ class TourTest(unittest.TestCase):
         self.assertEqual(lines[t + 1], "god off")
         self.assertIn("quiet %.0f" % ac.DEFAULTS["quiet"], lines[t:])
         # A tour without such a place has no god steps.
-        self.assertNotIn("god", ac.tour(ac.pick_areas("central-yharnam,moonside-lake"), dict(ac.DEFAULTS), "perf"))
+        self.assertNotIn("god", ac.tour(ac.pick_areas("central-yharnam,byrgenwerth-balcony"), dict(ac.DEFAULTS), "perf"))
 
     def test_rom_water_place(self):
-        """Rom's arena in the lake's water: moonside-lake's travel and doors, the
+        """Rom's arena in the lake's water: byrgenwerth-balcony's travel and doors, the
         warp down into the water, the enemies kept, and the feet view with the
         camera held looking down (released before the god step is undone)."""
         a = ac.AREA_BY_ID["rom-water"]
@@ -258,6 +258,33 @@ class TourTest(unittest.TestCase):
         self.assertLess(lines.index("pitch off"), lines.index("god off"))
         self.assertEqual(len([l for l in lines if l.startswith("dump rom-water-arena-")]), 5)
         self.assertNotIn("pitch", ac.tour(ac.pick_areas("chalice-aynbgu4m"), dict(ac.DEFAULTS), "perf"))
+
+    def test_moonside_lake_place(self):
+        """moonside-lake is the lake's own lamp (3202952), in the water: no
+        wall or standpoint to warp to, the enemies kept (Rom on a save that has
+        not killed her), the water at the player's feet with an F12 when the
+        run asks, the shore behind - and every frame of it held to the water
+        check. The balcony's doorway it was until 11-10 keeps a name of its own."""
+        a = ac.AREA_BY_ID["moonside-lake"]
+        self.assertIn(a, ac.AREAS)
+        self.assertEqual((a.block, a.return_point, a.fog, a.stand, a.flags), ("m32_00_00_00", 3202952, None, None, ()))
+        self.assertIsNone(a.view())
+        self.assertTrue(a.enemies)
+        self.assertEqual(a.water, {"a": "band", "b": "band", "feet": "sides", "shore": "band"})
+        self.assertEqual(set(a.water.values()) - set(ac.WATER_REGIONS), set())
+        lines = ac.tour([a], dict(ac.DEFAULTS, f12_looks=True), "perf").splitlines()
+        self.assertEqual(lines[2:5], ["travel 3202952 20000000 moonside-lake", "god hide", "camera"])
+        self.assertFalse([l for l in lines if l.startswith("warp moonside-lake:view") or l.startswith("quiet")])
+        for name in ("a", "b", "feet", "shore"):
+            self.assertIn("dump moonside-lake-" + name, lines)
+        w = lines.index(next(l for l in lines if l.startswith("warp moonside-lake:feet ")))
+        self.assertEqual(lines[w + 1:w + 3], ["camera", "pitch 0.9000"])
+        self.assertLess(lines.index("f12 moonside-lake-feet"), lines.index("pitch off"))
+        self.assertEqual(a.as_dict()["water"], a.water)
+        old = ac.AREA_BY_ID["byrgenwerth-balcony"]
+        self.assertNotIn(old, ac.AREAS)
+        self.assertEqual((old.return_point, old.flags, old.water), (3202950, (13200040, 13200120), {}))
+        self.assertIsNotNone(old.view())
 
     def test_auto_numa_node(self):
         """--numa-node auto: node 0 with every CPU allowed, the node an outer numactl confined the harness to (a
@@ -464,7 +491,7 @@ class CheckAreasTest(unittest.TestCase):
 
 class LogTest(unittest.TestCase):
     def run_lines(self):
-        cy, rom = ac.AREA_BY_ID["central-yharnam"], ac.AREA_BY_ID["moonside-lake"]
+        cy, rom = ac.AREA_BY_ID["central-yharnam"], ac.AREA_BY_ID["byrgenwerth-balcony"]
         rng = random.Random(7)
         window = [[16.67 + rng.uniform(-0.3, 0.3) for _ in range(60)] for _ in range(20)]
         window[5][10] = 40.0  # one hitch
@@ -505,10 +532,22 @@ class LogTest(unittest.TestCase):
         self.assertIn("perf pass: rendered at 1920x1080, not the 3840x2160 asked for", ac.problems_of(report))
         report["run"]["size"] = [1920, 1080]
         self.assertFalse([p for p in ac.problems_of(report) if "rendered at" in p])
+        # The line since 11-08 (d9b90b81): the back buffer and the scan-out buffers, then the picture's size; an
+        # upscaler below the window renders the picture at the output's size, which is not a wrong size.
+        lines[0] = ("[bbhost] resolution: back buffer 2560x1440 (scan-out buffers 2560x1440), rendering 1920x1080; the scene "
+                    "renders into a target of its own")
+        rep = ac.pass_report(lines, ac.pick_areas("hunters-dream"), "perf")
+        self.assertEqual((rep["rendering"], rep["render_scaled"]), ([1920, 1080], False))
+        lines[0] = ("[bbhost] resolution: back buffer 2560x1600 (scan-out buffers 2560x1600), rendering 2560x1600; the scene "
+                    "renders at the render size, upscaled to the output size (render scale)")
+        rep = ac.pass_report(lines, ac.pick_areas("hunters-dream"), "perf")
+        self.assertEqual((rep["rendering"], rep["render_scaled"]), ([2560, 1600], True))
+        report = {"run": {"size": [1920, 1080]}, "passes": {"perf": dict(rep, tour_done=True)}, "areas": {}}
+        self.assertFalse([p for p in ac.problems_of(report) if "rendered at" in p])
 
     def test_places_from_the_log(self):
         lines, window = self.run_lines()
-        rep = ac.pass_report(lines, ac.pick_areas("central-yharnam,moonside-lake,hunters-dream"), "perf")
+        rep = ac.pass_report(lines, ac.pick_areas("central-yharnam,byrgenwerth-balcony,hunters-dream"), "perf")
         self.assertTrue(rep["tour_done"])
         self.assertEqual(rep["version"], "v0.2.16-14-g2291ffe+")
         self.assertEqual(rep["world"], {"flip": 1500, "seconds": 31.0})
@@ -543,7 +582,7 @@ class LogTest(unittest.TestCase):
         self.assertEqual(nps["reasons"], {"ds_swizzle_b32 is not lifted": 2})
         self.assertEqual(sorted(cy["frames"]), ["a", "b"])
         self.assertTrue(cy["frames"]["a"]["path"].endswith("central-yharnam-a.ppm"))
-        rom = rep["areas"]["moonside-lake"]
+        rom = rep["areas"]["byrgenwerth-balcony"]
         self.assertEqual(rom["status"], "ok")
         self.assertTrue(rom["view"]["reached"])
         # Nothing of Central Yharnam's spills into the next place.
@@ -551,18 +590,18 @@ class LogTest(unittest.TestCase):
         self.assertEqual(rep["areas"]["hunters-dream"]["status"], "not reached")
 
     def test_failed_travel_and_missing_view(self):
-        cy, rom = ac.AREA_BY_ID["central-yharnam"], ac.AREA_BY_ID["moonside-lake"]
+        cy, rom = ac.AREA_BY_ID["central-yharnam"], ac.AREA_BY_ID["byrgenwerth-balcony"]
         lines = [mapval("mapval step %d travel %s %.3f return point %d block %s -> %s", 1, rom.id, 10.0, rom.return_point, "20000000", "queued"),
                  mapval("mapval travel-failed %s %.3f in %s after %.1f s", rom.id, 160.0, "15000000", 150.0)]
         lines += area_lines(cy, 170.0, "18010000", [[16.7] * 60 for _ in range(5)])
         rep = ac.pass_report(lines, [rom, cy], "perf")
-        self.assertEqual(rep["areas"]["moonside-lake"]["status"], "travel failed")
+        self.assertEqual(rep["areas"]["byrgenwerth-balcony"]["status"], "travel failed")
         self.assertEqual(rep["areas"]["central-yharnam"]["status"], "ok")
         self.assertFalse(rep["tour_done"])
         # A view that was never reached.
         lines = area_lines(rom, 10.0, "20000000", [[16.7] * 60 for _ in range(5)])
         lines = [l for l in lines if "mapval at " not in l]
-        self.assertEqual(ac.pass_report(lines, [rom], "perf")["areas"]["moonside-lake"]["status"], "view not reached")
+        self.assertEqual(ac.pass_report(lines, [rom], "perf")["areas"]["byrgenwerth-balcony"]["status"], "view not reached")
 
     def test_a_place_never_reached_is_not_ok(self):
         """The marks say where the player was: a run once read "ok" at The Old
@@ -654,22 +693,22 @@ class LogTest(unittest.TestCase):
     def test_view_and_settle(self):
         """A view's place measured away from its standpoint is not the view;
         the settle that was had counts from the loading screen's end."""
-        rom = ac.AREA_BY_ID["moonside-lake"]
+        rom = ac.AREA_BY_ID["byrgenwerth-balcony"]
         v = rom.view()
         win = [[16.7] * 60 for _ in range(4)]
         rep = ac.pass_report(area_lines(rom, 100.0, "20000000", win, view=v), [rom], "perf")
-        a = rep["areas"]["moonside-lake"]
+        a = rep["areas"]["byrgenwerth-balcony"]
         self.assertEqual(a["status"], "ok")
         self.assertEqual(a["presence"]["view_off_m"], 0.0)
         self.assertEqual(a["presence"]["settle_s"], 15.0)  # arrived at 108, the window at 123
         self.assertNotIn("loading_after_arrival", a["presence"])
         away = (v[0] + 8.0, v[1], v[2], v[3])
         rep = ac.pass_report(area_lines(rom, 100.0, "20000000", win, view=v, at=away[:3]), [rom], "perf")
-        self.assertEqual(rep["areas"]["moonside-lake"]["status"], "not at the view (8 m from it)")
+        self.assertEqual(rep["areas"]["byrgenwerth-balcony"]["status"], "not at the view (8 m from it)")
         # The loading screen still up at the arrival: it ended at 113.
         late = [mapval("mapval loading-ends %.3f after %.1f s", 113.0, 9.0)]
         rep = ac.pass_report(area_lines(rom, 100.0, "20000000", win, view=v, settle_events=late), [rom], "perf")
-        p = rep["areas"]["moonside-lake"]["presence"]
+        p = rep["areas"]["byrgenwerth-balcony"]["presence"]
         self.assertEqual(p["settle_s"], 10.0)
         self.assertTrue(p["loading_after_arrival"])
         # The travel says how long its loading screen was up.
@@ -858,6 +897,68 @@ class FrameTest(unittest.TestCase):
         self.assertIn("BLACK", ac.frame_note(rep["areas"]["x"]["frames"]["a"]))
         self.assertNotIn("BLACK", ac.frame_note(rep["areas"]["x"]["frames"]["b"]))
 
+    def test_water_check(self):
+        """The water check over a frame's water region: the lake's texture
+        (the luma's spread) against the flat fog or sky of a lake drawn as
+        nothing - with numpy and without - and the problems it gives: a frame
+        with no water, and a frame the check needs that was never dumped."""
+        rng = random.Random(3)
+
+        def frame(w, h, water):
+            px = bytearray()
+            for y in range(h):
+                for x in range(w):
+                    if water and y > h // 2:
+                        v = max(0, min(255, int(rng.gauss(60, 35))))  # the lake: dark water and bright glints
+                    else:
+                        v = 180 + (x + y) % 3  # the fog, near flat
+                    px += bytes((v, v, v))
+            return ac.Image(w, h, bytes(px))
+        wet, dry = frame(64, 40, True), frame(64, 40, False)
+        for region in ("band", "sides"):
+            g, b = ac.water_stats(wet, region), ac.water_stats(dry, region)
+            self.assertTrue(g["ok"], g)
+            self.assertFalse(b["ok"], b)
+            self.assertGreater(g["std"], ac.WATER_MIN_STD)
+            self.assertLess(b["std"], 2.0)
+            self.assertEqual(g["region"], region)
+        saved = ac.np
+        try:
+            ac.np = None
+            slow = ac.water_stats(wet, "band")
+        finally:
+            ac.np = saved
+        fast = ac.water_stats(wet, "band")
+        self.assertEqual(slow["ok"], fast["ok"])
+        self.assertAlmostEqual(slow["std"], fast["std"], delta=3.0)  # every other pixel: near, not equal
+        self.assertAlmostEqual(slow["mean"], fast["mean"], delta=3.0)
+        # The problems, and the frame's note in the summary.
+        rep = {"run": {}, "passes": {}, "areas": {"moonside-lake": {"status": "ok", "frames": {
+            "a": {"ok": True, "stats": {"mean_luma": 170.0, "width": 64, "height": 40}, "bands": {}, "water": ac.water_stats(dry, "band")},
+            "b": {"ok": True, "stats": {"mean_luma": 120.0, "width": 64, "height": 40}, "bands": {}, "water": ac.water_stats(wet, "band")},
+            "feet": {"ok": False, "water": {"region": "sides", "ok": False, "missing": True}}}}}}
+        probs = ac.problems_of(rep)
+        self.assertEqual(len(probs), 2, probs)
+        self.assertTrue(probs[0].startswith("moonside-lake: frame a shows no water - the band region's luma std "), probs[0])
+        self.assertEqual(probs[1], "moonside-lake: frame feet, which the water check needs, was not dumped")
+        self.assertIn("NO WATER", ac.frame_note(rep["areas"]["moonside-lake"]["frames"]["a"]))
+        self.assertNotIn("NO WATER", ac.frame_note(rep["areas"]["moonside-lake"]["frames"]["b"]))
+        self.assertIn("water std", ac.frame_note(rep["areas"]["moonside-lake"]["frames"]["b"]))
+        # merge scores the place's water frames from their files, and a water frame the run never dumped fails.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "moonside-lake-a.ppm"
+            ac.write_ppm(path, dry)
+            perf = {"areas": {"moonside-lake": {"id": "moonside-lake", "status": "ok", "frames": {
+                "a": {"path": str(path), "flip": 1, "ok": True, "crop": [64, 40]}}}}}
+            got = ac.merge(perf, None, None, [ac.AREA_BY_ID["moonside-lake"]])["moonside-lake"]["frames"]
+            self.assertFalse(got["a"]["water"]["ok"])
+            self.assertEqual(sorted(n for n, f in got.items() if (f.get("water") or {}).get("missing")), ["b", "feet", "shore"])
+            # A place without water frames is not held to it.
+            perf = {"areas": {"central-yharnam": {"id": "central-yharnam", "status": "ok", "frames": {
+                "a": {"path": str(path), "flip": 1, "ok": True, "crop": [64, 40]}}}}}
+            got = ac.merge(perf, None, None, [ac.AREA_BY_ID["central-yharnam"]])["central-yharnam"]["frames"]
+            self.assertNotIn("water", got["a"])
+
     def test_verdict_against_the_noise_floor(self):
         noise = [{"changed_pct": 12.0, "max_block": 3.0, "blurred_pct": 1.0, "mean_signed": 0.4}]
         within = [{"changed_pct": 14.0, "max_block": 3.5, "blurred_pct": 1.2, "mean_signed": 0.5}]
@@ -942,10 +1043,10 @@ class CompareTest(unittest.TestCase):
 
     def test_summary_text(self):
         lines, _ = LogTest().run_lines()
-        perf = ac.pass_report(lines, ac.pick_areas("central-yharnam,moonside-lake"), "perf")
+        perf = ac.pass_report(lines, ac.pick_areas("central-yharnam,byrgenwerth-balcony"), "perf")
         rep = {"dir": "/r", "run": {"version": perf["version"], "numa_node": 0, "fps": 60}, "passes": {"perf": {
             "stop_reason": "tour done", "elapsed_s": 300, "world": perf["world"], "tour_done": True, "fatal": []}},
-               "areas": ac.merge(perf, None, None, ac.pick_areas("central-yharnam,moonside-lake"))}
+               "areas": ac.merge(perf, None, None, ac.pick_areas("central-yharnam,byrgenwerth-balcony"))}
         rep["problems"] = ac.problems_of(rep)
         self.assertEqual(rep["problems"], [])
         text = ac.summary_text(rep)
@@ -1055,7 +1156,7 @@ class EndToEndTest(unittest.TestCase):
     def run_once(self, name):
         d = self.d
         args = ["run", "--bbhost", str(d / "build" / "bbhost"), "--app0", str(d / "app0"), "--eboot", str(d / "eboot.bin"),
-                "--seed", str(d / "seed"), "--out", str(d / name), "--areas", "central-yharnam,moonside-lake", "--numa-node", "none",
+                "--seed", str(d / "seed"), "--out", str(d / name), "--areas", "central-yharnam,byrgenwerth-balcony", "--numa-node", "none",
                 "--captures", "2", "--capture-window", "3", "--settle", "3", "--measure", "6", "--width", "4", "--height", "4"]
         import contextlib
         import io
@@ -1080,7 +1181,7 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(cy["arrival"]["new_pixel_shaders"]["lifted"], 1)
         self.assertEqual(cy["capture_pass"]["status"], "ok")
         self.assertEqual(cy["lift"]["totals"], {"identical": 2})
-        self.assertTrue(rep["areas"]["moonside-lake"]["view"]["reached"])
+        self.assertTrue(rep["areas"]["byrgenwerth-balcony"]["view"]["reached"])
         self.assertFalse((self.d / "a1" / "perf" / "data").exists())  # the seed's copy goes
         self.assertIn("central-yharnam", (self.d / "a1" / "summary.txt").read_text())
         # The report again from the logs.

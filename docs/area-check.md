@@ -14,7 +14,7 @@ draw them, place by place. Two builds can be run against each other.
 | `cathedral-ward` | Cathedral Ward | its lamp |
 | `old-yharnam` | Old Yharnam | its lamp |
 | `forbidden-woods` | Forbidden Woods (tessellated meshes) | its lamp |
-| `moonside-lake` | Byrgenwerth, Rom's arena | the first lamp, then the lake's doorway |
+| `moonside-lake` | Moonside Lake, standing in the lake's water | the lake's own lamp (lit once Rom is dead; the travel works without it) |
 | `nightmare-of-mensis` | Nightmare of Mensis, Mergo's Loft and the brain's window | the Nightmare of Mensis lamp, then the rocks above the north path |
 | `fishing-hamlet` | Fishing Hamlet, the Orphan of Kos's coast | the first lamp, then the arena's edge |
 | `astral-clocktower` | Lady Maria's arena | the Research Hall lamp, then the arena's door |
@@ -26,6 +26,14 @@ The last five are The Old Hunters' (always on in bbhost). An
 arena view stands just outside the boss's fog wall, facing in, where the boss
 rush plugin starts its rounds, without walking in. Two arenas are behind
 doors, which the run opens with the flags the boss rush uses.
+
+Moonside Lake is its lamp in the lake's shallow water, the water in the lower
+half of every view, and two looks after the place's frames: the water at the
+player's feet with the camera held looking down, and the shore behind. On a
+save that has not killed Rom she and her children are in the lake; the player
+is hidden from them and kept alive while there. Until 11-10 the place was the
+balcony's doorway above the lake, which showed the moon and none of the
+water; that view is `byrgenwerth-balcony` now, for comparisons with older runs.
 
 Mensis and the staircase are views rather than arenas, two of the heaviest
 scenes the game draws, and each has a standpoint of its own: a position in the
@@ -98,6 +106,16 @@ For each place the report says:
   two neighbouring columns or rows that runs all the way across the picture,
   as the 4K world that was black left of three quarters of the width had - is
   flagged, and so is a black picture;
+- the water check: a place whose views show water (`moonside-lake`'s four
+  frames, `rom-water`'s) has each of those frames measured over the part of
+  the picture the water fills - the band below the horizon left and right of
+  the hunter, or the frame's sides when the camera looks down at the feet. The
+  spread of the luma there is the water's texture: 21-57 at the lake with the
+  water drawn, at 1080p and through TAA, FSR 3 and DLSS, standing and looking
+  down; 5-13 when the lake was drawn as nothing (11-10: the fog's flat grey
+  where the water should be). A frame under 15, or one the check needs that was
+  not dumped, is a problem of the run - so a gate fails on it whichever build
+  it compares with;
 - memory as the place was left, from the 5-second report: the device-local
   heaps' use, the image heap and everything bbhost allocated, and what the
   place added since the place before;
@@ -121,6 +139,35 @@ tools/area_check.py ab --a <build A>/bbhost --b <build B>/bbhost --config test.t
 tools/area_check.py compare --a <run>... --b <run>... --out <dir>
 tools/area_check.py report <run>                     # the report again from a run's logs
 ```
+
+A run is headless by default: the display buffers are the largest size the
+Resolution setting offers (5120x2160) and the picture renders at the run's
+size into their corner. `--display :N` runs the game in a window on a private X
+display instead (an Xvfb of the screen's size - never a player's display), as
+a player has it: the swapchain, the window's size and the present's scaling.
+`--options FILE` starts the game from a settings file (a
+`bbhost-options.toml`, as the in-game PC menus write it). Together they act out
+a player's setup - for the render below the display that many players run, an
+Xvfb at 2560x1440 with `resolution = "1920x1080"` and `window_mode =
+"Borderless"`: the scene in a target of its own, FSR 1 bringing it up at the
+present (with Upscaling TAA, the render-scale path). A private Xvfb has no
+window manager to size a borderless or fullscreen window to the screen, so with
+`--display` and such a `window_mode` the harness does it with `xdotool` the
+moment the window is up (xdotool must be installed).
+
+The release gate runs the water places that way too, after its headless
+passes - the configuration players run and the gate never covered until the
+water went missing at Moonside Lake (11-10):
+
+```sh
+Xvfb :91 -screen 0 2560x1440x24 &        # a private display, never a player's
+tools/area_check.py run --bbhost <build>/bbhost --config test.toml --seed <save folder> --out <dir> \
+    --areas moonside-lake,rom-water --display :91 --options tools/area_check_below_display.toml
+```
+
+and again with `upscaler = "TAA"` added to a copy of that file (the
+render-scale path). The water check holds every one of those frames to the
+water; the run's exit status is 1 when one fails.
 
 `--dry-run` checks the configuration, copies the seed and checks the copy,
 checks each place's lamp and view against the game's data, builds the probe
