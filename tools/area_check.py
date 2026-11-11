@@ -76,6 +76,7 @@ Exit status: 0 when every place was measured and no lift differed, 1 when
 something did not, 2 for bad arguments.
 """
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -148,7 +149,7 @@ class Area:
     flag, so the place shows it from any save."""
 
     def __init__(self, ident, name, block, return_point, fog=None, dlc=False, flags=(), stand=None, chalice=None, looks=(),
-                 enemies=False, flags_off=()):
+                 enemies=False, flags_off=(), water=None):
         self.id, self.name, self.block, self.return_point, self.fog, self.dlc = ident, name, block, return_point, fog, dlc
         self.flags = tuple(flags)
         self.flags_off = tuple(flags_off)
@@ -164,6 +165,9 @@ class Area:
         # The place's enemies are part of what it shows: none switched off (no quiet), the player hidden from them and
         # kept alive (the probe's "god hide") while there, and both undone ("god off") before the next place.
         self.enemies = bool(enemies)
+        # The frames that show water and where (the water check, WATER_REGIONS): {frame name: region name}, the frame
+        # names as the report keeps them - "a", "b" for the place's own dumps, a look's name for its.
+        self.water = dict(water or {})
 
     def block_hex(self):
         a, b, c, d = (int(x) for x in self.block[1:].split("_"))
@@ -190,7 +194,7 @@ class Area:
                 "flags_off": list(self.flags_off),
                 "chalice": dict(self.chalice) if self.chalice else None,
                 "looks": [list(l[:5]) + ([l[5]] if l[5] else []) for l in self.looks],
-                "enemies": self.enemies}
+                "enemies": self.enemies, "water": dict(self.water)}
 
 
 AREAS = (
@@ -199,9 +203,18 @@ AREAS = (
     Area("cathedral-ward", "Cathedral Ward", "m24_00_00_00", 2402950),
     Area("old-yharnam", "Old Yharnam", "m23_00_00_00", 2302950),
     Area("forbidden-woods", "Forbidden Woods (tessellated meshes)", "m27_00_00_00", 2702950),
-    # The lake's door (m32_00's 13200040 and its opening's 13200120) open.
-    Area("moonside-lake", "Byrgenwerth: Moonside Lake, Rom's arena", "m32_00_00_00", 3202950,
-         fog=(-452.874, -175.03, 392.65, 70.0), flags=(13200040, 13200120)),
+    # Moonside Lake's own lamp (ReturnPointParam 3202952, headstone slot 40, lit once Rom is dead): its travel stands the
+    # player in the lake's shallow water - m32_00's respawn point 白痴の蜘蛛 at -509.0, -271.2, 371.0, facing 70 degrees,
+    # across the lake - with the water in the lower half of every view. Looks: the water at the player's feet (the camera
+    # held looking down) and the shore behind. On a save that has not killed Rom she and her children are in the lake:
+    # the player hidden and kept alive (enemies). Every frame here is held to the water check (WATER_REGIONS): 11-10,
+    # the owner and players saw the lake drawn as nothing - fog where the water should be - and the gate's view (the
+    # balcony's doorway, now byrgenwerth-balcony) never showed the water. A travel works without the lamp lit.
+    Area("moonside-lake", "Byrgenwerth: Moonside Lake's lamp, standing in the lake's water", "m32_00_00_00", 3202952,
+         enemies=True,
+         looks=(("feet", -508.984, -271.24, 371.03, 70.0, {"pitch": 0.9, "f12": True}),
+                ("shore", -508.984, -271.24, 371.03, -110.0)),
+         water={"a": "band", "b": "band", "feet": "sides", "shore": "band"}),
     # A lookout: the top of the rock slope off the north path (navmesh piece
     # h000003), facing Mergo's Loft's west front and the brain's lit window.
     # The brain's gaze (the evil eye, m26_00's 2600100/2600101) frenzies the
@@ -265,9 +278,14 @@ EXTRA_AREAS = (
          stand=(110.5, 33.0, 52.0, 180.0), enemies=True,
          looks=(("room-south", 110.5, 33.0, 52.0, 0.0), ("hall", 78.0, 33.5, -42.0, 180.0),
                 ("spirit", 53.5, 39.0, -33.0, 0.0, {"dumps": 5, "gap": 2.5, "f12": True}))),
+    # The gate's moonside-lake until 11-10: Byrgenwerth's first lamp (3202950), then the balcony's doorway to the lake
+    # (Rom's "fog wall" as the boss rush keeps it), its door (m32_00's 13200040 and its opening's 13200120) open - the
+    # moon through the doorway, none of the lake's water. Kept for runs compared with earlier ones.
+    Area("byrgenwerth-balcony", "Byrgenwerth: the balcony's doorway to Moonside Lake (the gate's moonside-lake before 11-10)",
+         "m32_00_00_00", 3202950, fog=(-452.874, -175.03, 392.65, 70.0), flags=(13200040, 13200120)),
     # The owner's report (10-19): rendering wrong in Rom's arena while standing in the water. The arena is Moonside
     # Lake's shallow water below Byrgenwerth's balcony (m32_00_00_00's MSB: the floor at y -271.2, Rom - c5100_0000
-    # "白痴の蜘蛛" - at -534.4, 361.8, the lamp the fight leaves at -510.9, 370.4); the travel is moonside-lake's
+    # "白痴の蜘蛛" - at -534.4, 361.8, the lamp the fight leaves at -510.9, 370.4); the travel is byrgenwerth-balcony's
     # (Byrgenwerth's lamp, its doors open), then the warp down into the water 8 m from that lamp, facing Rom; Rom and
     # her children stay in (enemies: the player hidden and kept alive). Views: the same way as a timeline, the cliff
     # and Byrgenwerth behind, and the water at the player's feet (the camera held looking down) as a timeline with an
@@ -276,7 +294,9 @@ EXTRA_AREAS = (
          flags=(13200040, 13200120), stand=(-508.0, -270.5, 378.0, 58.5), enemies=True,
          looks=(("arena", -508.0, -270.5, 378.0, 58.5, {"dumps": 5, "gap": 2.5}),
                 ("cliff", -508.0, -270.5, 378.0, -105.0),
-                ("feet", -508.0, -270.5, 378.0, 58.5, {"pitch": 0.9, "dumps": 5, "gap": 2.5, "f12": True}))),
+                ("feet", -508.0, -270.5, 378.0, 58.5, {"pitch": 0.9, "dumps": 5, "gap": 2.5, "f12": True})),
+         water=dict([("a", "band"), ("b", "band")] + [("arena-%d" % k, "band") for k in range(1, 6)] +
+                    [("feet-%d" % k, "sides") for k in range(1, 6)])),
     # The sewers under Central Yharnam (m24_01_00_00's MSB names their pieces 下水トンネル, the pillared tunnel, and
     # 下水道壁, the sewer's wooden walls; they are in that block alone): four standpoints from Central Yharnam's lamp, each
     # a warp onto a floor the MSB stands its rats on, facing along the passage. The rats' pit is the heaviest of the four
@@ -463,6 +483,10 @@ def pass_settings(pass_dir, areas, opts, kind):
         s.update({"BBHOST_CAPTURE_DRAW": "*ps", "BBHOST_CAPTURE_ARMED": "1",
                   "BBHOST_CAPTURE_COUNT": str(max(1, opts["captures"]) * len(areas)),
                   "BBHOST_CAPTURE_DIR": str(pass_dir / "captures"), "BBHOST_SET_CACHE": "0"})
+    if opts.get("display"):
+        # Windowed: the game's window on that display (game_env passes DISPLAY on to it).
+        del s["BBHOST_HEADLESS"]
+        s["DISPLAY"] = opts["display"]
     for item in opts.get("env", []):
         name, sep, value = item.partition("=")
         if not sep or not name.startswith("BBHOST_") or name in s:
@@ -611,7 +635,11 @@ TOUR_START = re.compile(PROBE + r"tour-start ")
 PROBE_LINE = re.compile(PROBE)
 TOUR_DONE = re.compile(PROBE + r"tour-done ")
 VERSION = re.compile(r"\] bbhost (v\S+) \(")
-RENDERING = re.compile(r"\] resolution: display buffers \d+x\d+, rendering (\d+)x(\d+)")
+# The size the game renders the picture at, which the frames are scored over: "display buffers AxB, rendering WxH" until
+# 11-08, "back buffer AxB (scan-out buffers AxB), rendering WxH; the scene renders ..." since (d9b90b81) - unmatched, the
+# frames were scored over the whole display buffer. With an upscaler below the window the picture is the output's size
+# ("... upscaled to the output size (render scale)"), not the size a run asks for.
+RENDERING = re.compile(r"\] resolution: (?:display buffers \d+x\d+|back buffer \d+x\d+ \(scan-out buffers \d+x\d+\)), rendering (\d+)x(\d+)(.*)")
 FATAL = re.compile(r"SIGSEGV pc=|dumped core|Segmentation fault|the device is lost|VK_ERROR_DEVICE_LOST|\] DL_PANIC ")
 PROBLEM = re.compile(r"HLE stub #|descriptor set allocation failed|wait timed out|capture: .*abandoned")
 
@@ -643,6 +671,7 @@ class Log:
         self.version = None
         self.world = None
         self.rendering = None  # [w, h]: the last size the game rendered at
+        self.render_scaled = False  # that size is an upscaler's output (render scale), the 3D smaller
         self.tour_done = False
         self.fatal = []
         for i, line in enumerate(lines):
@@ -778,6 +807,7 @@ class Log:
         m = RENDERING.search(line)
         if m:
             self.rendering = [int(m.group(1)), int(m.group(2))]
+            self.render_scaled = "upscaled to the output size" in m.group(3)
             self._ev(i, "rendering", size=list(self.rendering))
         if FATAL.search(line):
             self.fatal.append(line.strip()[:300])
@@ -1113,7 +1143,7 @@ def pass_report(lines, areas, kind):
     log = Log(lines)
     segs = area_segments(log, {a.id for a in areas})
     out = {"kind": kind, "version": log.version, "world": log.world, "tour_done": log.tour_done, "fatal": log.fatal[:20],
-           "rendering": log.rendering, "title": title_report(log), "areas": {}}
+           "rendering": log.rendering, "render_scaled": log.render_scaled, "title": title_report(log), "areas": {}}
     for a in areas:
         if a.id in segs:
             out["areas"][a.id] = area_report(log, a, segs[a.id], kind)
@@ -1227,6 +1257,55 @@ BAND_AGREE = 7
 # A picture this dark is black: nothing drawn (the 4K Forbidden Woods' 0.5).
 # The darkest scenes of earlier runs read 18 or more.
 BLACK_LUMA = 2.0
+
+# The water check. 11-10: the owner and players saw Moonside Lake drawn as nothing - the fog's or the sky's flat grey
+# where the water should be, for a whole visit - and no gate looked at the water. A place whose views show water names,
+# per frame, the part of the picture the water fills (Area.water: a region of WATER_REGIONS); the frame is measured
+# there, and the luma's standard deviation is the water's texture - its waves, glints and the shore's shading. At the
+# Moonside Lake lamp it read 21-57 with the water (1080p dumps; the 2560x1600 output of TAA, FSR 3 and DLSS; standing
+# and looking down; v0.2.29-v0.2.31, Linux and Windows; 31.6-44.4 in 40 frames of the RTX's kept visits) and 4.8-13.4
+# without it (40 frames of the RTX's lost visits and the laptop's, 11-10: the shore view the highest, the others under
+# 10.5). A frame under WATER_MIN_STD fails its place.
+WATER_MIN_STD = 15.0
+# Regions as boxes of the picture (x0, y0, x1, y1 as fractions of its width and height), the hunter in the middle left
+# out: "band", the lower band of a view standing in or by the water (just below the horizon to the feet); "sides", the
+# camera held looking down at the water round the hunter (a look's {"pitch": 0.9}), below the HUD.
+WATER_REGIONS = {
+    "band": ((0.05, 0.62, 0.38, 0.95), (0.62, 0.62, 0.95, 0.95)),
+    "sides": ((0.02, 0.25, 0.36, 0.95), (0.64, 0.25, 0.98, 0.95)),
+}
+
+
+def water_stats(img, region):
+    """The water check's numbers for one picture over a WATER_REGIONS region: the luma's mean, standard deviation and
+    detail (the mean difference between neighbouring pixels), and whether it reads as water (std >= WATER_MIN_STD)."""
+    w, h = img.width, img.height
+    boxes = [(int(x0 * w), int(y0 * h), max(int(x0 * w) + 2, int(x1 * w)), max(int(y0 * h) + 2, int(y1 * h)))
+             for x0, y0, x1, y1 in WATER_REGIONS[region]]
+    if np is not None:
+        a = np.frombuffer(img.rgb, np.uint8).reshape(h, w, 3).astype(np.float32)
+        lum = a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+        parts = [lum[y0:y1, x0:x1] for x0, y0, x1, y1 in boxes]
+        vals = np.concatenate([q.ravel() for q in parts])
+        mean, std = float(vals.mean()), float(vals.std())
+        detail = sum(float(np.abs(np.diff(q, axis=1)).mean() + np.abs(np.diff(q, axis=0)).mean()) / 2 for q in parts) / len(parts)
+    else:
+        d = img.rgb
+        def l(x, y):
+            k = (y * w + x) * 3
+            return 0.299 * d[k] + 0.587 * d[k + 1] + 0.114 * d[k + 2]
+        vals, diffs = [], []
+        for x0, y0, x1, y1 in boxes:  # every other pixel each way: the same answer, a quarter of the work
+            for y in range(y0, y1 - 2, 2):
+                for x in range(x0, x1 - 2, 2):
+                    v = l(x, y)
+                    vals.append(v)
+                    diffs.append((abs(l(x + 1, y) - v) + abs(l(x, y + 1) - v)) / 2)
+        mean = sum(vals) / len(vals)
+        std = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
+        detail = sum(diffs) / len(diffs)
+    return {"region": region, "mean": round(mean, 1), "std": round(std, 1), "detail": round(detail, 2),
+            "ok": std >= WATER_MIN_STD}
 
 
 def band_edges(img):
@@ -1726,6 +1805,9 @@ def frame_note(f):
     if not st:
         return "-"
     out = "luma %.1f (%dx%d)%s" % (st["mean_luma"], st["width"], st["height"], " BLACK" if st["mean_luma"] < BLACK_LUMA else "")
+    wt = f.get("water")
+    if wt and not wt.get("missing"):
+        out += " water std %.1f%s" % (wt["std"], "" if wt["ok"] else " NO WATER")
     for edge in (f.get("bands") or {}).values():
         if edge.get("flagged"):
             out += " BAND EDGE at %s=%d (%.0f -> %.0f)" % ("x" if edge["axis"] == "column" else "y", edge["at"], edge["from"], edge["to"])
@@ -1882,12 +1964,14 @@ def prepare_pass(pass_dir, kind, areas, opts, paths):
     toml = run_toml(paths["app0"], paths["eboot"], pass_dir / "data", opts["p2p_port"], opts["width"], opts["height"],
                     old_hunters=any(a.dlc for a in areas))
     (pass_dir / "cfg" / "bbhost.toml").write_text(toml)
+    if opts.get("options_file"):
+        shutil.copy2(opts["options_file"], pass_dir / "cfg" / "bbhost-options.toml")
     (pass_dir / "tour.txt").write_text(tour(areas, opts, kind))
     settings = pass_settings(pass_dir, areas, opts, kind)
     argv = world_baseline.launch_argv([str(Path(opts["bbhost"]).resolve()), "--config", str(pass_dir / "cfg" / "bbhost.toml")],
                                       opts["numa_node"])
     plan = {"kind": kind, "argv": argv, "cwd": str(pass_dir), "settings": settings, "budget_s": pass_budget(areas, opts, kind),
-            "estimate_s": estimate(areas, opts, kind)}
+            "estimate_s": estimate(areas, opts, kind), "fill_window": bool(opts.get("fill_window"))}
     (pass_dir / "pass-plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     return plan
 
@@ -1908,6 +1992,25 @@ def title_tap(requests, n, hold_ms=None):
     tmp = requests / ("title-%03d.tmp" % n)
     tmp.write_text("menutap confirm%s\n" % (" %d" % hold_ms if hold_ms else ""))
     os.replace(tmp, requests / ("title-%03d.req" % n))
+
+
+WINDOW_UP = re.compile(r"^\[bbhost\] window (\d+)x(\d+)$")
+
+
+def fill_window(display, say):
+    """Size the game's window to the X screen, at its top-left (xdotool): what a window manager does for a borderless
+    window on a player's desktop. Best effort - the run goes on without it."""
+    env = dict(os.environ, DISPLAY=display)
+    try:
+        geo = subprocess.run(["xdotool", "getdisplaygeometry"], env=env, capture_output=True, text=True, timeout=10).stdout.split()
+        ids = subprocess.run(["xdotool", "search", "--name", "Bloodborne"], env=env, capture_output=True, text=True, timeout=10).stdout.split()
+        if len(geo) != 2 or not ids:
+            say("the window was not filled (screen %s, windows %s)" % (geo, ids))
+            return
+        subprocess.run(["xdotool", "windowmove", ids[-1], "0", "0", "windowsize", ids[-1], geo[0], geo[1]], env=env, timeout=10)
+        say("the window filled the %sx%s screen" % (geo[0], geo[1]))
+    except (OSError, subprocess.SubprocessError) as exc:
+        say("the window was not filled: %s" % exc)
 
 
 def launch(pass_dir, plan, say):
@@ -1959,6 +2062,8 @@ def launch(pass_dir, plan, say):
                             if not world and WORLD.search(line):
                                 world = True
                                 say("world reached")
+                            if plan.get("fill_window") and WINDOW_UP.match(line):
+                                fill_window(plan["settings"]["DISPLAY"], say)
                             if not read_one:
                                 m = PAD_READ.search(line)
                                 if m and int(m.group(2), 16):
@@ -2044,8 +2149,15 @@ def merge(perf, capture, lifts, areas):
                     img = crop_image(read_ppm(f["path"]), *(f.get("crop") or (0, 0)))
                     f["stats"] = image_stats(img)
                     f["bands"] = band_edges(img)
+                    if name in a.water:
+                        f["water"] = water_stats(img, a.water[name])
                 except (OSError, ValueError) as exc:
                     f["error"] = str(exc)
+        if a.water and ent.get("status") == "ok":
+            # Each frame the place says shows water must be there: one the tour did not dump is a failure too.
+            for name in a.water:
+                if name not in (ent.get("frames") or {}):
+                    ent.setdefault("frames", {})[name] = {"ok": False, "water": {"region": a.water[name], "ok": False, "missing": True}}
         if capture:
             c = capture.get("areas", {}).get(a.id) or {}
             ent["capture_pass"] = {"status": c.get("status"), "arrival": c.get("arrival")}
@@ -2067,7 +2179,7 @@ def problems_of(report):
         if not p.get("tour_done"):
             out.append("%s pass: the tour did not finish (%s)" % (kind, p.get("stop_reason")))
         size = report.get("run", {}).get("size")
-        if size and p.get("rendering") and list(p["rendering"]) != list(size):
+        if size and p.get("rendering") and list(p["rendering"]) != list(size) and not p.get("render_scaled"):
             out.append("%s pass: rendered at %dx%d, not the %dx%d asked for" % (kind, p["rendering"][0], p["rendering"][1], size[0], size[1]))
     for aid, a in report.get("areas", {}).items():
         if a.get("status") != "ok":
@@ -2085,6 +2197,13 @@ def problems_of(report):
         if a.get("status") == "ok" and settle and pr.get("settle_s") is not None and pr["settle_s"] < settle / 2:
             out.append("%s: settled %.0f s of the %.0f asked: the loading screen was still up at the arrival" % (aid, pr["settle_s"], settle))
         for name, f in sorted((a.get("frames") or {}).items()):
+            wt = f.get("water")
+            if wt and not wt.get("ok"):
+                if wt.get("missing"):
+                    out.append("%s: frame %s, which the water check needs, was not dumped" % (aid, name))
+                else:
+                    out.append("%s: frame %s shows no water - the %s region's luma std %.1f under %.0f (mean %.1f, detail %.2f)" % (
+                        aid, name, wt["region"], wt["std"], WATER_MIN_STD, wt["mean"], wt["detail"]))
             if f.get("stats") and f["stats"]["mean_luma"] < BLACK_LUMA:
                 out.append("%s: frame %s is black (luma %.1f)" % (aid, name, f["stats"]["mean_luma"]))
             for edge in (f.get("bands") or {}).values():
@@ -2126,6 +2245,18 @@ def resolve_options(args):
                  "pipeline_cache": args.pipeline_cache == "seed", "p2p_port": args.p2p_port, "width": args.width,
                  "height": args.height, "env": args.env, "keep_data": args.keep_data, "keep_captures": args.keep_captures,
                  "numa_node": numa, "seed": str(seed), "f12_looks": args.f12_looks})
+    if args.display:
+        if not re.fullmatch(r":[0-9]+", args.display) or args.display == ":0":
+            raise ValueError("--display takes a private X display such as :91 (never :0)")
+        opts["display"] = args.display
+    if args.options:
+        if not Path(args.options).is_file():
+            raise ValueError("--options: no such file: %s" % args.options)
+        opts["options_file"] = str(Path(args.options).resolve())
+        # A borderless or fullscreen window fills the screen on a player's desktop - the window manager sizes it. A
+        # private Xvfb has none, so the run does (launch, fill_window): the present's scaling as the player has it.
+        if opts.get("display") and re.search(r'^\s*window_mode\s*=\s*"(Borderless|Fullscreen)"', Path(args.options).read_text(), re.M):
+            opts["fill_window"] = True
     if opts["measure"] < 5 or opts["settle"] < 0 or opts["dumps"] < 0 or opts["dumps"] > 8 or opts["captures"] < 0:
         raise ValueError("--measure must be 5 s or more, --settle and --captures not negative, --dumps 0-8")
     return areas, {"app0": str(Path(app0).resolve()), "eboot": str(Path(eboot).resolve())}, opts
@@ -2209,7 +2340,7 @@ def do_run(args, bbhost=None, out=None, captures=True, say=print):
         launched = launch(out / k, plans[k], say_t)
         passes[k] = finish_pass(out / k, areas, k, launched, opts)
         report["passes"][k] = {x: passes[k].get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version",
-                                                             "rendering", "build_files", "title")}
+                                                             "rendering", "render_scaled", "build_files", "title")}
         say_t("%s after %.0f s" % (launched["stop_reason"], launched["elapsed_s"]))
         if k == "capture":
             lifts = verify_lifts(out / k, areas, opts, say_t)
@@ -2231,7 +2362,15 @@ def do_report(args):
     """The report again from a run's logs (after a change to this script)."""
     run = Path(args.run).resolve()
     plan = json.loads((run / "plan.json").read_text())
-    areas = [AREA_BY_ID[a["id"]] for a in plan["areas"] if a["id"] in AREA_BY_ID]
+    areas = []
+    for entry in plan["areas"]:
+        if entry["id"] not in AREA_BY_ID:
+            continue
+        # The water check as the run's own plan had it: a run from before it (or of a place an id named differently
+        # then - moonside-lake was the balcony's doorway until 11-10) is not held to it.
+        a = copy.copy(AREA_BY_ID[entry["id"]])
+        a.water = dict(entry.get("water") or {})
+        areas.append(a)
     old = {}
     if (run / "report.json").is_file():
         old = json.loads((run / "report.json").read_text())
@@ -2343,6 +2482,13 @@ def add_run_options(p):
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--height", type=int, default=1080)
     p.add_argument("--env", action="append", default=[], metavar="BBHOST_NAME=VALUE", help="another setting for the game (repeatable)")
+    p.add_argument("--display", metavar=":N",
+                   help="run the game in a window on this X display (a private Xvfb, never a player's), not headless: the "
+                        "swapchain, the present's scaling and the window's size as a player has them; the frame dumps are "
+                        "still the display buffers'")
+    p.add_argument("--options", metavar="FILE",
+                   help="the game's settings to start from (a bbhost-options.toml, as the in-game PC menus write it), copied "
+                        "into each pass's own config folder; default: none, the defaults")
     p.add_argument("--keep-data", action="store_true", help="keep each pass's copy of the seed")
     p.add_argument("--f12-looks", action="store_true",
                    help="take an F12 at each extra view that asks for one (with --env BBHOST_F12_TEXTURES=1 for its textures)")

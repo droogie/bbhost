@@ -161,6 +161,12 @@ come. The Windows build runs it under wine the same way; started with no
 file or pipe for its output, it opens a console as a double-clicked
 `bbhost.exe` does.
 
+`bbhost --options-selftest DIR` (ctest's `options_file_test`) reads an
+options file as an earlier version wrote it and writes it back, the way a run
+does, in `DIR`'s own `bbhost-options.toml` (never the player's): Character
+motion's `Velocity map`, Off's name until v0.2.32, reads as Off and is
+written back as `Off`.
+
 ## Packages
 
 | Target or script | Produces |

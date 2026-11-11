@@ -738,14 +738,23 @@ what TAA, FSR or DLSS gives. While one of them runs, the game's own
 Anti-aliasing pass is off: it came after their picture and only softened it
 again.
 
-Character motion (Graphics, or System > PC Upscaling in the game) is where
-the upscalers and frame generation take the motion of the hunter, enemies and
-other moving characters from; the camera's own always comes from the depth.
-Precise, the default, draws each character a second time into the motion,
-with its own position this frame and the last: clean edges and no trail behind
-a running character, for about 1% of the frame rate at 4K, on any GPU. Velocity
-map takes the game's motion blur map alone, 640x360 at any Resolution: a
-little faster, softer at a character's edge, where a faint trail can show.
+Character motion (Graphics, or System > PC Upscaling in the game) is how the
+upscalers and frame generation follow the hunter, enemies and other moving
+characters; the camera's own motion always comes from the depth. It matters
+only while TAA, FSR, DLSS or frame generation runs, and F10 and the setup
+window show it then:
+
+| Choice | What it does |
+|---|---|
+| Precise (the default) | Draws each character a second time into the motion, with its own position this frame and the last: clean edges and no trail behind a running character, for about 1% of the frame rate at 4K, on any GPU |
+| Off | Takes the game's motion blur map alone (640x360, or HD motion blur's size): a little faster, with softer edges and a faint trail behind running characters |
+
+Turn it off if your GPU or driver has trouble with Precise, or for the last
+bit of speed on a weak GPU. On the Steam Deck with FSR 3 Quality, Off saves
+0.2-0.4 ms of the GPU's frame, more with more characters on screen: 1-2.5% of
+the frame rate where the GPU sets it, and no change in the frame rate or the
+power drawn at 30 fps. An options file from an earlier version that says
+`char_motion = "Velocity map"` (Off's name until v0.2.32) reads as Off.
 
 A plugin can take the anti-aliasing over (plugin API 27, see
 [plugins.md](plugins.md)): while it is on, TAA, FSR and DLSS stay off, the

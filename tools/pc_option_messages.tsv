@@ -187,7 +187,7 @@
 125003	Upscaling	Replaces the game's AA: TAA or FSR 3 (any GPU), FSR 4 (AMD, Windows only) or DLSS (NVIDIA RTX).
 125004	Upscaling Quality	The 3D's drawn size: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
 125005	TAA Strength	How much TAA smooths: higher is steadier but may leave a faint trail, lower crisper. Default 5.
-125006	Character Motion	Precise: each character's own motion, clean edges, about 1% at 4K. Velocity Map: softer edges.
+125006	Character Motion	Precise (default): clean edges, about 1% at 4K. Off: a bit faster, softer edges, a faint trail.
 125030	Quarter	
 125031	Half	
 125032	Off	
@@ -200,4 +200,4 @@
 125039	Native AA	
 125040	TAA	
 125041	Precise	
-125042	Velocity Map	
+125042	Off	

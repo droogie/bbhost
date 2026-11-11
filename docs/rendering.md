@@ -905,13 +905,30 @@ commit at a true 60; `=0` keeps the path before them with the run commit as it w
 
 **The pool's duty (`BBHOST_GXVK_LISTS_REST`).** The pool works only where it
 shortens the frame; resting, it is given no draw and the command processor
-draws them all in order with the homes, as with `BBHOST_GXVK_LISTS=0`. It rests
+draws them all in order with the homes, as with `BBHOST_GXVK_LISTS=0`. A draw
+stored while the pool rests is the command processor's alone: it asks the pool
+nothing about it (`BBHOST_GXVK_LISTS_SKIP_UNFED=0`: it looks each one up as it
+does while the pool works) - at a 90 cap on the RTX 4070 below that takes the
+99th percentile frame 0.7-0.85 ms shorter where the pool rests. It rests
 while a frame cap holds the frame (two half-second windows in a row with the
 limiter waiting 15% of the time; it works again once the command processor,
-drawing everything, is busy 85% of a window at the cap, or the frame misses the
-cap with the game held back by the command processor's backlog 20% of the
-time), while the frame is the GPU's (busy 90% of two windows, until it is under
-80% over six), and wherever resting costs the frame nothing. That last is
+drawing everything, is busy 85% with the frame meeting its cap narrowly - the
+limiter waiting under 15%, the medians of three windows at the cap - or 92%
+however long the limiter waits, or the frame misses the cap with the game held
+back by the command processor's backlog 20% of the time; until 2026-11-10 any
+one window 85% busy woke it, and at Central Yharnam at a 90 cap on the RTX 4070
+below, with Windows' default acted out and the command processor 71-75% busy at
+rest, one such window kept the pool working, 1.2 cores, for a frame the cap held
+either way - it rests there now; a saturated command processor drops frames
+resting, so the pool works on there: at Old Yharnam at the same cap, 92-97%
+busy at rest, resting left 4-15 frames of a 30 s window over 16.7 ms against 2
+working and the 99th percentile frame 1.7 ms longer (15.4 against 13.7 ms), for
+0.8 of a core and 4 W; near a cap (the limiter
+waiting 8-15%), where it used to work on for good, it tries a rest - the
+switch's 1.5 s, then 1-1.5 s counted - and keeps it where the cap holds the
+frame without it, else it works again and the next trial waits the cap's
+backoff), while the frame is the GPU's (busy 90% of two windows, until it is
+under 80% over six), and wherever resting costs the frame nothing. That last is
 measured at each place, both ways: 10 s after the pool began to work there, an
 experiment rests it for 5.5 s and lets it work for 5.5 s more, and compares the
 frame rate resting with the windows on either side of it; under 0.5% slower

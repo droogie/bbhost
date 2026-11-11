@@ -20,6 +20,7 @@
 #include "hle/modules.h"
 #include "hle/np.h"
 #include "net/account.h"
+#include "net/nat_job.h"
 #include "log.h"
 
 #include <algorithm>
@@ -31,8 +32,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <filesystem>
 #include <functional>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -567,19 +571,22 @@ Setting g_set[kSettingCount] = {
      "turns the game's own motion blur off (it reads the map). Changes at once.",
      false},
     // Where the upscalers' motion for the characters comes from
-    // (host/upscale_pass.cpp): their own vertex shaders' positions, this frame's
-    // and the last, drawn into the motion (the capture), or the game's motion
-    // blur velocity map alone. The capture's cost measured at 4K: about 1%.
-    {"char_motion", "Character motion", {"Precise", "Velocity map"}, 0,
+    // (host/upscale_pass.cpp): Precise, their own vertex shaders' positions,
+    // this frame's and the last, drawn into the motion (the capture); Off, the
+    // game's motion blur velocity map alone. The capture's cost measured at 4K:
+    // about 1%. Off was called Velocity map until 2026-11-10 (an options file's
+    // reads as Off: host_options_load); the two choices keep their places.
+    {"char_motion", "Character motion", {"Precise", "Off"}, 0,
 #if defined(_WIN32)
-     "Where TAA, FSR, DLSS and frame generation take the motion of the hunter, enemies and other moving characters from "
+     "How TAA, FSR, DLSS and frame generation follow the hunter, enemies and other moving characters (the camera's own "
 #else
-     "Where TAA, FSR 3 and DLSS take the motion of the hunter, enemies and other moving characters from "
+     "How TAA, FSR 3 and DLSS follow the hunter, enemies and other moving characters (the camera's own "
 #endif
-     "(the camera's own always comes from the depth). Precise: each character's own position this frame and the last, "
-     "for every pixel - clean edges and no trail behind a running character; it draws those characters a second time "
-     "into the motion, about 1% of the frame rate at 4K. Velocity map: the game's motion blur map, 640x360 at any "
-     "Resolution - a little faster, softer at a character's edge, where a faint trail can show. Any GPU. Changes at once.",
+     "motion always comes from the depth). Precise (the default): each character drawn a second time into the motion, "
+     "at its own position this frame and the last - clean edges and no trail behind a running character, for about 1% "
+     "of the frame rate at 4K. Off: the game's motion blur map alone - a little faster, with softer edges and a faint "
+     "trail behind running characters. Turn it off if your GPU or driver has trouble with Precise, or for the last bit "
+     "of speed on a weak GPU. Changes at once.",
      false},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
@@ -1553,7 +1560,7 @@ void rebuild_settings() {
         h.taa_strength = static_cast<float>(std::clamp(index_of(kTaaStrength), 0, 100)) / 100.0f;
         h.frame_generation = on_of(kFrameGeneration);
         h.motion_vectors = std::clamp(index_of(kMotionVectors), 0, 3);
-        h.char_motion = index_of(kCharMotion) != 1;  // Precise, Velocity map
+        h.char_motion = index_of(kCharMotion) != 1;  // Precise, Off (the game's velocity map alone)
     }
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
@@ -1763,6 +1770,8 @@ void host_options_load() {
             if (key == "texture_quality") val = val == "1.0x" ? "High" : val == "0.5x" ? "Medium" : val == "0.25x" ? "Low" : val;
             // Display-Limited was called Uncapped until 2026-10-28.
             if (key == "frame_cap" && val == "Uncapped") val = "Display-Limited";
+            // Character motion's Off was called Velocity map until 2026-11-10.
+            if (key == "char_motion" && val == "Velocity map") val = "Off";
             // Effect timing's names before it had three choices; a saved Smooth,
             // no longer one, reads as not chosen (the default, 60 fps).
             if (key == "effect_timing") {
@@ -2081,6 +2090,12 @@ const char* const* value_tips(int id, bool dlss) {
         "Medium: textures at half their width and height (0.5x), a quarter of the video memory - a 1024x2048 texture is 512x1024.",
         "High: every texture at the size the game made it (1.0x).",
     };
+    static const char* const kCharMotionTips[] = {
+        "Precise (the default): each character drawn a second time into the motion - clean edges, no trail. About 1% of "
+        "the frame rate at 4K.",
+        "Off: the game's motion blur map alone - a little faster, with softer edges and a faint trail behind running "
+        "characters. For a GPU or driver that has trouble with Precise, or the last bit of speed on a weak GPU.",
+    };
     switch (id) {
         case kUpscaler: return kUpscalerTips;
         case kUpscaleQuality: return dlss ? kDlssTips : kFsrTips;
@@ -2088,6 +2103,7 @@ const char* const* value_tips(int id, bool dlss) {
         case kHdMotionBlurRes: return kHdBlurTips;
         case kTextureQuality:
         case kSfxTextureQuality: return kTextureTips;
+        case kCharMotion: return kCharMotionTips;
         default: return nullptr;
     }
 }
@@ -2388,6 +2404,23 @@ void account_page() {
         ImGui::PopFont();
         ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextDim);
         ImGui::TextUnformatted(hle_np_online_status().c_str());
+        // The connection test's verdict as the setup window had it before
+        // the game started (its own test, or the account's last one): the
+        // test itself runs only there, from the game's port while the game
+        // is closed. Nothing when the setup window did not open.
+        if (const net::nat::Remembered c = net::nat::remembered(); c.known) {
+            const double now = static_cast<double>(std::time(nullptr));
+            ImGui::TextUnformatted(("Connection test (" + net::nat::ago(c.at, now) + (c.saved ? "" : ", not saved") +
+                                    "): " + net::nat::headline(c.verdict))
+                                       .c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+                ui::tooltip("Connection test",
+                            std::string(net::nat::meaning(c.verdict)) +
+                                (c.inbound != net::nat::Inbound::NotTested
+                                     ? " " + net::nat::inbound_line(c.inbound, config().p2p_port > 0 ? config().p2p_port : 9307, c.verdict)
+                                     : std::string()),
+                            "The setup window's Game page runs it again (bbhost --setup, while the game is closed).");
+        }
         ImGui::PopStyleColor();
         ImGui::EndGroup();
     }
@@ -2954,6 +2987,49 @@ void host_opt_set_index(const char* key, int index) {
 void host_options_save_now() {
     g_dirty = true;
     save();
+}
+
+int host_options_selftest(const std::string& dir) {
+    // An options file as v0.2.31 wrote it, Character motion at Off (then
+    // called Velocity map) and one other setting away from its default.
+    const std::string path = dir + "/bbhost-options.toml";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f << "# bbhost PC port options. Written by the options screen (F10).\n[options]\nversion = \"8\"\n"
+             "char_motion = \"Velocity map\"\nssr_quality = \"Half\"\n";
+        if (!f) {
+            std::printf("options selftest: cannot write %s\n", path.c_str());
+            return 1;
+        }
+    }
+#if defined(_WIN32)
+    _putenv_s("BBHOST_OPTIONS_PATH", path.c_str());
+#else
+    setenv("BBHOST_OPTIONS_PATH", path.c_str(), 1);
+#endif
+    int failed = 0;
+    const auto check = [&failed](bool ok, const char* what) {
+        std::printf("options selftest: %s %s\n", ok ? "ok  " : "FAIL", what);
+        failed += ok ? 0 : 1;
+    };
+    host_options_load();
+    check(host_opt_default_index("char_motion") == 0 && std::strcmp(g_set[kCharMotion].values[0], "Precise") == 0,
+          "Character motion's default is Precise");
+    check(host_opt_index("char_motion") == 1 && std::strcmp(g_set[kCharMotion].values[1], "Off") == 0,
+          "char_motion = \"Velocity map\" reads as Off");
+    check(host_opt_saved("char_motion"), "as the player's own choice");
+    check(!host_settings_ref().char_motion, "with the characters' capture off");
+    check(host_opt_index("ssr_quality") == 1, "the file's other setting reads as saved (ssr_quality Half)");
+    host_options_save_now();
+    std::ifstream in(path);  // text: the file is written as text (CRLF on Windows)
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    check(text.find("\nchar_motion = \"Off\"\n") != std::string::npos, "written back as char_motion = \"Off\"");
+    check(text.find("Velocity map") == std::string::npos, "with no Velocity map left in the file");
+    check(text.find("\nssr_quality = \"Half\"\n") != std::string::npos, "and ssr_quality = \"Half\" kept");
+    std::printf("options selftest: %s (%s)\n", failed ? "FAILED" : "passed", path.c_str());
+    return failed ? 1 : 0;
 }
 
 bool host_steam_deck() {

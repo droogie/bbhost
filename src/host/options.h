@@ -141,6 +141,12 @@ void host_opt_set_index(const char* key, int index);
 void host_opt_menu_colour(float* hue_degrees, float* vibrance);
 // Writes the options file now: the key bindings changed (host/bindings.h).
 void host_options_save_now();
+// `bbhost --options-selftest DIR` (the options_file_test): an options file
+// from an earlier version read and written back the way a run reads and
+// writes it, in DIR's own file - BBHOST_OPTIONS_PATH is set to it, so the
+// player's is never touched. Character motion's Off was saved as Velocity map
+// until 2026-11-10: it reads as Off and is written back as Off. 0: passed.
+int host_options_selftest(const std::string& dir);
 
 // A Steam Deck - Valve's Jupiter or Galileo, from /sys/devices/virtual/dmi/id
 // on Linux and the BIOS registry key on Windows - where the System menu has a

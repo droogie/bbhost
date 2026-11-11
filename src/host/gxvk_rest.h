@@ -12,7 +12,20 @@
 // frame back the pool's work is a cost:
 //  - At a frame cap holding the frame (two windows in a row with the limiter
 //    waiting 15% of the window or more) it rests. It works again when the
-//    command processor, drawing everything, is busy 85% of a window at the cap,
+//    command processor, drawing everything, is busy 85% with the frame meeting
+//    its cap narrowly (the limiter waiting under 15%; the medians of the last
+//    three windows at the cap, a window just off it in between not starting
+//    the count again - with more the cap holds the frame with room: until
+//    2026-11-10 any one window 85% busy woke the pool, and at Central Yharnam
+//    at a 90 cap on two Xeon Gold 6230 with Windows' default acted out, the
+//    command processor 71-75% busy at rest, one such window kept it working
+//    through a measure window the cap held either way, 1.2 cores), or busy 92%
+//    (the medians of the same three windows) however long the limiter waits: a
+//    command processor that saturated drops frames resting - at Old Yharnam at
+//    the same 90 cap, 92-97% busy at rest with the limiter waiting 15-21%,
+//    resting left 4-15 frames of a 30 s window over 16.7 ms against 2 working,
+//    and the 99th percentile frame 1.7 ms longer (15.4 against 13.7 ms), for
+//    0.8 of a core and 4 W saved,
 //    or the limiter waits under 8% and the main loop is held back by the command
 //    processor's backlog 20% of the time or more (a frame that misses its cap
 //    for the main loop's own work or the GPU's gains nothing from the pool); a
@@ -26,6 +39,19 @@
 //    lamp's travel between each two, woke the pool at each arrival 27 s into
 //    its rest, and the doubled waits kept it working 40 s into the third
 //    place).
+//  - Near its cap (two windows in a row with the limiter waiting 8% of the
+//    window or more, but not 15% twice) the frame meets the cap, narrowly: the
+//    pool's work buys a frame there only if the frame would miss the cap
+//    without it. A trial rest asks - the switch's three windows, then three
+//    counted (two when they agree, which fixes the medians of three): where the
+//    counted ones would keep a rest at the cap (their medians: the limiter still
+//    waiting 8% or more, the command processor's share not ending it) the rest
+//    goes on as a cap's; else the pool works
+//    again, and the next trial waits as after a short rest at a cap (the same
+//    backoff). Until 2026-11-10 a working pool never rested there ("no
+//    experiment"), and since every loading screen starts a place working, a
+//    place whose frame takes 85-92% of its cap's interval - a cap a machine
+//    nearly makes - kept the pool working for good.
 //  - With no cap holding the frame (uncapped, or a frame slower than its cap)
 //    the frame rate decides, measured both ways at the place: an experiment
 //    switches to the other state and back, and compares the frame rate there
@@ -90,6 +116,7 @@ namespace gxvk_rest {
 constexpr double kRestSlack = 0.15;  // the limiter's wait, as a share of a window, that counts toward a rest at a cap
 constexpr double kWakeSlack = 0.08;  // under it the cap no longer holds the frame
 constexpr double kWakeCp = 0.85;     // the command processor busy this share of a window ends a rest at a cap
+constexpr double kSaturated = 0.92;  // ... and this share over three windows' medians, however long the limiter waits
 constexpr double kWorkHeld = 0.20;   // the main loop held back by the command processor this share (the median of six windows)
 constexpr double kFar = 0.85;        // a rest at a cap with the frame under this share of the cap (six windows): the cap holds nothing
 constexpr double kCost = 0.005;      // resting no more than this much slower than working costs nothing: the pool rests
@@ -99,6 +126,8 @@ constexpr double kQuiet = 0.10;      // resting holds the game back under this s
 constexpr double kGpuBound = 0.90;   // the GPU busy this share of a window: the frame is the GPU's
 constexpr double kGpuFree = 0.80;    // a rest the GPU began ends with the GPU busy under this (the median of six windows)
 constexpr int kQuietWindows = 2;     // windows in a row with the cap holding the frame, or GPU-bound
+constexpr int kCapWindows = 3;       // resting at a cap: the command processor's busy share and the wait are the median of this many windows
+constexpr int kTrialWindows = 3;     // a trial rest near the cap: its counted windows, after the switch's kSkip
 constexpr int kHeldWindows = 6;      // resting: the held-back share is the median of this many windows
 constexpr int kSkip = 3;             // an experiment's phase (and a state after any switch): its first windows are the switch's
 constexpr int kPhase = 8;            // ... then this many are counted: the phase's frame rate is their median
@@ -108,7 +137,7 @@ constexpr std::uint64_t kProbeFirstNs = 10'000'000'000ull, kProbeMostNs = 240'00
 
 // Why the rest under way began (the lines and the counts say it). kWhyProbe: an experiment's rest (a probe's, or an
 // ask's second); kWhyJudged: a rest an experiment decided.
-enum Why : int { kWhyNone, kWhyCap, kWhyGpu, kWhyProbe, kWhyJudged, kWhys };
+enum Why : int { kWhyNone, kWhyCap, kWhyGpu, kWhyProbe, kWhyJudged, kWhyNear, kWhys };
 
 // The experiment under way, by its phase: a probe (from working: rest, then work again) or an ask (from a rest an
 // experiment decided: work, then rest again).
@@ -128,6 +157,9 @@ enum Event : int {
     kEvCapWake,   // a rest at a cap (or GPU-bound) ended
     kEvLoadWake,  // a rest an experiment decided or the GPU began ended with a loading screen
     kEvQuiet,     // a decided rest's ask came due with the rest holding the game back under kQuiet: not made
+    kEvNearTrial, // near the cap: a trial rest began
+    kEvNearRests, // the trial: the cap holds the frame without the pool - a cap's rest goes on
+    kEvNearWorks, // the trial: without the pool the frame does not keep its cap - the pool works again
 };
 
 struct State {
@@ -137,6 +169,7 @@ struct State {
     Event event = kEvNone;
     bool held_ask = false;            // the ask under way began with the game held back (kHeavier)
     int quiet = 0;                    // windows in a row with the cap holding the frame (working)
+    int near = 0;                     // ... and with the frame at its cap or nearly (the limiter waiting kWakeSlack or more)
     int gpu_bound = 0;                // windows in a row GPU-bound
     int settle = kSkip;               // the state's own windows (outside an experiment) start after this many more
     double own[kPhase] = {};          // ... and its last kPhase windows' frame rates: an experiment's first phase
@@ -152,6 +185,10 @@ struct State {
     double rest_fps[kHeldWindows] = {};  // ... frame rates
     double rest_gpu[kHeldWindows] = {};  // ... and the GPU's busy shares
     int held_n = 0;
+    double cap_cp[kCapWindows] = {}, cap_slack[kCapWindows] = {};  // resting at a cap: the last windows' busy shares and waits
+    int cap_n = 0;
+    double trial_cp[kTrialWindows] = {}, trial_slack[kTrialWindows] = {};  // a trial near the cap: its counted windows'
+    int trial_n = 0;
     std::uint64_t rest_at = 0;        // when the rest under way began
     std::uint64_t allowed_at = 0;     // no rest at a cap begins before (the backoff)
     std::uint64_t backoff_ns = kBackoffFirstNs;
@@ -203,7 +240,15 @@ inline void own_again(State& s) {
     s.settle = kSkip;
     s.held_n = 0;
     s.quiet = 0;
+    s.near = 0;
+    s.cap_n = 0;
 }
+// At a cap: whether the command processor's busy share wakes a rest, over windows' medians - kWakeCp or more with
+// the frame meeting its cap narrowly (the limiter waiting under kRestSlack), or kSaturated or more however it waits.
+inline bool cap_wakes(double cp, double slack) { return (cp >= kWakeCp && slack < kRestSlack) || cp >= kSaturated; }
+// Whether a rest at the cap holds over windows' medians: the frame at its cap (the limiter waiting kWakeSlack or more)
+// and the command processor's share not waking it.
+inline bool cap_holds(double cp, double slack) { return slack >= kWakeSlack && !cap_wakes(cp, slack); }
 inline void phase(State& s, Phase p) {
     s.phase = p;
     s.skip = kSkip;
@@ -304,7 +349,9 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
         // Not the place's: nothing counts, an experiment under way is dropped, and the next place is one no experiment
         // has judged - a rest an experiment decided (or began) or the GPU began ends here; one at a cap goes on.
         s.quiet = s.gpu_bound = 0;
+        s.near = 0;
         s.held_n = 0;
+        s.cap_n = 0;
         s.own_n = 0;
         s.settle = kSkip;
         s.rest_ref = 0;
@@ -313,6 +360,7 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
         no_experiment(s);
         if (!s.resting) return kStay;
         s.travelled = true;
+        if (s.why == kWhyNear) s.why = kWhyCap;  // (a trial under way: its windows were not the place's - it goes on as a cap's)
         if (s.why == kWhyCap) return kStay;
         s.event = kEvLoadWake;
         return work(s);
@@ -323,6 +371,7 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
     const bool gpu_bound = s.gpu_bound >= kQuietWindows;
     if (!s.resting) {
         s.quiet = capped ? s.quiet + 1 : 0;
+        s.near = at_cap ? s.near + 1 : 0;
         if (s.quiet >= kQuietWindows && now >= s.allowed_at) {
             no_experiment(s);
             s.event = kEvCapRest;
@@ -338,6 +387,14 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
             s.next_at = 0;
             s.own_n = 0;
             s.settle = kSkip;
+            // Near the cap: a trial whether the cap holds the frame without the pool.
+            if (s.near >= kQuietWindows && now >= s.allowed_at) {
+                s.event = kEvNearTrial;
+                const Step r = rest(s, kWhyNear, now);
+                s.skip = kSkip;
+                s.trial_n = 0;
+                return r;
+            }
             return kStay;
         }
         if (s.phase == kProbeWork) {  // a probe's last phase: the pool's frame rate after its rest
@@ -380,6 +437,36 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
         s.event = kEvProbe;
         return rest(s, kWhyProbe, now);
     }
+    if (s.why == kWhyNear) {
+        // A trial near the cap: past the switch's windows, the counted ones would keep a rest at the cap (their medians)
+        // - the cap holds the frame without the pool: the rest goes on as a cap's. Else the pool's work was what met the
+        // cap: it works again, and the next trial (or rest at the cap) waits the backoff, doubled as after any short rest
+        // at a cap.
+        if (s.skip) {
+            --s.skip;
+            return kStay;
+        }
+        s.trial_cp[s.trial_n] = w.cp;
+        s.trial_slack[s.trial_n++] = w.cap_fps > 0 ? w.slack : 0.0;
+        // Two counted windows that agree fix the medians of three: both off the cap, both busy at a narrow
+        // cap, or both with room - the third would not change the verdict. Half a second less per trial.
+        int decided = 0;  // 1 holds, -1 fails
+        if (s.trial_n == 2) {
+            const double c0 = s.trial_cp[0], c1 = s.trial_cp[1], w0 = s.trial_slack[0], w1 = s.trial_slack[1];
+            if (w0 < kWakeSlack && w1 < kWakeSlack) decided = -1;
+            else if (cap_wakes(c0, w0) && cap_wakes(c1, w1)) decided = -1;
+            else if (w0 >= kRestSlack && w1 >= kRestSlack && c0 < kSaturated && c1 < kSaturated) decided = 1;
+        }
+        if (!decided && s.trial_n < kTrialWindows) return kStay;
+        s.why = kWhyCap;
+        if (decided > 0 || (!decided && cap_holds(median(s.trial_cp, s.trial_n), median(s.trial_slack, s.trial_n)))) {
+            s.event = kEvNearRests;
+            return kStay;
+        }
+        const Step r = cap_wake(s, now);
+        s.event = kEvNearWorks;
+        return r;
+    }
     if (gpu_bound) {
         if (s.phase != kNoPhase || s.why == kWhyJudged || s.why == kWhyProbe) {  // the frame is the GPU's now, whatever an experiment says
             no_experiment(s);
@@ -398,9 +485,20 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
             s.why = kWhyCap;
         }
         s.held_n = 0;
+        if (s.cap_n == kCapWindows) {
+            for (int k = 1; k < kCapWindows; ++k) {
+                s.cap_cp[k - 1] = s.cap_cp[k];
+                s.cap_slack[k - 1] = s.cap_slack[k];
+            }
+            s.cap_n = kCapWindows - 1;
+        }
+        s.cap_cp[s.cap_n] = w.cp;
+        s.cap_slack[s.cap_n++] = w.slack;
         if (s.why == kWhyGpu && w.gpu >= kGpuFree) return kStay;
-        return w.cp >= kWakeCp ? cap_wake(s, now) : kStay;
+        return s.cap_n == kCapWindows && cap_wakes(median(s.cap_cp, s.cap_n), median(s.cap_slack, s.cap_n)) ? cap_wake(s, now) : kStay;
     }
+    if (w.cap_fps <= 0) s.cap_n = 0;  // (no cap: its count starts again; a window just off it leaves the count as it is - a frame
+                                      // hovering at the line is one at the cap, and its windows at the cap still make three)
     if (s.phase == kProbeRest) {  // a probe's middle phase: the frame resting
         if (!count(s, w)) {
             if (s.cur_n == kEarly && s.before > 0 && median(s.cur, s.cur_n) <= s.before * (1.0 - kClear)) {

@@ -510,9 +510,9 @@ bool capture_env() {
     return on;
 }
 
-// Character motion (Graphics: Precise or Velocity map, host/options.cpp), read
-// live from the settings' newest snapshot (no lock). Velocity map: no draw is
-// given a place, so the vertex shaders keep their store and skip it (a place
+// Character motion (Graphics: Precise or Off, host/options.cpp), read live
+// from the settings' newest snapshot (no lock). Off: no draw is given a
+// place, so the vertex shaders keep their store and skip it (a place
 // of 0) and nothing is translated again; the map, cleared each frame, has
 // nothing drawn into it and the motion comes from the velocity map alone.
 // Turned back on, a draw is matched from the frame after its first place.
@@ -670,7 +670,7 @@ void record_capture(VkCommandBuffer cb, std::uint32_t w, std::uint32_t h) {
     if (const int on = char_motion_on() ? 1 : 0; on != said && g_cap.ok) {
         if (said >= 0 || !on)
             host_log("upscaler: Character motion %s", on ? "Precise: the characters' own positions drawn into the motion"
-                                                         : "Velocity map: the game's map alone, no character drawn into the motion");
+                                                         : "Off: the game's velocity map alone, no character drawn into the motion");
         said = on;
     }
     // This frame's draws in the stream's order, each key's n-th counted in it

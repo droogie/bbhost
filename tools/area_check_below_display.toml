@@ -1,0 +1,9 @@
+# tools/area_check.py --options: the render below the display, as many players run it - a Borderless window on a larger
+# screen (the gate's: an Xvfb at 2560x1440, --display :N) with Resolution 1920x1080, so the scene renders into a target of
+# its own and FSR 1 brings it up at the present; Frame rate 60. Everything else as the defaults have it. With
+# `upscaler = "TAA"` added, the same screen takes the render-scale path (the 3D below the window, TAA then FSR 1).
+[options]
+version = "8"
+window_mode = "Borderless"
+resolution = "1920x1080"
+frame_cap = "60"

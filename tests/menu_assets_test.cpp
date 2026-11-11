@@ -205,6 +205,9 @@ int main() {
     CHECK(rows.count(124005) && rows.at(124005).text == "Full Phantom HP" && rows.at(124005).help.find("restart") != std::string::npos);
     CHECK(rows.count(124006) && rows.at(124006).text == "Auto-Replenish Items" &&
           rows.at(124006).help.find("restart") != std::string::npos);
+    // Character motion's pair: Precise (the default) or Off (Velocity Map until 2026-11-10).
+    CHECK(rows.count(125006) && rows.at(125006).text == "Character Motion" && rows.at(125006).help.find("Off:") != std::string::npos);
+    CHECK(rows.count(125041) && rows.at(125041).text == "Precise" && rows.count(125042) && rows.at(125042).text == "Off");
     int languages = 0;
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator(test_app0_file("dvdroot_ps4/msg"), ec)) {

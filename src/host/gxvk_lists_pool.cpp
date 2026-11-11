@@ -168,7 +168,7 @@ std::atomic<u64> g_rests{0}, g_rested_ns{0};  // the rests begun, and their time
 // experiments (probes from working, asks from a decided rest - those a heavier place began) and what they decided, and
 // the rests a loading screen ended.
 std::atomic<u64> g_rests_by[gxvk_rest::kWhys] = {}, g_probes{0}, g_asks{0}, g_held_asks{0}, g_decided_rest{0}, g_decided_work{0},
-    g_load_wakes{0}, g_quiet_asks{0};
+    g_load_wakes{0}, g_quiet_asks{0}, g_trials_rested{0};
 // BBHOST_GXVK_LISTS_REST_LOG=1: every window of the duty's rule logged, with the state it left the pool in.
 const bool g_rest_log = [] {
     const char* e = std::getenv("BBHOST_GXVK_LISTS_REST_LOG");
@@ -504,11 +504,13 @@ void report_line(bool at_exit) {
             const u64 rests = g_rests.load(std::memory_order_relaxed);
             const auto by = [](int k) { return static_cast<ull>(g_rests_by[k].load(std::memory_order_relaxed)); };
             const auto n = [](const std::atomic<u64>& a) { return static_cast<ull>(a.load(std::memory_order_relaxed)); };
-            host_log("gxvk-lists (%s): the pool rested %llu times (at a frame cap %llu, GPU-bound %llu, an experiment's %llu, decided %llu), "
+            host_log("gxvk-lists (%s): the pool rested %llu times (at a frame cap %llu, GPU-bound %llu, an experiment's %llu, decided %llu, "
+                     "a trial near the cap %llu of which %llu rested on), "
                      "%.1f s in the ended ones%s; experiments: %llu probes, %llu asks (%llu at a heavier place; %llu not made, the rest "
                      "holding the game back under 10%%), %llu decided it rests, %llu that it works; %llu rests ended at a loading screen",
                      what, static_cast<ull>(rests), by(gxvk_rest::kWhyCap), by(gxvk_rest::kWhyGpu), by(gxvk_rest::kWhyProbe),
-                     by(gxvk_rest::kWhyJudged), static_cast<double>(g_rested_ns.load(std::memory_order_relaxed)) / 1e9,
+                     by(gxvk_rest::kWhyJudged), by(gxvk_rest::kWhyNear), n(g_trials_rested),
+                     static_cast<double>(g_rested_ns.load(std::memory_order_relaxed)) / 1e9,
                      resting() ? "; resting now" : "", n(g_probes), n(g_asks), n(g_held_asks), n(g_quiet_asks), n(g_decided_rest),
                      n(g_decided_work), n(g_load_wakes));
         }
@@ -618,6 +620,7 @@ const char* duty_state(const gxvk_rest::State& st) {
     case kWhyCap: return "resting (a cap)";
     case kWhyGpu: return "resting (GPU-bound)";
     case kWhyJudged: return "resting (decided)";
+    case kWhyNear: return "resting (a trial near the cap)";
     default: return "resting";
     }
 }
@@ -791,6 +794,28 @@ void frame_paced(std::uint64_t wait_ns, float cap_fps, bool loading) {
                      "shorten); the next in %.0f s",
                      100.0 * gxvk_rest::detail::median(state.held, state.held_n), static_cast<double>(state.interval_ns) / 1e9);
         break;
+    case gxvk_rest::kEvNearTrial:
+        if (log)
+            host_log("gxvk-lists: the pool rests for a trial - the frame waits %.0f%% of its time for its cap (%.0f fps at %.0f), near it, the "
+                     "command processor busy %.0f%%: whether the cap holds the frame without the pool (BBHOST_GXVK_LISTS_REST=0: never rests)",
+                     100.0 * w.slack, fps, static_cast<double>(cap_fps), 100.0 * w.cp);
+        break;
+    case gxvk_rest::kEvNearRests:
+        g_trials_rested.fetch_add(1, std::memory_order_relaxed);
+        if (log)
+            host_log("gxvk-lists: the trial rests on - without the pool the frame waits %.0f%% of its time for its cap (the median; %.0f fps "
+                     "at %.0f), the command processor busy %.0f%%: its draws are drawn in order as at any cap",
+                     100.0 * gxvk_rest::detail::median(state.trial_slack, state.trial_n), fps, static_cast<double>(cap_fps),
+                     100.0 * gxvk_rest::detail::median(state.trial_cp, state.trial_n));
+        break;
+    case gxvk_rest::kEvNearWorks:
+        if (log)
+            host_log("gxvk-lists: the trial wakes the pool - without it the frame waits %.0f%% of its time for its cap (the median; %.0f fps "
+                     "at %.0f), the command processor busy %.0f%%; the next trial no sooner than %d s on",
+                     100.0 * gxvk_rest::detail::median(state.trial_slack, state.trial_n), fps, static_cast<double>(cap_fps),
+                     100.0 * gxvk_rest::detail::median(state.trial_cp, state.trial_n),
+                     static_cast<int>(state.backoff_ns / 1'000'000'000ull));
+        break;
     case gxvk_rest::kEvLoadWake:
         g_load_wakes.fetch_add(1, std::memory_order_relaxed);
         if (log)
@@ -802,9 +827,11 @@ void frame_paced(std::uint64_t wait_ns, float cap_fps, bool loading) {
     }
 }
 
-void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va) {
+void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va, bool feed) {
     if (!g_ready.load(std::memory_order_acquire)) std::call_once(g_started, start);
-    if (resting()) return;  // nothing fed, no list record: the command processor draws it in order (counted there)
+    // Not fed (the pool rested when it was stored - the caller's decision, written in its slot): no list record, and
+    // the command processor draws it in order (counted there).
+    if (!feed) return;
     if (g_times) {
         detail::DrawTime& t = detail::g_draw_times[id & (detail::kTimeSlots - 1)];
         t.id.store(id, std::memory_order_relaxed);

@@ -46,6 +46,18 @@ struct Relay {
 std::size_t build_binding_request(std::uint8_t* out, std::uint8_t txid[kTxid], bool hello = false,
                                   const std::uint8_t* token = nullptr);
 
+// RFC 5780's CHANGE-REQUEST (0x0003): a Binding Request asking for the
+// answer from another port (kChangePort) or address. The private server's
+// connection test (server/nat_test.py) answers such a request as usual, with
+// OTHER-ADDRESS naming its port check's port, and again from that port, to
+// which the client never sent anything (net/nat_check.h). Otherwise as
+// build_binding_request.
+constexpr std::uint32_t kChangePort = 0x02;
+std::size_t build_change_request(std::uint8_t* out, std::uint8_t txid[kTxid], std::uint32_t flags);
+// OTHER-ADDRESS (0x802C) in a Binding Response: `addr` in network byte order,
+// `port` in host order. False without it.
+bool response_other_address(const std::uint8_t* d, std::size_t n, std::uint32_t* addr, std::uint16_t* port);
+
 // True when [d, d+n) is a Binding Response to `txid` carrying a mapped IPv4
 // address: `addr` in network byte order, `port` in host order. `relay`, when
 // given, is filled from BBHOST-RELAY (present = false without it).

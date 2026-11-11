@@ -9,6 +9,10 @@
 // (a sign-out elsewhere, a recovery, "sign out everywhere"). Anything else is
 // no verdict: no answer, a 5xx or 429, a server without the account service
 // (its framework's 404 without ResKind), a body that is not JSON.
+//
+// A known token's answer also carries the account's last connection test
+// (NatTest: {Verdict, TestedAt, Inbound?, Port?}, or null), which the setup
+// window's Connection card shows (net/nat_check.h).
 #pragma once
 
 #include "replay/json.h"
@@ -23,12 +27,22 @@ enum class SignInVerdict {
     Unchecked,  // no verdict; `why` says what came back instead
 };
 
+// The account's last connection test as whoami tells it.
+struct NatTestRecord {
+    bool present = false;
+    std::string verdict;  // "direct", "relay" or "blocked"
+    double tested_at = 0; // Unix seconds
+    std::string inbound;  // bbhost's port check: "open", "closed", or "" (the website's test has none)
+    int port = 0;         // the P2P port it ran from (with inbound)
+};
+
 struct SignInReply {
     SignInVerdict verdict = SignInVerdict::Unchecked;
     std::string name;       // Valid: the account's name, as the server spells it
     double expires_at = 0;  // Valid: when the token expires (Unix seconds); 0 when not said
     std::string why;        // Refused: the server's Message; Unchecked: what came instead
     long status = 0;        // the HTTP status, 0 when no answer came
+    NatTestRecord nat_test; // Valid: the account's last connection test, when it has one
 };
 
 namespace sign_in_detail {
@@ -74,6 +88,18 @@ inline SignInReply read_sign_in_reply(long status, const std::string& body, cons
     r.verdict = SignInVerdict::Valid;
     r.name = id->string;
     if (const json::Value* e = field(v, "ExpiresAt"); e && e->type == json::Value::Type::Number) r.expires_at = e->number;
+    if (const json::Value* n = field(v, "NatTest"); n && n->type == json::Value::Type::Object) {
+        const json::Value* verdict = field(*n, "Verdict");
+        const json::Value* at = field(*n, "TestedAt");
+        if (verdict && verdict->type == json::Value::Type::String && at && at->type == json::Value::Type::Number) {
+            r.nat_test.present = true;
+            r.nat_test.verdict = verdict->string;
+            r.nat_test.tested_at = at->number;
+            if (const json::Value* i = field(*n, "Inbound"); i && i->type == json::Value::Type::String) r.nat_test.inbound = i->string;
+            if (const json::Value* p = field(*n, "Port"); p && p->type == json::Value::Type::Number && p->number > 0 && p->number < 65536)
+                r.nat_test.port = static_cast<int>(p->number);
+        }
+    }
     return r;
 }
 

@@ -25,6 +25,7 @@ struct HostConfig {
     std::string p2p_addr;      // online.p2p_addr: the address other players reach this host at (default 127.0.0.1)
     std::string stun_server;   // online.stun_server: "host[:port]" the P2P port asks for its reflexive address; "" = the server's host on 3478, "off" = never
     int p2p_port = 9307;       // online.p2p_port: this host's P2P UDP port; two instances on one machine differ here
+    std::string nat_test_ports = "3479,3480";  // online.nat_test_ports: the server's connection-test STUN ports (net/nat_check.h)
     int playlog_upload_seconds = 30;  // online.playlog_upload_seconds / BBHOST_PLAYLOG_UPLOAD_SECONDS: how often the game sends its play log (the game's own: 300; 0 keeps it)
     int playlog_sample_ms = 500;      // online.playlog_sample_ms: how often it logs the player's position (the game's own: 1500; 0 keeps it)
     int sign_timeout_seconds = 30;    // online.sign_timeout_seconds: how long a sign being answered may take (the game's own: 180; 0 keeps it)

@@ -24,6 +24,7 @@
 #include "host/vertex_cutaway.h"
 #include "host/vertex_snap.h"
 #include "host/gs_emit_gate.h"
+#include "host/fill_pending.h"
 #include "host/heap_compact.h"
 #include "host/import_fallback.h"
 #include "host/label_landing.h"
@@ -2008,10 +2009,13 @@ std::uint64_t g_rt_padded_over[2] = {0, 0}, g_rt_learn_differ = 0;
 // Fill shaders run before the first draw that creates the image (and again
 // after a size/format recreate). The translated compute writes guest memory
 // the image never reads, so remember the value and apply it when the image
-// appears.
+// appears - a target's (apply_pending_clear) or a texture's made there
+// afterwards (render_pending_fill_for_locked, host/fill_pending.h).
 struct PendingFill {
     float rgba[4];
     std::size_t bytes;
+    std::uint64_t gen = 0;        // the generation of the GX texture whose memory began at the fill when it came (0: none)
+    std::uint64_t write_seq = 0;  // and that resource's write sequence then
 };
 std::map<std::uint64_t, PendingFill> g_pending_clears;  // ordered: rt_image scans only overlapping fills
 // Bumped at every insert and erase of g_pending_clears: a target that scanned
@@ -14364,6 +14368,19 @@ void apply_pending_clear(RtImage& r) {
     r.pending_seen = g_pending_gen;
 }
 
+// BBHOST_FILL_POISON=1 (checks): a fill that meets no image and was made for
+// the whole of a live GX texture writes 0xff over that texture's memory - what
+// a fill that never reached the memory can leave at its worst (NaN in a float
+// texture) - so a texture made there later shows it unless it takes the fill
+// (host/fill_pending.h). Moonside Lake's water vanished when its interaction
+// maps were made over memory an area visited before had used, which only some
+// runs' heaps arranged; with this every run's do (tools/area_check.py's water check).
+const bool g_fill_poison = [] {
+    const char* e = std::getenv("BBHOST_FILL_POISON");
+    return e && e[0] == '1';
+}();
+std::atomic<std::uint64_t> g_fill_poisoned{0};
+
 // BBHOST_FILL_TEXTURES=0 (checks): a fill with no target leaves the textures
 // under it as they were uploaded.
 const bool g_fill_textures = [] {
@@ -14426,6 +14443,19 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
     PendingFill pc{};
     std::memcpy(pc.rgba, rgba, sizeof(pc.rgba));
     pc.bytes = bytes;
+    // The GX texture the fill was made for, by generation: a texture made at
+    // its memory later takes the fill while it is that resource (host/fill_pending.h).
+    if (GxResourceInfo res; gx_resource_at(va, 1, &res) && res.memory == va && res.type >= 2) {
+        pc.gen = res.gen;
+        pc.write_seq = res.write_seq;
+        if (g_fill_poison && res.bytes && bytes >= res.bytes && hle_kernel_va_mapped(va, res.bytes)) {
+            std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(va)), 0xff, res.bytes);
+            if (g_fill_poisoned.fetch_add(1, std::memory_order_relaxed) < 8) {
+                host_log("render: fill of 0x%llx met no image: the texture's %u bytes poisoned with 0xff (BBHOST_FILL_POISON)",
+                         static_cast<unsigned long long>(va), res.bytes);
+            }
+        }
+    }
     g_pending_clears[va] = pc;
     ++g_pending_gen;
     g_pending_clear_max = std::max(g_pending_clear_max, pc.bytes);
@@ -14441,16 +14471,35 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
     return true;
 }
 
+// The colour of the pending fill a texture made at `va`, `bytes` long, of
+// the live GX texture of generation `gen` and write sequence `write_seq`,
+// takes (host/fill_pending.h): the fill that met no image and was made for
+// that resource, unwritten since. False for none.
+bool render_pending_fill_for_locked(std::uint64_t va, std::size_t bytes, std::uint64_t gen, std::uint64_t write_seq, float rgba[4]) {
+    const auto it = g_pending_clears.find(va);
+    if (it == g_pending_clears.end()) return false;
+    PendingFillFor f;
+    f.base = it->first;
+    f.bytes = it->second.bytes;
+    f.gen = it->second.gen;
+    f.write_seq = it->second.write_seq;
+    std::memcpy(f.rgba, it->second.rgba, sizeof(f.rgba));
+    if (!pending_fill_takes(f, va, bytes, gen, write_seq)) return false;
+    std::memcpy(rgba, f.rgba, sizeof(f.rgba));
+    return true;
+}
+
 std::string render_fill_stats() {
-    char buf[320];
+    char buf[384];
     std::snprintf(buf, sizeof(buf),
-                  "pending=%llu applied=%llu starting-inside-a-target=%llu textures=%llu (%llu not clearable); pending now %zu (the largest "
-                  "%zu bytes), visited %llu times in %llu scans",
+                  "pending=%llu applied=%llu starting-inside-a-target=%llu textures=%llu (%llu not clearable; made after their fill %llu); "
+                  "pending now %zu (the largest %zu bytes), visited %llu times in %llu scans",
                   static_cast<unsigned long long>(g_fill_pending.load()),
                   static_cast<unsigned long long>(g_fill_applied.load()),
                   static_cast<unsigned long long>(g_fills_inside.load()),
                   static_cast<unsigned long long>(g_fill_surfaces.load()),
-                  static_cast<unsigned long long>(g_fill_surfaces_skipped.load()), g_pending_clears.size(), g_pending_clear_max,
+                  static_cast<unsigned long long>(g_fill_surfaces_skipped.load()),
+                  static_cast<unsigned long long>(g_fill_made_after.load()), g_pending_clears.size(), g_pending_clear_max,
                   static_cast<unsigned long long>(g_pending_scan_steps), static_cast<unsigned long long>(g_pending_scans));
     return buf;
 }
@@ -28972,6 +29021,8 @@ bool segment_release_member(std::uint64_t id);  // (stage 4b.2, below)
 // the draw is done; false when it is to be drawn in order (counted by why).
 // splice-compare: always false, and host_gpu_splice_compare compares the draw
 // in order with the commit.
+void host_gpu_splice_unfed(std::uint32_t n) { g_sp_why[kSwRested].fetch_add(n, std::memory_order_relaxed); }
+
 bool host_gpu_splice(std::uint64_t id) {
     ListCommit* const all = g_list_commits;
     if (!all) {

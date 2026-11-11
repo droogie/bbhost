@@ -1931,12 +1931,23 @@ bool segment_follows_next(const std::uint32_t* p) {
         if (op == kNop && cnt >= 3 && body[0] == kGxNativeMagic) {
             std::uint32_t count = 0;
             std::uint64_t word = 0;
-            return host_gpu_segment_ids(body[1] | (static_cast<std::uint64_t>(body[2]) << 32), &count, &word) != nullptr;
+            const std::uint64_t next = body[1] | (static_cast<std::uint64_t>(body[2]) << 32);
+            return hle_gx_native_fed(next) && host_gpu_segment_ids(next, &count, &word) != nullptr;  // (a draw the pool never saw: no segment)
         }
         if (list_split_of(op, body, cnt) >= 0) return false;
         p += 1 + cnt;
     }
     return false;
+}
+
+// Draw tokens the pool was never given (stored while it rested), counted
+// on this thread and handed to the splice's report in batches.
+void unfed_token() {
+    static thread_local std::uint32_t n = 0;
+    if (++n == 64) {
+        host_gpu_splice_unfed(n);
+        n = 0;
+    }
 }
 
 // The walk at GX-native draw token b (its n dwords): true when it is a spliced
@@ -2683,8 +2694,12 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             if (n >= 3 && b[0] == kGxNativeMagic) {
                 g_token_nops.fetch_add(1, std::memory_order_relaxed);
                 if (gxvk_lists::times() && gxvk_lists::splice()) host_gpu_lists_arrival(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
+                // A draw stored while the pool rested was never the pool's - no segment, no commit, no pool thread
+                // on its slot - so none of the pool's checks (a spliced segment's members were all fed).
+                const bool fed = !gxvk_lists::pool() || t_seg_left || hle_gx_native_fed(b[1] | (static_cast<std::uint64_t>(b[2]) << 32));
+                if (!fed) unfed_token();
                 // Stage 4b.2: a spliced segment's member, or the first member of a segment spliced here.
-                if (gxvk_lists::segments() && segment_token(b, n)) break;
+                if (gxvk_lists::segments() && fed && segment_token(b, n)) break;
                 lookahead_tokens(b + n);
                 const GpuDrawInputs* in = hle_gx_native_token(b[1] | (static_cast<std::uint64_t>(b[2]) << 32), t_regs.sh, t_regs.ctx);
                 if (in && list_resolve::census()) {
@@ -2708,7 +2723,7 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                 // Stage 4b.1b (BBHOST_GXVK_LISTS=splice): the pool's commit of the
                 // draw spliced in, where it falls in the run open here.
                 const std::uint64_t token_id = b[1] | (static_cast<std::uint64_t>(b[2]) << 32);
-                if (in && !committed && gxvk_lists::splice() && !list_resolve::commit_draws() && host_gpu_splice(token_id)) {
+                if (in && !committed && fed && gxvk_lists::splice() && !list_resolve::commit_draws() && host_gpu_splice(token_id)) {
                     committed = true;
                     g_draws.fetch_add(1);
                 }

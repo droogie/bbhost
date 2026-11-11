@@ -162,6 +162,8 @@ add_executable(bbhost
   src/net/http.cpp
   src/net/session.cpp
   src/net/stun.cpp
+  src/net/nat_probe.cpp
+  src/net/nat_job.cpp
   src/hle/np_matching2.cpp
   src/hle/np_signaling.cpp
   src/host/window.cpp
@@ -192,6 +194,7 @@ add_executable(bbhost
   src/hle/sync.cpp
   src/hle/kernel.cpp
   src/hle/fs.cpp
+  src/hle/save_commit.cpp
   src/hle/fios.cpp
   src/hle/dialog.cpp
   src/hle/avplayer.cpp
@@ -697,6 +700,15 @@ if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   set_property(TARGET guest_console_test PROPERTY CROSSCOMPILING_EMULATOR wine)
 endif()
 add_test(NAME guest_console_test COMMAND guest_console_test)
+# A save written whole or not at all: the commit at unmount, and on Linux a
+# kill at each of its steps with the recovery after it (hle/save_commit.h).
+add_executable(save_commit_test tests/save_commit_test.cpp src/hle/save_commit.cpp)
+target_include_directories(save_commit_test PRIVATE src)
+target_compile_features(save_commit_test PRIVATE cxx_std_17)
+if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  set_property(TARGET save_commit_test PROPERTY CROSSCOMPILING_EMULATOR wine)
+endif()
+add_test(NAME save_commit_test COMMAND save_commit_test)
 add_executable(libc_wide_test tests/libc_wide_test.cpp src/hle/sysv_va.cpp)
 target_include_directories(libc_wide_test PRIVATE src)
 if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
@@ -872,6 +884,15 @@ if(UNIX)
   add_executable(sign_in_check_test tests/sign_in_check_test.cpp src/replay/json.cpp)
   target_include_directories(sign_in_check_test PRIVATE src)
   add_test(NAME sign_in_check_test COMMAND sign_in_check_test)
+  # The setup window's connection test (net/nat_check.h): the exchange from a
+  # port against a test server of its own on loopback - a router that keeps
+  # one port, one that changes it, none answering, the port check open, closed
+  # and absent - and the server's answers read.
+  add_executable(nat_check_test tests/nat_check_test.cpp src/net/nat_probe.cpp src/net/stun.cpp src/replay/json.cpp)
+  target_include_directories(nat_check_test PRIVATE src)
+  target_link_libraries(nat_check_test PRIVATE Threads::Threads)
+  add_test(NAME nat_check_test COMMAND nat_check_test)
+  set_tests_properties(nat_check_test PROPERTIES TIMEOUT 60)
   add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
   target_include_directories(uncapped_limit_test PRIVATE src)
   add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)
@@ -1203,6 +1224,10 @@ if(UNIX)
   add_executable(clip_control_test tests/clip_control_test.cpp)
   target_include_directories(clip_control_test PRIVATE src)
   add_test(NAME clip_control_test COMMAND clip_control_test)
+  # A texture made after the fill its resource was cleared with, which met no image (tests/fill_pending_test.cpp).
+  add_executable(fill_pending_test tests/fill_pending_test.cpp)
+  target_include_directories(fill_pending_test PRIVATE src)
+  add_test(NAME fill_pending_test COMMAND fill_pending_test)
   # The engine's per-view block found at every screen shape and field of view (tests/view_block_test.cpp).
   add_executable(view_block_test tests/view_block_test.cpp)
   target_include_directories(view_block_test PRIVATE src)
@@ -1357,6 +1382,12 @@ if(UNIX)
     add_test(NAME shader_compile_e2e COMMAND bbhost --compile-selftest ${CMAKE_BINARY_DIR}/shader-compile-e2e)
     set_tests_properties(shader_compile_e2e PROPERTIES TIMEOUT 120)
   endif()
+  # An older options file read and written back by bbhost itself
+  # (host/options.h host_options_selftest), in a folder of its own: Character
+  # motion's Velocity map, Off's name until 2026-11-10, reads as Off and is
+  # written back as Off.
+  add_test(NAME options_file_test COMMAND bbhost --options-selftest ${CMAKE_BINARY_DIR}/options-selftest)
+  set_tests_properties(options_file_test PROPERTIES TIMEOUT 60)
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)
