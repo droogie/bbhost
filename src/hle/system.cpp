@@ -715,11 +715,35 @@ void recover_all_saves() {
     }
 }
 
+// BBHOST_TEST_SAVE_KILL=STEP[:N] (a test switch): the process ends at once -
+// no exit, no reports, as a kill or a power cut would - at the N-th time (1)
+// a save reaches STEP: "session" (a writable mount's stage just made, the
+// game about to write it) or one of a commit's steps (save_commit.h: flushed,
+// marker, exchanged, live-moved, stage-moved, marker-removed, old-removed).
+// The next start's recovery must leave the old save or the new one, whole.
+void save_test_kill(const char* step) {
+    static const char* const want = std::getenv("BBHOST_TEST_SAVE_KILL");
+    static int left = [] {
+        const char* c = want ? std::strchr(want, ':') : nullptr;
+        return c ? std::max(1, std::atoi(c + 1)) : 1;
+    }();
+    if (!want) return;
+    const std::size_t n = std::strcspn(want, ":");
+    if (std::strlen(step) != n || std::strncmp(step, want, n) != 0 || --left != 0) return;
+    host_log("save: BBHOST_TEST_SAVE_KILL - the process ends here, at %s (a test switch)", step);
+    std::fflush(nullptr);
+#if defined(_WIN32)
+    TerminateProcess(GetCurrentProcess(), 9);
+#endif
+    _exit(9);
+}
+
 GUEST_ABI int hle_save_init(void*) {
     host_log("sceSaveDataInitialize");
     hle_fs_mount("/data/saves", "saves");  // ensures <data>/saves exists
     std::lock_guard<std::mutex> lock(g_save_mu);
     recover_all_saves();
+    if (std::getenv("BBHOST_TEST_SAVE_KILL")) save_commit::set_test_hook(save_test_kill);
     return 0;
 }
 GUEST_ABI int hle_save_term() { return 0; }
@@ -772,7 +796,7 @@ GUEST_ABI int hle_save_mount(const SaveMountReq* req, SaveMountResult* result) {
     std::string host = holds;
     if (writable && !live.empty()) {
         const std::string stage = save_commit::begin(live);
-        if (!stage.empty()) host = stage;
+        if (!stage.empty()) host = stage, save_test_kill("session");
         else host_log("save %s: no stage could be made; this session writes in place", dir.c_str());
     }
     const bool staged = writable && host != live && host == save_commit::paths_of(live).stage;
