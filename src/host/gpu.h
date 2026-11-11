@@ -534,6 +534,9 @@ void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us);
 // Vulkan, and spinning for the next block before it sleeps. False without the
 // thread (recording in place or inline): the bottleneck meter's recorder load.
 bool host_gpu_recorder_ns(std::uint64_t* replay_ns, std::uint64_t* spin_ns);
+// The main loop's frame limiter, once a frame (engine/frame_rate.cpp): how long it waited, the rate it held the frame to
+// and whether a loading screen is up - the recorder's rest at a frame cap (host/recorder_rest.h, BBHOST_RECORDER_REST).
+void host_gpu_recorder_paced(std::uint64_t wait_ns, float cap_fps, bool loading);
 // A GX buffer was made over [memory, memory + bytes) with this usage, these
 // bind flags and the registry's generation: with BBHOST_GX_TWINS=1 one the
 // GPU writes (usage default, unordered-access bind) gets a device-local twin

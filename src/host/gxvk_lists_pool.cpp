@@ -604,6 +604,9 @@ std::atomic<bool> g_resting{false};
 
 void cp_busy(std::uint64_t ns) { g_cp_busy_ns.store(g_cp_busy_ns.load(std::memory_order_relaxed) + ns, std::memory_order_relaxed); }
 void cp_held(std::uint64_t ns) { g_cp_held_ns.fetch_add(ns, std::memory_order_relaxed); }
+std::atomic<std::uintptr_t> g_cp_clock{0};  // bb-cp0's CPU-time clock (cp_thread_note)
+void cp_thread_note(std::uintptr_t clock) { g_cp_clock.store(clock, std::memory_order_release); }
+std::uint64_t cp_cpu_ns() { return host_thread_cpu_ns_of(g_cp_clock.load(std::memory_order_acquire)); }
 
 namespace {
 const char* duty_state(const gxvk_rest::State& st) {

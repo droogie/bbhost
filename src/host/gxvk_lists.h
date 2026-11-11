@@ -128,6 +128,12 @@ void cp_busy(std::uint64_t ns);
 // the back-pressure the bottleneck meter calls "held back by the command
 // processor"): counted always, for the rest's rule.
 void cp_held(std::uint64_t ns);
+// bb-cp0's CPU-time clock, noted at its start (hle/gnm_exec.cpp), and its CPU
+// time so far (0: not known): the command processor's own work, without the
+// waits its jobs take in - the recorder's rest reads its share of a window
+// (host/recorder.cpp).
+void cp_thread_note(std::uintptr_t clock);
+std::uint64_t cp_cpu_ns();
 
 // The pool's cores (stage 4b.1b, BBHOST_GXVK_LIST_CPUS: auto, the default
 // with splice - the last physical cores of the process's CPUs, one a pool

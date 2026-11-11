@@ -3218,6 +3218,7 @@ void cp_thread(Queue* q, int id) {
         char name[16];
         std::snprintf(name, sizeof(name), "bb-cp%d", id);
         host_thread_set_name(name);
+        if (id == 0) gxvk_lists::cp_thread_note(host_thread_cpu_clock());  // its CPU time, for the recorder's rest
         // Above the guest's threads on Windows: the game's frame waits on
         // this one, and a GX worker that took its core delayed every draw
         // behind it (core/host_clock.h, BBHOST_THREAD_PRIO=0).

@@ -110,6 +110,33 @@ it falls behind - where the kernel's half of a submission is costly, as on a
 Steam Deck, whose driver makes every import of the game's memory resident
 again at each one - the submissions queued behind each other go to the queue
 as one (`BBHOST_SUBMIT_MERGE=1` keeps them apart, to compare).
+Between two blocks `bb-record` spins (`BBHOST_RECORDER_SPIN`: 20,000 pauses
+with 16 hardware threads or more, 4,000 under) before it sleeps, which pays
+where the command processor limits the frame: a wake of a sleeping recorder is
+a system call on the command processor. Where something else holds the frame
+with room to spare, the recorder rests instead: a frame cap (two half-second
+windows with the limiter waiting 15% of the time, as the draw pool's rest at a
+cap) with the GPU busy under 85%, or the GPU under the cap (busy 90% of two
+windows) with the command processor's thread busy under 85%. Resting, it
+sleeps after 100 pauses, and the command processor wakes it at a submission or
+every 64 blocks, so it replays its blocks in batches; every wait of the
+command processor's on it wakes it at once (`src/host/recorder_rest.h`). At a
+true 60 that took the process 18-27 points of CPU under Windows on an RTX 3070
+Ti Laptop GPU (the recorder from 39-48% of a core to 13-16%), 25-34 on its
+Radeon 680M (GPU-bound) and 21-29 on an RTX 4070 under Linux, the frame rate
+and the slowest frames the same. Without that room the rest's delays land on
+the frame: its waits added to a command processor near its limit (Old Yharnam
+uncapped on that laptop, the thread busy 91-95%: 2-4% slower; a Steam Deck's
+60 fps profile at the Nightmare of Mensis, 94-95%: 0.8%), and a submission it
+delays at a cap with the GPU near full (the same profile at Central Yharnam,
+the GPU 88-91% busy: the 99th percentile frame from 17 to 20 ms in one run of
+two). The command processor's share is its thread's own CPU time, read once a
+window - not its jobs' time, which takes in its waits for the GPU (98-101% of
+the window on the 680M at 32-37 fps, the thread busy 29-44%). A cap's rest
+ends with the limiter waiting under 8% of a window or the GPU busy 92%, the
+GPU's with the GPU under 80% busy (the median of six windows), the command
+processor busy 92% or a cap holding the frame, both at a loading screen.
+`BBHOST_RECORDER_REST=0`: it never rests; `=always`: it always does.
 
 **Shaders.** GCN shaders are converted to SPIR-V when the game creates them,
 and GX creates every shader of the game's bundles at the start (1,663 vertex
