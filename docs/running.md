@@ -25,6 +25,13 @@ Both must come from a copy of the game you own.
 And a PC with:
 
 - x86-64 Windows 10/11 or Linux
+- a processor with AVX, SSE4.2 and POPCNT: an Intel Core of the 2nd generation
+  (Sandy Bridge) or newer, or an AMD FX or newer. The game's code also uses
+  BMI1, LZCNT and MOVBE, which Intel's 2nd and 3rd generation Core and AMD FX
+  before Excavator lack; there bbhost rewrites each of those instructions at
+  load into code of its own that gives the same result (the log's `cpu:` and
+  `legacy cpu:` lines say so; `BBHOST_LEGACY_CPU=1` forces that on a newer
+  processor, `=0` off). Without AVX bbhost says what is missing and stops.
 - a GPU with a Vulkan 1.3 driver (recent NVIDIA, AMD or Intel; the Steam Deck works)
 - 16 GB of RAM and 8 GB of video memory are recommended. Less can do: 6 GB
   NVIDIA cards play at 1080p, an RTX 4070 held to a 4 GB card's video memory
