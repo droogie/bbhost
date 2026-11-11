@@ -20,6 +20,7 @@
 #include "hle/modules.h"
 #include "hle/np.h"
 #include "net/account.h"
+#include "net/nat_job.h"
 #include "log.h"
 
 #include <algorithm>
@@ -31,8 +32,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <filesystem>
 #include <functional>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <mutex>
@@ -235,8 +239,14 @@ Setting g_set[kSettingCount] = {
     // game's own 30 the game is converted then, and a converted game taken to
     // 30 stays converted.
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "150", "180", "240", "360", "480", "960", "Display-Limited"}, 0,
+#if defined(_WIN32)
+     "30 is the game's own pace; the others run its logic at that rate. Display-Limited runs it at your monitor's refresh "
+     "rate (180 on a 180 Hz monitor); with Frame generation on, at half of it, the frames between generated (90 + 90 at "
+     "180 Hz). Changes at once.",
+#else
      "30 is the game's own pace; the others run its logic at that rate. Display-Limited runs it at your monitor's refresh "
      "rate (180 on a 180 Hz monitor). Changes at once.",
+#endif
      true},
     // Frame rate's Custom limit, its tick box and its number, drawn in Frame
     // rate's row (frame_rate_control) and not rows of their own: ticked, the
@@ -492,10 +502,11 @@ Setting g_set[kSettingCount] = {
      "AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; without them they stay off. FSR 4 runs as "
      "FSR 3 where it cannot run. Changes at once.",
 #else
-     // (host/upscaler.h upscaler_offered: FSR is Windows' alone, DLSS where it runs.)
-     "TAA (bbhost's own temporal anti-aliasing, any GPU) or DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of "
-     "the game's own anti-aliasing. DLSS needs libbbhost_ngx_bridge.so and NVIDIA's libnvidia-ngx-dlss.so beside bbhost, "
-     "as the Linux package has them; FSR runs on Windows only. Changes at once.",
+     // (host/upscaler.h upscaler_offered: FSR 3 and DLSS where they run, never FSR 4.)
+     "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 3 (AMD's, any GPU: the same FSR 3.1.6 as on Windows) or "
+     "DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of the game's own anti-aliasing. FSR 3 needs "
+     "libbbhost_fidelityfx_vk.so beside bbhost, DLSS libbbhost_ngx_bridge.so and NVIDIA's libnvidia-ngx-dlss.so, as the "
+     "packages have them. FSR 4 and frame generation run on Windows only. Changes at once.",
 #endif
      false},
     // TAA's blend (host/upscale_pass.cpp record_taa): how much of each new
@@ -541,7 +552,7 @@ Setting g_set[kSettingCount] = {
     {"frame_generation", "Frame generation", {"Off", "On"}, 0,
      "AMD FidelityFX frame generation: a frame made between each two of the game's, from the 3D alone - "
      "the HUD and the menus are never interpolated. Works with any Upscaling choice, Off included, on any GPU. "
-     "While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Loading screens stay uncapped. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
+     "While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Display-Limited runs the game at half the refresh rate and generates the frames between. Loading screens stay uncapped. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
      false},
     // Where the upscaler's motion for what moves of itself comes from
     // (host/upscale_pass.cpp): the game's motion blur velocity map, or the
@@ -560,21 +571,24 @@ Setting g_set[kSettingCount] = {
      "turns the game's own motion blur off (it reads the map). Changes at once.",
      false},
     // Where the upscalers' motion for the characters comes from
-    // (host/upscale_pass.cpp): their own vertex shaders' positions, this frame's
-    // and the last, drawn into the motion (the capture), or the game's motion
-    // blur velocity map alone. The capture's cost measured at 4K: about 1%.
-    {"char_motion", "Character motion", {"Precise", "Velocity map"}, 0,
+    // (host/upscale_pass.cpp): Precise, their own vertex shaders' positions,
+    // this frame's and the last, drawn into the motion (the capture); Off, the
+    // game's motion blur velocity map alone. The capture's cost measured at 4K:
+    // about 1%. Off was called Velocity map until 2026-11-10 (an options file's
+    // reads as Off: host_options_load); the two choices keep their places.
+    {"char_motion", "Character motion", {"Precise", "Off"}, 0,
 #if defined(_WIN32)
-     "Where TAA, FSR, DLSS and frame generation take the motion of the hunter, enemies and other moving characters from "
+     "How TAA, FSR, DLSS and frame generation follow the hunter, enemies and other moving characters (the camera's own "
 #elif defined(__linux__) && defined(__x86_64__)
-     "Where TAA, FSR and DLSS take the motion of the hunter, enemies and other moving characters from "
+     "How TAA, FSR and DLSS follow the hunter, enemies and other moving characters (the camera's own "
 #else
-     "Where TAA and DLSS take the motion of the hunter, enemies and other moving characters from "
+     "How TAA, FSR 3 and DLSS follow the hunter, enemies and other moving characters (the camera's own "
 #endif
-     "(the camera's own always comes from the depth). Precise: each character's own position this frame and the last, "
-     "for every pixel - clean edges and no trail behind a running character; it draws those characters a second time "
-     "into the motion, about 1% of the frame rate at 4K. Velocity map: the game's motion blur map, 640x360 at any "
-     "Resolution - a little faster, softer at a character's edge, where a faint trail can show. Any GPU. Changes at once.",
+     "motion always comes from the depth). Precise (the default): each character drawn a second time into the motion, "
+     "at its own position this frame and the last - clean edges and no trail behind a running character, for about 1% "
+     "of the frame rate at 4K. Off: the game's motion blur map alone - a little faster, with softer edges and a faint "
+     "trail behind running characters. Turn it off if your GPU or driver has trouble with Precise, or for the last bit "
+     "of speed on a weak GPU. Changes at once.",
      false},
     // The render resolution. res_width and res_height are two int32s the eboot
     // never writes, so this is a data patch and every pass scales together -
@@ -685,7 +699,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFrameClock},
     {Row::Option, nullptr, kEffectTiming},
 #if defined(_WIN32)
-    {Row::Option, nullptr, kFrameGeneration},  // AMD's FidelityFX, Windows' alone: no row elsewhere
+    {Row::Option, nullptr, kFrameGeneration},  // AMD's frame generation, Windows' alone: no row elsewhere
 #endif
     {Row::Option, nullptr, kSkipLogos},
     {Row::Option, nullptr, kPerformanceMode},
@@ -1548,7 +1562,7 @@ void rebuild_settings() {
         h.taa_strength = static_cast<float>(std::clamp(index_of(kTaaStrength), 0, 100)) / 100.0f;
         h.frame_generation = on_of(kFrameGeneration);
         h.motion_vectors = std::clamp(index_of(kMotionVectors), 0, 3);
-        h.char_motion = index_of(kCharMotion) != 1;  // Precise, Velocity map
+        h.char_motion = index_of(kCharMotion) != 1;  // Precise, Off (the game's velocity map alone)
     }
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
@@ -1758,6 +1772,8 @@ void host_options_load() {
             if (key == "texture_quality") val = val == "1.0x" ? "High" : val == "0.5x" ? "Medium" : val == "0.25x" ? "Low" : val;
             // Display-Limited was called Uncapped until 2026-10-28.
             if (key == "frame_cap" && val == "Uncapped") val = "Display-Limited";
+            // Character motion's Off was called Velocity map until 2026-11-10.
+            if (key == "char_motion" && val == "Velocity map") val = "Off";
             // Effect timing's names before it had three choices; a saved Smooth,
             // no longer one, reads as not chosen (the default, 60 fps).
             if (key == "effect_timing") {
@@ -2039,7 +2055,11 @@ const char* const* value_tips(int id, bool dlss) {
         "The game's own anti-aliasing; the 3D at the Resolution.",
         "TAA: bbhost's own temporal anti-aliasing - steadier edges and less shimmer, a little softer. Any GPU, the 3D at the "
         "Resolution; one below the window keeps the HUD at the window's size. The fastest of these.",
+#if defined(_WIN32)
         "AMD FSR 3: any GPU.",
+#else
+        "AMD FSR 3: any GPU, the same FSR 3.1.6 as on Windows. FSR 4 and frame generation run on Windows only.",
+#endif
         "AMD FSR 4: AMD's newest, where the GPU and driver run it; FSR 3 where they do not.",
         "NVIDIA DLSS: RTX cards only.",
     };
@@ -2072,6 +2092,12 @@ const char* const* value_tips(int id, bool dlss) {
         "Medium: textures at half their width and height (0.5x), a quarter of the video memory - a 1024x2048 texture is 512x1024.",
         "High: every texture at the size the game made it (1.0x).",
     };
+    static const char* const kCharMotionTips[] = {
+        "Precise (the default): each character drawn a second time into the motion - clean edges, no trail. About 1% of "
+        "the frame rate at 4K.",
+        "Off: the game's motion blur map alone - a little faster, with softer edges and a faint trail behind running "
+        "characters. For a GPU or driver that has trouble with Precise, or the last bit of speed on a weak GPU.",
+    };
     switch (id) {
         case kUpscaler: return kUpscalerTips;
         case kUpscaleQuality: return dlss ? kDlssTips : kFsrTips;
@@ -2079,6 +2105,7 @@ const char* const* value_tips(int id, bool dlss) {
         case kHdMotionBlurRes: return kHdBlurTips;
         case kTextureQuality:
         case kSfxTextureQuality: return kTextureTips;
+        case kCharMotion: return kCharMotionTips;
         default: return nullptr;
     }
 }
@@ -2126,13 +2153,21 @@ bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
     static std::vector<std::string>* names = new std::vector<std::string>();
     static std::vector<const char*> items, tips;
     if (items.empty()) {
+        // Display-Limited's own; frame generation's half on Windows alone,
+        // where frame generation is (no row elsewhere).
+        static const char* const kDisplayLimitedTip =
+            "Caps the frame rate at your monitor's refresh rate, read when the game starts: 180 fps on a 180 Hz monitor, "
+            "144 on a 144 Hz one."
+#if defined(_WIN32)
+            " With Frame generation on, the game runs at half of it and the frames between are generated: 90 + 90 at "
+            "180 Hz."
+#endif
+            ;
         const Setting& f = g_set[kFrameCap];
         for (const char* v : f.values) names->push_back(fps_from_label(v) ? std::string(v) + " fps" : std::string(v));
         for (std::size_t v = 0; v < f.values.size(); ++v) {
             items.push_back((*names)[v].c_str());
-            tips.push_back(fps_from_label(f.values[v]) ? nullptr
-                                                       : "Caps the frame rate at your monitor's refresh rate, read when the game "
-                                                         "starts: 180 fps on a 180 Hz monitor, 144 on a 144 Hz one.");
+            tips.push_back(fps_from_label(f.values[v]) ? nullptr : kDisplayLimitedTip);
         }
     }
     const ImGuiStyle& st = ImGui::GetStyle();
@@ -2371,6 +2406,23 @@ void account_page() {
         ImGui::PopFont();
         ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextDim);
         ImGui::TextUnformatted(hle_np_online_status().c_str());
+        // The connection test's verdict as the setup window had it before
+        // the game started (its own test, or the account's last one): the
+        // test itself runs only there, from the game's port while the game
+        // is closed. Nothing when the setup window did not open.
+        if (const net::nat::Remembered c = net::nat::remembered(); c.known) {
+            const double now = static_cast<double>(std::time(nullptr));
+            ImGui::TextUnformatted(("Connection test (" + net::nat::ago(c.at, now) + (c.saved ? "" : ", not saved") +
+                                    "): " + net::nat::headline(c.verdict))
+                                       .c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+                ui::tooltip("Connection test",
+                            std::string(net::nat::meaning(c.verdict)) +
+                                (c.inbound != net::nat::Inbound::NotTested
+                                     ? " " + net::nat::inbound_line(c.inbound, config().p2p_port > 0 ? config().p2p_port : 9307, c.verdict)
+                                     : std::string()),
+                            "The setup window's Game page runs it again (bbhost --setup, while the game is closed).");
+        }
         ImGui::PopStyleColor();
         ImGui::EndGroup();
     }
@@ -2477,11 +2529,7 @@ std::string aa_taker() { return g_setup_page ? plugins_aa_owner_scanned() : plug
 const char* upscaler_note() {
     const int u = shown_index(kUpscaler);  // the menu's Off, TAA, FSR 3, FSR 4, DLSS
     static std::string note;
-#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
     const char* ours = "TAA, FSR or DLSS";
-#else
-    const char* ours = "TAA or DLSS";
-#endif
     if (const std::string who = aa_taker(); !who.empty()) {
         note = g_setup_page ? who + " (a plugin turned on in the Plugins tab) does the anti-aliasing itself: while it is on, bbhost runs no " +
                                   ours + " (nor Sharpness, which follows them), and the 3D is drawn at the Resolution. Your choice is kept for "
@@ -2501,9 +2549,9 @@ const char* upscaler_note() {
     if (u <= 1 || g_setup_page) return g_set[kUpscaler].note;
     const UpscalerCaps caps = upscaler_caps();
     const bool dlss = u == 4;
-#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
+#if defined(_WIN32)
     if (!caps.loaded) {
-        note = "Not running: upscaler_bridge.dll did not load (it and AMD's FidelityFX files belong beside bbhost). The "
+        note = "Not running: upscaler_bridge.dll did not load (it and AMD's FidelityFX files belong beside bbhost.exe). The "
                "game's own anti-aliasing runs instead; Frame generation works without it.";
     } else if (dlss ? !caps.dlss : !caps.fsr) {
         const std::string why = dlss ? caps.dlss_reason : caps.fsr_reason;
@@ -2514,9 +2562,26 @@ const char* upscaler_note() {
         return g_set[kUpscaler].note;
     }
 #else
-    // Linux without PE loader: DLSS through the NGX bridge, and no FSR.
-    if (!dlss) {
-        note = "FSR runs on Windows only: the game's own anti-aliasing runs instead.";
+    if (caps.loaded && caps.fsr4) {
+        // Linux with PE loader upscaler_bridge.dll (FSR 4 available)
+        if (dlss ? !caps.dlss : !caps.fsr) {
+            const std::string why = dlss ? caps.dlss_reason : caps.fsr_reason;
+            note = std::string(dlss ? "DLSS" : "FSR") + " is not available here" + (why.empty() ? "" : " (" + why + ")") +
+                   ": the game's own anti-aliasing runs instead." +
+                   (dlss ? " On an AMD or Intel GPU choose FSR 4 or FSR 3." : "");
+        } else {
+            return g_set[kUpscaler].note;
+        }
+    } else if (!dlss && !caps.fsr_loaded) {
+        note = "Not running: libbbhost_fidelityfx_vk.so or upscaler_bridge.dll did not load. The game's "
+               "own anti-aliasing runs instead.";
+    } else if (!dlss && !caps.fsr) {
+        note = "FSR 3 is not available here" + (caps.fsr_reason.empty() ? std::string() : " (" + caps.fsr_reason + ")") +
+               ": the game's own anti-aliasing runs instead.";
+    } else if (!dlss && u == 3) {
+        note = "FSR 4 runs on Windows only: FSR 3 runs here instead.";
+    } else if (!dlss) {
+        return g_set[kUpscaler].note;
     } else if (!caps.loaded) {
         note = "Not running: libbbhost_ngx_bridge.so did not load (it and NVIDIA's libnvidia-ngx-dlss.so belong beside "
                "bbhost, as the Linux package has them). The game's own anti-aliasing runs instead.";
@@ -2622,10 +2687,12 @@ const char* const kHostShaderModeTips[2] = {
 };
 
 const char* const kHostFrameRateCustomNote =
-    "Tick to type your own frame rate, 10 to 960: the game is capped at exactly that rate (45 runs it at 45). With "
-    "Frame generation on, twice as many frames are shown (45 shows 90), so the rate is at most half your refresh rate "
-    "(90 at 180 Hz). Unticked, Frame rate's list is used. Changes at once between rates above 30; to or from 30 needs "
-    "a restart.";
+    "Tick to type your own frame rate, 10 to 960: the game is capped at exactly that rate (45 runs it at 45). "
+#if defined(_WIN32)
+    "With Frame generation on, twice as many frames are shown (45 shows 90), so the rate is at most half your refresh "
+    "rate (90 at 180 Hz). "
+#endif
+    "Unticked, Frame rate's list is used. Changes at once between rates above 30; to or from 30 needs a restart.";
 const char* const kHostEffectTimingLabels[3] = {"30 fps", "60 fps", "Frame rate-dependent"};
 const char* const kHostEffectTimingNote =
     "How fire, blood, magic and the flicker of lamps and candles keep time above 30 fps. Changes at once.";
@@ -2930,6 +2997,49 @@ void host_opt_set_index(const char* key, int index) {
 void host_options_save_now() {
     g_dirty = true;
     save();
+}
+
+int host_options_selftest(const std::string& dir) {
+    // An options file as v0.2.31 wrote it, Character motion at Off (then
+    // called Velocity map) and one other setting away from its default.
+    const std::string path = dir + "/bbhost-options.toml";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        f << "# bbhost PC port options. Written by the options screen (F10).\n[options]\nversion = \"8\"\n"
+             "char_motion = \"Velocity map\"\nssr_quality = \"Half\"\n";
+        if (!f) {
+            std::printf("options selftest: cannot write %s\n", path.c_str());
+            return 1;
+        }
+    }
+#if defined(_WIN32)
+    _putenv_s("BBHOST_OPTIONS_PATH", path.c_str());
+#else
+    setenv("BBHOST_OPTIONS_PATH", path.c_str(), 1);
+#endif
+    int failed = 0;
+    const auto check = [&failed](bool ok, const char* what) {
+        std::printf("options selftest: %s %s\n", ok ? "ok  " : "FAIL", what);
+        failed += ok ? 0 : 1;
+    };
+    host_options_load();
+    check(host_opt_default_index("char_motion") == 0 && std::strcmp(g_set[kCharMotion].values[0], "Precise") == 0,
+          "Character motion's default is Precise");
+    check(host_opt_index("char_motion") == 1 && std::strcmp(g_set[kCharMotion].values[1], "Off") == 0,
+          "char_motion = \"Velocity map\" reads as Off");
+    check(host_opt_saved("char_motion"), "as the player's own choice");
+    check(!host_settings_ref().char_motion, "with the characters' capture off");
+    check(host_opt_index("ssr_quality") == 1, "the file's other setting reads as saved (ssr_quality Half)");
+    host_options_save_now();
+    std::ifstream in(path);  // text: the file is written as text (CRLF on Windows)
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    check(text.find("\nchar_motion = \"Off\"\n") != std::string::npos, "written back as char_motion = \"Off\"");
+    check(text.find("Velocity map") == std::string::npos, "with no Velocity map left in the file");
+    check(text.find("\nssr_quality = \"Half\"\n") != std::string::npos, "and ssr_quality = \"Half\" kept");
+    std::printf("options selftest: %s (%s)\n", failed ? "FAILED" : "passed", path.c_str());
+    return failed ? 1 : 0;
 }
 
 bool host_steam_deck() {

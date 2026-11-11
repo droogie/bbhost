@@ -15,6 +15,7 @@
 #include "core/portable.h"
 #include "engine/gx_resources.h"
 #include "engine/texture_origin.h"
+#include "host/fill_pending.h"
 #include "host/gxvk.h"
 
 #include "core/write_watch.h"
@@ -3167,6 +3168,7 @@ void textures_follow_quality_locked() {
 // memory is a newer resource's, is replaced like one of another shape - the
 // memory's previous owner's image is never handed to the resource after it.
 std::atomic<std::uint64_t> g_view_other_gen{0}, g_view_other_gen_kept{0}, g_view_other_gen_adopted{0};
+void take_pending_fill_locked(const Surface& sf);  // below, beside textures_fill_surfaces_locked
 VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& dims_ok, std::uint32_t& dim, bool& arrayed,
                          bool shader_arrayed, bool r128, std::uint64_t expect_gen = 0) {
     dims_ok = true;
@@ -3597,6 +3599,7 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
         }
         it = g_surfaces.emplace(base, sf).first;
         note_surface_added(it->second);
+        if (!carried) take_pending_fill_locked(it->second);
         if (!t_force_async) {
             ++g_bind_made;
             g_bind_made_bytes += it->second.memory.size;
@@ -4668,7 +4671,7 @@ bool textures_create_ahead_locked(const std::uint32_t* w, std::uint64_t gen, boo
 // GPU-written from then on: the image is the storage, nothing re-uploads it
 // from the memory the fill never reached. Formats a float clear colour
 // suits only; block-compressed and integer ones are left (and counted).
-std::atomic<std::uint64_t> g_fill_surfaces{0}, g_fill_surfaces_skipped{0};
+std::atomic<std::uint64_t> g_fill_surfaces{0}, g_fill_surfaces_skipped{0}, g_fill_made_after{0};
 bool float_clearable(VkFormat f) {
     switch (f) {
         case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_B8G8R8A8_UNORM:
@@ -4730,6 +4733,34 @@ int textures_fill_surfaces_locked(std::uint64_t va, std::size_t bytes, const flo
         g_fill_surfaces.fetch_add(1, std::memory_order_relaxed);
     }
     return cleared;
+}
+
+// A texture made after the fill its GX resource was cleared with, which met
+// no image (host/fill_pending.h): it was just uploaded from memory that fill
+// never wrote - the water's interaction height maps, from an area visited
+// before - so it takes the fill's colour now, as the console's fill left its
+// memory, and is the storage from here (textures_fill_surfaces_locked).
+// BBHOST_FILL_AT_MAKE=0: as uploaded.
+const bool g_fill_at_make = [] {
+    const char* e = std::getenv("BBHOST_FILL_AT_MAKE");
+    return !(e && e[0] == '0');
+}();
+void take_pending_fill_locked(const Surface& sf) {
+    if (!g_fill_at_make || !sf.total_src) return;
+    GxResourceInfo r;
+    if (!gx_resource_at(sf.base, 1, &r) || r.memory != sf.base || r.type < 2) return;
+    float rgba[4];
+    if (!render_pending_fill_for_locked(sf.base, sf.total_src, r.gen, r.write_seq, rgba)) return;
+    if (textures_fill_surfaces_locked(sf.base, sf.total_src, rgba) <= 0) return;
+    g_fill_made_after.fetch_add(1, std::memory_order_relaxed);
+    tex_event(sf.base, sf.total_src, "texture 0x%llx %ux%u made after its fill (which met no image): cleared to %g %g %g %g",
+              static_cast<unsigned long long>(sf.base), sf.width, sf.height, rgba[0], rgba[1], rgba[2], rgba[3]);
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+        host_log("texture: 0x%llx %ux%u made after the fill its GX resource was cleared with, which met no image: cleared to %g %g %g %g, "
+                 "not the memory the fill never wrote",
+                 static_cast<unsigned long long>(sf.base), sf.width, sf.height, rgba[0], rgba[1], rgba[2], rgba[3]);
+    }
 }
 
 // A subresource region from an upload token, copied into the

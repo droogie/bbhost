@@ -4335,6 +4335,23 @@ bool init_locked() {
         }
         host_log("gpu: GL's clip space %s", g.has_depth_clip_control ? "clipped at -w (VK_EXT_depth_clip_control)"
                                                                       : "clipped at 0 as D3D's (no VK_EXT_depth_clip_control, or BBHOST_GL_CLIP_SPACE=0)");
+        // FSR 3's two pyramid shaders (bbhost's FidelityFX library on Linux,
+        // host/upscaler_ffx.h) declare compute shaders' derivative groups -
+        // DXC's form of their QuadReadAcross* - which the device must turn on
+        // for them to be valid (AMD's own Windows shaders declare the same).
+        if (upscaler_wants_compute_derivatives()) {
+            if (has(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+                VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR qd{};
+                qd.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+                VkPhysicalDeviceFeatures2 qf{};
+                qf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                qf.pNext = &qd;
+                vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+                g.compute_derivatives = qd.computeDerivativeGroupLinear;
+            }
+            host_log("gpu: compute shaders' derivative groups for FSR 3 %s", g.compute_derivatives ? "on (VK_KHR_compute_shader_derivatives)"
+                                                                                                  : "not offered by this device: FSR 3 runs without them, as on Windows");
+        }
         // VK_EXT_memory_budget: what the driver says this process holds per
         // heap - the number to compare with nvidia-smi when instances starve.
         g.has_memory_budget = has("VK_EXT_memory_budget");
@@ -4454,6 +4471,7 @@ bool init_locked() {
     }
     if (g.dynamic_depth_clamp) dext.push_back("VK_EXT_extended_dynamic_state3");
     if (g.has_depth_clip_control) dext.push_back("VK_EXT_depth_clip_control");
+    if (g.compute_derivatives) dext.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     if (g_want_present && has_swapchain) {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         g.present_capable = true;
@@ -4531,6 +4549,13 @@ bool init_locked() {
     if (g.has_depth_clip_control) {
         fdcc.pNext = f13.pNext;
         f13.pNext = &fdcc;
+    }
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR fderiv{};
+    fderiv.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+    fderiv.computeDerivativeGroupLinear = VK_TRUE;
+    if (g.compute_derivatives) {
+        fderiv.pNext = f13.pNext;
+        f13.pNext = &fderiv;
     }
     // Pixel shaders at wave32 (gcn/wave.h).
     // The translated stages use subgroup operations in SPIR-V 1.5 without
@@ -9776,6 +9801,10 @@ GpuHandles host_gpu_handles() {
 void host_gpu_lock() { g.mu.lock(); }
 bool host_gpu_device_lost() { return g_device_lost.load(std::memory_order_acquire); }
 void host_gpu_unlock() { g.mu.unlock(); }
+std::string host_gpu_lock_holder() {
+    void* const site = gpu::g.mu.holder();
+    return site ? GpuMutex::name_of(site) : std::string("none");
+}
 void host_gpu_queue_lock() {
     slow_calls::Scope timed(kHostQueueLockSite);
     queue_drain();
@@ -12454,7 +12483,13 @@ std::string host_gpu_video_memory_report(bool at_exit) {
     return gpu::video_memory_report_locked(at_exit);
 }
 
-void host_gpu_memory_census_refresh() { (void)host_gpu_video_memory_report(false); }
+bool host_gpu_memory_census_refresh() {
+    if (!gpu::g.ok || !gpu::vram_report_on()) return true;  // nothing to run
+    std::unique_lock<GpuMutex> lock(gpu::g.mu, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    (void)gpu::video_memory_report_locked(false);
+    return true;
+}
 
 bool host_gpu_memory_glance(GpuMemoryGlance& out) {
     using namespace gpu;

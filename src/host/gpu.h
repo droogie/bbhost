@@ -396,6 +396,9 @@ int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uin
 // drawn in order. splice-compare: false, and after the draw in order
 // host_gpu_splice_compare(id) compares the commit with it. The lines.
 bool host_gpu_splice(std::uint64_t id);
+// `n` more draw tokens the pool was never given (stored while it rested), drawn in order with none of its checks
+// (counted with the splice's "the pool resting").
+void host_gpu_splice_unfed(std::uint32_t n);
 bool host_gpu_list_committed(std::uint64_t id);  // its commit is made: the pool reads its slot no more
 void host_gpu_splice_compare(std::uint64_t id);
 // Before that draw in order (gnm_exec.cpp): a token whose commit will be compared is drawn with the read masks its
@@ -517,8 +520,12 @@ struct GpuMemoryGlance {
     bool cache_known = false, integrated = false;
 };
 bool host_gpu_memory_glance(GpuMemoryGlance& out);
-// The video memory census run now, not logged (for the counter's cache).
-void host_gpu_memory_census_refresh();
+// The video memory census run now, not logged (for the counter's cache) -
+// only if the renderer's lock is free this moment: the window's thread asks,
+// and never waits for that lock (a renderer stopped behind a present that
+// does not come back would stop the window too, "Not Responding"). False when
+// the lock was taken: asked again later.
+bool host_gpu_memory_census_refresh();
 // The guest memory imports the command processor waited for so far - made at
 // a binding, a device address or a walk, not by the import thread - and the
 // driver's time they took (the frames and stall lines' "imports waited for").
@@ -892,6 +899,9 @@ void host_gpu_log_video_memory(bool at_exit);  // the same, logged a line a call
 // Serialises queue use between the presenter and the executor.
 void host_gpu_lock();
 void host_gpu_unlock();
+// Where the renderer's lock was taken by whoever holds it now ("none" when
+// free), for the watchdog's lines (host/sampler.h).
+std::string host_gpu_lock_holder();
 // The renderer's queue is shared with its submission thread: the presenter
 // (and anything else outside gpu.cpp) takes this around a direct submit,
 // present or wait on it. It waits for the thread's pending submissions first,

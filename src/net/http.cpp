@@ -117,6 +117,7 @@ HttpResult perform(const std::string& url, const std::string* post, const HttpCa
         curl_easy_setopt(c, CURLOPT_XFERINFODATA, &call.abandon);
     }
     curl_easy_setopt(c, CURLOPT_USERAGENT, "bbhost/" BBHOST_VERSION);
+    if (call.ipv4_only) curl_easy_setopt(c, CURLOPT_IPRESOLVE, static_cast<long>(CURL_IPRESOLVE_V4));
     if (!config().online_verify_tls) {
         curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(c, CURLOPT_SSL_VERIFYHOST, 0L);
@@ -207,6 +208,11 @@ HttpResult http_get(const std::string& url, int timeout_ms) { return perform(url
 HttpResult http_post_json(const std::string& url, const json::Value& body, int timeout_ms) {
     const std::string text = json::dump(body, 0);
     return perform(url, &text, timeout_only(timeout_ms));
+}
+
+HttpResult http_post_json(const std::string& url, const json::Value& body, const HttpCall& call) {
+    const std::string text = json::dump(body, 0);
+    return perform(url, &text, call);
 }
 
 std::string auth_server_base() {

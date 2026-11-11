@@ -11,6 +11,7 @@ namespace {
 constexpr std::uint16_t kBindingRequest = 0x0001, kBindingResponse = 0x0101;
 constexpr std::uint16_t kMappedAddress = 0x0001, kXorMappedAddress = 0x0020, kXorMappedAddressOld = 0x8020;
 constexpr std::uint16_t kBbhostHello = 0x8100, kBbhostRelay = 0x8101;
+constexpr std::uint16_t kChangeRequest = 0x0003, kOtherAddress = 0x802C;
 constexpr std::uint8_t kRelayVersion[4] = {'b', 'b', 'r', '1'};
 constexpr std::uint32_t kCookie = 0x2112A442u;
 constexpr std::uint8_t kFamilyIpv4 = 0x01;
@@ -56,6 +57,34 @@ std::size_t build_binding_request(std::uint8_t* out, std::uint8_t txid[kTxid], b
     }
     wr16(out + 2, static_cast<std::uint16_t>(n - kHeader));
     return n;
+}
+
+std::size_t build_change_request(std::uint8_t* out, std::uint8_t txid[kTxid], std::uint32_t flags) {
+    std::size_t n = build_binding_request(out, txid);
+    wr16(out + n, kChangeRequest);
+    wr16(out + n + 2, 4);
+    wr32(out + n + 4, flags);
+    n += 8;
+    wr16(out + 2, static_cast<std::uint16_t>(n - kHeader));
+    return n;
+}
+
+bool response_other_address(const std::uint8_t* d, std::size_t n, std::uint32_t* addr, std::uint16_t* port) {
+    if (n < kHeader || rd16(d) != kBindingResponse) return false;
+    const std::size_t len = rd16(d + 2);
+    if (kHeader + len > n) return false;
+    for (std::size_t at = kHeader; at + 4 <= kHeader + len;) {
+        const std::uint16_t type = rd16(d + at), alen = rd16(d + at + 2);
+        const std::uint8_t* v = d + at + 4;
+        if (at + 4 + alen > kHeader + len) break;
+        if (type == kOtherAddress && alen >= 8 && v[1] == kFamilyIpv4) {
+            if (addr) *addr = to_nbo(rd32(v + 4));
+            if (port) *port = rd16(v + 2);
+            return true;
+        }
+        at += 4 + ((alen + 3u) & ~3u);
+    }
+    return false;
 }
 
 bool parse_binding_response(const std::uint8_t* d, std::size_t n, const std::uint8_t txid[kTxid], std::uint32_t* addr,

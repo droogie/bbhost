@@ -9,6 +9,9 @@
 # lifter's SPIR-V, as with the switch off.
 #
 #   tools/fetch_dxc.sh linux|windows DIR   the library into DIR, the licences into DIR/licenses/dxc
+#   tools/fetch_dxc.sh linux-cli DIR       the Linux release's command-line compiler, DIR/bin/dxc with the
+#                                          library in DIR/lib, for the build's FidelityFX shaders
+#                                          (tools/ffx_permutations.py); a build tool, never packaged
 #   tools/fetch_dxc.sh --sha256 linux|windows   the pinned SHA-256 of the library (tools/check_release_bundle.sh)
 #   DXC_CACHE=DIR (default build/dxc)       where the release archives are kept
 #
@@ -25,6 +28,7 @@ DXC_TAG=v1.9.2602
 LINUX_ASSET=linux_dxc_2026_02_20.x86_64.tar.gz
 LINUX_ASSET_SHA256=a1d3e3b5e1c5685b3eb27d5e8890e41d87df45def05112a2d6f1a63a931f7d60
 LINUX_LIB_SHA256=f64b6a9cf32ecb6b456e3f492d736ce41c250845e2dba282f4fc1c4cbeaa0f04
+LINUX_CLI_SHA256=8d40f5eb5359ea0ea68ffdd9955a796a940d034ae3ff86629bc23eb2b1b56d6e
 WINDOWS_ASSET=dxc_2026_02_20.zip
 WINDOWS_ASSET_SHA256=a1e89031421cf3c1fca6627766ab3020ca4f962ac7e2caa7fab2b33a8436151e
 WINDOWS_LIB_SHA256=b86a738ece4c05dbe2d9bbb29668a2ccb28a0740773c9b027cdc61e8d07b4d75
@@ -41,9 +45,9 @@ fi
 target=${1:-}; dest=${2:-}
 [ -n "$dest" ] || fail "usage: tools/fetch_dxc.sh linux|windows DIR"
 case "$target" in
-    linux) asset=$LINUX_ASSET asset_sha=$LINUX_ASSET_SHA256 lib=libdxcompiler.so lib_sha=$LINUX_LIB_SHA256 ;;
+    linux | linux-cli) asset=$LINUX_ASSET asset_sha=$LINUX_ASSET_SHA256 lib=libdxcompiler.so lib_sha=$LINUX_LIB_SHA256 ;;
     windows) asset=$WINDOWS_ASSET asset_sha=$WINDOWS_ASSET_SHA256 lib=dxcompiler.dll lib_sha=$WINDOWS_LIB_SHA256 ;;
-    *) fail "the target is linux or windows, not '$target'" ;;
+    *) fail "the target is linux, linux-cli or windows, not '$target'" ;;
 esac
 [ "$(cat third_party/dxc/VERSION)" = "$DXC_TAG" ] || fail "third_party/dxc holds the licences of $(cat third_party/dxc/VERSION), not $DXC_TAG"
 sha() { sha256sum "$1" | cut -d' ' -f1; }
@@ -78,6 +82,20 @@ if [ ! -f "$archive" ] || [ "$(sha "$archive")" != "$asset_sha" ]; then
     mv "$archive.part" "$archive"
 fi
 
+if [ "$target" = linux-cli ]; then
+    # The compiler and the library it loads from ../lib (its RUNPATH), each checked.
+    mkdir -p "$dest/bin" "$dest/lib"
+    tar xzf "$archive" -O ./bin/dxc > "$dest/bin/dxc.part"
+    tar xzf "$archive" -O ./lib/libdxcompiler.so > "$dest/lib/libdxcompiler.so.part"
+    [ "$(sha "$dest/bin/dxc.part")" = "$LINUX_CLI_SHA256" ] || { rm -f "$dest/bin/dxc.part"; fail "bin/dxc out of $asset is not the pinned one"; }
+    [ "$(sha "$dest/lib/libdxcompiler.so.part")" = "$lib_sha" ] || { rm -f "$dest/lib/libdxcompiler.so.part"; fail "libdxcompiler.so out of $asset is not the pinned one"; }
+    mv "$dest/bin/dxc.part" "$dest/bin/dxc"
+    mv "$dest/lib/libdxcompiler.so.part" "$dest/lib/libdxcompiler.so"
+    chmod 755 "$dest/bin/dxc"
+    chmod 644 "$dest/lib/libdxcompiler.so"
+    echo "fetch_dxc: DXC $DXC_TAG's command-line compiler in $dest/bin/dxc"
+    exit 0
+fi
 mkdir -p "$dest/licenses/dxc"
 case "$target" in
     linux) tar xzf "$archive" -O ./lib/libdxcompiler.so > "$dest/$lib.part" ;;

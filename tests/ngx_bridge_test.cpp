@@ -8,7 +8,7 @@
 //                                  Vulkan (tests/fake_vulkan.h) whose GPU is not
 //                                  NVIDIA's: one symbol out, the host's instance
 //                                  and device untouched, DLSS off with its
-//                                  reason, FSR off as Linux's, and evaluate
+//                                  reason, FSR not the bridge's, and evaluate
 //                                  refused - never a call into NGX (BBHOST_NGX_OFF
 //                                  guards it, and must never be the reason).
 #include "fake_vulkan.h"
@@ -277,7 +277,7 @@ std::string run_order(const ub_api* api, const std::string& vendor_folder, const
     check(api->get_caps(c, &caps) == UB_OK, "get_caps");
     check(!caps.dlss_available && !caps.fsr_available && !caps.fsr4_available && !caps.fsr3_choice, "nothing runs on this GPU");
     check(std::strncmp(caps.bridge_version, "ngx-bridge ", 11) == 0, "the bridge says which it is");
-    check(std::strstr(caps.fsr_reason, "Windows") != nullptr, "FSR's reason: Windows only");
+    check(std::strstr(caps.fsr_reason, "libbbhost_fidelityfx_vk.so") != nullptr, "FSR's reason: the FidelityFX library's, not the bridge's");
     const std::string reason = caps.dlss_reason;
     check(!reason.empty() && reason.find("BBHOST_NGX_OFF") == std::string::npos, "DLSS's reason is the GPU's, never the tests' guard");
     // A short struct: only what it holds is written.

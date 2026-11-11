@@ -26,6 +26,9 @@ online_id = "Hunter"
 # (players behind NAT). Default: the private server's host on 3478; "off"
 # never asks.
 # stun_server = "thehuntersdream.com:3478"
+# The server's two connection-test ports, at the STUN server's host (the
+# setup window's Connection card). Default: the server's own, 3479 and 3480.
+# nat_test_ports = "3479,3480"
 # true: the game is signed out until this PC is signed in on the F10
 # screen (Account section), and the account's name is the online id. The
 # live server plays only with signed-in players.

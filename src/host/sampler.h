@@ -44,3 +44,15 @@ void sampler_recover();
 // taken by its own SIGPROF handler (a signal can cut a blocking call short,
 // so not during the start).
 void sampler_watchdog_start(std::uint64_t guest_lo, std::uint64_t guest_hi);
+
+// The window's thread pumped its messages (main.cpp, every 4 ms). Windows
+// calls a window whose thread has not looked at its messages for 5 s "Not
+// Responding"; with none for 4 s the Windows watchdog above logs every
+// thread's stack (once a stall, within its six dumps), flips or not.
+void sampler_note_pump();
+// The run is ending and is at `step` now (main.cpp exit_step: each of the
+// exit's reports, its waits). While exiting, a window not pumped for 4 s gets
+// one line - which step, for how long - and every thread's stack only once a
+// step has stood still for 30 s: a slow report is not a hang, a hung exit
+// still says where.
+void sampler_note_exit(const char* step);

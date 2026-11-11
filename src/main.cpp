@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <cstring>
+#include <cwchar>
 #include <stdexcept>
 #include <thread>
 #include <string>
@@ -63,6 +64,8 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
+#include <tlhelp32.h>
 #include <io.h>
 #else
 #include <csignal>
@@ -76,6 +79,73 @@
 
 void exit_reports();  // the reports a run prints when ended from outside (below)
 [[noreturn]] void device_lost_exit(bool windowed);  // the GPU is gone: tell the player, end (below)
+
+namespace {
+// The exit's steps, for the watchdog (host/sampler.h sampler_note_exit): one
+// line when a step stands still 4 s, every thread's stack past 30 s. On the
+// window's thread (g_exit_pumps set there) the window is pumped between them,
+// so a long exit reads "Not Responding" only while one step is stuck.
+std::atomic<bool> g_exit_pumps{false};
+std::atomic<const char*> g_exit_at{nullptr};  // the exit's step now, for its deadline's line
+void exit_step(const char* step) {
+    g_exit_at.store(step, std::memory_order_relaxed);
+    sampler_note_exit(step);
+    if (g_exit_pumps.load(std::memory_order_relaxed)) {
+        sampler_note_pump();
+        host_window_pump();
+    }
+}
+
+// Saves first: an exit waits while the game has a save mounted for writing
+// (its threads keep running, so the write ends), up to 30 s - a mount still
+// open then is a save thread stuck itself. Nothing here waits on the
+// renderer, the GPU or the driver. `pump`: on the window's thread, its
+// messages go on being read (exit_step).
+void exit_wait_for_saves(bool pump) {
+    for (int i = 0; i < 300 && hle_save_writable_mounts() > 0; ++i) {
+        if (pump) exit_step("waiting for a save to be written");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (hle_save_writable_mounts() > 0) host_log("exit: a save still mounted for writing after 30 s; ending without waiting more");
+}
+
+// The exit's deadline. A present stuck in the graphics driver holds the
+// renderer's lock, the presenting thread and the driver's own lock for good
+// (a freeze on a laptop, 11-10: AMD's frame generation presenter inside
+// NVIDIA's present), and the exit's later steps wait on one of them - the
+// pipeline cache's save (the driver), the reports (the renderer's lock), the
+// window's end (the presenting thread, AMD's swapchain, the device). Past
+// `seconds` the rest is skipped: a helper waits for saves once more and ends
+// the process. What a skip loses: the pipeline cache since its last periodic
+// save (written whole or not at all), the reports, the window's orderly end.
+void exit_deadline(int code, double seconds) {
+    std::thread([code, seconds] {
+        std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+        const char* at = g_exit_at.load(std::memory_order_relaxed);
+        host_log("exit: not done %.0f s on, at %s - the rest skipped (the renderer, the GPU or the driver is stuck), saves first, then the end",
+                 seconds, at ? at : "its start");
+        exit_wait_for_saves(false);
+        std::fflush(nullptr);
+#if defined(_WIN32)
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
+        _exit(code);
+    }).detach();
+}
+
+// BBHOST_TEST_EXIT_STALL=1 (a test switch): the exit's start takes the
+// renderer's lock on a thread of its own and keeps it - as a present stuck in
+// the driver does - so the deadline has steps to skip.
+void exit_test_stall() {
+    if (!std::getenv("BBHOST_TEST_EXIT_STALL")) return;
+    host_log("exit: BBHOST_TEST_EXIT_STALL - the renderer's lock taken for good (a test switch)");
+    std::thread([] {
+        host_gpu_lock();
+        for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+    }).detach();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+}
+}  // namespace
 
 namespace {
 
@@ -117,6 +187,56 @@ extern "C" int __llvm_profile_write_file(void);
 #endif
 // An instrumented build's profile (BBHOST_PGO=generate), which the profile
 // runtime writes at exit - and the ends below skip the exit handlers.
+#if defined(_WIN32)
+// An earlier bbhost.exe stuck for good: a present that never came back out of
+// the graphics driver keeps its process from ending - one thread left in a
+// kernel wait, and the guest's memory, which the driver keeps locked while it
+// is imported, held until Windows restarts (End task cannot end it). Told at
+// start in the log and in a box nothing waits on. A working copy - a test's
+// second game, co-op on one machine - has a hundred threads and is left alone:
+// only one with at most 2 threads and 1 GiB or more in use counts.
+// BBHOST_TEST_STUCK_WARNING=1 (a test switch) counts this process as one.
+void warn_stuck_instances() {
+    using MemInfo = BOOL(WINAPI*)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+    const auto mem_info = reinterpret_cast<MemInfo>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32GetProcessMemoryInfo")));
+    const bool test = std::getenv("BBHOST_TEST_STUCK_WARNING") != nullptr;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (!mem_info || snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    const DWORD self = GetCurrentProcessId();
+    int stuck = 0;
+    double gib_all = 0.0;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        const bool me = pe.th32ProcessID == self;
+        if (_wcsicmp(pe.szExeFile, L"bbhost.exe") != 0 || (me && !test) || (!me && pe.cntThreads > 2)) continue;
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+        if (!h) continue;
+        PROCESS_MEMORY_COUNTERS pmc{};
+        pmc.cb = sizeof(pmc);
+        const bool got = mem_info(h, &pmc, sizeof(pmc)) != FALSE;
+        CloseHandle(h);
+        if (!got || (!me && pmc.WorkingSetSize < (1ull << 30))) continue;
+        const double gib = static_cast<double>(pmc.WorkingSetSize) / static_cast<double>(1ull << 30);
+        host_log("start: an earlier bbhost.exe (PID %lu, %lu thread%s, %.1f GiB) is stuck in the graphics driver; Windows frees its "
+                 "memory only when it restarts%s",
+                 static_cast<unsigned long>(pe.th32ProcessID), static_cast<unsigned long>(pe.cntThreads), pe.cntThreads == 1 ? "" : "s", gib,
+                 me ? " (BBHOST_TEST_STUCK_WARNING: this one)" : "");
+        ++stuck;
+        gib_all += gib;
+    }
+    CloseHandle(snap);
+    if (!stuck) return;
+    static wchar_t text[512];
+    std::swprintf(text, sizeof(text) / sizeof(text[0]),
+                  L"%ls still in memory, stuck in the graphics driver, and holding %.1f GB. It cannot be ended from Task Manager: "
+                  L"Windows frees that memory when it restarts.\n\nThis game goes on; restart Windows when it suits you.",
+                  stuck == 1 ? L"An earlier bbhost is" : L"Earlier bbhosts are", gib_all);
+    std::thread([] { MessageBoxW(nullptr, text, L"bbhost", MB_OK | MB_ICONWARNING); }).detach();
+}
+#endif
+
 void write_pgo_profile() {
 #if defined(BBHOST_PGO_GENERATE)
     host_log("pgo: profile %s", __llvm_profile_write_file() == 0 ? "written" : "not written");
@@ -146,13 +266,28 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
     auto pump_until_done = [&](auto is_done) {
         while (!is_done()) {
             if (host_gpu_device_lost()) device_lost_exit(windowed);
+            if (windowed) sampler_note_pump();  // the watchdog's "Not Responding" stacks (host/sampler.h)
             if (windowed && !host_window_pump()) {
                 host_log("window closed");
+                exit_wait_for_saves(true);
+                exit_deadline(0, 15.0);
+                exit_test_stall();
+                exit_step("perf_meter_exit (the window closed)");
                 perf_meter_exit();
+                exit_step("saving the pipeline cache (the window closed)");
                 host_gpu_save_pipeline_cache_at_exit();
+                exit_step("hle_kernel_memory_report (the window closed)");
                 hle_kernel_memory_report();
+                exit_step("host_window_stop (the window closed)");
                 host_window_stop();
+                exit_step("write_pgo_profile (the window closed)");
                 write_pgo_profile();
+                std::fflush(nullptr);
+#if defined(_WIN32)
+                // Not ExitProcess (what _exit is here): it detaches every DLL
+                // under the loader lock, and a driver thread inside one hangs it.
+                TerminateProcess(GetCurrentProcess(), 0);
+#endif
                 _exit(0);
             }
             if (fault_flip && hle_video_flip_count() >= fault_flip) {
@@ -177,6 +312,10 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 // not stopped (that waits for the GPU lock the command
                 // processor may hold), the process just ends.
                 host_log("exit: flip %llu reached (BBHOST_EXIT_FLIP)", static_cast<unsigned long long>(exit_flip));
+                g_exit_pumps.store(windowed);
+                exit_wait_for_saves(windowed);
+                exit_deadline(0, 30.0);
+                exit_test_stall();
                 exit_reports();
                 // The cache save takes the GPU lock, which the command
                 // processor (still running) may hold for good: a helper
@@ -186,8 +325,12 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                     host_gpu_save_pipeline_cache_at_exit();
                     saved.store(true);
                 }).detach();
-                for (int i = 0; i < 100 && !saved.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                for (int i = 0; i < 100 && !saved.load(); ++i) {
+                    exit_step("waiting for the pipeline cache's save");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
                 if (!saved.load()) host_log("exit: the pipeline cache save did not finish in 5 s; leaving without it");
+                exit_step("write_pgo_profile");
                 write_pgo_profile();
                 std::fflush(nullptr);
 #if defined(_WIN32)
@@ -332,10 +475,16 @@ void device_lost_exit(bool windowed) {
             closed.store(true);
         }).detach();
         const int ticks = test ? 30 : 1200;  // 3 s / 2 min
-        for (int i = 0; i < ticks && !closed.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        g_exit_pumps.store(true);  // the game's window answers while the box is up
+        for (int i = 0; i < ticks && !closed.load(); ++i) {
+            exit_step("showing the device-lost message");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
-    // A save being written finishes first (up to 10 s).
-    for (int i = 0; i < 100 && hle_save_writable_mounts() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // A save being written finishes first.
+    exit_wait_for_saves(windowed);
+    exit_deadline(3, 20.0);
+    exit_test_stall();
     exit_reports();
     // The pipelines built so far, for a quicker next start: the save takes the
     // GPU lock a stuck thread may hold, so a helper does it, waited for 5 s.
@@ -344,7 +493,10 @@ void device_lost_exit(bool windowed) {
         host_gpu_save_pipeline_cache_at_exit();
         saved.store(true);
     }).detach();
-    for (int i = 0; i < 100 && !saved.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    for (int i = 0; i < 100 && !saved.load(); ++i) {
+        exit_step("waiting for the pipeline cache's save");
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     std::fflush(nullptr);
 #if defined(_WIN32)
     TerminateProcess(GetCurrentProcess(), 3);
@@ -353,20 +505,37 @@ void device_lost_exit(bool windowed) {
 }
 
 void exit_reports() {
+    // Each report a step (exit_step): named for the watchdog, the window pumped
+    // between them on its thread.
+    exit_step("perf_meter_exit");
     perf_meter_exit();
+    exit_step("hle_gx_scaleform_report");
     hle_gx_scaleform_report();
+    exit_step("hle_gnm_cp_report");
     hle_gnm_cp_report();
+    exit_step("gx_resources_report");
     gx_resources_report();
+    exit_step("params_report");
     params_report();
+    exit_step("hle_bp_report");
     hle_bp_report();
+    exit_step("hle_watch_report");
     hle_watch_report();
+    exit_step("hle_kernel_memory_report");
     hle_kernel_memory_report();
+    exit_step("frame_pool_report");
     frame_pool_report();
+    exit_step("key_prompts_report");
     key_prompts_report();
+    exit_step("decomp_report");
     decomp_report();
+    exit_step("mouse_camera_report");
     mouse_camera_report();
+    exit_step("fmod_ring_report");
     fmod_ring_report();
+    exit_step("sf_text_layout_report");
     sf_text_layout_report();
+    exit_step("the reports written");
 }
 
 #if !defined(_WIN32)
@@ -955,6 +1124,7 @@ int main(int argc, char** argv) {
                      static_cast<double>(ms.ullTotalPageFile) / kGiB, static_cast<double>(ms.ullAvailPageFile) / kGiB);
         }
     }
+    warn_stuck_instances();
     // The manifest (res/bbhost.manifest) makes UTF-8 the code page every
     // narrow path is in; a Windows 10 before version 1903 leaves the old one.
     if (const UINT cp = GetACP(); cp != CP_UTF8) {
@@ -1027,6 +1197,16 @@ int main(int argc, char** argv) {
             const int rc = host_gpu_stream_selftest(rounds);
             std::fflush(nullptr);
             std::_Exit(rc);  // the recorder and submission threads run on: no static destructors under them
+        }
+    }
+    // --options-selftest DIR (host/options.h): an older options file read and
+    // written back as a run does, in DIR's own file, before any configuration;
+    // the exit code says.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--options-selftest") == 0) {
+            const int rc = host_options_selftest(argv[i + 1]);
+            std::fflush(nullptr);
+            std::_Exit(rc);
         }
     }
 #if defined(BBHOST_HAVE_SDL3)

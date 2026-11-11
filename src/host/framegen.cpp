@@ -2,6 +2,7 @@
 
 #include "core/config.h"
 #include "engine/loading.h"
+#include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/settings.h"
 #include "log.h"
@@ -12,6 +13,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -55,6 +59,62 @@ std::mutex g_hudless_mu;
 // the renderer's, the configure on the presenter's - where AMD's sample uses
 // it from one: one at a time.
 std::mutex g_ctx_mu;
+// The call into AMD's swapchain the presenting thread is in, and since when
+// (steady clock, ns), for the watchdog (framegen_in_call); null when none.
+std::atomic<const char*> g_amd_call{nullptr};
+std::atomic<std::uint64_t> g_amd_call_ns{0};
+struct AmdCall {
+    explicit AmdCall(const char* what) {
+        g_amd_call_ns.store(static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
+                            std::memory_order_relaxed);
+        g_amd_call.store(what, std::memory_order_release);
+    }
+    ~AmdCall() { g_amd_call.store(nullptr, std::memory_order_release); }
+};
+const char* present_mode_text(VkPresentModeKHR m) {
+    switch (m) {
+        case VK_PRESENT_MODE_IMMEDIATE_KHR: return "IMMEDIATE";
+        case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
+        case VK_PRESENT_MODE_FIFO_KHR: return "FIFO";
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+        default: return "another mode";
+    }
+}
+// Generation switched on or off in AMD's swapchain (framegen_present): each
+// switch waits inside the configure for everything AMD has in flight and
+// stops or starts its presenting threads. Counted, the first ones told with
+// their time; the presenting thread's.
+std::uint64_t g_switches = 0, g_switches_base = 0;
+double g_switch_ms_max = 0.0;
+bool g_generating_now = false;
+// AMD's swapchain drains the device in some calls - a configure that switches
+// generation on or off, its swapchain's end (FrameInterpolationSwapchainVK.cpp
+// setFrameGenerationConfig -> waitForPresents: vkQueueWaitIdle on its four
+// queues, then vkDeviceWaitIdle; destroySwapchain the same) - and
+// vkDeviceWaitIdle needs every queue of the device kept from other threads
+// while it runs: bb-submit submitting the game's frames to queue 0 meanwhile
+// broke that (one laptop run lost the GPU in exactly such a drain, at the
+// switch on right after a loading screen).
+// Those calls run with the submission thread's queue lock held
+// (host_gpu_queue_lock: its pending submissions first, then no submit until
+// released); every value AMD's drain waits for is submitted by then - see
+// framegen_present. BBHOST_TEST_FG_QUEUE_LOCK=off (a test switch): without it,
+// as v0.2.30.
+const bool g_queue_lock = [] {
+    const char* e = std::getenv("BBHOST_TEST_FG_QUEUE_LOCK");
+    const bool off = e && std::strcmp(e, "off") == 0;
+    if (off) host_log("framegen: BBHOST_TEST_FG_QUEUE_LOCK=off - AMD's device drains run beside the game's submissions (a test switch)");
+    return !off;
+}();
+struct DrainLock {
+    explicit DrainLock(bool take) : held(take && g_queue_lock) {
+        if (held) host_gpu_queue_lock();
+    }
+    ~DrainLock() {
+        if (held) host_gpu_queue_unlock();
+    }
+    const bool held;
+};
 // Frames AMD's swapchain presented for each of ours over the last 60 of ours:
 // 0 until this swapchain has been measured once (framegen_present).
 std::atomic<float> g_shown_per_frame{0.0f};
@@ -239,12 +299,24 @@ bool framegen_create_swapchain(VkPhysicalDevice phys, VkDevice device, const VkS
                              L"vulkan-1.dll", L"upscaler_bridge.dll", L"amd_fidelityfx_upscaler_vk.dll"})
         if (HMODULE h = GetModuleHandleW(m)) host_log("framegen: module %ls at %p", m, static_cast<void*>(h));
 #endif
-    host_log("framegen: AMD's swapchain %ux%u in place, render sizes up to %ux%u (queues 2-4 of family %u)%s", sci.imageExtent.width,
-             sci.imageExtent.height, g_max_render.width, g_max_render.height, family, g_fg_ctx ? ", frame generation on for the flips whose motion was prepared" : "");
+    host_log("framegen: AMD's swapchain %ux%u in place, presenting %s, render sizes up to %ux%u (queues 2-4 of family %u)%s",
+             sci.imageExtent.width, sci.imageExtent.height, present_mode_text(sci.presentMode), g_max_render.width, g_max_render.height,
+             family, g_fg_ctx ? ", frame generation on for the flips whose motion was prepared" : "");
+    g_generating_now = false;
+    g_switches = g_switches_base = 0;
+    g_switch_ms_max = 0.0;
     return true;
 }
 
 bool framegen_active() { return g_swap_ctx != nullptr; }
+
+const char* framegen_in_call(double& seconds) {
+    const char* const what = g_amd_call.load(std::memory_order_acquire);
+    if (!what) return nullptr;
+    const std::chrono::steady_clock::time_point t0{std::chrono::steady_clock::duration(g_amd_call_ns.load(std::memory_order_relaxed))};
+    seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return what;
+}
 
 float framegen_shown_per_frame() { return g_swap_ctx ? g_shown_per_frame.load(std::memory_order_relaxed) : 1.0f; }  // 0: not measured yet
 
@@ -264,7 +336,39 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
         // over every frame it shows.
         // Not while a loading screen is up: its frames run uncapped to load
         // faster, and there is nothing to smooth.
-        const bool on = g_present_ready && !loading_screen_up();
+        const bool ready = g_present_ready && !loading_screen_up();
+        // Switched on only after that many such flips in a row, off at the
+        // first without (BBHOST_FG_DEBOUNCE=N; 0: on at the first, as
+        // v0.2.30). A switch waits inside AMD's configure for all it has in
+        // flight and starts or stops its presenting threads; at a loading
+        // screen's end that was the world's first flip, its frame times still
+        // uneven, where a player saw "Not Responding" (Display-Limited with
+        // frame generation). Now the switch on comes 30 steady flips later. (A
+        // loading screen still makes one switch off and one on: the flips that
+        // show a display buffer again fall inside it, generation off already.)
+        static const int need = [] {
+            const char* e = std::getenv("BBHOST_FG_DEBOUNCE");
+            const int n = e && *e ? std::atoi(e) : 30;
+            if (n > 1)
+                host_log("framegen: generation switched on after %d new frames in a row (BBHOST_FG_DEBOUNCE=0: at the first, as v0.2.30)", n);
+            else
+                host_log("framegen: BBHOST_FG_DEBOUNCE=%s - generation switched on at the first new frame, as v0.2.30", e ? e : "");
+            return n > 1 ? n : 0;
+        }();
+        // BBHOST_TEST_FG_SWITCH=N (a test switch): one present in N taken as not
+        // ready - generation switched off there and on again by the rule above,
+        // hundreds of switches a run.
+        static const int test_switch = [] {
+            const char* e = std::getenv("BBHOST_TEST_FG_SWITCH");
+            const int n = e ? std::atoi(e) : 0;
+            if (n > 1) host_log("framegen: BBHOST_TEST_FG_SWITCH=%d - one present in %d taken as not ready (a test switch)", n, n);
+            return n > 1 ? n : 0;
+        }();
+        static std::uint64_t presents = 0;
+        const bool forced_off = test_switch && ++presents % static_cast<std::uint64_t>(test_switch) == 0;
+        static int in_a_row = 0;
+        in_a_row = ready && !forced_off ? std::min(in_a_row + 1, need) : 0;  // held at need: no overflow in a long session
+        const bool on = ready && !forced_off && (g_generating_now || in_a_row >= need);
         ffxConfigureDescFrameGeneration cfg{};
         cfg.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
         cfg.swapChain = g_swapchain;
@@ -290,9 +394,57 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
         cfg.frameID = g_present_id;
         static std::atomic<int> told{0};
         ffxReturnCode_t rc;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto t_locked = t0;  // when the queue lock was held (a switch's)
+        bool locked = false;
         {
+            // A switch drains the device inside the configure: the game's
+            // submissions held off meanwhile (g_queue_lock). Everything it
+            // waits for is submitted by now, so the lock cannot hold up a
+            // value the drain needs: AMD's game, interpolation and present
+            // semaphores are signalled by its own submits - made inside our
+            // earlier presents on this thread, or by its presenting thread,
+            // which takes none of our locks - and the game's work they wait on,
+            // our blit's `rendered`, went in before the last present
+            // (host_gpu_wait_submitted in vk_present); what queue 0 holds waits
+            // only on queue 0's earlier work and on AMD's acquire semaphore,
+            // signalled by a submit made at that acquire. The queue lock first,
+            // outside g_ctx_mu: its wait for the submission thread's pending
+            // jobs needs nothing the context's lock guards.
+            const DrainLock drain(on != g_generating_now);
+            locked = drain.held;
+            t_locked = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> lk(g_ctx_mu);
+            const AmdCall in("configuring frame generation");
             rc = g_configure(&g_fg_ctx, &cfg.header);
+        }
+        // A switch - generation on or off in AMD's swapchain - waits inside the
+        // configure for all AMD has in flight (its presents, its queues, the
+        // device) and starts or stops its presenting threads: the first 24 told
+        // with their time and why, and after them any that held this thread
+        // over 40 ms (48 more at most), then a count every 600 of our frames
+        // with the longest hold (the queue lock's wait and the configure).
+        if (rc == FFX_API_RETURN_OK && on != g_generating_now) {
+            g_generating_now = on;
+            ++g_switches;
+            const auto t1 = std::chrono::steady_clock::now();
+            const double held = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            const double amd = std::chrono::duration<double, std::milli>(t1 - t_locked).count();
+            g_switch_ms_max = std::max(g_switch_ms_max, held);
+            static int said = 0, said_slow = 0;
+            if (said < 24 || (held > 40.0 && said_slow < 48)) {
+                if (said < 24)
+                    ++said;
+                else
+                    ++said_slow;
+                char wait[64] = "";
+                if (locked) std::snprintf(wait, sizeof(wait), ", after the queue lock's wait of %.1f ms", held - amd);
+                host_log("framegen: generation switched %s at flip %llu, frame %llu (%s), AMD's configure %.1f ms%s", on ? "on" : "off",
+                         static_cast<unsigned long long>(hle_video_flip_count()), static_cast<unsigned long long>(g_present_id),
+                         on ? (need ? "the new frames in a row" : "prepared, with its HUD-less picture")
+                            : (forced_off ? "BBHOST_TEST_FG_SWITCH" : loading_screen_up() ? "a loading screen" : "no fresh HUD-less picture"),
+                         amd, wait);
+            }
         }
         if (rc != FFX_API_RETURN_OK) {
             if (told.fetch_add(1) < 4) host_log("framegen: configuring frame %llu failed", static_cast<unsigned long long>(g_present_id));
@@ -307,6 +459,7 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
     VkResult r;
     {
         std::lock_guard<std::mutex> lk(g_ctx_mu);
+        const AmdCall in("presenting");
         r = g_fns.pOutQueuePresentKHR(queue, info);
     }
     // What reaches the screen, real and generated, against the game's frames:
@@ -322,8 +475,15 @@ VkResult framegen_present(VkQueue queue, const VkPresentInfoKHR* info) {
     }
     if (g_fns.pOutGetLastPresentCountFFXAPI && ++g_count_ours % 600 == 0) {
         const std::uint64_t shown = g_fns.pOutGetLastPresentCountFFXAPI(g_swapchain);
-        host_log("framegen: AMD presented %llu frames for the last 600 of ours", static_cast<unsigned long long>(shown - g_count_base));
+        if (g_switches > g_switches_base)
+            host_log("framegen: AMD presented %llu frames for the last 600 of ours; generation switched %llu times, the longest switch %.1f ms",
+                     static_cast<unsigned long long>(shown - g_count_base), static_cast<unsigned long long>(g_switches - g_switches_base),
+                     g_switch_ms_max);
+        else
+            host_log("framegen: AMD presented %llu frames for the last 600 of ours", static_cast<unsigned long long>(shown - g_count_base));
         g_count_base = shown;
+        g_switches_base = g_switches;
+        g_switch_ms_max = 0.0;
     }
     return r;
 }
@@ -493,12 +653,23 @@ void framegen_frame(VkCommandBuffer cmd, std::uint64_t display_va, VkOffset2D ds
 
 void framegen_destroy_swapchain(VkDevice device) {
     if (!g_swap_ctx) return;
-    if (g_fg_ctx) g_destroy(&g_fg_ctx, nullptr);
-    g_fg_ctx = nullptr;
-    g_destroy(&g_swap_ctx, nullptr);
-    g_swap_ctx = nullptr;
-    // After the contexts, as AMD's replacement asks.
-    g_fns.pOutDestroySwapchainFFXAPI(device, g_swapchain, nullptr, nullptr);
+    {
+        // AMD's swapchain's end drains the device (destroySwapchain ->
+        // waitForPresents) before it stops its threads: the game's submissions
+        // held off meanwhile (g_queue_lock; what it waits for is submitted, as
+        // for a switching configure). Its callers hold the renderer's lock, so
+        // no prepare is in the frame generation context either.
+        const DrainLock drain(true);
+        if (g_fg_ctx) g_destroy(&g_fg_ctx, nullptr);
+        g_fg_ctx = nullptr;
+        {
+            const AmdCall in("ending its swapchain");  // its threads stopped, its presents waited for
+            g_destroy(&g_swap_ctx, nullptr);
+        }
+        g_swap_ctx = nullptr;
+        // After the contexts, as AMD's replacement asks.
+        g_fns.pOutDestroySwapchainFFXAPI(device, g_swapchain, nullptr, nullptr);
+    }
     g_swapchain = VK_NULL_HANDLE;
     if (g_sc_hudless) vkDestroyImage(device, g_sc_hudless, nullptr);
     if (g_sc_hudless_mem) vkFreeMemory(device, g_sc_hudless_mem, nullptr);

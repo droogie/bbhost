@@ -421,7 +421,23 @@ bool host_desktop_primary_size(int* w, int* h) {
 #endif
 }
 
+float host_test_refresh_hz() {
+    static const float hz = [] {
+        const char* e = std::getenv("BBHOST_TEST_REFRESH_HZ");
+        if (!e || !*e) return 0.0f;
+        const float v = static_cast<float>(std::atof(e));
+        if (!(v >= 20.0f && v <= 1000.0f)) {
+            host_log("display: BBHOST_TEST_REFRESH_HZ=%s is not a rate from 20 to 1000 Hz; ignored", e);
+            return 0.0f;
+        }
+        host_log("display: every refresh rate asked reads %.3f Hz (BBHOST_TEST_REFRESH_HZ, a test switch)", static_cast<double>(v));
+        return v;
+    }();
+    return hz;
+}
+
 float host_desktop_refresh_hz() {
+    if (const float t = host_test_refresh_hz(); t > 0.0f) return t;
 #if defined(BBHOST_HAVE_SDL3)
     // The primary display, where SDL makes a window it is given no position
     // for (host_window_start), and its desktop mode's rate, which SDL keeps as

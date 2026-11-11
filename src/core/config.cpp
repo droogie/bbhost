@@ -149,6 +149,7 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
     str("online.p2p_addr", &c->p2p_addr);
     str("online.stun_server", &c->stun_server);
     num("online.p2p_port", &c->p2p_port);
+    str("online.nat_test_ports", &c->nat_test_ports);
     num("online.playlog_upload_seconds", &c->playlog_upload_seconds);
     num("online.playlog_sample_ms", &c->playlog_sample_ms);
     num("online.sign_timeout_seconds", &c->sign_timeout_seconds);
@@ -1085,6 +1086,9 @@ bool config_write_template(const std::string& path) {
            "# (players behind NAT). Default: the private server's host on 3478;\n"
            "# \"off\" never asks.\n"
            "# stun_server = \"thehuntersdream.com:3478\"\n"
+           "# The server's two connection-test ports, at the STUN server's host (the\n"
+           "# setup window's Connection card). Default: the server's own, 3479 and 3480.\n"
+           "# nat_test_ports = \"3479,3480\"\n"
            "\n[player]\n"
            "# The character's name the name box starts from (the first key typed\n"
            "# replaces it). Default: online_id.\n"

@@ -571,6 +571,7 @@ struct Gpu {
     // in GL's clip space (PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear) clips z
     // at -w as the PS4 does, not at 0 (GfxFixedState::gl_clip_space).
     bool has_depth_clip_control = false;
+    bool compute_derivatives = false;  // VK_KHR_compute_shader_derivatives on, for FSR 3's shaders (host/upscaler.h)
     // Graphics constant buffers, pushed per draw into set 2 (cb_push_on()):
     // the vertex stage's at bindings 112-127, the pixel stage's at 128-143.
     VkDescriptorSetLayout cb_push_layout = VK_NULL_HANDLE;
@@ -2645,6 +2646,7 @@ std::string render_barriers_report();  // "" unless BBHOST_PASS_BARRIERS=lazy
 // it (textures.cpp); how many.
 int textures_fill_surfaces_locked(std::uint64_t va, std::size_t bytes, const float rgba[4]);
 extern std::atomic<std::uint64_t> g_fill_surfaces, g_fill_surfaces_skipped;
+extern std::atomic<std::uint64_t> g_fill_made_after;  // textures made after their resource's fill met no image, cleared to it
 // Forget the cached sampled views of a render target before its image dies.
 void invalidate_rt_views(std::uint64_t base);
 // Depth layouts (render.cpp; RtImage::managed_layout): `r` taken to `want`
@@ -2820,6 +2822,10 @@ bool render_htile_fill_locked(std::uint64_t va, std::size_t bytes, std::uint32_t
 bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float rgba[4], std::uint32_t depth_clear,
                                std::uint32_t stencil_clear);
 std::string render_fill_stats();  // " fill-pending=N fill-applied=M"
+// The colour a texture made at `va`, `bytes` long, of the live GX texture of
+// generation `gen` and write sequence `write_seq`, takes from the fill made
+// for that resource that met no image (host/fill_pending.h); false for none.
+bool render_pending_fill_for_locked(std::uint64_t va, std::size_t bytes, std::uint64_t gen, std::uint64_t write_seq, float rgba[4]);
 // Command-processor pipeline builds so far: [0] translate us, [1] modules us, [2] vkCreateGraphicsPipelines us,
 // [3] stage translations, [4] stages the cache served (with BBHOST_STAGE_CACHE=0: translations whose key was seen before).
 void render_pipeline_time_us(std::uint64_t out[5]);

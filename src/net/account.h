@@ -9,6 +9,8 @@
 // account whatever a config file says.
 #pragma once
 
+#include "net/sign_in_check.h"
+
 #include <string>
 
 namespace net {
@@ -49,6 +51,7 @@ struct AccountCheck {
     std::string name;  // the account checked
     std::string why;   // Refused: the server's words; Unchecked: what came back instead
     long status = 0;   // the answer's HTTP status, 0 when none came
+    NatTestRecord nat_test;  // Valid: the account's last connection test (whoami's NatTest)
 };
 void account_check_start(int timeout_ms = 5000);
 AccountCheck account_check();

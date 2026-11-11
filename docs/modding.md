@@ -167,7 +167,8 @@ Things to know:
 
 ## Draw and frame hooks
 
-Plugin API 27 has the frame's part of these hooks; see
+The frame's part of these hooks came with plugin API 27 (the current version,
+28, adds `on_camera_target`, a plugin's own target for the follow camera); see
 [plugins.md](plugins.md#rendering-effects-v27):
 
 - `frame_info` describes each 3D frame: its render and output sizes, the

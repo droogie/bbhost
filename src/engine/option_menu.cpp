@@ -230,7 +230,7 @@ constexpr std::uint32_t kSystemEnhanceRowId = 110013;
 constexpr std::uint32_t kSystemUpscaleRowId = 110014;
 // PC Upscaling, 125000: frame generation, sharpness, TAA strength (125005),
 // reflection quality (its two entries 125030 Quarter, 125031 Half), character
-// motion (125006; 125041 Precise, 125042 Velocity Map), then the two pick
+// motion (125006; 125041 Precise, 125042 Off), then the two pick
 // lists - Upscaling (125032..125035, TAA 125040) and its quality
 // (125036..125039).
 constexpr std::uint32_t kUpFrameGen = 125000, kUpSharpness = 125001, kUpReflection = 125002, kUpScaler = 125003,
@@ -770,7 +770,8 @@ Slider g_up_sharpness{"sharpness", kUpSharpness, 0, 0xff};
 Slider g_up_taa_strength{"taa_strength", kUpTaaStrength, 0, 0xff};
 const Choice kReflectionQualities[2] = {{0, 125030}, {1, 125031}};
 std::uint8_t g_up_reflection = 0, g_up_reflection_last = 0xff;
-// Character motion: Precise or Velocity Map, a pair as Reflection quality is.
+// Character motion: Precise or Off (the game's velocity map alone), a pair as
+// Reflection quality is.
 const Choice kCharMotions[2] = {{0, 125041}, {1, 125042}};
 std::uint8_t g_up_char_motion = 0, g_up_char_motion_last = 0xff;
 // Off, TAA, FSR 3, FSR 4, DLSS: the option's own order (host/options.cpp), TAA's message after the list's.

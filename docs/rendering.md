@@ -903,6 +903,57 @@ commit at a true 60; `=0` keeps the path before them with the run commit as it w
 `BBHOST_RUN_COMMIT` set decides the run commit either way, and
 `BBHOST_GXVK_LISTS` the segments alone.
 
+**The pool's duty (`BBHOST_GXVK_LISTS_REST`).** The pool works only where it
+shortens the frame; resting, it is given no draw and the command processor
+draws them all in order with the homes, as with `BBHOST_GXVK_LISTS=0`. A draw
+stored while the pool rests is the command processor's alone: it asks the pool
+nothing about it (`BBHOST_GXVK_LISTS_SKIP_UNFED=0`: it looks each one up as it
+does while the pool works) - at a 90 cap on the RTX 4070 below that takes the
+99th percentile frame 0.7-0.85 ms shorter where the pool rests. It rests
+while a frame cap holds the frame (two half-second windows in a row with the
+limiter waiting 15% of the time; it works again once the command processor,
+drawing everything, is busy 85% with the frame meeting its cap narrowly - the
+limiter waiting under 15%, the medians of three windows at the cap - or 92%
+however long the limiter waits, or the frame misses the cap with the game held
+back by the command processor's backlog 20% of the time; until 2026-11-10 any
+one window 85% busy woke it, and at Central Yharnam at a 90 cap on the RTX 4070
+below, with Windows' default acted out and the command processor 71-75% busy at
+rest, one such window kept the pool working, 1.2 cores, for a frame the cap held
+either way - it rests there now; a saturated command processor drops frames
+resting, so the pool works on there: at Old Yharnam at the same cap, 92-97%
+busy at rest, resting left 4-15 frames of a 30 s window over 16.7 ms against 2
+working and the 99th percentile frame 1.7 ms longer (15.4 against 13.7 ms), for
+0.8 of a core and 4 W; near a cap (the limiter
+waiting 8-15%), where it used to work on for good, it tries a rest - the
+switch's 1.5 s, then 1-1.5 s counted - and keeps it where the cap holds the
+frame without it, else it works again and the next trial waits the cap's
+backoff), while the frame is the GPU's (busy 90% of two windows, until it is
+under 80% over six), and wherever resting costs the frame nothing. That last is
+measured at each place, both ways: 10 s after the pool began to work there, an
+experiment rests it for 5.5 s and lets it work for 5.5 s more, and compares the
+frame rate resting with the windows on either side of it; under 0.5% slower
+resting, the pool rests, and an ask now and then (work, then rest again,
+compared the same way) looks again, twice as far apart each time (to 4
+minutes). An 8% difference decides in 3 s and puts the next experiment four
+times as far away. Where resting holds the game back by the command processor's
+backlog under 10% of the time, the pool has nothing to shorten: it rests unless
+resting is 8% slower, and no ask is made while that lasts (the frame rate
+alone, a few seconds each way, can be 2-3% off at such a place). Each switch
+takes 1-2 s to settle either way, and the first 1.5 s of each phase are not
+counted. On an RTX 4070 with two Xeon Gold 6230 (1080p, uncapped) the pool is
+worth 9-13% at Old Yharnam and 7-11% at Cainhurst's courtyard, and costs 1-3.5%
+in the sewers under Central Yharnam, where its two threads beside the game's
+slow the game's own code; under Windows on an RTX 3070 Ti Laptop GPU (16
+hardware threads) it is worth 24-32% at Old Yharnam, 2-4% at the Nightmare of
+Mensis and Cainhurst's courtyard, about 4% in the sewer pit, and 0-4% at
+Central Yharnam from one sitting to the next. Each place after a loading screen
+starts working, and a rest at a cap ends once the frame is under 85% of the cap
+for 3 s (the title's menus meet an uncapped game's 960 cap).
+`BBHOST_GXVK_LISTS_REST=0`: the pool never rests; `=always`: it always does
+(what resting costs against the pool off); `=cycle:N` rests and works N frames
+each in turn (a check); `BBHOST_GXVK_LISTS_REST_LOG=1`: every window of the
+rule in the log.
+
 ### GX's objects as Vulkan objects (a design note)
 
 GX - the engine's Direct3D 11-shaped layer - keeps its buffers and textures in

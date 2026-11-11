@@ -109,10 +109,12 @@ inline bool times() { return g_times; }
 // it commits nothing and the command processor draws every GX-native draw in
 // order, as with the pool off (the constant buffers' homes on as before). It
 // rests while a frame cap holds the frame, while the frame is the GPU's, and
-// wherever the command processor drawing in order does not hold the game
-// back - found while it works by a probe now and then (a rest of three
-// half-second windows) - and works where it does. A loading screen changes
-// nothing. BBHOST_GXVK_LISTS_REST=0: it never rests.
+// wherever resting costs the frame nothing - measured at the place by an
+// experiment now and then (the other state for 5.5 s and back, its frame rate
+// against the windows on either side) - and works anywhere else.
+// Each place after a loading screen starts working. BBHOST_GXVK_LISTS_REST=0:
+// it never rests; =always: it always does (what resting costs against the pool
+// off); BBHOST_GXVK_LISTS_REST_LOG=1: every window of the rule in the log.
 extern std::atomic<bool> g_resting;
 inline bool resting() { return g_resting.load(std::memory_order_relaxed); }
 // The main loop's frame limiter, once a frame (engine/frame_rate.cpp): how long
@@ -137,8 +139,11 @@ void keep_off_pool_cpus();
 // The recording thread stored GX-native draw token `id`'s slot
 // (gx_trace.cpp native_draw_call; a host function, not a leaf): recorded on
 // GX context `ctx`, its token at `token_va` in the context's command buffer
-// (segments: the draw goes into the context's open list record too).
-void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va);
+// (segments: the draw goes into the context's open list record too). `feed`:
+// the pool is given it - the caller's decision (not while it rests), written
+// in the slot before it reads ready, so the command processor knows a draw the
+// pool never saw (hle_gx_native_fed) and asks the pool nothing about it.
+void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va, bool feed);
 
 // The pool's answers, and the command processor's in compare mode: a lookup's
 // kind, its key (the cache's own key, folded to 56 bits) and what it answered

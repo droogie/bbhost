@@ -162,6 +162,8 @@ add_executable(bbhost
   src/net/http.cpp
   src/net/session.cpp
   src/net/stun.cpp
+  src/net/nat_probe.cpp
+  src/net/nat_job.cpp
   src/hle/np_matching2.cpp
   src/hle/np_signaling.cpp
   src/host/window.cpp
@@ -192,6 +194,7 @@ add_executable(bbhost
   src/hle/sync.cpp
   src/hle/kernel.cpp
   src/hle/fs.cpp
+  src/hle/save_commit.cpp
   src/hle/fios.cpp
   src/hle/dialog.cpp
   src/hle/avplayer.cpp
@@ -357,7 +360,7 @@ if(Vulkan_FOUND)
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/gxvk_homes_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/vertex_snap.cpp src/host/vertex_cutaway.cpp src/host/pixel_cutaway.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/upscaler.cpp src/host/upscale_pass.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/gxvk_vk.cpp src/host/gxvk_homes_vk.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/vertex_snap.cpp src/host/vertex_cutaway.cpp src/host/pixel_cutaway.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/upscaler.cpp src/host/upscaler_ffx.cpp src/host/upscale_pass.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/copy_census.cpp src/host/copy_compare.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
@@ -519,6 +522,93 @@ if(UNIX AND NOT APPLE AND Vulkan_FOUND)
   endif()
 endif()
 
+# AMD FSR 3 on Linux: bbhost's build of AMD's FidelityFX library (src/ffx_vk,
+# MIT), libbbhost_fidelityfx_vk.so beside bbhost, which bbhost loads at run
+# time (host/upscaler_ffx.cpp) as the Windows build uses AMD's signed DLLs.
+# AMD's sources - the FidelityFX API, its Vulkan backend and FSR 3 - come from
+# its repository at a pinned tag, each file checked by SHA-256 and patched by
+# third_party/fidelityfx/patches (tools/fetch_fidelityfx.sh, kept in FFX_CACHE,
+# build/fidelityfx by default); never in the repository. Their compute shaders
+# are compiled here into the permutation headers the sources include
+# (tools/ffx_permutations.py, with the command-line DXC of tools/fetch_dxc.sh
+# linux-cli, kept in DXC_CACHE, every blob checked by spirv-val). BBHOST_FFX=OFF,
+# or anything of it missing (offline, no spirv-val): no library, and FSR stays
+# off on Linux.
+if(UNIX AND NOT APPLE AND Vulkan_FOUND)
+  option(BBHOST_FFX "build bbhost's FidelityFX library (FSR 3 on Linux) from AMD's SDK, fetched pinned by tools/fetch_fidelityfx.sh" ON)
+  if(BBHOST_FFX)
+    find_package(Python3 COMPONENTS Interpreter)
+    find_package(Threads REQUIRED)
+    find_program(BBHOST_SPIRV_VAL spirv-val)
+    set(BBHOST_FFX_SDK ${CMAKE_BINARY_DIR}/fidelityfx-sdk)
+    set(BBHOST_FFX_DXC ${CMAKE_BINARY_DIR}/dxc-cli)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_fidelityfx.sh sdk ${BBHOST_FFX_SDK}
+      RESULT_VARIABLE ffx_rc OUTPUT_VARIABLE ffx_out ERROR_VARIABLE ffx_err TIMEOUT 900)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_dxc.sh linux-cli ${BBHOST_FFX_DXC}
+      RESULT_VARIABLE dxc_rc OUTPUT_VARIABLE dxc_out ERROR_VARIABLE dxc_err TIMEOUT 900)
+    execute_process(COMMAND ${CMAKE_SOURCE_DIR}/tools/fetch_fidelityfx.sh --tag OUTPUT_VARIABLE ffx_tag OUTPUT_STRIP_TRAILING_WHITESPACE)
+    set(ffx_kit ${BBHOST_FFX_SDK}/Kits/FidelityFX)
+    if(NOT ffx_rc EQUAL 0)
+      string(STRIP "${ffx_err}" ffx_why)
+    elseif(NOT dxc_rc EQUAL 0)
+      string(STRIP "DXC's command-line compiler: ${dxc_err}" ffx_why)
+    elseif(NOT Python3_FOUND OR NOT BBHOST_SPIRV_VAL)
+      set(ffx_why "python3 and spirv-val are needed to make its shaders")
+    else()
+      set(ffx_why "")
+    endif()
+    if(ffx_why STREQUAL "")
+      # The shaders: the headers the SDK's *_shaderblobs.cpp includes, made
+      # together by one run of the generator, which rewrites only what changed.
+      set(ffx_blobs_cpp ${ffx_kit}/upscalers/fsr3/internal/ffx_fsr3upscaler_shaderblobs.cpp)
+      set(ffx_gen ${CMAKE_BINARY_DIR}/ffx-permutations)
+      file(STRINGS ${ffx_blobs_cpp} ffx_includes REGEX "^#include <.*_permutations\\.h>")
+      set(ffx_headers "")
+      foreach(line ${ffx_includes})
+        string(REGEX REPLACE "^#include <(.*)>.*$" "${ffx_gen}/\\1" header "${line}")
+        list(APPEND ffx_headers ${header})
+      endforeach()
+      file(GLOB_RECURSE ffx_shader_sources ${ffx_kit}/upscalers/fsr3/internal/shaders/*.hlsl ${ffx_kit}/upscalers/fsr3/include/gpu/*.h
+        ${ffx_kit}/api/internal/gpu/*.h ${ffx_kit}/framegeneration/*.h)
+      add_custom_command(OUTPUT ${ffx_gen}/ffx_permutations.stamp ${ffx_headers}
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/ffx_permutations.py --sdk ${ffx_kit} --dxc ${BBHOST_FFX_DXC}/bin/dxc
+          --out ${ffx_gen} --spirv-val ${BBHOST_SPIRV_VAL} --compress --stamp ${ffx_gen}/ffx_permutations.stamp
+        DEPENDS ${CMAKE_SOURCE_DIR}/tools/ffx_permutations.py ${ffx_blobs_cpp} ${ffx_kit}/upscalers/fsr3/internal/ffx_fsr3upscaler.cpp
+          ${ffx_shader_sources} ${BBHOST_FFX_DXC}/bin/dxc
+        COMMENT "FidelityFX: FSR 3's shader permutations (DXC, spirv-val)" VERBATIM)
+      set(ffx_sources ${ffx_kit}/api/internal/ffx_api.cpp ${ffx_kit}/api/internal/ffx_assert.cpp ${ffx_kit}/api/internal/ffx_message.cpp
+        ${ffx_kit}/api/internal/ffx_object_management.cpp ${ffx_kit}/api/internal/ffx_query_fallback.cpp ${ffx_kit}/backend/vk/ffx_backends_vk.cpp
+        ${ffx_kit}/backend/vk/ffx_vk.cpp ${ffx_kit}/upscalers/fsr3/internal/ffx_fsr3upscaler.cpp ${ffx_blobs_cpp}
+        ${ffx_kit}/upscalers/fsr3/internal/ffx_provider_fsr3upscale.cpp)
+      add_library(bbhost_fidelityfx_vk MODULE ${ffx_sources} src/ffx_vk/ffx_providers_vk.cpp ${ffx_gen}/ffx_permutations.stamp)
+      set_source_files_properties(${ffx_blobs_cpp} PROPERTIES OBJECT_DEPENDS "${ffx_headers}")
+      target_include_directories(bbhost_fidelityfx_vk PRIVATE src/ffx_vk/include ${ffx_gen} ${ffx_kit} ${ffx_kit}/api/internal ${ffx_kit}/api/include)
+      target_compile_definitions(bbhost_fidelityfx_vk PRIVATE FFX_BACKEND_VK FFX_UPSCALER)
+      # AMD's sources as they are: MSVC's literal suffixes (ui64) take
+      # -fms-extensions, src/ffx_vk/ffx_linux.h the rest; its MSVC pragmas and
+      # deprecations are AMD's. A float handed to int abs() fails the build
+      # (ffx_linux.h says why).
+      target_compile_options(bbhost_fidelityfx_vk PRIVATE -fms-extensions -include ${CMAKE_SOURCE_DIR}/src/ffx_vk/ffx_linux.h
+        -Wno-unknown-pragmas -Wno-unknown-warning-option -Wno-deprecated-declarations -Werror=absolute-value)
+      target_link_libraries(bbhost_fidelityfx_vk PRIVATE Vulkan::Vulkan ZLIB::ZLIB Threads::Threads m)
+      # The five API functions out, libstdc++ and libgcc inside, nothing left
+      # unresolved: the library needs only the Vulkan loader, zlib and glibc.
+      target_link_options(bbhost_fidelityfx_vk PRIVATE -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL
+        -Wl,--version-script=${CMAKE_SOURCE_DIR}/src/ffx_vk/exports.map -Wl,-z,defs)
+      set_target_properties(bbhost_fidelityfx_vk PROPERTIES OUTPUT_NAME bbhost_fidelityfx_vk PREFIX lib
+        CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+        LINK_DEPENDS ${CMAKE_SOURCE_DIR}/src/ffx_vk/exports.map)
+      add_dependencies(bbhost bbhost_fidelityfx_vk)
+      message(STATUS "bbhost: AMD's FidelityFX SDK ${ffx_tag}; building the FidelityFX library (FSR 3 on Linux), ${CMAKE_BINARY_DIR}/libbbhost_fidelityfx_vk.so")
+    else()
+      string(REPLACE "\n" "; " ffx_why "${ffx_why}")
+      message(STATUS "bbhost: no FidelityFX library (${ffx_why}): FSR stays off on Linux")
+    endif()
+  else()
+    message(STATUS "bbhost: BBHOST_FFX=OFF; no FidelityFX library: FSR stays off on Linux")
+  endif()
+endif()
+
 # The game's functions as ours (src/decomp, docs/decomp.md), one folder per
 # engine area. A leaf runs on the game's thread state, where FS may be the
 # game's, so no decomp file reads the stack protector's canary through it; and
@@ -619,6 +709,15 @@ if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   set_property(TARGET guest_console_test PROPERTY CROSSCOMPILING_EMULATOR wine)
 endif()
 add_test(NAME guest_console_test COMMAND guest_console_test)
+# A save written whole or not at all: the commit at unmount, and on Linux a
+# kill at each of its steps with the recovery after it (hle/save_commit.h).
+add_executable(save_commit_test tests/save_commit_test.cpp src/hle/save_commit.cpp)
+target_include_directories(save_commit_test PRIVATE src)
+target_compile_features(save_commit_test PRIVATE cxx_std_17)
+if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  set_property(TARGET save_commit_test PROPERTY CROSSCOMPILING_EMULATOR wine)
+endif()
+add_test(NAME save_commit_test COMMAND save_commit_test)
 add_executable(libc_wide_test tests/libc_wide_test.cpp src/hle/sysv_va.cpp)
 target_include_directories(libc_wide_test PRIVATE src)
 if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
@@ -698,11 +797,11 @@ if(UNIX)
     add_executable(ngx_bridge_test tests/ngx_bridge_test.cpp src/ngx_bridge/bridge_core.cpp)
     target_include_directories(ngx_bridge_test PRIVATE src third_party/upscaler_bridge)
     target_link_libraries(ngx_bridge_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
-    add_executable(upscaler_load_test tests/upscaler_load_test.cpp src/host/upscaler.cpp)
+    add_executable(upscaler_load_test tests/upscaler_load_test.cpp src/host/upscaler.cpp src/host/upscaler_ffx.cpp)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
       target_sources(upscaler_load_test PRIVATE src/host/pe_loader.cpp)
     endif()
-    target_include_directories(upscaler_load_test PRIVATE src third_party/upscaler_bridge ${CMAKE_BINARY_DIR}/gen)
+    target_include_directories(upscaler_load_test PRIVATE src third_party/upscaler_bridge third_party/fidelityfx ${CMAKE_BINARY_DIR}/gen)
     target_link_libraries(upscaler_load_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     add_dependencies(upscaler_load_test bbhost_version)
     add_test(NAME upscaler_load_none COMMAND upscaler_load_test none)
@@ -717,6 +816,28 @@ if(UNIX)
       add_test(NAME upscaler_load_order COMMAND upscaler_load_test order $<TARGET_FILE:bbhost_ngx_bridge>)
     else()
       add_test(NAME ngx_bridge_test COMMAND ngx_bridge_test)
+    endif()
+    # host/upscaler.cpp's FSR on Linux: bbhost's FidelityFX library beside
+    # bbhost, alone and with the NGX bridge, and on a device it cannot run on.
+    if(TARGET bbhost_fidelityfx_vk)
+      add_dependencies(upscaler_load_test bbhost_fidelityfx_vk)
+      add_test(NAME upscaler_load_fsr COMMAND upscaler_load_test fsr $<TARGET_FILE:bbhost_fidelityfx_vk>)
+      add_test(NAME upscaler_load_fsr_noquad COMMAND upscaler_load_test fsr-noquad $<TARGET_FILE:bbhost_fidelityfx_vk>)
+      if(TARGET bbhost_ngx_bridge)
+        add_test(NAME upscaler_load_fsr_bridge COMMAND upscaler_load_test fsr $<TARGET_FILE:bbhost_fidelityfx_vk> $<TARGET_FILE:bbhost_ngx_bridge>)
+      endif()
+    endif()
+    # bbhost's FidelityFX library (src/ffx_vk) on a real device - lavapipe in
+    # the tests: FSR 3 upscales a jittered synthetic picture, accumulated and
+    # with the jitter read as the host means it. Exit 77 without a device.
+    if(TARGET bbhost_fidelityfx_vk)
+      add_executable(ffx_fsr3_test tests/ffx_fsr3_test.cpp)
+      target_include_directories(ffx_fsr3_test PRIVATE third_party/fidelityfx)
+      target_link_libraries(ffx_fsr3_test PRIVATE Vulkan::Vulkan ${CMAKE_DL_LIBS})
+      target_compile_options(ffx_fsr3_test PRIVATE -Wno-missing-field-initializers)
+      add_dependencies(ffx_fsr3_test bbhost_fidelityfx_vk)
+      add_test(NAME ffx_fsr3_test COMMAND ffx_fsr3_test $<TARGET_FILE:bbhost_fidelityfx_vk>)
+      set_tests_properties(ffx_fsr3_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     endif()
   endif()
   add_executable(thunk_args tests/thunk_args.cpp src/core/thunk.cpp src/core/tls_rewrite.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
@@ -766,13 +887,30 @@ if(UNIX)
   target_link_libraries(poll_pacing_test PRIVATE pthread)
   add_test(NAME poll_pacing_test COMMAND poll_pacing_test)
   set_tests_properties(poll_pacing_test PROPERTIES TIMEOUT 60)  # a turn never handed back hangs its threads
+  # sceNpScoreSanitizeComment's answer: the character names the game shows
+  # under Player Name Display "Name" come back whole (hle/np_score.h).
+  add_executable(np_score_test tests/np_score_test.cpp)
+  target_include_directories(np_score_test PRIVATE src)
+  add_test(NAME np_score_test COMMAND np_score_test)
   # The setup window's sign-in check: the server's answers read (net/sign_in_check.h).
   add_executable(sign_in_check_test tests/sign_in_check_test.cpp src/replay/json.cpp)
   target_include_directories(sign_in_check_test PRIVATE src)
   add_test(NAME sign_in_check_test COMMAND sign_in_check_test)
+  # The setup window's connection test (net/nat_check.h): the exchange from a
+  # port against a test server of its own on loopback - a router that keeps
+  # one port, one that changes it, none answering, the port check open, closed
+  # and absent - and the server's answers read.
+  add_executable(nat_check_test tests/nat_check_test.cpp src/net/nat_probe.cpp src/net/stun.cpp src/replay/json.cpp)
+  target_include_directories(nat_check_test PRIVATE src)
+  target_link_libraries(nat_check_test PRIVATE Threads::Threads)
+  add_test(NAME nat_check_test COMMAND nat_check_test)
+  set_tests_properties(nat_check_test PROPERTIES TIMEOUT 60)
   add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
   target_include_directories(uncapped_limit_test PRIVATE src)
   add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)
+  add_executable(fg_pace_test tests/fg_pace_test.cpp)
+  target_include_directories(fg_pace_test PRIVATE src)
+  add_test(NAME fg_pace_test COMMAND fg_pace_test)
   add_executable(frame_clock_test tests/frame_clock_test.cpp)
   target_include_directories(frame_clock_test PRIVATE src)
   add_test(NAME frame_clock_test COMMAND frame_clock_test)
@@ -859,6 +997,10 @@ if(UNIX)
   add_executable(gxvk_rest_test tests/gxvk_rest_test.cpp)
   target_include_directories(gxvk_rest_test PRIVATE src include)
   add_test(NAME gxvk_rest_test COMMAND gxvk_rest_test)
+  # Stage 4b.1b/4b.2: the list arena's memo binds a copy only while the guest's bytes are the ones it took (host/list_cb_memo.h).
+  add_executable(list_cb_memo_test tests/list_cb_memo_test.cpp)
+  target_include_directories(list_cb_memo_test PRIVATE src include)
+  add_test(NAME list_cb_memo_test COMMAND list_cb_memo_test)
   # The draw pool's threads by default, counted from the process's affinity (host/gxvk_lists.h pool_threads_for).
   add_executable(pool_threads_test tests/pool_threads_test.cpp src/core/portable.cpp)
   target_include_directories(pool_threads_test PRIVATE src include)
@@ -1094,6 +1236,10 @@ if(UNIX)
   add_executable(clip_control_test tests/clip_control_test.cpp)
   target_include_directories(clip_control_test PRIVATE src)
   add_test(NAME clip_control_test COMMAND clip_control_test)
+  # A texture made after the fill its resource was cleared with, which met no image (tests/fill_pending_test.cpp).
+  add_executable(fill_pending_test tests/fill_pending_test.cpp)
+  target_include_directories(fill_pending_test PRIVATE src)
+  add_test(NAME fill_pending_test COMMAND fill_pending_test)
   # The engine's per-view block found at every screen shape and field of view (tests/view_block_test.cpp).
   add_executable(view_block_test tests/view_block_test.cpp)
   target_include_directories(view_block_test PRIVATE src)
@@ -1248,6 +1394,12 @@ if(UNIX)
     add_test(NAME shader_compile_e2e COMMAND bbhost --compile-selftest ${CMAKE_BINARY_DIR}/shader-compile-e2e)
     set_tests_properties(shader_compile_e2e PROPERTIES TIMEOUT 120)
   endif()
+  # An older options file read and written back by bbhost itself
+  # (host/options.h host_options_selftest), in a folder of its own: Character
+  # motion's Velocity map, Off's name until 2026-11-10, reads as Off and is
+  # written back as Off.
+  add_test(NAME options_file_test COMMAND bbhost --options-selftest ${CMAKE_BINARY_DIR}/options-selftest)
+  set_tests_properties(options_file_test PROPERTIES TIMEOUT 60)
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)

@@ -1,0 +1,35 @@
+The Vulkan backend's memory: a device whose device-local memory is all
+host-visible has no "invisible heap", and findMemoryTypeIndex then found no
+memory for FidelityFX's device-local resources, so every FSR 3 context failed
+at its first resource (FFX_ERROR_BACKEND_API_ERROR from ffxCreateContext).
+A CPU renderer (lavapipe: one memory type, device-local and host-visible)
+is one, as is an integrated GPU whose driver offers no device-local memory
+that the host cannot see. With this change such a device's device-local
+memory is taken when no other is there; every other device chooses as
+before.
+
+A change to AMD FidelityFX SDK v2.4.0's Kits/FidelityFX/backend/vk/ffx_vk.cpp
+(MIT, Copyright (C) Advanced Micro Devices, Inc.; the SDK's
+Kits/FidelityFX/docs/license.md). This change: Copyright (c) 2026 the bbhost
+authors, under the same MIT terms. Applied by tools/fetch_fidelityfx.sh.
+
+--- a/Kits/FidelityFX/backend/vk/ffx_vk.cpp
++++ b/Kits/FidelityFX/backend/vk/ffx_vk.cpp
+@@ -408,6 +408,17 @@
+         }
+     }
+ 
++    // A device whose device-local memory is all host-visible (an integrated GPU, a CPU renderer) has no invisible heap:
++    // its device-local memory then.
++    if (bestCandidate == UINT32_MAX && requestedProperties == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
++        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
++            if ((memRequirements.memoryTypeBits & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & requestedProperties)) {
++                outProperties = memProperties.memoryTypes[i].propertyFlags;
++                return i;
++            }
++        }
++    }
++
+     return bestCandidate;
+ }
+ 

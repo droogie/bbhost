@@ -50,7 +50,43 @@ once over the game, and F10's Game page has the way back in.
   9307; a second instance on one machine takes the next free one).
 - **NAT**: the P2P port learns its public address from a STUN server
   (`online.stun_server`) and both sides punch holes towards each other. When
-  that fails, the server can relay the traffic.
+  that fails, the server can relay the traffic. The setup window's connection
+  test (below) tells which applies to this PC.
+
+## The connection test
+
+The setup window's Game page has a Connection card. **Test connection**
+checks whether other players can reach this PC directly, or whether its
+co-op and PvP go through the server's relay. It runs from the game's own P2P
+port, so it needs the game closed (Play waits for it), and it takes a few
+seconds.
+
+- It sends STUN requests from the P2P port to the server's two test ports
+  (3479 and 3480 at the STUN server's host; `online.nat_test_ports` for a
+  server of your own) and reads the public address and port each one saw:
+  - **Direct connections: yes, your router keeps one port** - the same public
+    port at both: other players can connect to this PC directly.
+  - **You'll use the relay: your router changes ports per destination** - a
+    different port (or address) at each, as symmetric and many carrier-grade
+    NATs do: a direct connection fails, and the relay carries the session.
+  - **UDP is blocked on this network** - no answer at all: online play will
+    not work from this network (a firewall, a VPN, a school or work network).
+- **Incoming**, the port check: one more request asks the server to answer
+  from a third port, which the game never sent anything to. When that answer
+  arrives, the router and this PC's firewall let in a packet nobody asked for
+  (a forwarded port, or a router that does not filter by port), so even
+  players whose routers change ports can connect directly. Closed is common
+  and fine: those players reach you through the relay instead. A server
+  without the check says so.
+- Signed in, the server classifies what it saw from your address and keeps
+  the result for your account, as the website's account page test does, and
+  a server that relays only the players who need it relays you when the
+  result says so. Not signed in, the card shows this PC's own reading, not
+  saved. The server takes 10 tests an hour per account.
+- The card says what the result means, the port the test ran from, and when
+  your account's last test ran (also one taken on the website). F10's Game
+  page repeats the verdict when the setup window opened before the game. The
+  log has one line per test (`connection test: ...`), with no addresses.
 
 ## Beyond the console
 

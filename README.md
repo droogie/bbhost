@@ -215,7 +215,8 @@ game's code or data.
 - [shadPS4](https://github.com/shadps4-emu/shadPS4), a reference for the PS4's
   system behaviour and a working run to compare against.
 - SDL3, Vulkan, FFmpeg, SPIRV-Tools, the DirectX Shader Compiler (DXC),
-  LibAtrac9, Dear ImGui, Monocypher and AMD FidelityFX Super Resolution 1.
+  LibAtrac9, Dear ImGui, Monocypher, AMD FidelityFX Super Resolution 1 and, for
+  FSR 3 on Linux, AMD's FidelityFX SDK.
 - Thanks to the many contributors and testers, incomplete and in no 
   particular order: Metr1k, Kyo, Schorched Knight, ancat, Nox-, Astrelle, 
   BlitzWOLF, CrunchyCheese, foxyhooligans, gkberk, sen, Ultra, droogie
