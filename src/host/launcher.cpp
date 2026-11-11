@@ -2,6 +2,7 @@
 #include "host/launcher.h"
 
 #include "bbhost_version.h"
+#include "core/config.h"
 #include "core/config_move.h"
 #include "core/sha256.h"
 #include "engine/addr.h"
@@ -10,6 +11,8 @@
 #include "host/launcher_ui.h"
 #include "host/options.h"
 #include "net/account.h"
+#include "net/http.h"
+#include "net/nat_job.h"
 #include "host/plugin_ui.h"
 #include "host/shader_compile.h"
 #include "host/updater.h"
@@ -28,6 +31,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <atomic>
@@ -342,6 +346,15 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // Vulkan devices are listed once, off the window's thread.
     int shaders = host_opt_index("shaders") == 1 ? 1 : 0;
     ShaderCompileJob compile_job;
+    // The Connection card's test (net/nat_job.h), from the game's P2P port:
+    // never while the game this window started runs, and Play waits for it.
+    // The button rests 10 s after a test that sent anything, and 10 minutes
+    // after the server said the account's tests this hour are used up.
+    net::nat::Job nat_job;
+    unsigned nat_tests_seen = 0;
+    double nat_wait_until = 0.0;  // ImGui time
+    std::string nat_server;       // the server the last test ran against (server_key)
+    bool nat_scroll = false;      // bring the card into view (the test hook)
     std::mutex devices_mu;
     std::vector<std::string> devices;
     std::atomic<bool> devices_ready{false};
@@ -460,10 +473,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // saving nothing: a look at the window without a person, and the docs'
     // pictures.
     const std::string test_shot = test && !std::strncmp(test, "shot:", 5) ? test + 5 : "";
+    // nattest:DIR runs the connection test as its button does, then saves the
+    // window with the Connection card in view as DIR/connection.png once the
+    // result is shown, and closes; natcard:DIR saves the card as it opens
+    // (once the sign-in check has answered), without a test.
+    const bool nat_hook_test = test && !std::strncmp(test, "nattest:", 8);
+    const std::string test_nat = nat_hook_test ? test + 8 : test && !std::strncmp(test, "natcard:", 8) ? test + 8 : "";
+    int nat_hook_stage = 0;  // 0 waiting to start, 1 testing, 2 the result shown, 3 saved
+    double nat_hook_at = 0.0;
     int shot = 0;  // the picture being waited for: a page, then the bubble
     double shot_at = 1.2;
     ImVec2 patch_row_at(-FLT_MAX, -FLT_MAX);  // a row's middle, for the bubble
-    if (!test_shot.empty()) page = kPageGame;
+    if (!test_shot.empty() || !test_nat.empty()) page = kPageGame;
 
     // The account section's fields (never saved: the name is the account's,
     // the recovery code is typed once to recover).
@@ -493,6 +514,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         apply_server();
         checked_server = server_key();
         net::account_check_start();
+    };
+    // The connection test, at the server the dropdown names: its STUN host's
+    // test ports, from this PC's P2P port, kept for the account when signed in.
+    auto start_nat_test = [&]() {
+        apply_server();
+        net::nat::JobParams p;
+        p.host = net::nat::test_host();
+        p.ports = net::nat::parse_ports(config().nat_test_ports);
+        p.p2p_port = cfg.p2p_port > 0 ? cfg.p2p_port : 9307;
+        if (net::account_logged_in() && !net::account_refused()) p.token = net::account_token();
+        p.save_url = net::auth_server_base() + "/auth/nat_test";
+        if (nat_job.start(p)) nat_server = server_key();
     };
     // What the window says of the sign-in: the account's line and its colour.
     struct SignIn {
@@ -740,7 +773,24 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             page_at = ImGui::GetTime();
         };
         const bool compiling = compile_job.running();
-        const bool can_play = app0_ok && eboot.ok && !compiling && !game;
+        const net::nat::Job::View nat_view = nat_job.view();
+        if (nat_view.tests != nat_tests_seen) {
+            nat_tests_seen = nat_view.tests;
+            const bool limited = nat_view.outcome.save.state == net::nat::SaveReply::State::Limited;
+            if (limited || nat_view.outcome.probe.sent > 0) nat_wait_until = ImGui::GetTime() + (limited ? 600.0 : 10.0);
+        }
+        // The card's result is the last test's while the server chosen is the
+        // one it ran against; else the account's last test (the sign-in
+        // check's), which F10 repeats in the game.
+        const bool nat_ours = nat_view.finished && nat_server == server_key();
+        const net::AccountCheck nat_check = net::account_check();
+        const bool nat_record = !nat_view.running && !nat_ours && nat_check.state == net::AccountCheckState::Valid &&
+                                nat_check.nat_test.present;
+        if (nat_record)
+            net::nat::remember(net::nat::Remembered{true, net::nat::verdict_from_word(nat_check.nat_test.verdict),
+                                                    net::nat::inbound_from_word(nat_check.nat_test.inbound),
+                                                    nat_check.nat_test.tested_at, true});
+        const bool can_play = app0_ok && eboot.ok && !compiling && !game && !nat_view.running;
         bool play = false;
         const SignIn si = sign_in_state();
 
@@ -806,9 +856,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             }
             play = ui::play_button("PLAY", ImVec2(w, play_h), can_play) || (test && !std::strcmp(test, "play") && ++frames > 30);
             if (!can_play && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ui::tooltip(nullptr, game        ? "The game is running; this window comes back when it ends."
-                                     : compiling ? "Play waits for the shader compile (Shaders)."
-                                                 : "Play needs the game folder and the 1.09 eboot (Game).");
+                ui::tooltip(nullptr, game                ? "The game is running; this window comes back when it ends."
+                                     : compiling         ? "Play waits for the shader compile (Shaders)."
+                                     : nat_view.running  ? "Play waits for the connection test (a few seconds): the test has the game's port."
+                                                         : "Play needs the game folder and the 1.09 eboot (Game).");
             ImGui::Dummy(ImVec2(0, 4 * scale));
             const float half = (w - st.ItemSpacing.x) * 0.5f;
             if (ui::ghost_button("Save", ImVec2(half, 0))) save();
@@ -829,6 +880,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 note = "The game is running";
             } else if (compiling) {
                 note = "Waiting for the shader compile";
+            } else if (nat_view.running) {
+                note = "Waiting for the connection test";
             } else if (!can_play) {
                 note = "Needs the game folder and 1.09 eboot";
                 note_col = ui::kWarn;
@@ -850,6 +903,25 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 if (sign_in_note && (si.refused || si.unchecked || !si.in)) ui::tooltip_for_item(nullptr, si.refused ? kRefusedNotice : si.line);
             }
             ImGui::EndChild();
+        }
+        if (!test_nat.empty() && ++frames > 30) {
+            if (nat_hook_stage == 0) {
+                // natcard: once the sign-in check has had its answer (or there is no sign-in).
+                const net::AccountCheckState cs = net::account_check().state;
+                const bool checked = !net::account_logged_in() || (cs != net::AccountCheckState::None && cs != net::AccountCheckState::Checking);
+                if (nat_hook_test) {
+                    start_nat_test();
+                    nat_hook_stage = 1;
+                } else if (checked || frames > 300) {
+                    nat_hook_stage = 2;
+                    nat_hook_at = ImGui::GetTime() + 1.0;
+                }
+            } else if (nat_hook_stage == 1 && !nat_view.running && nat_view.finished) {
+                host_log("setup: connection test test: %s", net::nat::log_line(nat_view.outcome).c_str());
+                nat_hook_stage = 2;
+                nat_hook_at = ImGui::GetTime() + 1.0;
+            }
+            if (nat_hook_stage == 2) nat_scroll = true;
         }
         if (test_link && ++frames > 30) {
             if (!test_created) {
@@ -1273,6 +1345,155 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::EndDisabled();
             }
             ui::card_end();
+
+            // The connection test (net/nat_check.h): can other hunters reach
+            // this PC directly, or does co-op go through the server's relay -
+            // and does a packet nobody asked for get in. From the game's own
+            // P2P port, while the game is not running. The result in words,
+            // what it means, the port it ran from and when; the account's last
+            // test (the sign-in check's) until one runs here.
+            ImGui::Dummy(ImVec2(0, gap - st.ItemSpacing.y));
+            ui::card_begin("##connection", ImVec2(w, 0), "CONNECTION");
+            {
+                namespace nat = net::nat;
+                const int p2p = cfg.p2p_port > 0 ? cfg.p2p_port : 9307;
+                const double now_unix = static_cast<double>(std::time(nullptr));
+                const net::AccountCheck& ac = nat_check;
+                const bool record = nat_record;
+                std::string head = nat::headline(nat::Verdict::None), meaning = nat::meaning(nat::Verdict::None);
+                std::string incoming, detail, note;
+                ImU32 col = ui::kText;
+                ui::Icon icon = ui::Icon::Online;
+                auto look = [&](nat::Verdict v) {
+                    head = nat::headline(v);
+                    meaning = nat::meaning(v);
+                    col = v == nat::Verdict::Direct ? ui::kGood : v == nat::Verdict::Relay ? ui::kIce : ui::kWarn;
+                    icon = v == nat::Verdict::Direct ? ui::Icon::Check : v == nat::Verdict::Relay ? ui::Icon::Info : ui::Icon::Warning;
+                    if (v == nat::Verdict::Blocked) col = ui::kBad;
+                };
+                if (nat_view.running) {
+                    head = "Testing the connection...";
+                    meaning = std::string(nat_view.step) + " From UDP port " + std::to_string(p2p) + "; a few seconds.";
+                    icon = ui::Icon::Refresh;
+                } else if (nat_ours) {
+                    const nat::Outcome& o = nat_view.outcome;
+                    const std::string port = std::to_string(o.probe.local_port);
+                    if (!o.resolved) {
+                        head = "The test server could not be found";
+                        meaning = "Its name did not resolve: check the server chosen above and this PC's network.";
+                        col = ui::kWarn;
+                        icon = ui::Icon::Warning;
+                    } else if (o.probe.error == nat::ProbeResult::Error::PortInUse) {
+                        head = "UDP port " + port + " is in use: close the game to test";
+                        meaning = "Another program has the game's P2P port - most likely bbhost itself, running the game. The "
+                                  "test sends from that port, so it runs while the game is closed.";
+                        col = ui::kWarn;
+                        icon = ui::Icon::Warning;
+                    } else if (o.probe.error != nat::ProbeResult::Error::None) {
+                        head = "The test could not use UDP port " + port;
+                        meaning = o.probe.error_text.empty() ? std::string("The test was stopped.") : o.probe.error_text + ".";
+                        col = ui::kWarn;
+                        icon = ui::Icon::Warning;
+                    } else {
+                        look(o.shown());
+                        if (o.local != nat::Verdict::Blocked) incoming = nat::inbound_line(o.inbound, o.probe.local_port, o.shown());
+                        std::string ports = nat::public_ports(o.probe);
+                        detail = "Tested from UDP port " + port + " (the game's P2P port)" + (ports.empty() ? "" : ": the server saw " + ports) +
+                                 ". " + capitalised(nat::ago(o.at, now_unix)) + "; ";
+                        if (o.saved()) {
+                            detail += "saved to your account for this network (test again on another one).";
+                            if (o.save.verdict != o.local)
+                                note = std::string("This PC's own reading was \"") + nat::verdict_word(o.local) +
+                                       "\": the server compares what reached it from the address this request came from, and a VPN or "
+                                       "proxy for web traffic can make the two differ.";
+                        } else if (!o.signed_in) {
+                            detail += "this PC's own reading, not saved to your account.";
+                            note = o.local == nat::Verdict::Relay
+                                       ? "Sign in (above) and test again: the server then knows to relay you, and other hunters can reach you."
+                                       : "Sign in (above) and test again to keep it for your account; the server goes by the kept result.";
+                        } else {
+                            detail += "not saved to your account: " + nat::unsaved_reason(o) + ".";
+                        }
+                    }
+                } else if (record) {
+                    const nat::Verdict v = nat::verdict_from_word(ac.nat_test.verdict);
+                    look(v);
+                    const nat::Inbound in = nat::inbound_from_word(ac.nat_test.inbound);
+                    if (in != nat::Inbound::NotTested) incoming = nat::inbound_line(in, ac.nat_test.port > 0 ? ac.nat_test.port : p2p, v);
+                    const std::string when = "Your account's last test, " + nat::ago(ac.nat_test.tested_at, now_unix);
+                    detail = ac.nat_test.port == p2p ? when + ", from this PC's P2P port (UDP " + std::to_string(p2p) + ")."
+                             : ac.nat_test.port > 0 ? when + ", from UDP port " + std::to_string(ac.nat_test.port) +
+                                                          "; this PC's P2P port is UDP " + std::to_string(p2p) + ": test again for it."
+                                                    : when + ", on the website or from another PC: test again for this PC's own (UDP " +
+                                                          std::to_string(p2p) + ").";
+                } else {
+                    detail = "Runs from UDP port " + std::to_string(p2p) + " (the game's P2P port, online.p2p_port)" +
+                             (si.in ? std::string(" and is kept for your account.") : std::string("; sign in (above) to keep the result for your account."));
+                }
+                const float fh = ImGui::GetFrameHeight();
+                const ImVec2 at = ImGui::GetCursorScreenPos();
+                const float right = at.x + ImGui::GetContentRegionAvail().x;
+                const char* label = nat_view.running ? "Testing..." : (nat_ours || record) ? "Test again" : "Test connection";
+                const float bw = std::max(ImGui::CalcTextSize("Test connection").x, ImGui::CalcTextSize(label).x) + st.FramePadding.x * 4;
+                ImGui::Dummy(ImVec2(fh * 0.8f, fh));
+                ui::draw_icon(ImGui::GetWindowDrawList(), icon, at + ImVec2(fh * 0.4f, fh * 0.5f), fh * 0.62f, col);
+                ImGui::SameLine(0, 8 * scale);
+                ImGui::BeginGroup();
+                ImGui::PushTextWrapPos(right - bw - 14 * scale - ImGui::GetWindowPos().x);
+                ImGui::AlignTextToFramePadding();
+                ImGui::PushFont(ui::font_strong(), 0.0f);
+                ImGui::PushStyleColor(ImGuiCol_Text, col);
+                ImGui::TextUnformatted(head.c_str());
+                ImGui::PopStyleColor();
+                ImGui::PopFont();
+                ImGui::PushFont(nullptr, 14.0f);
+                ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextDim);
+                ImGui::TextUnformatted(meaning.c_str());
+                ImGui::PopStyleColor();
+                if (!incoming.empty()) {
+                    ImGui::Dummy(ImVec2(0, 1 * scale));
+                    ImGui::TextUnformatted(incoming.c_str());
+                }
+                if (!detail.empty()) {
+                    ImGui::Dummy(ImVec2(0, 1 * scale));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextFaint);
+                    ImGui::TextUnformatted(detail.c_str());
+                    ImGui::PopStyleColor();
+                }
+                if (!note.empty()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::kWarn);
+                    ImGui::TextUnformatted(note.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::PopFont();
+                ImGui::PopTextWrapPos();
+                ImGui::EndGroup();
+                const float bottom = ImGui::GetItemRectMax().y;
+                ImGui::SetCursorScreenPos(ImVec2(right - bw, at.y));
+                const double wait = nat_wait_until - ImGui::GetTime();
+                const bool can_test = !nat_view.running && !game && wait <= 0;
+                if (ui::primary_button(label, ImVec2(bw, 0), can_test)) start_nat_test();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    const std::string what = "Sends a few UDP packets from the game's P2P port (UDP " + std::to_string(p2p) +
+                                             ") to the server's two test ports, and one the server answers from a third port, "
+                                             "then asks the server what it saw. A few seconds; the game must be closed.";
+                    const std::string why = game ? std::string("The game is running: the test needs its port. Test from here while the game is closed.")
+                                            : nat_view.running ? std::string("The test is running.")
+                                            : wait > 0 && nat_view.outcome.save.state == nat::SaveReply::State::Limited
+                                                ? "The server takes 10 tests an hour; try again in " + std::to_string(static_cast<int>(wait / 60) + 1) + " minutes."
+                                            : wait > 0 ? "Again in " + std::to_string(static_cast<int>(wait) + 1) + " s."
+                                                       : std::string(si.in ? "Signed in, the result is kept for your account: the server relays you when you need it."
+                                                                           : "Not signed in: the result is this PC's own and is not kept.");
+                    ui::tooltip("Connection test", what, why);
+                }
+                ImGui::SetCursorScreenPos(ImVec2(at.x, std::max(bottom, at.y + fh)));
+                ImGui::Dummy(ImVec2(0, 0));
+            }
+            ui::card_end();
+            if (nat_scroll) {
+                ImGui::SetScrollHereY(1.0f);
+                nat_scroll = false;
+            }
 
             // Caches that are not this bbhost's or this driver's: one line,
             // once there is a game to compile them for.
@@ -1753,6 +1974,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         );
         SDL_RenderClear(ren);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
+        if (nat_hook_stage == 2 && ImGui::GetTime() >= nat_hook_at) {
+            const std::string file = test_nat + "/connection.png";
+            if (SDL_Surface* s = SDL_RenderReadPixels(ren, nullptr)) {
+                if (!SDL_SavePNG(s, file.c_str())) host_log("setup: shot: %s: %s", file.c_str(), SDL_GetError());
+                SDL_DestroySurface(s);
+            }
+            host_log("setup: shot %s", file.c_str());
+            nat_hook_stage = 3;
+            done = true;
+        }
         if (!test_shot.empty() && ImGui::GetTime() >= shot_at) {
             const std::string name = shot < kPageCount ? kPages[shot].slug : "patches-bubble";
             char path[64];

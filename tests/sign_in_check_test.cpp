@@ -83,12 +83,35 @@ void unchecked() {
     check(read(500, R"({"ResKind":0,"OnlineId":"Hunter"})").verdict == SignInVerdict::Unchecked, "ResKind 0 on a 500");
 }
 
+// whoami's NatTest: the account's last connection test, for the setup
+// window's Connection card - bbhost's with its port check and port, the
+// website's without, none, and shapes that are not one.
+void nat_test() {
+    const net::SignInReply b = read(200, R"({"ResKind":0,"OnlineId":"Hunter","NatTest":{"Verdict":"relay","TestedAt":1794268800.5,)"
+                                         R"("Inbound":"closed","Port":9307}})");
+    check(b.nat_test.present && b.nat_test.verdict == "relay", "bbhost's test: its verdict");
+    check(b.nat_test.tested_at == 1794268800.5, "its time");
+    check(b.nat_test.inbound == "closed" && b.nat_test.port == 9307, "its port check and port");
+    const net::SignInReply w = read(200, R"({"ResKind":0,"OnlineId":"Hunter","NatTest":{"Verdict":"direct","TestedAt":5}})");
+    check(w.nat_test.present && w.nat_test.verdict == "direct" && w.nat_test.inbound.empty() && w.nat_test.port == 0,
+          "the website's test: no port check");
+    check(!read(200, R"({"ResKind":0,"OnlineId":"Hunter","NatTest":null})").nat_test.present, "no test yet");
+    check(!read(200, R"({"ResKind":0,"OnlineId":"Hunter"})").nat_test.present, "a server without NatTest");
+    check(!read(200, R"({"ResKind":0,"OnlineId":"Hunter","NatTest":{"Verdict":"direct"}})").nat_test.present, "no time: none");
+    check(!read(200, R"({"ResKind":0,"OnlineId":"Hunter","NatTest":"direct"})").nat_test.present, "not an object: none");
+    check(read(200, R"({"ResKind":0,"OnlineId":"Hunter","NatTest":{"Verdict":"direct","TestedAt":5,"Port":70000}})").nat_test.port == 0,
+          "a port out of range is left out");
+    check(!read(200, R"({"ResKind":1,"Message":"no such token","NatTest":{"Verdict":"direct","TestedAt":5}})").nat_test.present,
+          "a refusal carries none");
+}
+
 }  // namespace
 
 int main() {
     valid();
     refused();
     unchecked();
+    nat_test();
     if (g_fail) {
         std::printf("%d failed\n", g_fail);
         return 1;

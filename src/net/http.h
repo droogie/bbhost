@@ -32,6 +32,9 @@ struct HttpCall {
     // that sets this too (HTTP keep-alive), instead of a new connection and
     // TLS handshake every time.
     bool keep_connection = false;
+    // Over IPv4 only: the connection test's request, which the server matches
+    // by address with the test's datagrams (IPv4 alone; net/nat_check.h).
+    bool ipv4_only = false;
 };
 
 // online.np_server from the config, else "<online.scheme>://<online.host>:18671".
@@ -44,6 +47,8 @@ bool auth_post(const std::string& path, const json::Value& body, json::Value& ou
 
 HttpResult http_get(const std::string& url, int timeout_ms = 5000);
 HttpResult http_post_json(const std::string& url, const json::Value& body, int timeout_ms = 5000);
+// The same with a call's own limits (HttpCall).
+HttpResult http_post_json(const std::string& url, const json::Value& body, const HttpCall& call);
 
 // POST/GET to "<np_server_base><path>" and parse the JSON reply. Returns
 // false (with `error`) on a transport error, a non-2xx status, or a body

@@ -20,6 +20,7 @@
 #include "hle/modules.h"
 #include "hle/np.h"
 #include "net/account.h"
+#include "net/nat_job.h"
 #include "log.h"
 
 #include <algorithm>
@@ -31,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -2402,6 +2404,23 @@ void account_page() {
         ImGui::PopFont();
         ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextDim);
         ImGui::TextUnformatted(hle_np_online_status().c_str());
+        // The connection test's verdict as the setup window had it before
+        // the game started (its own test, or the account's last one): the
+        // test itself runs only there, from the game's port while the game
+        // is closed. Nothing when the setup window did not open.
+        if (const net::nat::Remembered c = net::nat::remembered(); c.known) {
+            const double now = static_cast<double>(std::time(nullptr));
+            ImGui::TextUnformatted(("Connection test (" + net::nat::ago(c.at, now) + (c.saved ? "" : ", not saved") +
+                                    "): " + net::nat::headline(c.verdict))
+                                       .c_str());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+                ui::tooltip("Connection test",
+                            std::string(net::nat::meaning(c.verdict)) +
+                                (c.inbound != net::nat::Inbound::NotTested
+                                     ? " " + net::nat::inbound_line(c.inbound, config().p2p_port > 0 ? config().p2p_port : 9307, c.verdict)
+                                     : std::string()),
+                            "The setup window's Game page runs it again (bbhost --setup, while the game is closed).");
+        }
         ImGui::PopStyleColor();
         ImGui::EndGroup();
     }

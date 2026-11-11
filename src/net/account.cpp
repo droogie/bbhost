@@ -153,7 +153,7 @@ void account_check_start(int timeout_ms) {
         name = g_name;
         signin = g_signin;
         mine = ++g_check_serial;
-        g_check = AccountCheck{AccountCheckState::Checking, name, "", 0};
+        g_check = AccountCheck{AccountCheckState::Checking, name, "", 0, {}};
     }
     // The server the caller has chosen now (the setup window's dropdown).
     const std::string url = auth_server_base() + "/auth/whoami";
@@ -170,6 +170,7 @@ void account_check_start(int timeout_ms) {
             g_check.status = v.status;
             if (v.verdict == SignInVerdict::Valid) {
                 g_check.state = AccountCheckState::Valid;
+                g_check.nat_test = v.nat_test;
                 g_refused = false;
             } else if (v.verdict == SignInVerdict::Refused) {
                 g_check.state = AccountCheckState::Refused;

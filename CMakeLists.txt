@@ -162,6 +162,8 @@ add_executable(bbhost
   src/net/http.cpp
   src/net/session.cpp
   src/net/stun.cpp
+  src/net/nat_probe.cpp
+  src/net/nat_job.cpp
   src/hle/np_matching2.cpp
   src/hle/np_signaling.cpp
   src/host/window.cpp
@@ -882,6 +884,15 @@ if(UNIX)
   add_executable(sign_in_check_test tests/sign_in_check_test.cpp src/replay/json.cpp)
   target_include_directories(sign_in_check_test PRIVATE src)
   add_test(NAME sign_in_check_test COMMAND sign_in_check_test)
+  # The setup window's connection test (net/nat_check.h): the exchange from a
+  # port against a test server of its own on loopback - a router that keeps
+  # one port, one that changes it, none answering, the port check open, closed
+  # and absent - and the server's answers read.
+  add_executable(nat_check_test tests/nat_check_test.cpp src/net/nat_probe.cpp src/net/stun.cpp src/replay/json.cpp)
+  target_include_directories(nat_check_test PRIVATE src)
+  target_link_libraries(nat_check_test PRIVATE Threads::Threads)
+  add_test(NAME nat_check_test COMMAND nat_check_test)
+  set_tests_properties(nat_check_test PROPERTIES TIMEOUT 60)
   add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
   target_include_directories(uncapped_limit_test PRIVATE src)
   add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)
