@@ -89,9 +89,12 @@ W=/src/build-linux-portable
 P=$W/prefix
 # libstdc++ 14, not 24.04's default 13: the HLE libc calls std::acosf and friends,
 # which libstdc++ has only had since 14. Clang takes the newest GCC it finds.
-if [ ! -x /usr/bin/clang ] || [ ! -f /usr/lib/x86_64-linux-gnu/libSPIRV-Tools-opt.a ] || [ ! -d /usr/include/c++/14 ]; then
+# curl and patch: the configure step fetches the pinned SDKs (tools/fetch_ngx.sh,
+# tools/fetch_fidelityfx.sh, tools/fetch_dxc.sh) into their caches in this tree
+# and patches AMD's sources.
+if [ ! -x /usr/bin/clang ] || [ ! -f /usr/lib/x86_64-linux-gnu/libSPIRV-Tools-opt.a ] || [ ! -d /usr/include/c++/14 ] || [ ! -x /usr/bin/patch ] || [ ! -x /usr/bin/curl ]; then
     apt-get update -q > /tmp/apt-update.log 2>&1
-    apt-get install -y -q --no-install-recommends clang lld llvm cmake ninja-build pkg-config make nasm \
+    apt-get install -y -q --no-install-recommends clang lld llvm cmake ninja-build pkg-config make nasm patch curl \
         libstdc++-14-dev libcurl4-openssl-dev libvulkan-dev zlib1g-dev spirv-tools \
         libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev \
         libxkbcommon-dev libwayland-dev wayland-protocols libegl-dev libdecor-0-dev libpulse-dev \
@@ -138,6 +141,6 @@ cmake -S /src -B "$W/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc -fuse-ld=lld" \
     -DCMAKE_MODULE_LINKER_FLAGS="-static-libgcc -fuse-ld=lld" > "$W/bbhost-configure.log"
 grep -E "^-- bbhost" "$W/bbhost-configure.log" || true
-cmake --build "$W/build" --target bbhost bb_plugin_hello bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_debug_menu ${PORTABLE_TARGETS:-} -j"$(nproc)" > "$W/bbhost-build.log" 2>&1 \
+cmake --build "$W/build" --target bbhost bb_plugin_hello bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_iso bb_plugin_debug_menu ${PORTABLE_TARGETS:-} -j"$(nproc)" > "$W/bbhost-build.log" 2>&1 \
     || { grep -E "error|undefined" "$W/bbhost-build.log" | head -30; exit 1; }
 echo "portable build: $W/build/bbhost"

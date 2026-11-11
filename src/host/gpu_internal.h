@@ -571,6 +571,7 @@ struct Gpu {
     // in GL's clip space (PA_CL_CLIP_CNTL's DX_CLIP_SPACE_DEF clear) clips z
     // at -w as the PS4 does, not at 0 (GfxFixedState::gl_clip_space).
     bool has_depth_clip_control = false;
+    bool compute_derivatives = false;  // VK_KHR_compute_shader_derivatives on, for FSR 3's shaders (host/upscaler.h)
     // Graphics constant buffers, pushed per draw into set 2 (cb_push_on()):
     // the vertex stage's at bindings 112-127, the pixel stage's at 128-143.
     VkDescriptorSetLayout cb_push_layout = VK_NULL_HANDLE;

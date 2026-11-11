@@ -31,6 +31,20 @@ Requirements:
   `-DBBHOST_NGX=OFF`, or no network, builds without it: DLSS is then off and
   everything else is the same. `tools/fetch_ngx.sh runtime build` puts
   NVIDIA's DLSS runtime beside `build/bbhost`, for DLSS on an RTX card
+- for FSR 3, AMD's FidelityFX SDK source (its API, Vulkan backend and FSR 3
+  upscaler, MIT), which the configure step fetches from AMD's FidelityFX SDK
+  repository with `tools/fetch_fidelityfx.sh`, each file pinned by SHA-256
+  and patched by `third_party/fidelityfx/patches` (kept in `build/fidelityfx`,
+  `FFX_CACHE` elsewhere; it needs `patch`), and DXC's command-line compiler
+  (`tools/fetch_dxc.sh linux-cli`, from the same pinned release). The build
+  compiles FSR 3's shaders into the permutation headers AMD's source includes
+  (`tools/ffx_permutations.py`: every blob through `spirv-val`, so it needs
+  SPIRV-Tools' `spirv-val` and `python3`) and links
+  `build/libbbhost_fidelityfx_vk.so`, bbhost's FidelityFX library (AMD's
+  source with `src/ffx_vk`'s portability files, MIT, not GPL; it exports the
+  FidelityFX API alone), which bbhost loads at run time from beside itself.
+  `-DBBHOST_FFX=OFF`, or no network, builds without it: FSR is then off on
+  Linux and everything else is the same
 
 On Arch Linux the packages are `vulkan-headers vulkan-icd-loader sdl3 ffmpeg
 curl zlib spirv-tools`. On Ubuntu 24.04 the distribution's Vulkan headers and
@@ -186,10 +200,13 @@ SHA-256 with its licence, and Numity1504's `upscaler_bridge.dll`. The Linux
 package carries DLSS the same way: the NGX bridge the build made and NVIDIA's
 `libnvidia-ngx-dlss.so.310.9.16` (`tools/fetch_ngx.sh runtime`), with their
 licences in `licenses/dlss`, `licenses/ngx_bridge` and
-`licenses/upscaler_bridge`; the Steam Deck kit leaves them out. None of
-NVIDIA's or AMD's files is in the repository, and bbhost itself links none of
-their code. `tools/check_release_bundle.sh` fails a release whose Windows or
-Linux package lacks them, or whose Steam Deck kit has DLSS's.
+`licenses/upscaler_bridge`; the Steam Deck kit leaves them out. The Linux
+package and the Steam Deck kit carry FSR 3: the FidelityFX library the build
+made, from the same SDK tag as the Windows DLLs (so both run FSR 3.1.6), with
+AMD's licence and bbhost's in `licenses/fidelityfx`. None of NVIDIA's or
+AMD's files is in the repository, and bbhost itself links none of their code.
+`tools/check_release_bundle.sh` fails a release whose Windows or Linux
+package or Steam Deck kit lacks its files, or whose Steam Deck kit has DLSS's.
 
 The Windows and Linux packages (and so the Steam Deck kit) carry the pipeline
 list beside the executable, `pipeline-list.bin`: every pipeline a tour of the

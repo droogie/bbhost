@@ -17,6 +17,7 @@ inline std::uint32_t g_vendor = 0x1002;  // AMD
 inline const char* g_name = "Pretend AMD GPU";
 inline VkDriverId g_driver = VK_DRIVER_ID_MESA_RADV;
 inline int g_instances = 0, g_live_instances = 0, g_barriers = 0;
+inline bool g_quad_compute = true;  // subgroup quad operations in compute shaders (FSR 3 needs them)
 
 inline VkInstance instance() { return reinterpret_cast<VkInstance>(static_cast<std::uintptr_t>(0x1000)); }
 inline VkPhysicalDevice physical_device() { return reinterpret_cast<VkPhysicalDevice>(static_cast<std::uintptr_t>(0x2000)); }
@@ -49,6 +50,11 @@ VKAPI_ATTR inline void VKAPI_CALL get_properties2(VkPhysicalDevice, VkPhysicalDe
             auto* d = reinterpret_cast<VkPhysicalDeviceDriverProperties*>(s);
             d->driverID = g_driver;
             std::snprintf(d->driverName, sizeof(d->driverName), "%s", g_driver == VK_DRIVER_ID_MESA_NVK ? "NVK" : "pretend driver");
+        } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES) {
+            auto* sg = reinterpret_cast<VkPhysicalDeviceSubgroupProperties*>(s);
+            sg->subgroupSize = 64;
+            sg->supportedStages = g_quad_compute ? VK_SHADER_STAGE_COMPUTE_BIT : 0;
+            sg->supportedOperations = g_quad_compute ? VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT : 0;
         }
 }
 VKAPI_ATTR inline void VKAPI_CALL get_features2(VkPhysicalDevice, VkPhysicalDeviceFeatures2*) {}

@@ -78,6 +78,21 @@ void exit_reports();  // the reports a run prints when ended from outside (below
 [[noreturn]] void device_lost_exit(bool windowed);  // the GPU is gone: tell the player, end (below)
 
 namespace {
+// The exit's steps, for the watchdog (host/sampler.h sampler_note_exit): one
+// line when a step stands still 4 s, every thread's stack past 30 s. On the
+// window's thread (g_exit_pumps set there) the window is pumped between them,
+// so a long exit reads "Not Responding" only while one step is stuck.
+std::atomic<bool> g_exit_pumps{false};
+void exit_step(const char* step) {
+    sampler_note_exit(step);
+    if (g_exit_pumps.load(std::memory_order_relaxed)) {
+        sampler_note_pump();
+        host_window_pump();
+    }
+}
+}  // namespace
+
+namespace {
 
 struct GuestLaunch {
     GuestStart fn = nullptr;
@@ -146,12 +161,18 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
     auto pump_until_done = [&](auto is_done) {
         while (!is_done()) {
             if (host_gpu_device_lost()) device_lost_exit(windowed);
+            if (windowed) sampler_note_pump();  // the watchdog's "Not Responding" stacks (host/sampler.h)
             if (windowed && !host_window_pump()) {
                 host_log("window closed");
+                exit_step("perf_meter_exit (the window closed)");
                 perf_meter_exit();
+                exit_step("saving the pipeline cache (the window closed)");
                 host_gpu_save_pipeline_cache_at_exit();
+                exit_step("hle_kernel_memory_report (the window closed)");
                 hle_kernel_memory_report();
+                exit_step("host_window_stop (the window closed)");
                 host_window_stop();
+                exit_step("write_pgo_profile (the window closed)");
                 write_pgo_profile();
                 _exit(0);
             }
@@ -177,6 +198,7 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 // not stopped (that waits for the GPU lock the command
                 // processor may hold), the process just ends.
                 host_log("exit: flip %llu reached (BBHOST_EXIT_FLIP)", static_cast<unsigned long long>(exit_flip));
+                g_exit_pumps.store(windowed);
                 exit_reports();
                 // The cache save takes the GPU lock, which the command
                 // processor (still running) may hold for good: a helper
@@ -186,8 +208,12 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                     host_gpu_save_pipeline_cache_at_exit();
                     saved.store(true);
                 }).detach();
-                for (int i = 0; i < 100 && !saved.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                for (int i = 0; i < 100 && !saved.load(); ++i) {
+                    exit_step("waiting for the pipeline cache's save");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
                 if (!saved.load()) host_log("exit: the pipeline cache save did not finish in 5 s; leaving without it");
+                exit_step("write_pgo_profile");
                 write_pgo_profile();
                 std::fflush(nullptr);
 #if defined(_WIN32)
@@ -332,10 +358,17 @@ void device_lost_exit(bool windowed) {
             closed.store(true);
         }).detach();
         const int ticks = test ? 30 : 1200;  // 3 s / 2 min
-        for (int i = 0; i < ticks && !closed.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        g_exit_pumps.store(true);  // the game's window answers while the box is up
+        for (int i = 0; i < ticks && !closed.load(); ++i) {
+            exit_step("showing the device-lost message");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     }
     // A save being written finishes first (up to 10 s).
-    for (int i = 0; i < 100 && hle_save_writable_mounts() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (int i = 0; i < 100 && hle_save_writable_mounts() > 0; ++i) {
+        exit_step("waiting for a save to be written");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     exit_reports();
     // The pipelines built so far, for a quicker next start: the save takes the
     // GPU lock a stuck thread may hold, so a helper does it, waited for 5 s.
@@ -344,7 +377,10 @@ void device_lost_exit(bool windowed) {
         host_gpu_save_pipeline_cache_at_exit();
         saved.store(true);
     }).detach();
-    for (int i = 0; i < 100 && !saved.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    for (int i = 0; i < 100 && !saved.load(); ++i) {
+        exit_step("waiting for the pipeline cache's save");
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     std::fflush(nullptr);
 #if defined(_WIN32)
     TerminateProcess(GetCurrentProcess(), 3);
@@ -353,20 +389,37 @@ void device_lost_exit(bool windowed) {
 }
 
 void exit_reports() {
+    // Each report a step (exit_step): named for the watchdog, the window pumped
+    // between them on its thread.
+    exit_step("perf_meter_exit");
     perf_meter_exit();
+    exit_step("hle_gx_scaleform_report");
     hle_gx_scaleform_report();
+    exit_step("hle_gnm_cp_report");
     hle_gnm_cp_report();
+    exit_step("gx_resources_report");
     gx_resources_report();
+    exit_step("params_report");
     params_report();
+    exit_step("hle_bp_report");
     hle_bp_report();
+    exit_step("hle_watch_report");
     hle_watch_report();
+    exit_step("hle_kernel_memory_report");
     hle_kernel_memory_report();
+    exit_step("frame_pool_report");
     frame_pool_report();
+    exit_step("key_prompts_report");
     key_prompts_report();
+    exit_step("decomp_report");
     decomp_report();
+    exit_step("mouse_camera_report");
     mouse_camera_report();
+    exit_step("fmod_ring_report");
     fmod_ring_report();
+    exit_step("sf_text_layout_report");
     sf_text_layout_report();
+    exit_step("the reports written");
 }
 
 #if !defined(_WIN32)

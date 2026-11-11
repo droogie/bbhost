@@ -111,6 +111,25 @@ while IFS= read -r exe; do
             ;;
     esac
 done < <(find "$work" -mindepth 3 -maxdepth 3 -type f -name bbhost)
+# FSR 3 on Linux beside each Linux executable, the Steam Deck kit's too:
+# bbhost's build of AMD's FidelityFX library (src/ffx_vk, BBHOST_FFX,
+# tools/fetch_fidelityfx.sh) with AMD's licence and bbhost's for its own files;
+# it exports the FidelityFX API and nothing else, and AMD's code is in it
+# alone, never in bbhost (without it the release has no FSR on Linux).
+amd_licence=$(dirname "$0")/../third_party/fidelityfx/LICENSE-signedbin.md
+while IFS= read -r exe; do
+    b=$(dirname "$exe")
+    lib=$b/libbbhost_fidelityfx_vk.so
+    [ -f "$lib" ] || fail "${b#"$work"/}: no libbbhost_fidelityfx_vk.so beside bbhost (FSR 3 on Linux: BBHOST_FFX, tools/fetch_fidelityfx.sh)"
+    exports=$(nm -D --defined-only "$lib" | awk '{print $3}' | sort | tr '\n' ' ')
+    [ "$exports" = "ffxConfigure ffxCreateContext ffxDestroyContext ffxDispatch ffxQuery " ] ||
+        fail "${lib#"$work"/}: exports $exports, not the FidelityFX API alone"
+    for l in fidelityfx/LICENSE.md fidelityfx/LICENSE-bbhost.txt; do
+        [ -f "$b/licenses/$l" ] || fail "${b#"$work"/}: no licenses/$l"
+    done
+    cmp -s "$b/licenses/fidelityfx/LICENSE.md" "$amd_licence" || fail "${b#"$work"/}: licenses/fidelityfx/LICENSE.md is not AMD's (third_party/fidelityfx)"
+    if nm "$exe" 2> /dev/null | grep -q ffxFsr3UpscalerContextCreate; then fail "${exe#"$work"/}: AMD's FidelityFX code in bbhost itself"; fi
+done < <(find "$work" -mindepth 3 -maxdepth 3 -type f -name bbhost)
 # What a first start writes (core/config.cpp's template), in each executable.
 for b in "$d"/bbhost "$d"/bbhost.exe; do
     [ -f "$b" ] || continue
@@ -121,4 +140,4 @@ for b in "$d"/bbhost "$d"/bbhost.exe; do
     done
 done
 if [ -n "$list_sha" ]; then listmsg="and the pinned pipeline list (${list_sha:0:12}) beside each executable"; else listmsg="beside each executable (no pipeline list pinned yet)"; fi
-echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg; the Windows ones in UTF-8 with FidelityFX, DLSS and the upscaler bridge; the Linux ones with DLSS and the NGX bridge, the Steam Deck's without"
+echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg; the Windows ones in UTF-8 with FidelityFX, DLSS and the upscaler bridge; the Linux ones with FSR 3 (bbhost's FidelityFX library), DLSS and the NGX bridge, the Steam Deck's with FSR 3 and without DLSS"

@@ -517,8 +517,12 @@ struct GpuMemoryGlance {
     bool cache_known = false, integrated = false;
 };
 bool host_gpu_memory_glance(GpuMemoryGlance& out);
-// The video memory census run now, not logged (for the counter's cache).
-void host_gpu_memory_census_refresh();
+// The video memory census run now, not logged (for the counter's cache) -
+// only if the renderer's lock is free this moment: the window's thread asks,
+// and never waits for that lock (a renderer stopped behind a present that
+// does not come back would stop the window too, "Not Responding"). False when
+// the lock was taken: asked again later.
+bool host_gpu_memory_census_refresh();
 // The guest memory imports the command processor waited for so far - made at
 // a binding, a device address or a walk, not by the import thread - and the
 // driver's time they took (the frames and stall lines' "imports waited for").
@@ -892,6 +896,9 @@ void host_gpu_log_video_memory(bool at_exit);  // the same, logged a line a call
 // Serialises queue use between the presenter and the executor.
 void host_gpu_lock();
 void host_gpu_unlock();
+// Where the renderer's lock was taken by whoever holds it now ("none" when
+// free), for the watchdog's lines (host/sampler.h).
+std::string host_gpu_lock_holder();
 // The renderer's queue is shared with its submission thread: the presenter
 // (and anything else outside gpu.cpp) takes this around a direct submit,
 // present or wait on it. It waits for the thread's pending submissions first,

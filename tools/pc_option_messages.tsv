@@ -36,14 +36,14 @@
 110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Additions to the game, each for the next start: the mirror, rebirth, five players and more.
-110014	PC Upscaling	TAA, FSR, DLSS and frame generation: the upscaler, quality, sharpness, character motion, reflections.
+110014	PC Upscaling	TAA, FSR, DLSS, frame generation (Windows): quality, sharpness, character motion, reflections.
 116000	Vertical Sync	Wait for the display. Off can tear.
 116001	Fullscreen	Fill the screen: Borderless, or Fullscreen where Window mode (F10) says so.
 116009	Stay Borderless	Borderless never turns into exclusive fullscreen. AMD cards: may lower the frame rate.
 116002	Mouse in Menus	Move and click to select.
 116003	Draw the Pointer	Show the mouse pointer.
 116004	Skip Company Logos	Skips the logos and the Exit Game warning at startup. Applies on the next run.
-116005	Frame Rate	Applies on the next run. 30 is the game's own pace. Display-Limited runs at your refresh rate.
+116005	Frame Rate	30 is the game's own pace. Display-Limited: refresh rate, half with frame generation (Windows).
 116008	Texture Quality	Textures' size in video memory: Medium is half each way, Low a quarter. Changes at once.
 116045	Lowest
 116042	Low
@@ -181,10 +181,10 @@
 14000335	Accept Rebirth	
 14000336	Undo Rebirth	
 125020	PC Upscaling	
-125000	Frame Generation	A frame made between each two of the game's. The game then runs at most half your refresh rate.
+125000	Frame Generation	A frame made between each two of the game's. The game runs at half your refresh rate, or less.
 125001	Sharpness	Sharpens the 3D after TAA, FSR or DLSS; 0 leaves it as it is. Needs Upscaling on.
 125002	Reflection Quality	Reflection resolution: Quarter is about four times cheaper; Half is the game's own, sharper.
-125003	Upscaling	Replaces the game's AA: TAA or FSR 3 (any GPU), FSR 4 (AMD, where offered) or DLSS (NVIDIA RTX).
+125003	Upscaling	Replaces the game's AA: TAA or FSR 3 (any GPU), FSR 4 (AMD, Windows only) or DLSS (NVIDIA RTX).
 125004	Upscaling Quality	The 3D's drawn size: Performance half, Balanced 59%, Quality two thirds, Native AA full size.
 125005	TAA Strength	How much TAA smooths: higher is steadier but may leave a faint trail, lower crisper. Default 5.
 125006	Character Motion	Precise: each character's own motion, clean edges, about 1% at 4K. Velocity Map: softer edges.

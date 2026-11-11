@@ -109,10 +109,12 @@ inline bool times() { return g_times; }
 // it commits nothing and the command processor draws every GX-native draw in
 // order, as with the pool off (the constant buffers' homes on as before). It
 // rests while a frame cap holds the frame, while the frame is the GPU's, and
-// wherever the command processor drawing in order does not hold the game
-// back - found while it works by a probe now and then (a rest of three
-// half-second windows) - and works where it does. A loading screen changes
-// nothing. BBHOST_GXVK_LISTS_REST=0: it never rests.
+// wherever resting costs the frame nothing - measured at the place by an
+// experiment now and then (the other state for 5.5 s and back, its frame rate
+// against the windows on either side) - and works anywhere else.
+// Each place after a loading screen starts working. BBHOST_GXVK_LISTS_REST=0:
+// it never rests; =always: it always does (what resting costs against the pool
+// off); BBHOST_GXVK_LISTS_REST_LOG=1: every window of the rule in the log.
 extern std::atomic<bool> g_resting;
 inline bool resting() { return g_resting.load(std::memory_order_relaxed); }
 // The main loop's frame limiter, once a frame (engine/frame_rate.cpp): how long

@@ -235,8 +235,14 @@ Setting g_set[kSettingCount] = {
     // game's own 30 the game is converted then, and a converted game taken to
     // 30 stays converted.
     {"frame_cap", "Frame rate", {"30", "60", "90", "120", "150", "180", "240", "360", "480", "960", "Display-Limited"}, 0,
+#if defined(_WIN32)
+     "30 is the game's own pace; the others run its logic at that rate. Display-Limited runs it at your monitor's refresh "
+     "rate (180 on a 180 Hz monitor); with Frame generation on, at half of it, the frames between generated (90 + 90 at "
+     "180 Hz). Changes at once.",
+#else
      "30 is the game's own pace; the others run its logic at that rate. Display-Limited runs it at your monitor's refresh "
      "rate (180 on a 180 Hz monitor). Changes at once.",
+#endif
      true},
     // Frame rate's Custom limit, its tick box and its number, drawn in Frame
     // rate's row (frame_rate_control) and not rows of their own: ticked, the
@@ -492,10 +498,11 @@ Setting g_set[kSettingCount] = {
      "AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; without them they stay off. FSR 4 runs as "
      "FSR 3 where it cannot run. Changes at once.",
 #else
-     // (host/upscaler.h upscaler_offered: FSR is Windows' alone, DLSS where it runs.)
-     "TAA (bbhost's own temporal anti-aliasing, any GPU) or DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of "
-     "the game's own anti-aliasing. DLSS needs libbbhost_ngx_bridge.so and NVIDIA's libnvidia-ngx-dlss.so beside bbhost, "
-     "as the Linux package has them; FSR runs on Windows only. Changes at once.",
+     // (host/upscaler.h upscaler_offered: FSR 3 and DLSS where they run, never FSR 4.)
+     "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 3 (AMD's, any GPU: the same FSR 3.1.6 as on Windows) or "
+     "DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of the game's own anti-aliasing. FSR 3 needs "
+     "libbbhost_fidelityfx_vk.so beside bbhost, DLSS libbbhost_ngx_bridge.so and NVIDIA's libnvidia-ngx-dlss.so, as the "
+     "packages have them. FSR 4 and frame generation run on Windows only. Changes at once.",
 #endif
      false},
     // TAA's blend (host/upscale_pass.cpp record_taa): how much of each new
@@ -541,7 +548,7 @@ Setting g_set[kSettingCount] = {
     {"frame_generation", "Frame generation", {"Off", "On"}, 0,
      "AMD FidelityFX frame generation: a frame made between each two of the game's, from the 3D alone - "
      "the HUD and the menus are never interpolated. Works with any Upscaling choice, Off included, on any GPU. "
-     "While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Loading screens stay uncapped. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
+     "While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Display-Limited runs the game at half the refresh rate and generates the frames between. Loading screens stay uncapped. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
      false},
     // Where the upscaler's motion for what moves of itself comes from
     // (host/upscale_pass.cpp): the game's motion blur velocity map, or the
@@ -567,7 +574,7 @@ Setting g_set[kSettingCount] = {
 #if defined(_WIN32)
      "Where TAA, FSR, DLSS and frame generation take the motion of the hunter, enemies and other moving characters from "
 #else
-     "Where TAA and DLSS take the motion of the hunter, enemies and other moving characters from "
+     "Where TAA, FSR 3 and DLSS take the motion of the hunter, enemies and other moving characters from "
 #endif
      "(the camera's own always comes from the depth). Precise: each character's own position this frame and the last, "
      "for every pixel - clean edges and no trail behind a running character; it draws those characters a second time "
@@ -683,7 +690,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFrameClock},
     {Row::Option, nullptr, kEffectTiming},
 #if defined(_WIN32)
-    {Row::Option, nullptr, kFrameGeneration},  // AMD's FidelityFX, Windows' alone: no row elsewhere
+    {Row::Option, nullptr, kFrameGeneration},  // AMD's frame generation, Windows' alone: no row elsewhere
 #endif
     {Row::Option, nullptr, kSkipLogos},
     {Row::Option, nullptr, kPerformanceMode},
@@ -2037,7 +2044,11 @@ const char* const* value_tips(int id, bool dlss) {
         "The game's own anti-aliasing; the 3D at the Resolution.",
         "TAA: bbhost's own temporal anti-aliasing - steadier edges and less shimmer, a little softer. Any GPU, the 3D at the "
         "Resolution; one below the window keeps the HUD at the window's size. The fastest of these.",
+#if defined(_WIN32)
         "AMD FSR 3: any GPU.",
+#else
+        "AMD FSR 3: any GPU, the same FSR 3.1.6 as on Windows. FSR 4 and frame generation run on Windows only.",
+#endif
         "AMD FSR 4: AMD's newest, where the GPU and driver run it; FSR 3 where they do not.",
         "NVIDIA DLSS: RTX cards only.",
     };
@@ -2124,13 +2135,21 @@ bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
     static std::vector<std::string>* names = new std::vector<std::string>();
     static std::vector<const char*> items, tips;
     if (items.empty()) {
+        // Display-Limited's own; frame generation's half on Windows alone,
+        // where frame generation is (no row elsewhere).
+        static const char* const kDisplayLimitedTip =
+            "Caps the frame rate at your monitor's refresh rate, read when the game starts: 180 fps on a 180 Hz monitor, "
+            "144 on a 144 Hz one."
+#if defined(_WIN32)
+            " With Frame generation on, the game runs at half of it and the frames between are generated: 90 + 90 at "
+            "180 Hz."
+#endif
+            ;
         const Setting& f = g_set[kFrameCap];
         for (const char* v : f.values) names->push_back(fps_from_label(v) ? std::string(v) + " fps" : std::string(v));
         for (std::size_t v = 0; v < f.values.size(); ++v) {
             items.push_back((*names)[v].c_str());
-            tips.push_back(fps_from_label(f.values[v]) ? nullptr
-                                                       : "Caps the frame rate at your monitor's refresh rate, read when the game "
-                                                         "starts: 180 fps on a 180 Hz monitor, 144 on a 144 Hz one.");
+            tips.push_back(fps_from_label(f.values[v]) ? nullptr : kDisplayLimitedTip);
         }
     }
     const ImGuiStyle& st = ImGui::GetStyle();
@@ -2475,11 +2494,7 @@ std::string aa_taker() { return g_setup_page ? plugins_aa_owner_scanned() : plug
 const char* upscaler_note() {
     const int u = shown_index(kUpscaler);  // the menu's Off, TAA, FSR 3, FSR 4, DLSS
     static std::string note;
-#if defined(_WIN32)
     const char* ours = "TAA, FSR or DLSS";
-#else
-    const char* ours = "TAA or DLSS";
-#endif
     if (const std::string who = aa_taker(); !who.empty()) {
         note = g_setup_page ? who + " (a plugin turned on in the Plugins tab) does the anti-aliasing itself: while it is on, bbhost runs no " +
                                   ours + " (nor Sharpness, which follows them), and the 3D is drawn at the Resolution. Your choice is kept for "
@@ -2500,9 +2515,18 @@ const char* upscaler_note() {
     const UpscalerCaps caps = upscaler_caps();
     const bool dlss = u == 4;
 #if !defined(_WIN32)
-    // Linux: DLSS through the NGX bridge, and no FSR.
-    if (!dlss) {
-        note = "FSR runs on Windows only: the game's own anti-aliasing runs instead.";
+    // Linux: FSR 3 through bbhost's FidelityFX library, DLSS through the NGX bridge, no FSR 4 (a Windows choice kept
+    // runs FSR 3).
+    if (!dlss && !caps.fsr_loaded) {
+        note = "Not running: libbbhost_fidelityfx_vk.so did not load (it belongs beside bbhost, as the packages have it). The game's "
+               "own anti-aliasing runs instead.";
+    } else if (!dlss && !caps.fsr) {
+        note = "FSR 3 is not available here" + (caps.fsr_reason.empty() ? std::string() : " (" + caps.fsr_reason + ")") +
+               ": the game's own anti-aliasing runs instead.";
+    } else if (!dlss && u == 3) {
+        note = "FSR 4 runs on Windows only: FSR 3 runs here instead.";
+    } else if (!dlss) {
+        return g_set[kUpscaler].note;
     } else if (!caps.loaded) {
         note = "Not running: libbbhost_ngx_bridge.so did not load (it and NVIDIA's libnvidia-ngx-dlss.so belong beside "
                "bbhost, as the Linux package has them). The game's own anti-aliasing runs instead.";
@@ -2620,10 +2644,12 @@ const char* const kHostShaderModeTips[2] = {
 };
 
 const char* const kHostFrameRateCustomNote =
-    "Tick to type your own frame rate, 10 to 960: the game is capped at exactly that rate (45 runs it at 45). With "
-    "Frame generation on, twice as many frames are shown (45 shows 90), so the rate is at most half your refresh rate "
-    "(90 at 180 Hz). Unticked, Frame rate's list is used. Changes at once between rates above 30; to or from 30 needs "
-    "a restart.";
+    "Tick to type your own frame rate, 10 to 960: the game is capped at exactly that rate (45 runs it at 45). "
+#if defined(_WIN32)
+    "With Frame generation on, twice as many frames are shown (45 shows 90), so the rate is at most half your refresh "
+    "rate (90 at 180 Hz). "
+#endif
+    "Unticked, Frame rate's list is used. Changes at once between rates above 30; to or from 30 needs a restart.";
 const char* const kHostEffectTimingLabels[3] = {"30 fps", "60 fps", "Frame rate-dependent"};
 const char* const kHostEffectTimingNote =
     "How fire, blood, magic and the flicker of lamps and candles keep time above 30 fps. Changes at once.";

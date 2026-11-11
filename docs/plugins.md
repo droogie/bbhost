@@ -82,7 +82,7 @@ log line. Everything a plugin logs is prefixed with `plugin:`.
 
 The API only ever grows. A plugin checks that `api->version` is at least the
 version whose calls it makes, and `api->size` for fields a newer host
-appended. The current version is 27 (`BB_PLUGIN_API_VERSION`).
+appended. The current version is 28 (`BB_PLUGIN_API_VERSION`).
 
 ## Addresses
 
@@ -181,6 +181,15 @@ gives the Binary Ninja address.
   drawn, while the game's own camera - which the follow camera keeps, the
   controls move by and the aim reads - stays as `on_camera` left it. The
   Isometric plugin draws its view this way.
+- `on_camera_target(fn, user)` (v28): the recompiled follow camera's target.
+  Registered once, from `bb_plugin_image`; on the game thread at each of the
+  camera's updates `fn` gets the character whose controls the camera uses and
+  returns a live `ChrIns` to follow instead, or NULL to leave it. Only the
+  model and the moving floor's position are followed elsewhere, never the
+  input, and a plugin keeps no pointer to an actor that may die. A spectator
+  camera this way; where the game's own follow camera runs instead of the
+  recompiled one, a plugin still needs its own camera hooks. One plugin owns
+  it: 1 outside image setup, for NULL, or once taken; 0 otherwise.
 
 **Settings, UI and files**
 

@@ -614,6 +614,18 @@ bool surface_empty() {
     return caps.currentExtent.width == 0 || caps.currentExtent.height == 0;
 }
 
+// AMD's frame generation swapchain ended before a whole-device wait of ours:
+// its threads submitting to its queues meanwhile would break vkDeviceWaitIdle's
+// rule (every queue kept from other threads) as bb-submit's submissions broke
+// AMD's. Its own drain runs under the submission thread's queue lock
+// (framegen_destroy_swapchain); the swapchain is made again after. Under the
+// renderer's lock, like its other callers.
+void framegen_end_for_idle() {
+    if (!framegen_active()) return;
+    framegen_destroy_swapchain(g_vk.device);
+    g_vk.swapchain = VK_NULL_HANDLE;
+}
+
 bool vk_create_swapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps);
@@ -725,8 +737,14 @@ bool vk_create_swapchain() {
         // the surface holds one at a time - ours goes first, its last present done.
         {
             static constexpr slow_calls::Site kFgSwitchIdleSite{slow_calls::kQueueIdle, "our swapchain going for frame generation's"};
+            // The presenter's own queue is this thread's alone; the renderer's
+            // (a device with one queue) is the submission thread's too.
+            const VkQueue q = g_vk.present_queue ? g_vk.present_queue : g_vk.queue;
+            const bool shared = q == g_vk.queue;
+            if (shared) host_gpu_queue_lock();
             slow_calls::Scope timed(kFgSwitchIdleSite);
-            vkQueueWaitIdle(g_vk.present_queue ? g_vk.present_queue : g_vk.queue);
+            vkQueueWaitIdle(q);
+            if (shared) host_gpu_queue_unlock();
         }
         vkDestroySwapchainKHR(g_vk.device, old, nullptr);
         old = VK_NULL_HANDLE;
@@ -1069,6 +1087,7 @@ bool vk_present() {
     // would otherwise never be told to do.
     if (g_swap_dirty.exchange(false)) {
         host_gpu_lock();
+        framegen_end_for_idle();
         host_gpu_queue_lock();
         {
             slow_calls::Scope timed(kRebuildIdleSite);
@@ -1116,6 +1135,7 @@ bool vk_present() {
     }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         host_gpu_lock();
+        framegen_end_for_idle();
         host_gpu_queue_lock();
         {
             slow_calls::Scope timed(kRebuildIdleSite);
@@ -2066,12 +2086,28 @@ void host_window_set_stay_borderless(bool on) {
 #endif
 }
 
+namespace {
+// Set as the window shell starts (host_window_start): from then on SDL's
+// video is the window thread's, and host_desktop_refresh_hz - which brings
+// it up and down - is not asked from any other thread. The primary
+// display's desktop rate as the window shell started, which a display that
+// does not say its rate falls back to.
+std::atomic<bool> g_shell_started{false};
+std::atomic<float> g_desktop_hz_at_start{0.0f};
+}  // namespace
+
 float host_display_refresh_hz() {
-    const float hz = host_window_refresh_hz();
-    return hz > 0.0f ? hz : host_desktop_refresh_hz();
+    if (const float hz = host_window_refresh_hz(); hz > 0.0f) return hz;
+    // Before the window shell, on the thread that starts it (the frame rate
+    // is chosen as the game's code is patched); after, from any thread - the
+    // game's main loop asks when Display-Limited is chosen while it runs, and
+    // frame generation's half-refresh limit each frame.
+    if (!g_shell_started.load(std::memory_order_acquire)) return host_desktop_refresh_hz();
+    return g_desktop_hz_at_start.load(std::memory_order_relaxed);
 }
 
 float host_window_refresh_hz() {
+    if (const float t = host_test_refresh_hz(); t > 0.0f) return t;  // BBHOST_TEST_REFRESH_HZ (core/portable.h)
 #if defined(BBHOST_HAVE_SDL3)
     if (!g_active.load() || !g_window) return 0.0f;
     // Cached: the flip clock asks once a second, and this walks SDL's display
@@ -2139,6 +2175,7 @@ bool window_start_impl(int width, int height, const char* title);
 // Windows 11 laptop, every run), while the game ran on without it; the
 // caller is the thread that pumps it (run_guest_start).
 bool host_window_start(int width, int height, const char* title) {
+    g_shell_started.store(true, std::memory_order_release);  // host_display_refresh_hz
 #if defined(BBHOST_HAVE_SDL3) && defined(_WIN32)
     return window_start_impl(width, height, title);
 #elif defined(BBHOST_HAVE_SDL3)
@@ -2190,6 +2227,11 @@ bool window_start_impl(int width, int height, const char* title) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         host_log("SDL_Init failed: %s", SDL_GetError());
         return false;
+    }
+    // What a display that does not say its rate stands for from now on
+    // (host_display_refresh_hz): the primary display's, where the window opens.
+    if (const SDL_DisplayID id = SDL_GetPrimaryDisplay()) {
+        if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(id)) g_desktop_hz_at_start.store(m->refresh_rate, std::memory_order_relaxed);
     }
     // The options are read before the window exists, so a saved Borderless
     // or Fullscreen is only a wish until here (host_window_set_mode). Both
@@ -2608,16 +2650,17 @@ bool host_window_pump() {
         // counts as shared GPU memory, so the two read beside Task Manager's
         // dedicated and shared columns (docs/running.md). Read once a second;
         // the cache from the video memory census, run here every 30 s (2-3 ms
-        // under the renderer's lock).
+        // under the renderer's lock) - when that lock is free: this thread
+        // never waits for it, and tries again the next second.
         static char text[96] = "";
         static std::uint64_t read_at = 0, census_at = 0;
         const std::uint64_t now = host_clock_monotonic_ns();
         if (!read_at || now - read_at >= 1'000'000'000ull) {
             read_at = now;
-            const bool census = !census_at || now - census_at >= 30'000'000'000ull;
+            bool census = !census_at || now - census_at >= 30'000'000'000ull;
             if (census) {
-                census_at = now;
-                host_gpu_memory_census_refresh();
+                census = host_gpu_memory_census_refresh();
+                if (census) census_at = now;
             }
             GpuMemoryGlance m;
             text[0] = '\0';
@@ -3058,6 +3101,7 @@ void host_window_stop() {
         std::lock_guard<std::mutex> lock(g_vk.mu);
         g_vk.ok = false;
         host_gpu_lock();
+        framegen_end_for_idle();
         host_gpu_queue_lock();
         vkDeviceWaitIdle(g_vk.device);
         host_gpu_queue_unlock();

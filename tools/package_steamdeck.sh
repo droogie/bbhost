@@ -4,7 +4,8 @@
 # 1280x800, full screen, 30 fps - STEAMDECK.md, and the launcher pointed at
 # them. The game's paths stay in the per-user config, as for every package.
 # Without DLSS: the Deck's GPU is AMD's, so the NGX bridge, NVIDIA's runtime,
-# their licences and the README's Upscaling section are left out.
+# their licences and the DLSS part of the README's Upscaling section are left
+# out. FSR 3 (bbhost's FidelityFX library, licenses/fidelityfx) stays.
 #   tools/package_steamdeck.sh LINUX_TARBALL OUTDIR
 set -eu
 cd "$(dirname "$0")/.."
@@ -22,10 +23,15 @@ sed -i 's/^  bbhost.example.toml lists every setting./  bbhost.example.toml list
 grep -q 'STEAMDECK.md' "$ldir/README-linux.txt" || { echo "README-linux.txt: settings line not found"; exit 1; }
 rm -f "$ldir/libbbhost_ngx_bridge.so" "$ldir"/libnvidia-ngx-dlss.so.*
 rm -rf "$ldir/licenses/dlss" "$ldir/licenses/ngx_bridge" "$ldir/licenses/upscaler_bridge"
-sed -i '/^Upscaling$/,/^Setup$/{/^Setup$/!d}' "$ldir/README-linux.txt"
-if grep -q 'libnvidia-ngx-dlss' "$ldir/README-linux.txt"; then echo "README-linux.txt: the Upscaling section is still there"; exit 1; fi
+sed -i '/^  DLSS, on an NVIDIA RTX card/,/^$/d' "$ldir/README-linux.txt"
+if grep -q 'libnvidia-ngx-dlss' "$ldir/README-linux.txt"; then echo "README-linux.txt: the DLSS part is still there"; exit 1; fi
+if [ -f "$ldir/libbbhost_fidelityfx_vk.so" ] && ! grep -q 'libbbhost_fidelityfx_vk.so' "$ldir/README-linux.txt"; then
+    echo "README-linux.txt: FSR 3's part is gone"
+    exit 1
+fi
 find "$ldir" -type d -exec chmod 755 {} + && find "$ldir" -type f -exec chmod 644 {} +
 chmod 755 "$ldir/bbhost" "$ldir/run-bbhost.sh"
+[ ! -f "$ldir/libbbhost_fidelityfx_vk.so" ] || chmod 755 "$ldir/libbbhost_fidelityfx_vk.so"
 mv "$ldir" "$work/$name"
 (cd "$work" && rm -f "$out/$name.tar.gz" && tar czf "$out/$name.tar.gz" --owner=0 --group=0 "$name")
 ls -la "$out/$name.tar.gz"

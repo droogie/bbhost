@@ -40,7 +40,7 @@ if [ "${CI_APT:-1}" = 1 ]; then
     SUDO=$(command -v sudo || true)
     export DEBIAN_FRONTEND=noninteractive
     $SUDO apt-get update -q > "$W/apt-update.log" 2>&1
-    $SUDO apt-get install -y -q --no-install-recommends clang lld llvm cmake ninja-build pkg-config make nasm curl \
+    $SUDO apt-get install -y -q --no-install-recommends clang lld llvm cmake ninja-build pkg-config make nasm curl patch \
         git libstdc++-14-dev libcurl4-openssl-dev libvulkan-dev zlib1g-dev spirv-tools python3 xz-utils \
         ca-certificates libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev \
         libxtst-dev libxkbcommon-dev libwayland-dev wayland-protocols libegl-dev libdecor-0-dev libpulse-dev \
@@ -103,6 +103,10 @@ tail -1 "$W/dxc.log"
 # fetches pinned (tools/fetch_ngx.sh): kept in the prefix too, beside the DLSS
 # runtime the Linux package takes from there.
 export NGX_CACHE=${NGX_CACHE:-$P/ngx-cache}
+# AMD's FidelityFX SDK source and DXC's command-line compiler for bbhost's
+# FidelityFX library (FSR 3 on Linux), which the configure step fetches pinned
+# (tools/fetch_fidelityfx.sh, tools/fetch_dxc.sh linux-cli): kept there too.
+export FFX_CACHE=${FFX_CACHE:-$P/ffx-cache} DXC_CACHE=${DXC_CACHE:-$P/dxc-cache}
 
 # bbhost, its tools and tests.
 export PKG_CONFIG_PATH=$P/lib/pkgconfig

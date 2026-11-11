@@ -1,0 +1,5 @@
+/* The FidelityFX library exports the FidelityFX API's five functions (ffx_api.h) and nothing else. */
+{
+    global: ffxCreateContext; ffxDestroyContext; ffxConfigure; ffxQuery; ffxDispatch;
+    local: *;
+};

@@ -244,7 +244,10 @@ float host_window_refresh_hz();
 // (host_window_refresh_hz) once there is one, before that the primary
 // display's, where the window opens (host_desktop_refresh_hz) - Display-Limited
 // and frame generation's limit take it, so a window on a 144 Hz second screen
-// beside a 60 Hz primary runs at 144, not 60.
+// beside a 60 Hz primary runs at 144, not 60. Safe from any thread once the
+// window shell has started: a window whose display does not say its rate
+// then reads the primary display's as it started, never SDL's video brought
+// up and down off the window's thread (0 when neither says).
 float host_display_refresh_hz();
 // The steady-clock time, in nanoseconds, at which the presenting thread last
 // finished a present, and a counter of finished presents. With V-Sync on the
