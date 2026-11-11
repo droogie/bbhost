@@ -731,7 +731,7 @@ anti-aliasing:
 | TAA | bbhost's own temporal anti-aliasing: any GPU, Windows and Linux, the 3D at the Resolution - one below the window keeps the game and its HUD at the window's size, as DLSS and FSR do |
 | DLSS | NVIDIA RTX cards, on Windows and on Linux: DLAA, Quality, Balanced or Performance (the 3D at the full Resolution, two thirds, about 59% or half each way) and its model (DLSS preset K, J, L or M) |
 | FSR 3 | AMD FidelityFX FSR 3.1.6, any GPU, on Windows and Linux (the Steam Deck included): Native AA, Quality, Balanced or Performance |
-| FSR 4 | AMD's newest, on Windows and Linux, where the GPU and driver run it (FSR 3 elsewhere) |
+| FSR 4 | AMD's newest, on Windows only, where the GPU and driver run it (FSR 3 elsewhere) |
 
 Frame generation (AMD FidelityFX) runs on Windows only. Sharpness sharpens
 what TAA, FSR or DLSS gives. While one of them runs, the game's own

@@ -500,13 +500,13 @@ Setting g_set[kSettingCount] = {
      "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 "
      "(any GPU) or DLSS (NVIDIA RTX) in place of the game's own anti-aliasing. FSR and DLSS need upscaler_bridge.dll and "
      "AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; without them they stay off. FSR 4 runs as "
-     "FSR 3 where it cannot run. Frame generation runs on Windows only. Changes at once.",
+     "FSR 3 where it cannot run. Changes at once.",
 #else
-     // (host/upscaler.h upscaler_offered: FSR 4, FSR 3 and DLSS where they run.)
-     "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 "
-     "(AMD's, any GPU: the same FSR 3.1.6 as on Windows) or DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of the "
-     "game's own anti-aliasing. FSR 4 and FSR 3 run on Windows and Linux (via upscaler_bridge.dll or native libbbhost_fidelityfx_vk.so). "
-     "Frame generation runs on Windows only. Changes at once.",
+     // (host/upscaler.h upscaler_offered: FSR 3 and DLSS where they run, never FSR 4.)
+     "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 3 (AMD's, any GPU: the same FSR 3.1.6 as on Windows) or "
+     "DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of the game's own anti-aliasing. FSR 3 needs "
+     "libbbhost_fidelityfx_vk.so beside bbhost, DLSS libbbhost_ngx_bridge.so and NVIDIA's libnvidia-ngx-dlss.so, as the "
+     "packages have them. FSR 4 and frame generation run on Windows only. Changes at once.",
 #endif
      false},
     // TAA's blend (host/upscale_pass.cpp record_taa): how much of each new
@@ -551,8 +551,8 @@ Setting g_set[kSettingCount] = {
     // size (host/upscale_pass.cpp).
     {"frame_generation", "Frame generation", {"Off", "On"}, 0,
      "AMD FidelityFX frame generation: a frame made between each two of the game's, from the 3D alone - "
-     "the HUD and the menus are never interpolated. Works with any Upscaling choice, Off included, on any GPU (Windows only). "
-     "While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Display-Limited runs the game at half the refresh rate and generates the frames between. Loading screens stay uncapped. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Frame generation runs on Windows only. Changes at once.",
+     "the HUD and the menus are never interpolated. Works with any Upscaling choice, Off included, on any GPU. "
+     "While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Display-Limited runs the game at half the refresh rate and generates the frames between. Loading screens stay uncapped. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
      false},
     // Where the upscaler's motion for what moves of itself comes from
     // (host/upscale_pass.cpp): the game's motion blur velocity map, or the
@@ -2058,9 +2058,9 @@ const char* const* value_tips(int id, bool dlss) {
 #if defined(_WIN32)
         "AMD FSR 3: any GPU.",
 #else
-        "AMD FSR 3: any GPU, the same FSR 3.1.6 as on Windows. Frame generation runs on Windows only.",
+        "AMD FSR 3: any GPU, the same FSR 3.1.6 as on Windows. FSR 4 and frame generation run on Windows only.",
 #endif
-        "AMD FSR 4: AMD's newest, runs on Windows and Linux where the GPU and driver run it; FSR 3 where they do not. Frame generation runs on Windows only.",
+        "AMD FSR 4: AMD's newest, where the GPU and driver run it; FSR 3 where they do not.",
         "NVIDIA DLSS: RTX cards only.",
     };
     static const char* const kFsrTips[] = {
@@ -2579,7 +2579,7 @@ const char* upscaler_note() {
         note = "FSR 3 is not available here" + (caps.fsr_reason.empty() ? std::string() : " (" + caps.fsr_reason + ")") +
                ": the game's own anti-aliasing runs instead.";
     } else if (!dlss && u == 3) {
-        note = "FSR 4 is not available on this GPU or driver: FSR 3 runs here instead. (FSR 4 runs on Windows and Linux; Frame generation runs on Windows only.)";
+        note = "FSR 4 runs on Windows only: FSR 3 runs here instead.";
     } else if (!dlss) {
         return g_set[kUpscaler].note;
     } else if (!caps.loaded) {
