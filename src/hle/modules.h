@@ -238,6 +238,12 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
 void hle_gx_native_release();
 // The command processor's lookahead: a draw token further on in the stream.
 void hle_gx_native_prefetch(std::uint64_t id, bool next);
+// Whether the draw pool (host/gxvk_lists.h) was given draw token `id`'s draw:
+// false for one stored while it rested (or in the overflow map, which it never
+// reads) - none of its threads reads that slot, and it has no commit, so the
+// command processor takes it as with the pool off and asks nothing of the pool
+// (BBHOST_GXVK_LISTS_SKIP_UNFED=0: it asks as before). Command-processor thread.
+bool hle_gx_native_fed(std::uint64_t id);
 // The run look ahead (BBHOST_RUN_COMMIT, host/list_resolve.h): a draw token's
 // inputs in its slot when they are stored and still that token's, without
 // taking them, and its GX objects (`objects`, when asked); nullptr otherwise.

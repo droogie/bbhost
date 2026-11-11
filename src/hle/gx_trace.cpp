@@ -2384,8 +2384,21 @@ struct NativeSlot {
     // (the pool reads it no more).
     std::atomic<int> state{0};
     std::uint64_t id = 0;
+    // Given to the pool (gxvk_lists::draw_stored): only then can a pool thread
+    // pin it or a commit of it exist. Written before the state reads ready.
+    bool fed = false;
     alignas(64) NativeDraw draw;  // the inputs start a line of their own
 };
+// A draw stored while the pool rested (NativeSlot::fed) skips the pool's
+// slot protocol and checks at the command processor. BBHOST_GXVK_LISTS_SKIP_UNFED=0:
+// every slot as a pooled one, as before.
+bool skip_unfed() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_GXVK_LISTS_SKIP_UNFED");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 // A slot a pool thread is reading (3): the command processor waits for it to
 // be given back (counted), as briefly as one draw's lookups.
 std::atomic<std::uint64_t> g_native_pinned_waits{0};
@@ -2728,6 +2741,10 @@ bool native_draw_call(GxRec& r) {
         // slot reads ready. Streamed past the caches, they waited on an sfence
         // for the memory writes (~5% of the GX threads' host time).
         slot.id = id;
+        // The pool is given it unless it rests (decided once, here: the slot
+        // says so before it reads ready).
+        const bool feed = gxvk_lists::pool() && !gxvk_lists::resting();
+        slot.fed = feed;
         slot.draw.in = r.in;
         slot.draw.objects = objects;
         slot.draw.records = std::move(records);
@@ -2735,7 +2752,7 @@ bool native_draw_call(GxRec& r) {
         slot.draw.packed = std::move(packed);
         slot.state.store(2, std::memory_order_release);
         g_native_slot_pending.add();
-        if (gxvk_lists::pool()) gxvk_lists::draw_stored(id, r.ctx, token_va);  // stage 4b.1a's pool looks ahead at it
+        if (gxvk_lists::pool()) gxvk_lists::draw_stored(id, r.ctx, token_va, feed);  // stage 4b.1a's pool looks ahead at it
         prefetch_next_slot();
     } else {
         g_native_overflow.fetch_add(1, std::memory_order_relaxed);
@@ -7776,13 +7793,16 @@ const GpuDrawInputs* hle_gx_native_token(std::uint64_t id, const std::uint32_t* 
         NativeDraw* draw = nullptr;
         // With stage 4b.1a's pool on, the slot is taken (4) once a pool thread
         // reading it has given it back: the pool reads it no more.
-        int expect = gxvk_lists::pool() ? native_unpinned(slot->state) : slot->state.load(std::memory_order_acquire);
+        // A slot the pool was never given is read by none of its threads: taken
+        // as with the pool off.
+        const bool pooled = gxvk_lists::pool() && (!skip_unfed() || slot->fed || slot->id != id);
+        int expect = pooled ? native_unpinned(slot->state) : slot->state.load(std::memory_order_acquire);
         // Stage 4b.1b: a draw the pool has committed is read by no pool thread
         // again (each token is fed once, and its commit is published after the
         // slot was given back): taken with the load above, no CAS.
-        if (expect == 2 && gxvk_lists::splice() && slot->id == id && host_gpu_list_committed(id)) {
+        if (expect == 2 && pooled && gxvk_lists::splice() && slot->id == id && host_gpu_list_committed(id)) {
             g_native_plain_takes.fetch_add(1, std::memory_order_relaxed);
-        } else if (expect == 2 && gxvk_lists::pool() && slot->id == id) {
+        } else if (expect == 2 && pooled && slot->id == id) {
             while (expect == 2 && !slot->state.compare_exchange_weak(expect, 4, std::memory_order_acquire, std::memory_order_acquire)) {
                 if (expect == 3) expect = native_unpinned(slot->state);
             }
@@ -8379,6 +8399,13 @@ const GxDrawObjects* hle_gx_trace_objects() {
 // command processor's lookahead, gnm_exec.cpp). `next`: the very next draw,
 // whose slot the previous lookahead asked for - its records now; otherwise
 // the one after it - its slot. The lines then arrive while this draw is drawn.
+
+bool hle_gx_native_fed(std::uint64_t id) {
+    if (!skip_unfed()) return true;
+    NativeSlot& slot = native_slot(id);
+    const int st = slot.state.load(std::memory_order_acquire);
+    return st >= 2 && slot.id == id && slot.fed;
+}
 
 void hle_gx_native_prefetch(std::uint64_t id, bool next) {
     NativeSlot& slot = native_slot(id);

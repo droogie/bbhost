@@ -827,9 +827,11 @@ void frame_paced(std::uint64_t wait_ns, float cap_fps, bool loading) {
     }
 }
 
-void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va) {
+void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va, bool feed) {
     if (!g_ready.load(std::memory_order_acquire)) std::call_once(g_started, start);
-    if (resting()) return;  // nothing fed, no list record: the command processor draws it in order (counted there)
+    // Not fed (the pool rested when it was stored - the caller's decision, written in its slot): no list record, and
+    // the command processor draws it in order (counted there).
+    if (!feed) return;
     if (g_times) {
         detail::DrawTime& t = detail::g_draw_times[id & (detail::kTimeSlots - 1)];
         t.id.store(id, std::memory_order_relaxed);

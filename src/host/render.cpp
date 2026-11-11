@@ -29021,6 +29021,8 @@ bool segment_release_member(std::uint64_t id);  // (stage 4b.2, below)
 // the draw is done; false when it is to be drawn in order (counted by why).
 // splice-compare: always false, and host_gpu_splice_compare compares the draw
 // in order with the commit.
+void host_gpu_splice_unfed(std::uint32_t n) { g_sp_why[kSwRested].fetch_add(n, std::memory_order_relaxed); }
+
 bool host_gpu_splice(std::uint64_t id) {
     ListCommit* const all = g_list_commits;
     if (!all) {

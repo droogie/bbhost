@@ -139,8 +139,11 @@ void keep_off_pool_cpus();
 // The recording thread stored GX-native draw token `id`'s slot
 // (gx_trace.cpp native_draw_call; a host function, not a leaf): recorded on
 // GX context `ctx`, its token at `token_va` in the context's command buffer
-// (segments: the draw goes into the context's open list record too).
-void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va);
+// (segments: the draw goes into the context's open list record too). `feed`:
+// the pool is given it - the caller's decision (not while it rests), written
+// in the slot before it reads ready, so the command processor knows a draw the
+// pool never saw (hle_gx_native_fed) and asks the pool nothing about it.
+void draw_stored(std::uint64_t id, std::uint64_t ctx, std::uint64_t token_va, bool feed);
 
 // The pool's answers, and the command processor's in compare mode: a lookup's
 // kind, its key (the cache's own key, folded to 56 bits) and what it answered

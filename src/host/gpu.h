@@ -396,6 +396,9 @@ int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uin
 // drawn in order. splice-compare: false, and after the draw in order
 // host_gpu_splice_compare(id) compares the commit with it. The lines.
 bool host_gpu_splice(std::uint64_t id);
+// `n` more draw tokens the pool was never given (stored while it rested), drawn in order with none of its checks
+// (counted with the splice's "the pool resting").
+void host_gpu_splice_unfed(std::uint32_t n);
 bool host_gpu_list_committed(std::uint64_t id);  // its commit is made: the pool reads its slot no more
 void host_gpu_splice_compare(std::uint64_t id);
 // Before that draw in order (gnm_exec.cpp): a token whose commit will be compared is drawn with the read masks its

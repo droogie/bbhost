@@ -905,7 +905,11 @@ commit at a true 60; `=0` keeps the path before them with the run commit as it w
 
 **The pool's duty (`BBHOST_GXVK_LISTS_REST`).** The pool works only where it
 shortens the frame; resting, it is given no draw and the command processor
-draws them all in order with the homes, as with `BBHOST_GXVK_LISTS=0`. It rests
+draws them all in order with the homes, as with `BBHOST_GXVK_LISTS=0`. A draw
+stored while the pool rests is the command processor's alone: it asks the pool
+nothing about it (`BBHOST_GXVK_LISTS_SKIP_UNFED=0`: it looks each one up as it
+does while the pool works) - at a 90 cap on the RTX 4070 below that takes the
+99th percentile frame 0.7-0.85 ms shorter where the pool rests. It rests
 while a frame cap holds the frame (two half-second windows in a row with the
 limiter waiting 15% of the time; it works again once the command processor,
 drawing everything, is busy 85% with the frame meeting its cap narrowly - the
