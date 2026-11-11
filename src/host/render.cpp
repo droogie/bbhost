@@ -14368,6 +14368,19 @@ void apply_pending_clear(RtImage& r) {
     r.pending_seen = g_pending_gen;
 }
 
+// BBHOST_FILL_POISON=1 (checks): a fill that meets no image and was made for
+// the whole of a live GX texture writes 0xff over that texture's memory - what
+// a fill that never reached the memory can leave at its worst (NaN in a float
+// texture) - so a texture made there later shows it unless it takes the fill
+// (host/fill_pending.h). Moonside Lake's water vanished when its interaction
+// maps were made over memory an area visited before had used, which only some
+// runs' heaps arranged; with this every run's do (tools/area_check.py's water check).
+const bool g_fill_poison = [] {
+    const char* e = std::getenv("BBHOST_FILL_POISON");
+    return e && e[0] == '1';
+}();
+std::atomic<std::uint64_t> g_fill_poisoned{0};
+
 // BBHOST_FILL_TEXTURES=0 (checks): a fill with no target leaves the textures
 // under it as they were uploaded.
 const bool g_fill_textures = [] {
@@ -14435,6 +14448,13 @@ bool render_handle_fill_locked(std::uint64_t va, std::size_t bytes, const float 
     if (GxResourceInfo res; gx_resource_at(va, 1, &res) && res.memory == va && res.type >= 2) {
         pc.gen = res.gen;
         pc.write_seq = res.write_seq;
+        if (g_fill_poison && res.bytes && bytes >= res.bytes && hle_kernel_va_mapped(va, res.bytes)) {
+            std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(va)), 0xff, res.bytes);
+            if (g_fill_poisoned.fetch_add(1, std::memory_order_relaxed) < 8) {
+                host_log("render: fill of 0x%llx met no image: the texture's %u bytes poisoned with 0xff (BBHOST_FILL_POISON)",
+                         static_cast<unsigned long long>(va), res.bytes);
+            }
+        }
     }
     g_pending_clears[va] = pc;
     ++g_pending_gen;
