@@ -443,7 +443,8 @@ path at all:
 - Scaleform, the menu renderer: its draws are taken from its hardware
   abstraction layer.
 - Depth snapshots, the on-screen overlay and FSR 1 upscaling are bbhost's
-  own.
+  own. The depth snapshot's compute pass goes into the recorder's stream
+  (`BBHOST_STREAM_DEPTH_COPY=0` records it in place, draining the recorder).
 
 ## Native or emulated
 
