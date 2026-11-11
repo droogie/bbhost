@@ -138,6 +138,24 @@ GPU's with the GPU under 80% busy (the median of six windows), the command
 processor busy 92% or a cap holding the frame, both at a loading screen.
 `BBHOST_RECORDER_REST=0`: it never rests; `=always`: it always does.
 
+What is still recorded in place - by the command processor itself, on the
+command buffer - first waits for `bb-record` to replay everything published
+before it (a drain). Two kinds made nearly all of them: a GX image-copy
+token's barrier, copy and barrier (13 copies a flip at Old Yharnam and Central
+Yharnam), and draws left without their packet when an op had to follow what
+the packet held - a batch of home copies too long for one packet - each then
+recording its ~10 commands in place (2-4 draws a flip). The copy token's
+commands go into the stream as its ops (`BBHOST_STREAM_COPY_TOKEN=0`: in
+place), and a draw whose packet an op must follow goes on in a fresh packet
+(`BBHOST_STREAM_SPLIT=0`: in place); the same commands in the same order.
+Under Windows on an RTX 3070 Ti Laptop GPU uncapped that took the recordings
+in place from 79-82 a flip to 1 at Old Yharnam (25-28 to 1 at the Nightmare of
+Mensis, 69-72 to 1 at Central Yharnam) and the command processor's waits for
+the recorder from 1.4% of its time to 0.2%: Old Yharnam ran 127.7 fps against
+126.6, the Nightmare of Mensis 125.0 against 123.0. On a Steam Deck's 60 fps
+profile Old Yharnam's frames over 16.7 ms went from 45 to 2 in a window, and
+the Nightmare of Mensis ran 56.0 fps against 55.6.
+
 **Shaders.** GCN shaders are converted to SPIR-V when the game creates them,
 and GX creates every shader of the game's bundles at the start (1,663 vertex
 and 1,346 pixel programs; all but the debug bundle's), so their stages and

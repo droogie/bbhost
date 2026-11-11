@@ -341,6 +341,7 @@ struct Counts {
     std::uint64_t ops[static_cast<std::size_t>(Op::kCount)] = {};
 };
 Counts g_counts;
+std::uint64_t g_splits = 0;  // draws split (DrawCmds::split; under g.mu), for the census line
 
 // The recorder's own counters (written by it alone), and what it replayed
 // last, for the device-loss report: lines of their own, away from what the
@@ -957,10 +958,10 @@ void publish_block(bool kick) {
 }
 
 // Before an op: a packet holding commands goes first, so the op lands after
-// them (under g.mu).
+// them, and its draw goes on in a fresh packet (DrawCmds::split; under g.mu).
 void before_op(void* site) {
     if (g.profile_gaps) profile_note_site_locked(site);  // BBHOST_GPU_PROFILE=2: an op is recorded by its caller too
-    if (g_open && g_open->holds_commands()) g_open->publish();
+    if (g_open && g_open->holds_commands()) g_open->split();
 }
 
 // A record of `payload` bytes appended to the open block; its payload.
@@ -1002,10 +1003,11 @@ VkCommandBuffer in_place(void* site) {
     if (g.profile_gaps) profile_note_site_locked(site);
     if (g_census_on) ++g_census[site];
     if (g_mode != kModeOff && g_blocks) {
-        // An open draw whose packet already holds commands goes first.
-        // Descriptor writes alone need not: they only have to land before
-        // the draw's own binds, which come after them in the same packet.
-        if (g_open && g_open->holds_commands()) g_open->publish();
+        // An open draw whose packet already holds commands goes first (and
+        // goes on in a fresh packet: DrawCmds::split). Descriptor writes alone
+        // need not: they only have to land before the draw's own binds, which
+        // come after them in the same packet.
+        if (g_open && g_open->holds_commands()) g_open->split();
         publish_block(false);
         recorder_drain();
         if (g_mode == kModeThread) g_inplace_dirty = true;
@@ -1023,6 +1025,13 @@ bool warn_pnext(const char* what) {
 }  // namespace
 
 bool stream_on() { return g_mode != kModeOff && g_submit_on; }
+bool stream_split_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_STREAM_SPLIT");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 bool recorder_enabled() { return g_mode != kModeOff; }
 
 // ---- BBHOST_RUN_COMMIT: a forked run's packets (render.cpp run_commit) ----
@@ -1418,7 +1427,9 @@ std::string recorder_report() {
         std::vector<std::pair<void*, std::uint64_t>> v(g_census.begin(), g_census.end());
         std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
         const double flips = flip > last.flip ? static_cast<double>(flip - last.flip) : 1.0;
-        out += "\n[bbhost]   cmd census:";
+        char head[96];
+        std::snprintf(head, sizeof(head), "\n[bbhost]   cmd census (draws split %llu):", ull(g_splits));
+        out += head;
         for (std::size_t i = 0; i < v.size() && i < 12; ++i) {
             char e[64];
             std::snprintf(e, sizeof(e), " %llx=%.1f/flip", ull(reinterpret_cast<std::uintptr_t>(v[i].first) - host_image_base()),
@@ -1837,6 +1848,7 @@ void DrawCmds::start(bool deferred) {
     if (draw_ctx()) list_resolve::count(list_resolve::kCtxOutPackets);  // BBHOST_DRAW_CONTEXT's census
     p.number = g_pk_taken++;
     packet_ = &p;
+    fresh_ = true;
     g_open = this;
     prefetch_packet_for_write(g_packets[g_pk_taken % kPackets]);
 }
@@ -1848,6 +1860,7 @@ void DrawCmds::start_reserved(std::uint64_t number, bool part) {
     p.number = number;
     packet_ = &p;
     part_ = part;
+    fresh_ = false;
     if (part) return;
     if (g_open && g_open != this) g_open->publish();
     g_open = this;
@@ -1858,6 +1871,7 @@ void DrawCmds::start_list(void* packet) {
     DrawPacket& p = *static_cast<DrawPacket*>(packet);
     p.reset();
     packet_ = &p;
+    fresh_ = false;
     part_ = true;  // out of the stream when published: the command processor splices it (recorder_splice_list_packet)
 }
 
@@ -1893,6 +1907,25 @@ void DrawCmds::publish() {
     std::uint8_t* at = append_record(Op::kDrawState, sizeof(stream::DrawState));
     put_struct<stream::DrawState>(at)->packet = p.number;
     publish_block(false);
+}
+
+// The open draw's packet, holding commands, with an op or an in-place command to
+// come after them: published now, and the draw goes on in a fresh packet, so its
+// later commands - its pass begin, binds and draw - are replayed after that op as
+// before, not recorded in place. Recorded in place, a draw drained the recorder at
+// its first command: 2-4 draws a flip at Old Yharnam, Central Yharnam and the
+// Nightmare of Mensis, each with ~10 commands, after a batch of home copies too
+// long for one packet (DrawPacket::kCopies). Only a packet start() took: the
+// recorder counts packets replayed by their numbers (g_pk_done), so one reserved
+// for a run (start_reserved) keeps the old way, a fresh number not overtaking the
+// run's. BBHOST_STREAM_SPLIT=0: left without a packet, the rest of the draw
+// recorded in place, as before.
+void DrawCmds::split() {
+    const bool fresh = fresh_;
+    publish();
+    if (!fresh || !stream_split_on()) return;
+    ++g_splits;
+    start(true);
 }
 
 void DrawCmds::update_sets(const VkWriteDescriptorSet* writes, std::size_t n) {

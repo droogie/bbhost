@@ -2862,6 +2862,10 @@ std::string recorder_report();
 // them and hands their submissions to bb-submit, and rec() appends ops
 // (BBHOST_STREAM_SUBMIT, on unless 0, and the recorder on).
 bool stream_on();
+// An open draw's packet that an op or an in-place command must follow is split
+// (DrawCmds::split): the draw goes on in a fresh packet. BBHOST_STREAM_SPLIT=0:
+// the rest of the draw is recorded in place, as before.
+bool stream_split_on();
 // Until submission `serial` has gone to the queue (or failed): a fence the
 // command processor waits for must have been submitted. Under g.mu.
 void stream_wait_submitted(std::uint64_t serial);
@@ -3033,6 +3037,9 @@ public:
     bool deferred() const { return packet_ != nullptr; }
     std::uint64_t number() const;  // its packet's number (0: none)
     void publish();
+    // Published now, an op or an in-place command to follow what it holds, and
+    // the draw goes on in a fresh packet (BBHOST_STREAM_SPLIT=0: in place).
+    void split();
     void update_sets(const VkWriteDescriptorSet* writes, std::size_t n);
     // The draw's own writes, taken rather than copied: `writes` and `images`
     // are swapped with the packet's spent vectors (their buffers, which the
@@ -3092,7 +3099,8 @@ public:
 
 private:
     void* packet_ = nullptr;
-    bool part_ = false;  // a run part's packet (start_reserved)
+    bool part_ = false;   // a run part's packet (start_reserved)
+    bool fresh_ = false;  // its packet taken by start(), numbered in stream order: split() may take another
 };
 // BBHOST_RUN_COMMIT (recorder.cpp): whether draws are recorded on the
 // recorder's thread (the forks need it); `n` packet numbers reserved for a
