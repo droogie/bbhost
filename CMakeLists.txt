@@ -192,6 +192,7 @@ add_executable(bbhost
   src/hle/sync.cpp
   src/hle/kernel.cpp
   src/hle/fs.cpp
+  src/hle/save_commit.cpp
   src/hle/fios.cpp
   src/hle/dialog.cpp
   src/hle/avplayer.cpp
@@ -697,6 +698,15 @@ if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   set_property(TARGET guest_console_test PROPERTY CROSSCOMPILING_EMULATOR wine)
 endif()
 add_test(NAME guest_console_test COMMAND guest_console_test)
+# A save written whole or not at all: the commit at unmount, and on Linux a
+# kill at each of its steps with the recovery after it (hle/save_commit.h).
+add_executable(save_commit_test tests/save_commit_test.cpp src/hle/save_commit.cpp)
+target_include_directories(save_commit_test PRIVATE src)
+target_compile_features(save_commit_test PRIVATE cxx_std_17)
+if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  set_property(TARGET save_commit_test PROPERTY CROSSCOMPILING_EMULATOR wine)
+endif()
+add_test(NAME save_commit_test COMMAND save_commit_test)
 add_executable(libc_wide_test tests/libc_wide_test.cpp src/hle/sysv_va.cpp)
 target_include_directories(libc_wide_test PRIVATE src)
 if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)

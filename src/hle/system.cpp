@@ -3,6 +3,7 @@
 #include "hle/np_score.h"
 #include "hle/fs.h"
 #include "hle/platform.h"
+#include "hle/save_commit.h"
 #if !defined(_WIN32)
 #include <dirent.h>
 #endif
@@ -596,6 +597,10 @@ struct SaveMount {
     std::string dir_name;
     bool used = false;
     bool writable = false;  // mounted to write: the unmount may back it up
+    // Where the mount points: the save's directory, or its stage when the
+    // session writes there (hle/save_commit.h) - committed at the unmount.
+    std::string host;
+    bool staged = false;
 };
 SaveMount g_save_mounts[16];
 
@@ -684,9 +689,37 @@ void back_up_save(const std::string& dir) {
              std::min(backups.size(), static_cast<std::size_t>(keep)));
 }
 
+// What a run that ended mid-commit or mid-session left beside the saves (a
+// stage, its marker, an old copy), settled for each save before the game
+// looks: a save is then whole, the old one or the new one (save_commit.h).
+void recover_all_saves() {
+    namespace fs = std::filesystem;
+    const std::string root = hle_fs_map_path("/data/saves");
+    if (root.empty()) return;
+    std::vector<std::string> dirs;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(fs::path(root), ec)) {
+        const std::string n = e.path().filename().string();
+        for (const char* tail : {".stage", ".old", ".commit"}) {
+            const std::size_t t = std::strlen(tail);
+            if (n.size() > t + 1 && n[0] == '.' && n.compare(n.size() - t, t, tail) == 0) dirs.push_back(n.substr(1, n.size() - t - 1));
+        }
+    }
+    std::sort(dirs.begin(), dirs.end());
+    dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
+    for (const std::string& d : dirs) {
+        if (!valid_dir_name(d.c_str())) continue;
+        std::string did;
+        save_commit::recover(save_dir_host(d), &did);
+        if (!did.empty()) host_log("save %s: %s", d.c_str(), did.c_str());
+    }
+}
+
 GUEST_ABI int hle_save_init(void*) {
     host_log("sceSaveDataInitialize");
     hle_fs_mount("/data/saves", "saves");  // ensures <data>/saves exists
+    std::lock_guard<std::mutex> lock(g_save_mu);
+    recover_all_saves();
     return 0;
 }
 GUEST_ABI int hle_save_term() { return 0; }
@@ -700,7 +733,15 @@ GUEST_ABI int hle_save_mount(const SaveMountReq* req, SaveMountResult* result) {
 #if defined(_WIN32)
     if (const char* e = std::getenv("BBHOST_SAVE_DUMP"); e && e[0] == '1') win_vm_dump_views();
 #endif
-    const bool exists = save_dir_exists(dir);
+    std::lock_guard<std::mutex> lock(g_save_mu);
+    // An interrupted commit or session settled first; `holds` is the
+    // directory with the newest whole save (the save's own, unless a swap
+    // could not be finished).
+    const std::string live = save_dir_host(dir);
+    std::string did;
+    const std::string holds = live.empty() ? live : save_commit::recover(live, &did);
+    if (!did.empty()) host_log("save %s: %s", dir.c_str(), did.c_str());
+    const bool exists = save_dir_exists(dir) || holds != live;
     const bool create = (req->mount_mode & (kMountCreate | kMountCreate2)) != 0;
     if (!exists && !create) {
         host_log("sceSaveDataMount %s: not found", dir.c_str());
@@ -710,7 +751,6 @@ GUEST_ABI int hle_save_mount(const SaveMountReq* req, SaveMountResult* result) {
         !(req->mount_mode & (kMountRdwr | kMountRdonly))) {
         return kSaveErrExists;
     }
-    std::lock_guard<std::mutex> lock(g_save_mu);
     int slot = -1;
     for (int i = 0; i < 16; ++i) {
         if (g_save_mounts[i].used && g_save_mounts[i].dir_name == dir) {
@@ -725,12 +765,25 @@ GUEST_ABI int hle_save_mount(const SaveMountReq* req, SaveMountResult* result) {
     }
     char mp[16] = {};
     std::snprintf(mp, sizeof(mp), "/savedata%d", slot & 15);
-    if (!hle_fs_mount(mp, ("saves/" + dir).c_str())) {
+    const bool writable = (req->mount_mode & (kMountRdwr | kMountCreate | kMountCreate2)) != 0;
+    // A session that writes gets a stage, a copy of the save the unmount
+    // makes the save; where none could be made it writes where the newest
+    // save is, and the unmount commits that one if it is a stage.
+    std::string host = holds;
+    if (writable && !live.empty()) {
+        const std::string stage = save_commit::begin(live);
+        if (!stage.empty()) host = stage;
+        else host_log("save %s: no stage could be made; this session writes in place", dir.c_str());
+    }
+    const bool staged = writable && host != live && host == save_commit::paths_of(live).stage;
+    if (!hle_fs_mount(mp, ("saves/" + std::filesystem::path(host.empty() ? dir : host).filename().string()).c_str())) {
         return kSaveErrParam;
     }
     g_save_mounts[slot].used = true;
     g_save_mounts[slot].dir_name = dir;
-    g_save_mounts[slot].writable = (req->mount_mode & (kMountRdwr | kMountCreate | kMountCreate2)) != 0;
+    g_save_mounts[slot].writable = writable;
+    g_save_mounts[slot].host = host.empty() ? save_dir_host(dir) : host;
+    g_save_mounts[slot].staged = staged;
     std::memcpy(result->mount_point, mp, sizeof(mp));
     result->required_blocks = 0;
     result->mount_status = exists ? 0 : 1;  // 1 = SCE_SAVE_DATA_MOUNT_STATUS_CREATED
@@ -757,6 +810,14 @@ GUEST_ABI int hle_save_umount(const char* mount_point) {
     hle_fs_umount(mount_point);
     g_save_mounts[slot].used = false;
     host_log("sceSaveDataUmount %s", mount_point);
+    if (g_save_mounts[slot].staged) {
+        // The session's writes become the save, whole (save_commit.h); a
+        // commit that cannot finish leaves the stage for the next mount.
+        std::string why;
+        if (!save_commit::commit(save_dir_host(g_save_mounts[slot].dir_name), &why))
+            host_log("save %s: the commit stopped at %s; the next mount finishes it", g_save_mounts[slot].dir_name.c_str(), why.c_str());
+        g_save_mounts[slot].staged = false;
+    }
     if (g_save_mounts[slot].writable) back_up_save(g_save_mounts[slot].dir_name);
     return 0;
 }
@@ -788,6 +849,12 @@ GUEST_ABI int hle_save_delete(const SaveMountReq* req) {
 #else
     _rmdir(h.c_str());
 #endif
+    {
+        // What a session or a commit left beside it goes too.
+        const save_commit::Paths sp = save_commit::paths_of(h);
+        std::error_code ec;
+        for (const std::string& left : {sp.stage, sp.old, sp.marker}) std::filesystem::remove_all(std::filesystem::path(left), ec);
+    }
     host_log("sceSaveDataDelete %s", req->dir_name);
     return 0;
 }
@@ -832,9 +899,9 @@ struct SaveSearchResult {
     std::uint8_t reserved[12];
 };
 
-bool load_param(const std::string& dir_name, SaveParam* p) {
+// A save's param from the directory `h` (the save's, or a session's stage).
+bool load_param_at(const std::string& h, SaveParam* p) {
     std::memset(p, 0, sizeof(*p));
-    std::string h = save_dir_host(dir_name);
     if (h.empty()) {
         return false;
     }
@@ -851,8 +918,9 @@ bool load_param(const std::string& dir_name, SaveParam* p) {
     return n == sizeof(*p);
 }
 
-bool store_param(const std::string& dir_name, const SaveParam* p) {
-    std::string h = save_dir_host(dir_name);
+bool load_param(const std::string& dir_name, SaveParam* p) { return load_param_at(save_dir_host(dir_name), p); }
+
+bool store_param_at(const std::string& h, const SaveParam* p) {
     if (h.empty()) {
         return false;
     }
@@ -948,7 +1016,7 @@ GUEST_ABI int hle_save_set_param(const char* mount_point, int type, const void* 
         return kSaveErrParam;
     }
     SaveParam p;
-    load_param(g_save_mounts[slot].dir_name, &p);
+    load_param_at(g_save_mounts[slot].host, &p);
     auto copy = [&](char* dst, std::size_t cap) {
         std::memset(dst, 0, cap);
         std::memcpy(dst, buf, static_cast<std::size_t>(std::min<std::uint64_t>(size, cap - 1)));
@@ -978,7 +1046,7 @@ GUEST_ABI int hle_save_set_param(const char* mount_point, int type, const void* 
     if (type != 5) {
         p.mtime = static_cast<std::int64_t>(std::time(nullptr));
     }
-    return store_param(g_save_mounts[slot].dir_name, &p) ? 0 : kSaveErrParam;
+    return store_param_at(g_save_mounts[slot].host, &p) ? 0 : kSaveErrParam;
 }
 
 // SceSaveDataIcon { void* buf; size_t bufSize; size_t dataSize; reserved[32] }
@@ -994,7 +1062,7 @@ GUEST_ABI int hle_save_save_icon(const char* mount_point, const SaveIcon* icon) 
     if (slot < 0 || !icon || !icon->buf) {
         return kSaveErrParam;
     }
-    std::string h = save_dir_host(g_save_mounts[slot].dir_name);
+    const std::string& h = g_save_mounts[slot].host;
     std::FILE* f = h.empty() ? nullptr : std::fopen((h + "/icon0.png").c_str(), "wb");
     if (!f) {
         return kSaveErrParam;
