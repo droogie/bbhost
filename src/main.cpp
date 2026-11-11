@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <cstring>
+#include <cwchar>
 #include <stdexcept>
 #include <thread>
 #include <string>
@@ -63,6 +64,8 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
+#include <tlhelp32.h>
 #include <io.h>
 #else
 #include <csignal>
@@ -184,6 +187,56 @@ extern "C" int __llvm_profile_write_file(void);
 #endif
 // An instrumented build's profile (BBHOST_PGO=generate), which the profile
 // runtime writes at exit - and the ends below skip the exit handlers.
+#if defined(_WIN32)
+// An earlier bbhost.exe stuck for good: a present that never came back out of
+// the graphics driver keeps its process from ending - one thread left in a
+// kernel wait, and the guest's memory, which the driver keeps locked while it
+// is imported, held until Windows restarts (End task cannot end it). Told at
+// start in the log and in a box nothing waits on. A working copy - a test's
+// second game, co-op on one machine - has a hundred threads and is left alone:
+// only one with at most 2 threads and 1 GiB or more in use counts.
+// BBHOST_TEST_STUCK_WARNING=1 (a test switch) counts this process as one.
+void warn_stuck_instances() {
+    using MemInfo = BOOL(WINAPI*)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+    const auto mem_info = reinterpret_cast<MemInfo>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32GetProcessMemoryInfo")));
+    const bool test = std::getenv("BBHOST_TEST_STUCK_WARNING") != nullptr;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (!mem_info || snap == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    const DWORD self = GetCurrentProcessId();
+    int stuck = 0;
+    double gib_all = 0.0;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        const bool me = pe.th32ProcessID == self;
+        if (_wcsicmp(pe.szExeFile, L"bbhost.exe") != 0 || (me && !test) || (!me && pe.cntThreads > 2)) continue;
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+        if (!h) continue;
+        PROCESS_MEMORY_COUNTERS pmc{};
+        pmc.cb = sizeof(pmc);
+        const bool got = mem_info(h, &pmc, sizeof(pmc)) != FALSE;
+        CloseHandle(h);
+        if (!got || (!me && pmc.WorkingSetSize < (1ull << 30))) continue;
+        const double gib = static_cast<double>(pmc.WorkingSetSize) / static_cast<double>(1ull << 30);
+        host_log("start: an earlier bbhost.exe (PID %lu, %lu thread%s, %.1f GiB) is stuck in the graphics driver; Windows frees its "
+                 "memory only when it restarts%s",
+                 static_cast<unsigned long>(pe.th32ProcessID), static_cast<unsigned long>(pe.cntThreads), pe.cntThreads == 1 ? "" : "s", gib,
+                 me ? " (BBHOST_TEST_STUCK_WARNING: this one)" : "");
+        ++stuck;
+        gib_all += gib;
+    }
+    CloseHandle(snap);
+    if (!stuck) return;
+    static wchar_t text[512];
+    std::swprintf(text, sizeof(text) / sizeof(text[0]),
+                  L"%ls still in memory, stuck in the graphics driver, and holding %.1f GB. It cannot be ended from Task Manager: "
+                  L"Windows frees that memory when it restarts.\n\nThis game goes on; restart Windows when it suits you.",
+                  stuck == 1 ? L"An earlier bbhost is" : L"Earlier bbhosts are", gib_all);
+    std::thread([] { MessageBoxW(nullptr, text, L"bbhost", MB_OK | MB_ICONWARNING); }).detach();
+}
+#endif
+
 void write_pgo_profile() {
 #if defined(BBHOST_PGO_GENERATE)
     host_log("pgo: profile %s", __llvm_profile_write_file() == 0 ? "written" : "not written");
@@ -1071,6 +1124,7 @@ int main(int argc, char** argv) {
                      static_cast<double>(ms.ullTotalPageFile) / kGiB, static_cast<double>(ms.ullAvailPageFile) / kGiB);
         }
     }
+    warn_stuck_instances();
     // The manifest (res/bbhost.manifest) makes UTF-8 the code page every
     // narrow path is in; a Windows 10 before version 1903 leaves the old one.
     if (const UINT cp = GetACP(); cp != CP_UTF8) {
