@@ -9,6 +9,7 @@
 #include "host/heap_compact.h"
 #include "host/heap_place.h"
 #include "host/list_resolve.h"
+#include "host/tex_update.h"
 #include "host/foreign_hooks.h"
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
@@ -12779,6 +12780,25 @@ void host_gpu_targets_rebuild(bool on) {
 
 void host_gpu_texture_written(std::uint64_t base, std::size_t bytes) {
     textures_gx_written(base, bytes);  // its own lock, as the retirement's
+}
+
+bool host_gpu_yebis_texture_update(std::uint64_t memory, std::uint64_t gen, std::uint32_t mip, std::uint32_t slice, std::uint32_t x, std::uint32_t y,
+                                   std::uint32_t w, std::uint32_t h, const void* rows, std::uint32_t pitch, std::uint64_t submitted) {
+    if (!rows || !w || !h || !pitch) return false;
+    TexUpdate u;
+    u.memory = memory;
+    u.gen = gen;
+    u.mip = mip;
+    u.slice = slice;
+    u.x = x;
+    u.y = y;
+    u.w = w;
+    u.h = h;
+    u.pitch = pitch;
+    u.submitted = submitted;
+    const auto* p = static_cast<const std::uint8_t*>(rows);
+    u.rows.assign(p, p + static_cast<std::size_t>(pitch) * h);
+    return textures_yebis_update(std::move(u));  // its own lock
 }
 
 bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes) {

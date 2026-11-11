@@ -1271,6 +1271,10 @@ if(UNIX)
   add_executable(fill_pending_test tests/fill_pending_test.cpp)
   target_include_directories(fill_pending_test PRIVATE src)
   add_test(NAME fill_pending_test COMMAND fill_pending_test)
+  # A YEBIS texture's update kept for the texture made for it (tests/tex_update_test.cpp).
+  add_executable(tex_update_test tests/tex_update_test.cpp)
+  target_include_directories(tex_update_test PRIVATE src)
+  add_test(NAME tex_update_test COMMAND tex_update_test)
   # The engine's per-view block found at every screen shape and field of view (tests/view_block_test.cpp).
   add_executable(view_block_test tests/view_block_test.cpp)
   target_include_directories(view_block_test PRIVATE src)
