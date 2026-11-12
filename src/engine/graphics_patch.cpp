@@ -193,11 +193,14 @@ std::atomic<bool> g_made_any{false};
 // FilmicContrast mostly moves the overall brightness, which the game's own
 // Brightness already does.
 //
-// Nor does motion blur's strength, though "Yebis-MotionBlurScale" (+0x1ec) is
-// right there: at half and at double the area's value the game never fades in
-// from its loading screen (twice at half, three times at double; the glare
-// that eases in as the world starts stays at its first value), while 0, 1x
-// and 1.4x load normally. Motion blur keeps its on/off setting.
+// Nor does motion blur's strength - and +0x1ec, once taken here for
+// "Yebis-MotionBlurScale", is not it: it is an int, the blur's sample count
+// (4 in Central Yharnam), the first integer the apply hands the blur's
+// parameters (ppfx_sub_fb38f0). Scaled there as a float, to half and to
+// double, the game never faded in from its loading screen (twice at half,
+// three times at double; the glare that eases in as the world starts stayed
+// at its first value), while 0, 1x and 1.4x loaded normally. Motion blur
+// keeps its on/off setting.
 constexpr std::uint64_t kYebisRecord = 0x25d4860;
 // push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x28; mov r13, r9
 const std::uint8_t kYebisRecordPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
