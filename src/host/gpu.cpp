@@ -1,5 +1,6 @@
 #include "core/config.h"
 #include "core/host_clock.h"
+#include "core/linux_vm.h"
 #include "core/paced_file.h"
 #include "core/portable.h"
 #include "engine/gx_resources.h"
@@ -581,6 +582,10 @@ VkResult host_span(Chunk& c, void* ptr, std::uint64_t size) {
     mai.pNext = &flags;
     mai.allocationSize = size;
     mai.memoryTypeIndex = type;
+#if !defined(_WIN32)
+    // Kernel 7.3 pins unfaulted pages quadratically.
+    linux_vm_populate(ptr, size);
+#endif
     MemOwner own_mem("guest memory imports");
     if (const VkResult r = vkAllocateMemory(g.device, &mai, nullptr, &c.memory); r != VK_SUCCESS) return r;
     return vkBindBufferMemory(g.device, c.buffer, c.memory, 0);
