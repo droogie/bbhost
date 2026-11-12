@@ -249,6 +249,25 @@ std::atomic<bool> g_vignette{true}, g_dof{true};
 //   +0x1dc motion blur on (SetMotionBlurEnable), +0x1e4 and +0x1e8 its two
 //          times, +0x1ec its sample count (an int), +0x350 what the apply
 //          multiplies +0x1e8 by into the camera blur's amount
+//
+// The areas' depth of field is not the lens above but the game's own table:
+// each view the apply (the loop at 0x25d9760) fills 2048 floats at the YEBIS
+// object's +0xd0, entry i the blur at device depth i/2047 (the last two at
+// depth 1), which CustomDofLutCopy.cpo copies to the texture the CoC pass
+// reads depth through. An entry is the lens's circle of confusion at that
+// depth (sub_fb2dc0 0 -> 3: the focus and aperture above), negative in front
+// of the focus - unless +0x2d4 (the custom near ramp on) puts a ramp over
+// +0x2dc..+0x2e0 m there, strength +0x2e4, or +0x2d8 (the custom far ramp on)
+// one past +0x2ec..+0x2f0 m, strength +0x2f4; then a negative entry times
+// +0x2e8, a positive one times +0x2f8, and 0 past +0x2fc m. Every main area
+// has both ramps on (its GPARAM's CustomDof), so the lens's numbers never
+// reach the table there. With Central Yharnam's own levels (+0x1d0 0 in
+// front, +0x1d4 1 behind) YEBIS composites by clamp(k * CoC + b) (111fce32),
+// which never blends a negative circle; with a look's 7 and 7 it takes its
+// multi-level path (6e2d87e3), whose near levels blur what is in front.
+constexpr std::size_t kDofCustomNear = 0x2d4, kDofCustomFar = 0x2d8, kDofNearScale = 0x2e8, kDofFarScale = 0x2f8,
+                      kDofCut = 0x2fc;
+constexpr std::size_t kDofTable = 0xd0;  // on the YEBIS object: 2048 floats
 constexpr std::size_t kAutoExposure = 0x50, kMiddleGrey = 0x54, kExposure = 0x98, kGamma = 0x9c, kValue = 0xcc,
                       kContrast = 0x248;
 constexpr std::size_t kAberration = 0xac, kAberrationDispersion = 0xb4;
@@ -739,11 +758,13 @@ void apply_look(std::uint8_t* b) {
     if (!g_look_logged.exchange(true)) {
         host_log("graphics: a look over the area's exposure %g (auto %d, middle grey %g), gamma %g, saturation %g, value %g, "
                  "contrast %g, vignette %g; aberration %g (%g %g, %g %g); depth of field %d (auto focus %d, focus %g, aperture "
-                 "%g, levels %d %d; the post effect's part %d, on %d); motion blur %d (%g %g, %d samples, scale %g)",
+                 "%g, levels %d %d; its table's custom near %d far %d, scales %g %g, cut past %g m; the post effect's part %d, "
+                 "on %d); motion blur %d (%g %g, %d samples, scale %g)",
                  getf(kExposure), geti(kAutoExposure), getf(kMiddleGrey), getf(kGamma), getf(kSaturation), getf(kValue),
                  getf(kContrast), getf(kVignettePower), getf(kAberration), getf(kAberrationDispersion),
                  getf(kAberrationDispersion + 4), getf(kAberrationDispersion + 8), getf(kAberrationDispersion + 12),
                  geti(kDofOn), geti(kDofAuto), getf(kDofFocus), getf(kDofAperture), geti(kDofNear), geti(kDofFar),
+                 geti(kDofCustomNear), geti(kDofCustomFar), getf(kDofNearScale), getf(kDofFarScale), getf(kDofCut),
                  yebis_dof_ready(), yebis_dof_on(), geti(kBlurOn), getf(kBlurTime), getf(kBlurLength), geti(kBlurSamples),
                  getf(kBlurScale));
     }
@@ -776,6 +797,21 @@ void apply_look(std::uint8_t* b) {
             setf(kDofAperture, l.dof_aperture);
             seti(kDofNear, l.dof_near_levels);
             seti(kDofFar, l.dof_far_levels);
+            // The table from the lens instead of the area's ramps, every
+            // entry kept (nothing cut by distance) and as the lens gives it:
+            // negative in front of the focus, which the multi-level path's
+            // near levels blur at any focus distance (0 without blur in
+            // front), positive behind it (0 without blur behind). Turned to
+            // count as what is behind, the front went to the far side's
+            // levels, which YEBIS counts by the circle at the far end
+            // (0x1068b60) - none from a focus of about 50 m on, and no front
+            // blur with them. The block is the area's again at the next view
+            // without the look.
+            seti(kDofCustomNear, 0);
+            seti(kDofCustomFar, 0);
+            setf(kDofNearScale, l.dof_near_levels > 0 ? 1.0f : 0.0f);
+            setf(kDofFarScale, l.dof_far_levels > 0 ? 1.0f : 0.0f);
+            setf(kDofCut, 1.0e9f);
         }
     }
     if (l.set & kLookMotionBlur) {
@@ -789,9 +825,47 @@ void apply_look(std::uint8_t* b) {
     }
 }
 
+// BBHOST_DOF_TABLE_LOG=1: the depth of field's table as the last view's apply
+// filled it (the YEBIS object's +0xd0), a hash and its range each time it
+// changes - the area's table before a look's depth of field and after it is
+// byte for byte the same.
+void log_dof_table(const std::uint8_t* yebis) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_DOF_TABLE_LOG");
+        return e && e[0] == '1';
+    }();
+    if (!on) return;
+    std::uint64_t h = 1469598103934665603ull;
+    float lo = 0, hi = 0;
+    int neg = 0, pos = 0;
+    for (int i = 0; i < 2048; ++i) {
+        std::uint32_t u = 0;
+        std::memcpy(&u, yebis + kDofTable + i * 4, 4);
+        h = (h ^ u) * 1099511628211ull;
+        float v = 0;
+        std::memcpy(&v, &u, 4);
+        lo = i ? std::min(lo, v) : v;
+        hi = i ? std::max(hi, v) : v;
+        neg += v < 0.0f;
+        pos += v > 0.0f;
+    }
+    static std::uint64_t last = 0;
+    if (h == last) return;
+    last = h;
+    float at[6] = {};
+    const int idx[6] = {1024, 1945, 2013, 2037, 2045, 2047};  // ~0.1, 1, 3, 10, 50 m and depth 1
+    for (int i = 0; i < 6; ++i) std::memcpy(&at[i], yebis + kDofTable + idx[i] * 4, 4);
+    host_log("graphics: the depth of field's table %016llx: %d entries < 0, %d > 0, %g..%g; at 1024 %g, 1945 %g, 2013 %g, 2037 %g, "
+             "2045 %g, 2047 %g",
+             static_cast<unsigned long long>(h), neg, pos, static_cast<double>(lo), static_cast<double>(hi), static_cast<double>(at[0]),
+             static_cast<double>(at[1]), static_cast<double>(at[2]), static_cast<double>(at[3]), static_cast<double>(at[4]),
+             static_cast<double>(at[5]));
+}
+
 // sub_25d4860's entry: the YEBIS object in rdi.
 GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* saved) {
     const auto* yebis = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5]));
+    if (yebis) log_dof_table(yebis);
     if (!g_post_block || !yebis || yebis[kYebisHeld]) return 0;
     const float bloom = g_bloom.load(std::memory_order_relaxed);
     const bool vignette = g_vignette.load(std::memory_order_relaxed);

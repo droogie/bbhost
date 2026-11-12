@@ -279,7 +279,8 @@ over the game.
   area's; the exposure is the eye adaptation's target while it adapts, the
   fixed exposure otherwise), the vignette's power, depth of field (off, or on
   with a focus distance, an aperture and the blur's levels in front of and
-  behind the focus), chromatic aberration (off, or on with its lateral and
+  behind the focus - the lens's blur, in place of the area's own distance
+  ramps while it is on), chromatic aberration (off, or on with its lateral and
   uniform dispersions), motion blur (off, or on with its times, scale and
   samples) and the fog (its distance, density and contrast times the area's,
   its distance and height offsets added) - and the rest stay the area's. It is

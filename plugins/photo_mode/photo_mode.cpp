@@ -626,8 +626,10 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
                   "30", 5, 200, "dof=On"),
     {BB_OPT_FLOAT | BB_OPT_LIVE | BB_OPT_WHEN, "dof_aperture", "Aperture",
      "The lens's f-number: the smaller, the more blurred away from the focus. The areas use 5.6.", "5.6", 0.7, 32, "dof=On"},
-    LIVE_INT_WHEN("dof_near", "Blur in front", "How far the blur in front of the focus spreads: 0 to 7.", "0", 0, 7, "dof=On"),
-    LIVE_INT_WHEN("dof_far", "Blur behind", "How far the blur behind the focus spreads: 0 to 7.", "1", 0, 7, "dof=On"),
+    LIVE_INT_WHEN("dof_near", "Blur in front", "Blurs what is nearer than the focus, the further the more (0: none, up to 7).",
+                  "0", 0, 7, "dof=On"),
+    LIVE_INT_WHEN("dof_far", "Blur behind", "Blurs what is further than the focus, the further the more (0: none, up to 7).", "1",
+                  0, 7, "dof=On"),
 
     PANEL("ca", "Chromatic aberration", "Colour fringes towards the picture's edges, as a lens makes them."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "ca", "Chromatic aberration",
