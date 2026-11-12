@@ -104,6 +104,25 @@ int main() {
     std::uint64_t t = 100 * kSec;
     constexpr int kPhaseWindows = gxvk_rest::kSkip + gxvk_rest::kPhase;  // an experiment's phase: the switch's and the counted
     static_assert(gxvk_rest::kSkip == 3 && gxvk_rest::kPhase == 8 && gxvk_rest::kEarly == 3, "the phases' windows the cases count on");
+    // Without experiments (the run commit's duty, host/list_resolve.h): uncapped and not GPU-bound it works for good - no
+    // probe ever; a cap holding the frame and a GPU-bound frame still rest it, and the CP's saturation still ends a cap's rest.
+    {
+        State s;
+        s.experiments = false;
+        for (int k = 0; k < 2000; ++k) check(step(s, openf(0.0, 120.0), t += kWin) == kStay && !s.resting, "a probe without experiments", k);
+        State c;
+        c.experiments = false;
+        check(step(c, win(0.3), t += kWin) == kStay && step(c, win(0.3), t += kWin) == kRest && c.why == gxvk_rest::kWhyCap,
+              "no rest at a cap without experiments", 0);
+        for (int k = 0; k < 2; ++k) step(c, win(0.3, 60.0f, 0.97), t += kWin);
+        check(step(c, win(0.3, 60.0f, 0.97), t += kWin) == kWake, "a saturated CP does not end the cap's rest without experiments", 1);
+        for (int k = 0; k < 2000; ++k) check(step(c, openf(0.0, 120.0), t += kWin) != kRest, "a probe after the cap's rest without experiments", k);
+        State g;
+        g.experiments = false;
+        check(step(g, openf(0.0, 50.0, 0.95), t += kWin) == kStay && step(g, openf(0.0, 50.0, 0.95), t += kWin) == kRest &&
+                  g.why == gxvk_rest::kWhyGpu,
+              "no GPU-bound rest without experiments", 2);
+    }
     // A cap holding the frame: the second window in a row begins the rest, not the first.
     {
         State s;

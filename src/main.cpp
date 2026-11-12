@@ -9,6 +9,7 @@
 #include "core/thunk.h"
 #include "core/elf.h"
 #include "core/imports.h"
+#include "core/legacy_cpu.h"
 #include "core/win_watch.h"
 #include "core/write_watch.h"
 #include "engine/addr.h"
@@ -519,6 +520,8 @@ void exit_reports() {
     params_report();
     exit_step("hle_bp_report");
     hle_bp_report();
+    exit_step("legacy_cpu_verify");
+    legacy_cpu_verify("at exit");
     exit_step("hle_watch_report");
     hle_watch_report();
     exit_step("hle_kernel_memory_report");
@@ -753,6 +756,7 @@ void hle_watch_report() {
 
 // SIGTRAP: single-step landing after we allowed an out-of-range write; re-arm.
 void on_trap(int sig, siginfo_t*, void* ctx) {
+    if (legacy_cpu_on_sigtrap(ctx)) return;  // a branch into a rewritten site's int3s (core/legacy_cpu.h)
     auto* uc = static_cast<ucontext_t*>(ctx);
     const std::uint64_t bp = g_bp_va.load();
     if (bp) {
@@ -877,7 +881,8 @@ void on_segv(int sig, siginfo_t* info, void* ctx) {
     const std::uint64_t pc = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
     const std::uint64_t addr = reinterpret_cast<std::uint64_t>(info->si_addr);
     host_log("SIGSEGV pc=0x%llx addr=0x%llx (guest pc 0x%llx)", static_cast<unsigned long long>(pc),
-             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(pc));
+             static_cast<unsigned long long>(addr), static_cast<unsigned long long>(legacy_cpu_guest_pc(pc)));
+    legacy_cpu_crash_line(pc);
     host_log("  rax=%llx rdi=%llx rsi=%llx rdx=%llx rcx=%llx r8=%llx r13=%llx r15=%llx rsp=%llx rbp=%llx",
              static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RAX]),
              static_cast<unsigned long long>(uc->uc_mcontext.gregs[REG_RDI]),
@@ -1017,7 +1022,8 @@ __attribute__((no_stack_protector)) void on_segv_entry(int sig, siginfo_t* info,
     // frame's return address. Plain reads of the guest's own stack, no libc.
     std::uint64_t frame[kWriteWatchFrame] = {};
     if (sig == SIGSEGV && is_write) {
-        frame[0] = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]);
+        // A write from a legacy-CPU routine counts as the game instruction's.
+        frame[0] = legacy_cpu_guest_pc(static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RIP]));
         const std::uint64_t rsp = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RSP]);
         const std::uint64_t rbp = static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RBP]);
         const auto page_ok = [](std::uint64_t a) { return a > 0x10000 && (a & 0xfff) <= 0xff8; };
@@ -1031,6 +1037,14 @@ __attribute__((no_stack_protector)) void on_segv_entry(int sig, siginfo_t* info,
     if (sig == SIGSEGV && write_watch_on_fault(reinterpret_cast<std::uint64_t>(info->si_addr), is_write, frame)) {
         return;
     }
+    on_segv(sig, info, ctx);
+}
+
+// SIGILL: a BMI1 or MOVBE instruction of the game's that was not rewritten,
+// on a processor without them, is computed and stepped over
+// (core/legacy_cpu.h); anything else is a crash, reported as SIGSEGV's are.
+__attribute__((no_stack_protector)) void on_sigill(int sig, siginfo_t* info, void* ctx) {
+    if (legacy_cpu_on_sigill(ctx)) return;
     on_segv(sig, info, ctx);
 }
 #endif
@@ -1109,9 +1123,12 @@ int main(int argc, char** argv) {
     hle_kernel_reserve_guest_windows();  // before anything else can take those addresses
     write_watch_install();               // the vectored handler for write-protected texture memory
     win_crash_install();                 // the crash report, behind it
+    legacy_cpu_install_handler();        // BMI1/MOVBE left unrewritten, and the int3s of rewritten ones, first in line
     SetConsoleCtrlHandler(on_console_ctrl, TRUE);
     host_log("bbhost %s (%s, Windows x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
     log_cpu();
+    if (!legacy_cpu_check_floor()) return 4;  // below AVX, SSE4.2 and POPCNT: said, and nothing runs
+    legacy_cpu_log();
     {
         // The machine's memory, for reports from other machines: the GPU
         // locks the guest's direct memory (6 GiB) in RAM when it imports it.
@@ -1167,6 +1184,8 @@ int main(int argc, char** argv) {
     hle_kernel_reserve_guest_windows();  // before anything else can take those addresses (Vulkan's drivers, NGX)
     host_log("bbhost %s (%s, Linux x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
     log_cpu();
+    if (!legacy_cpu_check_floor()) return 4;  // below AVX, SSE4.2 and POPCNT: said, and nothing runs
+    legacy_cpu_log();
     std::signal(SIGTERM, on_term);
     {
         struct sigaction sa{};
@@ -1175,6 +1194,11 @@ int main(int argc, char** argv) {
         sigemptyset(&sa.sa_mask);
         sigaction(SIGSEGV, &sa, nullptr);
         sigaction(SIGBUS, &sa, nullptr);
+        struct sigaction si{};
+        si.sa_sigaction = on_sigill;
+        si.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&si.sa_mask);
+        sigaction(SIGILL, &si, nullptr);
         struct sigaction st{};
         st.sa_sigaction = on_trap;
         st.sa_flags = SA_SIGINFO | SA_ONSTACK;
@@ -1350,7 +1374,7 @@ int main(int argc, char** argv) {
     register_hle();
 
     ElfImage image{};
-    if (!load_orbis_elf(eboot, &image)) {
+    if (!load_orbis_elf(eboot, &image, legacy_cpu_arena_size())) {
         return 1;
     }
     // Only the 1.09 build runs: every patch, hook and engine layout is an
@@ -1368,6 +1392,10 @@ int main(int argc, char** argv) {
         }
         host_log("BBHOST_ANY_EBOOT=1: starting an eboot that is not 1.09");
     }
+    // A processor without BMI1, LZCNT or MOVBE: the game's instructions that
+    // use them rewritten now, after the relocations and before any patch,
+    // hook, decomp entry or plugin touches the code (core/legacy_cpu.h).
+    legacy_cpu_rewrite(&image);
     sampler_start(image.mem.slide, image.mem.slide + image.mem.size);  // BBHOST_SAMPLE
     perf_meter_start(image.mem.slide, image.mem.slide + image.mem.size, image.sha256 == kEboot109Sha256);  // which stage limits
     sampler_watchdog_start(image.mem.slide, image.mem.slide + image.mem.size);  // every thread's stack when the flips stop
@@ -1400,6 +1428,7 @@ int main(int argc, char** argv) {
             host_options_apply();  // the display settings, now that there is one
         }
     }
+    legacy_cpu_verify("before the guest starts");  // no patch or hook wrote into a rewritten site
     host_log("calling _start 0x%llx (CRT runs _init, stack=0x%zx)",
              static_cast<unsigned long long>(image.entry), kGuestMainStack);
     run_guest_start(reinterpret_cast<GuestStart>(image.entry), stack.data(), windowed);

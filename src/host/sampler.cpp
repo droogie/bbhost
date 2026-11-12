@@ -1,5 +1,6 @@
 #include "host/sampler.h"
 
+#include "core/legacy_cpu.h"
 #include "core/portable.h"
 #include "core/thunk.h"
 #include "hle/modules.h"
@@ -135,8 +136,9 @@ __attribute__((noinline)) void walk_stack(Slot& s, const ucontext_t* uc) {
     if (sigsetjmp(jb, 1) == 0) {
         t_unwinding = &jb;
         if (in_guest(rip)) {
-            // The eboot keeps frame pointers.
-            s.pc[s.n++] = reinterpret_cast<void*>(rip);
+            // The eboot keeps frame pointers. A legacy-CPU routine's pc counts
+            // as the game instruction's it stands for (core/legacy_cpu.h).
+            s.pc[s.n++] = reinterpret_cast<void*>(legacy_cpu_guest_pc(rip));
             walk_guest(s, static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RBP]),
                        static_cast<std::uint64_t>(uc->uc_mcontext.gregs[REG_RSP]));
             s.guest = 0;  // every frame is the guest's
@@ -740,7 +742,7 @@ void unwind(Sample& s, CONTEXT ctx) {
     while (s.n < kDepth) {
         const std::uint64_t rip = ctx.Rip;
         if (!rip) break;
-        s.pc[s.n++] = rip;
+        s.pc[s.n++] = in_guest(rip) ? legacy_cpu_guest_pc(rip) : rip;  // a legacy-CPU routine's: the game instruction's
         if (in_guest(rip)) {
             walk_guest(s, ctx.Rbp, ctx.Rsp);
             break;

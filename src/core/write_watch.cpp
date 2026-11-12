@@ -1,5 +1,7 @@
 #include "core/write_watch.h"
 
+#include "core/legacy_cpu.h"
+
 #include "log.h"
 
 #include <algorithm>
@@ -494,7 +496,7 @@ LONG CALLBACK write_watch_veh(EXCEPTION_POINTERS* ep) {
     std::uint64_t frame[kWriteWatchFrame] = {};
     if (is_write) {
         const CONTEXT* c = ep->ContextRecord;
-        frame[0] = not_host(c->Rip);
+        frame[0] = not_host(legacy_cpu_guest_pc(c->Rip));  // a legacy-CPU routine's write counts as the game's instruction's
         const std::uint64_t rsp = c->Rsp, rbp = c->Rbp;
         const auto page_ok = [](std::uint64_t a) { return a > 0x10000 && (a & 0xfff) <= 0xff8; };
         for (int k = 0; k < 6; ++k) {

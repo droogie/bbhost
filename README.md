@@ -119,7 +119,9 @@ See [docs/rendering.md](docs/rendering.md) for the graphics in detail and
    it (or kept beside it as `CUSA00900-UPDATE`, the way shadPS4 keeps it), and
    the 1.09 `eboot.bin` decrypted to an ELF (SHA-256
    `941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7`).
-2. Download a release for Windows or Linux, or build bbhost yourself.
+2. Download a release for Windows or Linux, or build bbhost yourself. The
+   processor needs AVX, SSE4.2 and POPCNT: an Intel Core of the 2nd
+   generation (Sandy Bridge) or newer, or an AMD FX or newer.
 3. Start `bbhost`. The setup window asks for the two paths, checks them and
    saves them; press Play.
 

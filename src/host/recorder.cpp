@@ -47,6 +47,7 @@
 #include "host/gpu_internal.h"
 #include "host/gxvk_lists.h"
 #include "host/list_resolve.h"
+#include "host/recorder_rest.h"
 #include "host/stream_ops.h"
 
 #include <algorithm>
@@ -60,6 +61,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 
@@ -292,6 +294,15 @@ alignas(64) std::atomic<std::uint64_t> g_published{0};  // blocks handed over (w
 alignas(64) std::atomic<std::uint64_t> g_done{0};       // blocks replayed (written by the recorder)
 alignas(64) std::atomic<std::uint64_t> g_pk_done{0};    // packets replayed: the last one's number + 1
 alignas(64) std::atomic<bool> g_sleeping{false};        // written by the recorder only as it sleeps and wakes
+// The recorder's rest at a frame cap (host/recorder_rest.h): set by host_gpu_recorder_paced on the main thread, read
+// by the recorder at each spin and by the producer at each publish to a sleeping recorder.
+alignas(64) std::atomic<bool> g_rest{false};
+std::uint32_t g_rest_unwoken = 0;  // resting: blocks published to a sleeping recorder since the last wake (under g.mu)
+std::atomic<std::uint64_t> g_rest_ns{0}, g_rests{0}, g_rest_at{0};  // the rests' time (ended ones), count, the one under way's start
+std::uint64_t rest_ns_total(std::uint64_t now) {
+    const std::uint64_t at = g_rest_at.load(std::memory_order_relaxed);
+    return g_rest_ns.load(std::memory_order_relaxed) + (g_rest.load(std::memory_order_relaxed) && at && now > at ? now - at : 0);
+}
 // The recorder's sleep on g_published and the producer's wake. std::atomic's
 // wait and notify are, in this build's libstdc++ on Windows, a mutex and a
 // winpthreads condition variable from a shared pool: each wake of a sleeping
@@ -789,14 +800,17 @@ void replay_block(const Block& b) {
 void recorder_thread() {
     host_thread_set_name("bb-record");
     host_thread_set_class(HostThreadClass::GpuFeed, "bb-record");  // with the command processor it serves
-    const int spin = g_recorder_spin;
+    const int spin_working = g_recorder_spin;
     std::uint64_t done = g_done.load(std::memory_order_acquire);
     for (;;) {
         if (gxvk_lists::splice()) gxvk_lists::keep_off_pool_cpus();  // (once the pool has its cores)
         std::uint64_t published = g_published.load(std::memory_order_acquire);
         if (published == done) {
             // Draws come in bursts a few microseconds apart: spin through
-            // those, sleep through the gaps between frames.
+            // those, sleep through the gaps between frames. Resting at a cap
+            // (host/recorder_rest.h) it sleeps almost at once, and is woken in
+            // batches.
+            const int spin = g_rest.load(std::memory_order_relaxed) ? recorder_rest::kRestSpin : spin_working;
             const std::uint64_t t0 = host_clock_monotonic_ns();
             for (int i = 0; i < spin && published == done; ++i) {
                 cpu_relax();
@@ -930,9 +944,14 @@ void publish_block(bool kick) {
         // g_sleeping and load of g_published, both sequentially consistent.
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (g_sleeping.load(std::memory_order_relaxed)) published_wake();
-    } else if (g_sleeping.load(std::memory_order_relaxed)) {
+        g_rest_unwoken = 0;
+    } else if (g_sleeping.load(std::memory_order_relaxed) &&
+               recorder_rest::wake_now(g_rest.load(std::memory_order_relaxed), g_rest_unwoken)) {
         // Unfenced: the recorder may go to sleep with this block unseen; the
-        // next publish or the drain that needs it wakes it.
+        // next publish or the drain that needs it wakes it. Resting at a cap,
+        // only every recorder_rest::kRestBatch blocks: a kick, and any wait
+        // on the recorder (wait_recorder, stream_wait_submitted), wakes it
+        // regardless.
         published_wake();
     }
 }
@@ -1253,6 +1272,93 @@ bool host_gpu_recorder_ns(std::uint64_t* replay_ns, std::uint64_t* spin_ns) {
     return true;
 }
 
+void host_gpu_recorder_paced(std::uint64_t wait_ns, float cap_fps, bool loading) {
+    using namespace gpu;
+    // BBHOST_RECORDER_REST: 1 the rule (unset), 0 never rests, 2 always rests.
+    static const int mode = [] {
+        const char* e = std::getenv("BBHOST_RECORDER_REST");
+        if (!e || !*e) return 1;
+        if (std::strcmp(e, "always") == 0) return 2;
+        return e[0] == '0' ? 0 : 1;
+    }();
+    if (!mode || g_mode != kModeThread || !g_blocks) return;
+    const std::uint64_t now = host_clock_monotonic_ns();
+    if (mode == 2) {
+        if (!g_rest.load(std::memory_order_relaxed)) {
+            g_rest_at.store(now, std::memory_order_relaxed);
+            g_rest.store(true, std::memory_order_relaxed);
+            g_rests.fetch_add(1, std::memory_order_relaxed);
+            host_log("recorder: rests from here on (BBHOST_RECORDER_REST=always)");
+        }
+        return;
+    }
+    // The main thread's alone: windows of half a second (or 120 frames), each decided by host/recorder_rest.h.
+    static std::uint64_t last = 0, win_ns = 0, win_wait = 0, frames = 0, gpu_at = 0, cp_at = 0;
+    static bool win_loading = false, gpu_known = false;
+    static recorder_rest::State state;
+    static int logs = 0;
+    if (!last) {
+        last = now;
+        const GpuBusy b = host_gpu_busy();
+        gpu_known = b.on;
+        gpu_at = b.busy_ns;
+        cp_at = gxvk_lists::cp_cpu_ns();
+        return;
+    }
+    win_ns += now - last;
+    last = now;
+    win_wait += wait_ns;
+    win_loading = win_loading || loading;
+    ++frames;
+    if (win_ns < 500'000'000ull && frames < 120) return;
+    const double slack = static_cast<double>(win_wait) / static_cast<double>(win_ns);
+    const double fps = static_cast<double>(frames) * 1e9 / static_cast<double>(win_ns);
+    const GpuBusy b = host_gpu_busy();
+    const double gpu = b.on && gpu_known ? static_cast<double>(b.busy_ns - gpu_at) / static_cast<double>(win_ns) : -1.0;
+    gpu_known = b.on;
+    gpu_at = b.busy_ns;
+    // The command processor's busy share: bb-cp0's CPU time, on every setup (its jobs' time would take in its waits for
+    // the GPU - 98-101% of the window on the Radeon 680M at 32-37 fps, the thread busy 29-44%).
+    const std::uint64_t cp_now = gxvk_lists::cp_cpu_ns();
+    const double cp = cp_now && cp_at ? static_cast<double>(cp_now - cp_at) / static_cast<double>(win_ns) : -1.0;
+    cp_at = cp_now;
+    const bool was = state.resting(), was_loading = win_loading;
+    const bool rest = recorder_rest::step(state, slack, gpu, cp, win_loading);
+    win_ns = win_wait = frames = 0;
+    win_loading = false;
+    if (rest == was) return;
+    if (rest) {
+        g_rest_at.store(now, std::memory_order_relaxed);
+        g_rest.store(true, std::memory_order_relaxed);
+        g_rests.fetch_add(1, std::memory_order_relaxed);
+        if (logs++ < 48) {
+            char why[160];
+            if (state.cap)
+                std::snprintf(why, sizeof(why), "the frame waits %.0f%% of its time for its cap (%.0f fps at %.0f)", 100.0 * slack, fps,
+                              static_cast<double>(cap_fps));
+            else if (cp >= 0)
+                std::snprintf(why, sizeof(why), "the frame is the GPU's (busy %.0f%% of the window, %.0f fps; the command processor %.0f%%)",
+                              100.0 * gpu, fps, 100.0 * cp);
+            else
+                std::snprintf(why, sizeof(why), "the frame is the GPU's (busy %.0f%% of the window, %.0f fps)", 100.0 * gpu, fps);
+            host_log("recorder: rests - %s: it spins %d pauses before it sleeps and is woken every %u blocks or at a submission "
+                     "(BBHOST_RECORDER_REST=0: never)",
+                     why, recorder_rest::kRestSpin, recorder_rest::kRestBatch);
+        }
+    } else {
+        const std::uint64_t at = g_rest_at.load(std::memory_order_relaxed);
+        g_rest.store(false, std::memory_order_relaxed);
+        g_rest_ns.fetch_add(at && now > at ? now - at : 0, std::memory_order_relaxed);
+        if (logs++ < 48)
+            host_log("recorder: works again after %.1f s - the frame waits %.0f%% of its time (%.0f fps, cap %.0f), the GPU busy %s, "
+                     "the command processor %s%s",
+                     at && now > at ? static_cast<double>(now - at) / 1e9 : 0.0, 100.0 * slack, fps, static_cast<double>(cap_fps),
+                     gpu >= 0 ? (std::to_string(static_cast<int>(100.0 * gpu + 0.5)) + "%").c_str() : "-",
+                     cp >= 0 ? (std::to_string(static_cast<int>(100.0 * cp + 0.5)) + "%").c_str() : "-",
+                     was_loading ? "; a loading screen" : "");
+    }
+}
+
 namespace gpu {
 
 std::string recorder_report() {
@@ -1260,7 +1366,7 @@ std::string recorder_report() {
     struct Last {
         Counts c;
         std::uint64_t spin = 0, replay = 0, sleeps = 0, endbegin_ns = 0, endbegin_n = 0, retire_ns = 0, retires = 0, fence_ns = 0, submits = 0;
-        std::uint64_t flip = 0;
+        std::uint64_t flip = 0, rested = 0;
     };
     static Last last;
     const Counts& c = g_counts;
@@ -1277,6 +1383,7 @@ std::string recorder_report() {
     const std::uint64_t submits = op(Op::kEndSubmit) + op(Op::kForeignSubmit) + op(Op::kBegin);
     const std::uint64_t draws = op(Op::kDrawState);
     const std::uint64_t spin = g_spin_ns.load(), replay = g_replay_ns.load(), sleeps = g_sleeps.load();
+    const std::uint64_t rested = rest_ns_total(host_clock_monotonic_ns());
     const StreamStats& s = g_stream_stats;
     const std::uint64_t eb_ns = s.endbegin_ns.load(), eb_n = s.endbegin_n.load(), r_ns = s.retire_ns.load(), r_n = s.retires.load(),
                         f_ns = s.fence_ns.load(), subs = s.submits.load();
@@ -1287,13 +1394,13 @@ std::string recorder_report() {
         "recorder: %llu draws replayed; %llu drains, %llu of them waited; %llu waits for a free packet. This window: %llu blocks "
         "(%llu draws), %llu ops (fill %llu, barrier %llu, copy %llu, pass %llu, query %llu, begin/submit %llu, other %llu); drains %llu "
         "(%llu waited, %llu us); submitted-waits %llu (%llu us); waits for a free block %llu / packet %llu; recorder spin %llu ms, "
-        "replay %llu ms, sleeps %llu%s",
+        "replay %llu ms, sleeps %llu, resting %llu ms%s",
         ull(g_pk_done.load()), ull(c.drains), ull(c.drain_waits), ull(c.packet_waits), ull(c.blocks - l.blocks), ull(draws), ull(all),
         ull(fills), ull(barriers), ull(copies), ull(passes), ull(queries), ull(submits),
         ull(all - fills - barriers - copies - passes - queries - submits - draws), ull(c.drains - l.drains), ull(c.drain_waits - l.drain_waits),
         ull((c.drain_ns - l.drain_ns) / 1000), ull(c.submitted_waits - l.submitted_waits), ull((c.submitted_wait_ns - l.submitted_wait_ns) / 1000),
         ull(c.full_waits - l.full_waits), ull(c.packet_waits - l.packet_waits), ull((spin - last.spin) / 1000000),
-        ull((replay - last.replay) / 1000000), ull(sleeps - last.sleeps),
+        ull((replay - last.replay) / 1000000), ull(sleeps - last.sleeps), ull((rested - last.rested) / 1000000),
         g_mode == kModeOff ? " (recorder off)" : g_mode == kModeInline ? " (inline)" : stream_on() ? "" : " (BBHOST_STREAM_SUBMIT=0)");
     // What a submission costs on its way, wherever it runs.
     const std::uint64_t ns = subs - last.submits;
@@ -1324,6 +1431,7 @@ std::string recorder_report() {
     last.spin = spin;
     last.replay = replay;
     last.sleeps = sleeps;
+    last.rested = rested;
     last.endbegin_ns = eb_ns;
     last.endbegin_n = eb_n;
     last.retire_ns = r_ns;

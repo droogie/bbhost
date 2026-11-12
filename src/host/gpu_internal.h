@@ -2777,6 +2777,9 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c);
 bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, std::uint32_t height, std::size_t bytes_per_pixel,
                                        VkImage target);
 void textures_retire(std::uint64_t base, std::size_t bytes, std::uint64_t after_submitted, std::uint64_t gen = 0);
+// A YEBIS texture's update kept for the texture made for it (host/tex_update.h); false when none is kept
+// (BBHOST_YEBIS_UPDATE_AT_MAKE=0, no resource). Any thread: its own lock.
+bool textures_yebis_update(struct TexUpdate&& u);
 // While on, the resources that die are a size change's old ones
 // (host_gpu_targets_rebuild): their retirements say so.
 void textures_rebuild_window(bool on);

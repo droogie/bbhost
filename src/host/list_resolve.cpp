@@ -7,6 +7,7 @@
 #include "core/portable.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
+#include "host/gxvk_lists.h"
 #include "log.h"
 
 #include <algorithm>
@@ -128,6 +129,29 @@ void commit_give_way() {
     // the homes' default (follow_homes) and BBHOST_GXVK_HOMES=1 want them too.
     g_commit.store(0, std::memory_order_relaxed);
     g_gave_way.store(true, std::memory_order_relaxed);
+}
+
+std::atomic<bool> g_run_resting{false};
+
+namespace {
+// BBHOST_RUN_COMMIT_REST: 1 the duty's rule (unset), 0 never rests, 2 always rests.
+int run_rest_mode() {
+    const char* e = std::getenv("BBHOST_RUN_COMMIT_REST");
+    if (!e || !*e) return 1;
+    if (std::strcmp(e, "always") == 0) return 2;
+    return e[0] == '0' ? 0 : 1;
+}
+}  // namespace
+
+bool duty_on() {
+    static const int mode = run_rest_mode();
+    static const bool by_default = commit_by_default();
+    // (commit_draws() false once the default gave way to the homes: no run is forked, nothing to rest)
+    return duty_wanted(by_default, commit_draws(), mode);
+}
+bool duty_always() {
+    static const bool always = run_rest_mode() == 2;
+    return always;
 }
 
 void follow_homes() {
@@ -593,6 +617,7 @@ void log_commit() {
              static_cast<ull>(g_look_stop[kLookSplit].load()), static_cast<ull>(g_look_stop[kLookTargets].load()),
              static_cast<ull>(g_look_stop[kLookNotReady].load()), static_cast<ull>(g_look_stop[kLookEnd].load()),
              static_cast<ull>(g_look_stop[kLookKind].load()));
+    if (duty_on()) host_log("list-resolve: run commit (duty): %s", gxvk_lists::run_duty_report().c_str());
 }
 
 }  // namespace

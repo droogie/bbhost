@@ -2743,7 +2743,11 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     if (gxvk_lists::splice_compare()) host_gpu_splice_compare(token_id);
                     if (look) gxvk_lists::cp_look_end();
                     if (lists_census) gxvk_lists::cp_draw_end();
-                    if (list_resolve::commit_draws() && !list_resolve::run_held()) run_commit_after(b + n, *in);
+                    // The run commit resting (list_resolve::run_resting, its duty): no fork - the run's draws are
+                    // drawn in order as the walk reaches them. Only a new run waits on it: one forked before the
+                    // rest began is taken above, a held run's count drains as before.
+                    if (list_resolve::commit_draws() && !list_resolve::run_held() && !list_resolve::run_resting())
+                        run_commit_after(b + n, *in);
                 }
                 hle_gx_native_release();
             }
@@ -3218,6 +3222,7 @@ void cp_thread(Queue* q, int id) {
         char name[16];
         std::snprintf(name, sizeof(name), "bb-cp%d", id);
         host_thread_set_name(name);
+        if (id == 0) gxvk_lists::cp_thread_note(host_thread_cpu_clock());  // its CPU time, for the recorder's rest
         // Above the guest's threads on Windows: the game's frame waits on
         // this one, and a GX worker that took its core delayed every draw
         // behind it (core/host_clock.h, BBHOST_THREAD_PRIO=0).
@@ -3261,7 +3266,8 @@ void cp_thread(Queue* q, int id) {
             q->jobs.pop_front();
         }
         ++taken;
-        const std::uint64_t job_t0 = id == 0 && gxvk_lists::pool() ? host_clock_monotonic_ns() : 0;  // (the draw pool's rest: host/gxvk_lists.h)
+        // (the duty's command-processor share: the draw pool's rest, host/gxvk_lists.h, or the run commit's, list_resolve::duty_on)
+        const std::uint64_t job_t0 = id == 0 && (gxvk_lists::pool() || list_resolve::duty_on()) ? host_clock_monotonic_ns() : 0;
         if (idle_log && id == 0) {
             const std::uint64_t now = host_clock_monotonic_ns();
             if (now - idle_since >= 10'000'000'000ull) {

@@ -5,6 +5,7 @@
 #include "core/config.h"
 #include "core/elf.h"
 #include "core/imports.h"
+#include "core/legacy_cpu.h"
 #include "core/memory.h"
 #include "core/portable.h"
 #include "engine/addr.h"
@@ -178,12 +179,22 @@ int api_read(std::uint64_t bn, void* out, std::size_t n) {
     const std::uint64_t at = plugin_address::read_address(bn, n, g_image->mem.slide, g_image->mem.size,
                                                           [](std::uint64_t a, std::size_t len) { return hle_kernel_va_mapped(a, len); });
     if (!at) return 1;
-    return host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), out, n) ? 0 : 1;
+    if (!host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), out, n)) return 1;
+    // The game's code reads as the game has it where a site was rewritten
+    // for this processor (core/legacy_cpu.h).
+    if (legacy_cpu_meets(at, n)) legacy_cpu_original(at, n, static_cast<std::uint8_t*>(out));
+    return 0;
 }
 
 int api_write(std::uint64_t bn, const void* data, std::size_t n) {
     const std::uint64_t at = runtime_of(bn, n);
     if (!at || !api_eboot_is_109()) return 1;
+    if (legacy_cpu_meets(at, n)) {
+        // A site rewritten for this processor (core/legacy_cpu.h): its jump would break.
+        host_log("plugin: a write to 0x%llx refused: it covers a site rewritten for this processor (api_patch can replace it)",
+                 static_cast<unsigned long long>(bn));
+        return 1;
+    }
     GuestMemory& mem = g_image->mem;
     const std::uint64_t lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
     if (!guest_protect_rw(&mem, lo, hi - lo)) return 2;
@@ -214,9 +225,20 @@ int api_patch(std::uint64_t bn, const void* expect, const void* bytes, std::size
     if (!at || !api_eboot_is_109()) return 1;
     GuestMemory& mem = g_image->mem;
     auto* p = static_cast<std::uint8_t*>(guest_ptr(mem, at));
-    if (std::memcmp(p, expect, n) != 0) return std::memcmp(p, bytes, n) == 0 ? 0 : 1;
+    // Against the bytes as the game has them; a site rewritten for this
+    // processor (core/legacy_cpu.h) is given up to a patch that replaces it
+    // whole, and refused to one that would cut its jump.
+    std::vector<std::uint8_t> have(n);
+    legacy_cpu_original(at, n, have.data());
+    if (std::memcmp(have.data(), expect, n) != 0) return std::memcmp(have.data(), bytes, n) == 0 ? 0 : 1;
+    if (legacy_cpu_meets(at, n) < 0) {
+        host_log("plugin: a patch at 0x%llx refused: it cuts a site rewritten for this processor",
+                 static_cast<unsigned long long>(bn));
+        return 1;
+    }
     const std::uint64_t lo = at & ~0xfffull, hi = (at + n + 0xfff) & ~0xfffull;
     if (!guest_protect_rwx(&mem, lo, hi - lo)) return 2;
+    legacy_cpu_release(at, n, "a plugin's patch");
     std::memcpy(p, bytes, n);
     if (!guest_protect_rx(&mem, lo, hi - lo)) {
         host_log("plugin: cannot restore the protection of 0x%llx", static_cast<unsigned long long>(bn));
@@ -255,7 +277,7 @@ int api_hook(std::uint64_t bn, const void* prologue, std::size_t n, BbHookFn fn,
     if (!at) return 1;
     std::uint8_t have[64];
     if (n > sizeof(have)) return 1;
-    std::memcpy(have, guest_ptr(g_image->mem, at), n);
+    legacy_cpu_original(at, n, have);  // as the game has them (core/legacy_cpu.h)
     if (std::memcmp(have, prologue, n) != 0) return 1;
     g_hooks.push_back({fn, nullptr, user});
     const std::uint64_t id = g_hooks.size();
@@ -392,7 +414,7 @@ int api_hook2(std::uint64_t bn, const void* prologue, std::size_t n, BbHookFn2 f
     const std::uint64_t at = runtime_of(bn, n);
     if (!at) return 1;
     std::uint8_t have[64];
-    std::memcpy(have, guest_ptr(g_image->mem, at), n);
+    legacy_cpu_original(at, n, have);  // as the game has them (core/legacy_cpu.h): what the stub runs, expanded there
     if (prologue && std::memcmp(have, prologue, n) != 0) return 1;
     g_hooks.push_back({nullptr, fn, user});
     const std::uint64_t id = g_hooks.size();

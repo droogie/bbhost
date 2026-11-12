@@ -99,6 +99,33 @@ std::uint64_t host_thread_cpu_ns() {
 #endif
 }
 
+std::uintptr_t host_thread_cpu_clock() {
+#if defined(_WIN32)
+    // A handle of its own, kept for the process's life (a thread watched so lives as long).
+    return reinterpret_cast<std::uintptr_t>(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId()));
+#else
+    clockid_t id{};
+    if (pthread_getcpuclockid(pthread_self(), &id) != 0) return 0;
+    return static_cast<std::uintptr_t>(static_cast<std::uint32_t>(id)) | (std::uintptr_t{1} << 40);  // never 0
+#endif
+}
+
+std::uint64_t host_thread_cpu_ns_of(std::uintptr_t clock) {
+    if (!clock) return 0;
+#if defined(_WIN32)
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(reinterpret_cast<HANDLE>(clock), &c, &e, &k, &u)) return 0;
+    const auto to64 = [](const FILETIME& f) {
+        return (static_cast<std::uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
+    };
+    return (to64(k) + to64(u)) * 100;  // 100 ns units
+#else
+    timespec ts{};
+    if (clock_gettime(static_cast<clockid_t>(static_cast<std::uint32_t>(clock)), &ts) != 0) return 0;
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(ts.tv_nsec);
+#endif
+}
+
 #if !defined(_WIN32)
 namespace {
 // Set while this thread copies in host_read_safe: a fault in the copy comes

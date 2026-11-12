@@ -2,6 +2,9 @@
 #include "engine/graphics_patch.h"
 
 #include "core/elf.h"
+#include "core/legacy_cpu.h"
+#include "core/legacy_cpu_code.h"
+#include "decomp/insn.h"
 #include "core/memory.h"
 #include "core/thunk.h"
 #include "engine/addr.h"
@@ -944,6 +947,7 @@ void* alloc_exec_near(std::uint64_t at) {
 // call: host ran the target itself, around its own work). For a jump the
 // stack is as at a function's entry (a tail call).
 bool install_jump_hook(ElfImage* image, std::uint64_t at, std::uint64_t target, void* host) {
+    if (legacy_cpu_meets(at, 5)) return false;  // a rewritten site there (core/legacy_cpu.h): not a call
     auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
     std::int32_t rel = 0;
     std::memcpy(&rel, p + 1, 4);
@@ -1400,14 +1404,45 @@ namespace {
 // `exec`/`m`: the bytes the stub runs in place of the displaced prologue when
 // it cannot run them verbatim (a rip-relative lea rewritten as a movabs of the
 // slid address); null runs the prologue itself.
+// Whether the bytes hold an instruction core/legacy_cpu.h rewrites.
+bool has_legacy_insn(const std::uint8_t* code, std::size_t n) {
+    for (std::size_t i = 0; i < n;) {
+        LegacyInsn li;
+        if (legacy_decode(code + i, n - i, &li)) return true;
+        const X86Insn x = x86_decode(code + i, n - i);
+        if (!x.len) return false;
+        i += x.len;
+    }
+    return false;
+}
+
 bool install_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t* prologue, std::size_t n,
                            void* host, std::uint64_t id = 0, const std::uint8_t* exec = nullptr, std::size_t m = 0,
                            bool keep_rax = false, bool site = false) {
     auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
-    if (n < 14 || std::memcmp(p, prologue, n) != 0) return false;
+    // The bytes as the game has them (a site rewritten for an older processor,
+    // core/legacy_cpu.h, compares as its own instruction), and none of those
+    // sites cut in two by the hook's jump.
+    std::uint8_t have[256];
+    if (n < 14 || n > sizeof(have)) return false;
+    legacy_cpu_original(at, n, have);
+    if (std::memcmp(have, prologue, n) != 0) return false;
+    if (legacy_cpu_meets(at, n) < 0) {
+        host_log("hook: 0x%llx's %zu bytes cut a site rewritten for this processor; not hooked",
+                 static_cast<unsigned long long>(at - image->mem.slide + kPreferredGuestSlide), n);
+        return false;
+    }
     if (!exec) {
         exec = prologue;
         m = n;
+    }
+    // Displaced instructions the processor lacks run as their routines in the stub.
+    std::uint8_t expanded[512];
+    if (legacy_cpu_on() && has_legacy_insn(exec, m)) {
+        const std::size_t k = legacy_relocate(exec, m, at, expanded, 0, sizeof(expanded));
+        if (!k) return false;
+        exec = expanded;
+        m = k;
     }
 #if defined(_WIN32)
     void* page = VirtualAlloc(nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -1420,6 +1455,7 @@ bool install_prologue_hook(ElfImage* image, std::uint64_t at, const std::uint8_t
     if (!placed || !guest_protect_rwx(&image->mem, lo, hi - lo)) return false;
     auto* stub = static_cast<std::uint8_t*>(page);
     thunk_emit_prologue_stub(stub, id, thunk_wrap(host), at + n, exec, m, keep_rax, site);
+    legacy_cpu_release(at, n, "a hook");
     const std::uint64_t dest = reinterpret_cast<std::uint64_t>(stub);
     p[0] = 0xff;
     p[1] = 0x25;  // jmp [rip+0]

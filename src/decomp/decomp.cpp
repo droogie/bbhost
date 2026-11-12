@@ -1,6 +1,8 @@
 #include "decomp/decomp.h"
 
 #include "core/elf.h"
+#include "core/legacy_cpu.h"
+#include "core/legacy_cpu_code.h"
 #include "core/memory.h"
 #include "core/thunk.h"
 #include "decomp/insn.h"
@@ -8,6 +10,7 @@
 #include "engine/addr.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -41,6 +44,10 @@ constexpr std::size_t kPage = 0x1000;
 constexpr std::uint64_t kReach = 0x7fff0000ull;  // a rel32, with room for the page itself
 std::uint8_t* g_page = nullptr;
 std::size_t g_page_used = 0;
+
+// How much of a function the body checks may read (core/legacy_cpu.h's copy
+// of the game's bytes): the longest checked body is a few KiB.
+constexpr std::uint64_t kBodyWindow = 0x10000;
 
 // An executable page from which a rel32 reaches all of [lo, hi), and back.
 std::uint8_t* page_near(std::uint64_t lo, std::uint64_t hi) {
@@ -118,25 +125,46 @@ bool place(ElfImage* image, const DecompFunction& fn, bool compare) {
     const std::uint64_t at = image->mem.slide + (fn.bn - kPreferredGuestSlide);
     if (fn.entry_len < 5 || at < image->mem.slide || at + fn.entry_len > image->mem.slide + image->mem.size) return false;
     auto* p = static_cast<std::uint8_t*>(guest_ptr(image->mem, at));
-    if (!p || std::memcmp(p, fn.entry, fn.entry_len) != 0) {
+    // The instructions as the game has them: a site rewritten for an older
+    // processor (core/legacy_cpu.h) compares as its own, and the body check
+    // reads a copy of the game's bytes from the entry on.
+    std::uint8_t entry[64];
+    if (fn.entry_len > sizeof(entry)) return false;
+    legacy_cpu_original(at, fn.entry_len, entry);
+    if (std::memcmp(entry, fn.entry, fn.entry_len) != 0) {
         host_log("decomp: %s refused, 0x%llx does not hold the instructions it was written against; the game's stays",
                  fn.name, static_cast<ull>(fn.bn));
         return false;
     }
-    if (fn.body_ok && !fn.body_ok(p)) {
+    if (legacy_cpu_meets(at, fn.entry_len) < 0) {
+        host_log("decomp: %s refused, its entry's jump would cut a site rewritten for this processor; the game's stays", fn.name);
+        return false;
+    }
+    std::vector<std::uint8_t> body;
+    const std::uint8_t* body_at = p;
+    if (fn.body_ok && legacy_cpu_on()) {
+        const std::uint64_t end = image->mem.slide + image->mem.size;
+        body.resize(static_cast<std::size_t>(std::min<std::uint64_t>(kBodyWindow, end - at)));
+        legacy_cpu_original(at, body.size(), body.data());
+        body_at = body.data();
+    }
+    if (fn.body_ok && !fn.body_ok(body_at)) {
         host_log("decomp: %s refused, its body after 0x%llx is not the one ours mirrors; the game's stays", fn.name,
                  static_cast<ull>(fn.bn));
         return false;
     }
     // The trampoline: the displaced instructions, re-aimed, at most 64 bytes
-    // (a short branch grows to its rel32 form); the jump back; the far leg.
-    constexpr std::size_t kMoved = 64, kNeed = kMoved + 5 + 14;
+    // (a short branch grows to its rel32 form; an instruction a routine
+    // stands for, its routine); the jump back; the far leg.
+    const std::size_t kMoved = legacy_cpu_on() ? 192 : 64, kNeed = kMoved + 5 + 14;
     std::uint8_t* t = carve(image->mem, kNeed);
     if (!t) {
         host_log("decomp: %s refused, no executable page within reach of the image", fn.name);
         return false;
     }
-    const std::size_t moved = x86_relocate(fn.entry, fn.entry_len, at, t, reinterpret_cast<std::uint64_t>(t), kMoved);
+    // An instruction the processor lacks (core/legacy_cpu.h) runs as its routine there.
+    const std::size_t moved = legacy_cpu_on() ? legacy_relocate(fn.entry, fn.entry_len, at, t, reinterpret_cast<std::uint64_t>(t), kMoved)
+                                              : x86_relocate(fn.entry, fn.entry_len, at, t, reinterpret_cast<std::uint64_t>(t), kMoved);
     std::uint8_t* back = t + moved;
     std::uint8_t* leg = back + 5;
     if (!moved || !rel32_reaches(back, at + fn.entry_len) || !rel32_reaches(p, reinterpret_cast<std::uint64_t>(leg))) {
@@ -159,6 +187,7 @@ bool place(ElfImage* image, const DecompFunction& fn, bool compare) {
     if (!guest_protect_rwx(&image->mem, lo, hi - lo)) return false;
     // The trampoline is published before the jump that can lead to it.
     if (fn.original) *fn.original = t;
+    legacy_cpu_release(at, fn.entry_len, fn.name);
     std::memset(p + 5, 0xcc, fn.entry_len - 5);
     put_rel32(p, 0xe9, reinterpret_cast<std::uint64_t>(leg));
     guest_protect_rx(&image->mem, lo, hi - lo);
