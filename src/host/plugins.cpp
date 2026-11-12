@@ -1174,10 +1174,10 @@ int api_on_camera(void (*fn)(BbCamera*, void*), void* user) {
 
 // The scene's camera, after the copy above: the game state's update keeps it
 // in r15, loaded at 0x1d3bb93 from the object the slot at 0x594f880 holds
-// (+0x10). At 0x1d3bec5 the copy is done and a scripted camera's replacing it
-// is still to come (mov rax, [r13+0x110]; cmp dword [rax+0xc4], 0 - the scripted
-// camera's switch). The stub keeps only the argument registers, so the camera is
-// found again through the slot rather than r15.
+// (+0x10). At 0x1d3bec5 the copy is done and the debug free camera's replacing
+// it is still to come (mov rax, [r13+0x110]; cmp dword [rax+0xc4], 0 - its switch;
+// set, its camera at +0xd0 is copied over the scene's). The stub keeps only the
+// argument registers, so the camera is found again through the slot rather than r15.
 std::vector<CameraCallback> g_view_callbacks;  // under g_frame_mu
 bool g_view_hooked = false;
 
