@@ -275,9 +275,10 @@ Plugins
       lohit = true         # the map's collision drawn in place of the map
       ps1 = true           # the 3D drawn as the first PlayStation drew it
       iso = true           # an isometric camera, the walls in its way cut away
+      shoulder = true      # a close camera over the hunter's shoulder
       debug_menu = true    # the developers' debug menu: \` opens it
   Each one's settings go in a section of its own name ([randomizer],
-  [boss_rush], [mutators], [quake], [lohit], [ps1], [iso]); docs/plugins.md in the repository lists them.
+  [boss_rush], [mutators], [quake], [lohit], [ps1], [iso], [shoulder]); docs/plugins.md in the repository lists them.
   Use the boss rush on a save of its own. Cheating against other players
   with the debug menu gets an account banned; trying it out online with
   friends is fine.
