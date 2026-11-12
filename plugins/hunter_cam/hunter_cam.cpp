@@ -18,8 +18,9 @@
 //   swap_time = 0.25         # seconds a swap takes
 //   first_person = false     # the view from the hunter's eyes
 //   first_person_key = "Z"   # toggles first person while playing
-//   eye_height = 1.55        # metres above the feet, in first person
-//   first_person_field_of_view = 0  # % wider, in first person
+//   head_bob = false         # the eyes ride on the hunter's head in first person
+//   eye_height = 1.55        # metres above the feet, in first person (head_bob off)
+//   first_person_field_of_view = 0  # % wider, in first person (0: field_of_view's)
 //   look_limit = 80          # degrees up or down in first person (the game's aim: 35 up, 40 down)
 //   stick_speed = 1.0        # the right stick's turning, times the game's
 //   mouse_sensitivity = 50   # the mouse in the aim (first person, facing the camera), F10's scale
@@ -40,7 +41,8 @@
 // zoom); the game's sphere cast with the follow camera's own filter (0x25,
 // sub_1c090e0) tests the way out to the shoulder and back, so a wall pulls the
 // camera in (at once; it eases back out). In first person the place is the
-// hunter's eyes: their feet raised by the Eye height, a hand's width forward.
+// hunter's eyes: their feet raised by the Eye height, a hand's width forward -
+// or, with Head bob, the eyes' dummy poly on the head's bone, as posed.
 //
 // The zoom. The wheel and the middle button (the host's Camera Zoom keys,
 // plugin API 26) zoom the shoulder camera 15% a notch and reset it. Once a
@@ -55,12 +57,15 @@
 // bit 2 says it is drawn (the Quake plugin's viewmodel); a model ins's file name
 // is at +0x148 -> +0x18 (WP_ the weapons, one slot a hand: 7 and 11; HD_, BD_,
 // AM_, LG_ the armour, FC_, HR_ and FG_ the face). In first person every
-// part but the weapons and the arms - the slots whose model is a WP_ or AM_
-// file - is hidden that way, frame by frame (a change of equipment makes new
-// ones), and shown again as first person ends, the plugin goes off or the
-// world loads. The hunter faces where the camera looks there, as with Always
-// face the camera, and the aim camera that brings may turn 80 degrees up and
-// down (Look up/down limit) where the game holds it to 35 and 40.
+// part but the weapons, the arms and the chest (whose coat carries the upper
+// arms) - the slots whose model is a WP_, AM_ or BD_ file - is hidden that
+// way, frame by frame (a change of equipment makes new ones), and shown again
+// as first person ends, the plugin goes off or the world loads. The hunter
+// faces where the camera looks there, as with Always face the camera, and the
+// aim camera that brings may turn 80 degrees up and down (Look up/down limit)
+// where the game holds it to 35 and 40. Its field of view is the follow
+// camera's, which only updates while it has the view: F10's Field of view
+// reaches it through LockCamParam's camFovY, read directly.
 //
 // The aim. With the precision-shooting bit set the game also hides X's prompt
 // and press (the action button's and the NPC talk's checks of it) and puts a
@@ -92,7 +97,12 @@
 // Isometric plugin's, from Kyo's Modern Movement Lite: four-way quicksteps
 // without a lock) unless something already wrote them, which keeps them: the
 // patch list's Modern Movement Lite works beside the plugin at either setting,
-// and only what the plugin wrote is taken back.
+// and only what the plugin wrote is taken back. Aiming (facing the camera, first
+// person), a roll could only go straight ahead - the game holds the aiming
+// hunter's facing, and reads the aim before the script runs - so a roll asked
+// for there is put off a frame (the stamina query answered 0), the aim dropped
+// for the roll, and the script, asking again, rolls the hunter the stick's way
+// as unaimed; the view is held still meanwhile and the aim given back its angles.
 #include "bbhost_plugin.h"
 
 #include <atomic>
@@ -110,7 +120,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "hunter_cam",
     "Hunter Cam",
-    "1.2.0",
+    "1.3.0",
     "Kyo",
     "The hunter from closer in: an over-the-shoulder camera (right or left, swapped with a key, zoomed with the wheel) "
     "or first person with only the arms and weapons drawn; the hunter can always face where the camera looks, the right "
@@ -145,9 +155,15 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "Starts in first person. The hunter always faces where they look there.", "false", 0, 0, nullptr},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "first_person_key", "First person key",
      "Switches between first person and the camera above while playing (keyboard and mouse).", "Z", 0, 0, KEY_CHOICES},
-    {BB_OPT_FLOAT | BB_OPT_LIVE, "eye_height", "Eye height", "Metres above the hunter's feet.", "1.55", 1.2, 1.9, nullptr},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "head_bob", "Head bob",
+     "The view rides on the hunter's head: it bobs, sways and dips as the head does when they run, roll and swing. Off: "
+     "a steady view at the Eye height.",
+     "false", 0, 0, nullptr},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "eye_height", "Eye height", "Metres above the hunter's feet (Head bob off).", "1.55", 1.2,
+     1.9, nullptr},
     {BB_OPT_INT | BB_OPT_LIVE, "first_person_field_of_view", "First-person field of view (+%)",
-     "How much wider the view from the eyes is, as F10's Field of view widens it: 0 is the game's.", "0", 0, 100, nullptr},
+     "How much wider the view from the eyes is, as F10's Field of view widens it: 0 takes the Field of view above.", "0",
+     0, 100, nullptr},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "look_limit", "Look up/down limit",
      "Degrees the view turns up or down from level in first person.", "80", 45, 89, nullptr},
     {BB_OPT_HEADING, "h_controls", "Turning", nullptr, nullptr, 0, 0, nullptr},
@@ -200,7 +216,7 @@ struct Settings {
     Key swap_key = Key::Tab, first_key = Key::Z;
     float distance = 1.7f, offset = 0.55f, height = 0.15f, swap_time = 0.25f;
     int fov = 0;  // +% wider
-    bool first_person = false;
+    bool first_person = false, head_bob = false;
     float eye_height = 1.55f, look_limit = 80.0f;
     int first_fov = 0;  // +% wider
     float stick_speed = 1.0f;
@@ -268,6 +284,7 @@ void read_options() {
     s.swap_time = number("hunter_cam.swap_time", 0.25f, 0.0f, 1.0f);
     s.first_person = flag("hunter_cam.first_person", false);
     s.eye_height = number("hunter_cam.eye_height", 1.55f, 1.2f, 1.9f);
+    s.head_bob = flag("hunter_cam.head_bob", false);
     s.first_fov = static_cast<int>(number("hunter_cam.first_person_field_of_view", 0.0f, 0.0f, 100.0f) + 0.5f);
     s.look_limit = number("hunter_cam.look_limit", 80.0f, 45.0f, 89.0f);
     s.stick_speed = number("hunter_cam.stick_speed", 1.0f, 0.25f, 4.0f);
@@ -427,6 +444,18 @@ struct SiteSet {
 };
 SiteSet g_interact{kInteract, sizeof(kInteract) / sizeof(kInteract[0]), "X's action button and talk"};
 SiteSet g_sight{kSight, sizeof(kSight) / sizeof(kSight[0]), "the crosshair"};
+// Until when (steady clock, ns) a roll runs unaimed. Aiming, the game holds
+// the hunter facing where the camera looks - it reads that before the script
+// runs - so a roll would only ever go straight ahead. The script's roll is
+// put off a frame instead (env_hook), the aim dropped, and the roll it then
+// starts turns to the stick as unaimed rolls do.
+std::atomic<long long> g_roll_until{0};
+constexpr long long kRollTurnNs = 800000000;  // 0.8 s: the roll, then the aim again
+
+
+long long now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // The checks passed (on) or the game's again (off).
 void set_sites(SiteSet& g, bool on) {
@@ -464,12 +493,13 @@ std::atomic<bool> g_monocular{false};          // SpEffect 2000 on: the monocula
 bool g_first = false;                          // in first person now (the key or the option)
 
 bool aim_wanted() { return s.on && (s.face_camera || g_first); }
+bool rolling() { return now_ns() < g_roll_until.load(); }
 
 // Once a frame, on the main thread: the bit set while it should be, cleared
 // once it should not (only when we set it).
 void face_camera_frame() {
     const bool loading = api->loading_screen && api->loading_screen();
-    const bool want = aim_wanted() && !loading;
+    const bool want = aim_wanted() && !loading && !rolling();
     std::uint8_t* chr = player();
     if (chr != g_aim_chr) g_aim_ours = false;  // a load: the character it was on is gone
     g_aim_chr = chr;
@@ -536,6 +566,16 @@ int env_hook(BbHookCtx* c, void*) {
     if (g_dodge == 1) {
         g_dodge = id == kEnvStamina ? 2 : 0;
         g_dodge_calls = 0;
+        if (g_dodge == 2 && aim && (me[kAimFlags] & kAimBit)) {
+            // A roll asked for while aiming: not this frame (no stamina, as
+            // far as the script knows) - the aim drops, and the request, still
+            // there next frame, rolls unaimed.
+            g_dodge = 0;
+            g_roll_until.store(now_ns() + kRollTurnNs);
+            me[kAimFlags] &= static_cast<std::uint8_t>(~kAimBit);
+            c->ret = 0;
+            return 1;
+        }
     } else if (g_dodge == 2 && ++g_dodge_calls > 8) {
         g_dodge = 0;
     }
@@ -545,7 +585,7 @@ int env_hook(BbHookCtx* c, void*) {
         c->ret = 0;
         return 1;
     }
-    if (aim) {  // the lock-on's locomotion - it runs - not precision shooting's walk
+    if (aim && !rolling()) {  // the lock-on's locomotion - it runs - not precision shooting's walk
         c->ret = id == kEnvLock ? 1 : 0;
         return 1;
     }
@@ -580,7 +620,8 @@ bool name_starts(std::uint64_t at, const char* prefix) {
 bool part_kept(std::uint8_t* mi) {
     std::uint64_t res = 0, name = 0;
     return api->read(reinterpret_cast<std::uint64_t>(mi) + 0x148, &res, 8) == 0 && res >= 0x10000 &&
-           api->read(res + 0x18, &name, 8) == 0 && (name_starts(name, "WP_") || name_starts(name, "AM_"));
+           api->read(res + 0x18, &name, 8) == 0 &&
+           (name_starts(name, "WP_") || name_starts(name, "AM_") || name_starts(name, "BD_"));
 }
 
 std::uint8_t* part_mi(std::uint8_t* holder, int slot) {
@@ -637,6 +678,67 @@ void parts_hide(std::uint8_t* chr) {
     if (changed) api->log("hunter_cam: first person keeps the weapon and arm parts 0x%06x drawn", parts.weapons);
 }
 
+// ---- the head: a dummy poly of the body's model ------------------------------
+//
+// ChrIns's vtable +0x6b0 (chr, &dummy) gives the model a dummy poly is on (the
+// body's for one under 1000); the model's +0x50 its table - +4 the count, +8
+// the entries (0x50 bytes each), +0x10 (id, first entry) pairs sorted by id -
+// and +0x58 (model, out, &{entry, 1}) an entry's world matrix as the skeleton
+// stands now, its position in the last row (what SprjSfx's dummy-poly
+// attachment does, 0x2135bb0). Dummy poly 7 is at the eyes: 1.54 m over the
+// feet, on the head's bone.
+
+constexpr std::int32_t kEyesDummy = 7;
+
+std::uint64_t bn_of_rt(std::uint64_t rt) { return rt - api->guest_addr(0x400000) + 0x400000; }
+
+bool head_position(std::uint8_t* chr, V3& out) {
+    if (!chr) return false;
+    const auto* vt = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(get<std::uint64_t>(chr, 0)));
+    if (!vt) return false;
+    static std::int32_t dummy;
+    dummy = kEyesDummy;
+    BbCallRegs r{};
+    r.arg[0] = reinterpret_cast<std::uint64_t>(chr);
+    r.arg[1] = reinterpret_cast<std::uint64_t>(&dummy);
+    if (api->call_guest(bn_of_rt(vt[0x6b0 / 8]), &r) != 0 || r.ret < 0x10000) return false;
+    auto* model = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(r.ret));
+    const auto* mvt = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(get<std::uint64_t>(model, 0)));
+    r = BbCallRegs{};
+    r.arg[0] = reinterpret_cast<std::uint64_t>(model);
+    if (!mvt || api->call_guest(bn_of_rt(mvt[0x50 / 8]), &r) != 0 || r.ret < 0x10000) return false;
+    const auto* table = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(r.ret));
+    const std::int32_t count = get<std::int32_t>(table, 4);
+    const std::uint8_t* entries = get<std::uint8_t*>(table, 8);
+    const std::uint8_t* pairs = get<std::uint8_t*>(table, 0x10);
+    if (!entries || !pairs || count <= 0 || count > 4096) return false;
+    int lo = 0, hi = count - 1, found = -1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) / 2;
+        const std::int32_t id = get<std::int32_t>(pairs, 8 * static_cast<std::size_t>(mid));
+        if (id == kEyesDummy) {
+            found = mid;
+            break;
+        }
+        if (id < kEyesDummy) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    if (found < 0) return false;
+    const std::int32_t first = get<std::int32_t>(pairs, 8 * static_cast<std::size_t>(found) + 4);
+    alignas(16) static float m[16];
+    alignas(16) static std::uint64_t span[2];
+    std::memset(m, 0, sizeof m);
+    span[0] = reinterpret_cast<std::uint64_t>(entries + 0x50 * static_cast<std::size_t>(first));
+    span[1] = 1;
+    r = BbCallRegs{};
+    r.arg[0] = reinterpret_cast<std::uint64_t>(model);
+    r.arg[1] = reinterpret_cast<std::uint64_t>(m);
+    r.arg[2] = reinterpret_cast<std::uint64_t>(span);
+    if (api->call_guest(bn_of_rt(mvt[0x58 / 8]), &r) != 0 || m[15] != 1.0f) return false;
+    out = V3{m[12], m[13], m[14]};
+    return std::isfinite(out.x) && std::isfinite(out.y) && std::isfinite(out.z);
+}
+
 // ---- the camera --------------------------------------------------------------
 
 struct View {
@@ -648,6 +750,7 @@ struct View {
     float away = 0.0f;        // 0 ours, 1 another camera's (the monocular's)
     float eye = 1.45f;        // the follow camera's look-at height over the feet
     float fov = 0.0f;         // its field of view (0: none seen yet)
+    float row_fov = 0.0f;     // its LockCamParam row's while it last ran (0: not yet)
     V3 focus{0, 0, 0};        // from the hunter: the look-at point (or the eyes) chased after them
     bool have_focus = false;
     bool keys_down[2] = {};   // the swap key, the first-person key
@@ -656,6 +759,11 @@ struct View {
     float game_reach = -1.0f; // its eased distance
     bool zoom_taken = false;
     float mouse_dx = 0.0f, mouse_dy = 0.0f;  // this frame's mouse counts while playing
+    float basis[3][4] = {};   // the last frame's view (right, up, forward)
+    float held[3][4] = {};    // held through a roll's unaimed moments
+    bool have_basis = false, roll_hold = false;
+    float held_angles[2] = {};  // the aim's pitch and yaw as the roll began
+    int restore = 0;            // frames left putting them back
     std::chrono::steady_clock::time_point last;
     bool started = false;
 } view;
@@ -667,8 +775,25 @@ constexpr float kEaseOut = 0.25f;     // seconds to ease back out after a wall
 constexpr float kMinReach = 0.15f;    // metres it keeps behind the shoulder
 constexpr float kChase = 0.06f;       // seconds the point from the hunter takes to catch up
 constexpr float kEyeForward = 0.12f;  // the eyes, metres ahead of the feet's middle
+constexpr float kHeadForward = 0.04f; // with Head bob: metres ahead of the eyes' dummy poly, past the face
 constexpr float kZoomStep = 1.15f, kZoomNear = 0.6f, kZoomFar = 6.0f;             // the shoulder camera's
 constexpr float kGameZoomStep = 1.2f, kGameZoomNear = 0.5f, kGameZoomFar = 6.0f;  // the host's own
+
+// LockCamParam row 0's camFovY in radians, 0 if unread: F10's Field of view
+// scales every row's by one factor (engine/camera.cpp), so how it has changed
+// says how the follow camera's would have.
+float lock_cam_fov(const std::uint8_t*) {
+    static float last = 0;
+    static int age = 0;
+    if (age++ % 15 != 0) return last;  // twice a second is enough for a setting
+    char v[32] = {};
+    last = 0;
+    if (api->param_get("LockCamParam", 0, "camFovY", v, sizeof v) == 0) {
+        const float deg = std::strtof(v, nullptr);
+        if (deg > 0 && deg < 170) last = deg * kPi / 180.0f;
+    }
+    return last;
+}
 
 std::uint8_t* follow_cam(BbCamera* c) {
     auto* manager = reinterpret_cast<std::uint8_t*>(c) - 0x10;
@@ -946,7 +1071,41 @@ void on_camera(BbCamera* c, void*) {
     // Another camera (the monocular's) has the player's camera: hand over -
     // but not to the aim camera our facing brings, whose turning we keep.
     const auto* own = reinterpret_cast<const BbCamera*>(f + 0x10);
-    const bool aim = aim_is_ours();
+    // (Through a roll the aim is down and the game blends to its follow
+    // camera, which takes the aim's angles: still ours, so the view stays put.)
+    const bool aim = aim_is_ours() || (aim_wanted() && rolling() && !g_monocular.load());
+    if (aim && !aim_is_ours()) {
+        // The view held as it was, and the follow camera kept on the aim's
+        // angles, which the aim takes back from it after the roll.
+        if (!view.roll_hold && view.have_basis) {
+            std::memcpy(view.held, view.basis, sizeof view.held);
+            if (aim_cam) std::memcpy(view.held_angles, aim_cam + kAimPitch, 8);
+        }
+        view.roll_hold = view.have_basis;
+        if (view.roll_hold) {
+            std::memcpy(c->right, view.held[0], 16);
+            std::memcpy(c->up, view.held[1], 16);
+            std::memcpy(c->forward, view.held[2], 16);
+        }
+        if (aim_cam) {
+            std::memcpy(follow + 0x140, aim_cam + kAimPitch, 4);
+            std::memcpy(follow + 0x144, aim_cam + kAimYaw, 4);
+        }
+    } else if (view.roll_hold || view.restore > 0) {
+        // The aim back: it takes its angles from the follow camera, which
+        // drifted (a reset to +0x154/+0x158 that its next update applies) -
+        // the ones it had instead, and the view as held until it has them.
+        if (view.roll_hold) view.restore = 3;
+        view.roll_hold = false;
+        --view.restore;
+        if (aim_cam && aim_is_ours()) {
+            std::memcpy(aim_cam + kAimPitch, view.held_angles, 8);
+            std::memcpy(aim_cam + 0x154, view.held_angles, 8);
+        }
+        std::memcpy(c->right, view.held[0], 16);
+        std::memcpy(c->up, view.held[1], 16);
+        std::memcpy(c->forward, view.held[2], 16);
+    }
     float away = 0.0f;
     if (!aim) {
         away = length(v3(c->position) - v3(own->position)) / kAwayPos;
@@ -983,6 +1142,11 @@ void on_camera(BbCamera* c, void*) {
         }
         view.focus = focus;
         view.have_focus = true;
+    } else if (V3 head; first && s.head_bob && head_position(player(), head)) {
+        // The eyes go where the head goes, each frame as it is posed.
+        view.focus = head + unit(V3{fwd.x, 0, fwd.z}) * kHeadForward;
+        view.have_focus = true;
+        focus = view.focus;
     } else if (have_feet) {
         V3 target{feet[0], feet[1] + (first ? s.eye_height : view.eye), feet[2]};
         if (first) target = target + unit(V3{fwd.x, 0, fwd.z}) * kEyeForward;
@@ -1035,13 +1199,27 @@ void on_camera(BbCamera* c, void*) {
     // The field of view: the follow camera's (the aim camera zooms in; ours
     // keeps the follow camera's), widened as F10's widens it.
     float base = c->fov_y;
+    const float row = lock_cam_fov(f);
     if (aim) {
+        // The follow camera eases to its LockCamParam row's camFovY (which
+        // F10's Field of view scales) only in its own update, which does not
+        // run while the aim camera has the view: its last, scaled as the row
+        // has changed since.
         if (own->fov_y > 0.1f && own->fov_y < 2.5f) base = own->fov_y;
         else if (view.fov > 0) base = view.fov;
+        if (row > 0 && view.row_fov <= 0) view.row_fov = row;  // never seen it run: take it as current
+        if (row > 0) base *= row / view.row_fov;
+    } else if (row > 0) {
+        view.row_fov = row;
     }
-    float ours_fov = base * (1.0f + 0.01f * static_cast<float>(first ? s.first_fov : s.fov));
+    const int pct = first && s.first_fov > 0 ? s.first_fov : s.fov;
+    float ours_fov = base * (1.0f + 0.01f * static_cast<float>(pct));
     if (ours_fov > 2.6f) ours_fov = 2.6f;
     c->fov_y = ours_fov + (c->fov_y - ours_fov) * view.away;
+    std::memcpy(view.basis[0], c->right, 16);
+    std::memcpy(view.basis[1], c->up, 16);
+    std::memcpy(view.basis[2], c->forward, 16);
+    view.have_basis = true;
     trace(c, pos);
 }
 
@@ -1062,6 +1240,7 @@ void on_frame(void*) {
     face_camera_frame();
     std::uint8_t* chr = player();
     const bool loading = api->loading_screen && api->loading_screen();
+
     if (s.on && g_first && chr && !loading) parts_hide(chr);
     else parts_show();
 }
