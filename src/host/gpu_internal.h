@@ -2391,6 +2391,11 @@ VkSampler sampler_with_lod_bias(VkSampler base, float bias);
 // depth comparison, one already nearest or one not made here. Null in a run
 // part's draw that stopped for it to be made in order.
 VkSampler sampler_nearest(VkSampler base);
+// `base` filtering its texels linearly (YEBIS's copy stretching a 3D drawn
+// smaller with no upscaler, render.cpp stretch_samplers), made once and kept;
+// `base` itself for a depth comparison, one already linear or one not made
+// here. Null in a run part's draw that stopped for it to be made in order.
+VkSampler sampler_linear(VkSampler base);
 // `base` with anisotropic filtering of at least `level` (2-16, the device's
 // limit at most), made once and kept; `base` itself for a depth comparison,
 // a nearest or unmipmapped sampler, one already that sharp or one not made

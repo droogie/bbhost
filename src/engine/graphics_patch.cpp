@@ -1699,8 +1699,8 @@ void ui_stage_pin(ElfImage* image) {
 
 void resolution_patch(ElfImage* image, bool live) {
     int w = 0, h = 0;
-    // The game's size: the Resolution, or the window's with an upscaler and a
-    // smaller Resolution (the 3D then drawn at the Resolution, render_scale.cpp).
+    // The game's size: the Resolution, or the window's with a smaller
+    // Resolution (the 3D then drawn at the Resolution, render_scale.cpp).
     if (!host_opt_output_size(&w, &h) || (w == 1920 && h == 1080)) {
         // What it shipped with: nothing to write - but the words change
         // under a live resolution change, so the stage readers are pinned.

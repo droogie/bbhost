@@ -614,7 +614,8 @@ Setting g_set[kSettingCount] = {
                                   "4800x1200", "5760x1200", "7680x1600", "5400x1080", "3840x720", "4800x900", "5760x1080",
                                   "7680x1440", "11520x2160", "7680x1080", "10320x1440"}, 6,
      "What the game renders at. 1920x1080 is what it shipped with; ultrawide, super-ultrawide, multi-screen, 16:10, 4:3 and "
-     "square screens are filled, the HUD kept 16:9 in the middle. The largest sizes can need a restart: the memory for them "
+     "square screens are filled, the HUD kept 16:9 in the middle. Below the window's size only the 3D is drawn smaller: the "
+     "menus, the HUD and the post effects stay at the window's, with any Upscaling choice, Off included. The largest sizes can need a restart: the memory for them "
      "is set aside when the game starts, and past about 11.5 million pixels (5120x2880, 7680x2160 and up) only Upscaling below "
      "Native AA, which draws the 3D smaller, fits in it.",
      true},
@@ -1334,8 +1335,8 @@ void apply(int id) {
             // A change the player made asks to be kept (g_res_prev set by
             // set_index); going back, and the start, ask nothing.
             if (output_of(&w, &h)) {
-                // The game's size (the window's, with an upscaler and a
-                // smaller Resolution); the 3D's at it is the rebuild's.
+                // The game's size (the window's, with a smaller
+                // Resolution); the 3D's at it is the rebuild's.
                 unsigned cw = 0, ch = 0;
                 live_resolution_current(&cw, &ch);
                 if (cw == w && ch == h) {
@@ -2822,9 +2823,23 @@ bool host_opt_output_size(int* w, int* h) {
 }
 
 namespace {
+// Whether the 3D can be drawn at a size of its own (engine/render_scale.cpp
+// render_scale_plan): off with BBHOST_RENDER_SCALE=0 or BBHOST_LIVE_RESOLUTION=0.
+bool render_scale_possible() {
+    static const bool on = [] {
+        for (const char* name : {"BBHOST_RENDER_SCALE", "BBHOST_LIVE_RESOLUTION"})
+            if (const char* e = std::getenv(name); e && e[0] == '0') return false;
+        return true;
+    }();
+    return on;
+}
+
 void output_for(int* w, int* h) {
     const bool look = scene_look_scale();
-    if (!host_opt_upscaler_chosen() && !look) return;
+    // Upscaling Off too: a Resolution below the window draws the 3D at it and
+    // keeps the game and its HUD at the window's size, as TAA, FSR and DLSS
+    // do - the 3D brought up by YEBIS's copy (engine/render_scale.cpp).
+    if (!host_opt_upscaler_chosen() && !look && !render_scale_possible()) return;
     int ww = 0, wh = 0;
     if (g_set[kWindowMode].index == 0) {
         ww = config().width;
