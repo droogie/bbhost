@@ -2485,6 +2485,16 @@ void hud_hide_save_locked(RtImage& target) {
 
 bool hud_hide_saved_locked() { return g_hud_saved; }
 
+bool hud_hide_held_locked() { return g_hud_saved || g_hud_copy.image; }
+
+void hud_hide_release_locked() {
+    if (!g_hud_copy.image || g_hud_saved) return;
+    drop(g_hud_copy);
+    g_hud_copy_format = VK_FORMAT_UNDEFINED;
+    g_hud_copy_w = g_hud_copy_h = 0;
+    host_log("plugin: the HUD shows again; its copy's video memory given back");
+}
+
 void hud_hide_restore_locked(RtImage& target) {
     const bool saved = g_hud_saved;
     g_hud_saved = false;

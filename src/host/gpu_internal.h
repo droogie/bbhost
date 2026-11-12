@@ -2015,6 +2015,12 @@ void upscale_pass_hudless_bind_locked(std::uint64_t display_va, std::uint32_t di
 void hud_hide_save_locked(RtImage& target);
 bool hud_hide_saved_locked();
 void hud_hide_restore_locked(RtImage& target);
+// The copy is held (made and not yet given back), or this frame's picture kept.
+bool hud_hide_held_locked();
+// The HUD shown again (no plugin hides it) and nothing kept to put back: the
+// copy's video memory given back at the display buffer's pass, so a hidden HUD
+// costs it only while hidden.
+void hud_hide_release_locked();
 // Under render scale: the upscaler's picture, at the output size, for YEBIS's
 // copy to sample in place of a scene of scene_w x scene_h; null when there is
 // none (no upscale of that size has run, or the picture went back into the

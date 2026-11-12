@@ -27074,7 +27074,7 @@ static bool draw_impl(const GpuDraw& d) {
     // buffer's pass reads it.
     const std::uint32_t dither = scene_look_dither();
     const bool hud_hidden = scene_look_hud_hidden();
-    if ((upscale_pass_hudless_due_locked() || dither || hud_hidden || hud_hide_saved_locked()) && s.color[0]) {
+    if ((upscale_pass_hudless_due_locked() || dither || hud_hidden || hud_hide_held_locked()) && s.color[0]) {
         static std::uint64_t hud_target = 0;
         // The target's last write (RtImage::last_write) as the display
         // buffer's pass read it: a write since is the next frame's.
@@ -27100,6 +27100,7 @@ static bool draw_impl(const GpuDraw& d) {
                     }
                     if (RtImage* t = hud_target ? find_render_target(hud_target) : nullptr) hud_hide_restore_locked(*t);
                 }
+                if (!hud_hidden) hud_hide_release_locked();  // shown again: the copy given back
                 if (upscale_pass_hudless_due_locked()) upscale_pass_hudless_bind_locked(dst, s.color[0]->width, s.color[0]->height);
             }
             target_written = false;
