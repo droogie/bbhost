@@ -1257,6 +1257,8 @@ void twins_want_locked(std::uint64_t va);
 void twins_arm_wanted_locked();
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address = nullptr);
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
+// The live twins' shape: moves whenever one is made or let go (twin_covers_locked's answers can change only then).
+std::uint64_t twins_shape_locked();
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes);  // inside a live twin: its stores leave guest memory as it was
 // Stage 4b.3a(i): the live twin holding [va, +bytes) whole, its place in `out` - none made, none let go.

@@ -30,9 +30,10 @@ extern const int g_mode;
 // with the run commit or the homes), 2 (`compare`) today's work with every
 // answer a run would have shared checked against it. What a draw of a run
 // takes from the draw before it: its targets' lookups (render.cpp
-// draw_targets); and, on, the lite shadow drains GX's notices once a draw
-// rather than once a vertex record (no answer to check: compare drains as
-// before).
+// draw_targets); a constant buffer's copy an earlier draw of the run took,
+// without its lookups (render.cpp resolve_stage_buffers, CbRunEntry); and, on,
+// the lite shadow drains GX's notices once a draw rather than once a vertex
+// record (no answer to check: compare drains as before).
 extern std::atomic<int> g_batch;
 inline int batch_mode() { return g_batch.load(std::memory_order_relaxed); }
 inline bool batching() { return batch_mode() != 0; }
@@ -164,6 +165,9 @@ enum Count : int {
     kBatchCompared,         // compare mode: shared answers checked against the lookup
     kBatchDiffered,         // ... that differed
     kBatchDrains,           // lite drains at a draw's first vertex record
+    kBatchCbShared,         // constant-buffer bindings that took the copy an earlier draw of their run took
+    kBatchCbCompared,       // compare mode: such bindings resolved as before and checked against that copy
+    kBatchCbDiffered,       // ... that bound something else
     kCtxDraws,              // draws committed through a draw context
     kCtxGxChunks,           // chunks it took of the GX ring
     kCtxCbChunks,           // ... of the constant-buffer copies' ring

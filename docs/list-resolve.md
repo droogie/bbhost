@@ -359,7 +359,7 @@ sampled images' clears and layouts, the copy-version straddles). The lite
 shadow drains GX's notices at each vertex record, reading a line GX's threads
 write at every Map.
 
-`BBHOST_RUN_BATCH=1` shares two of those:
+`BBHOST_RUN_BATCH=1` shares these:
 
 - **The targets.** A GX-native draw whose target inputs - the colour targets'
   registers, extents and generations with the masks, the depth target's
@@ -374,12 +374,42 @@ write at every Map.
   the census's counts. Tessellated and geometry-shader draws look up as
   before.
 - **The drain.** Once a draw, at its first vertex record.
+- **The constant buffers' copies** (since 2026-11-11). A constant buffer the
+  game writes on the CPU is copied as its draw records, after four lookups:
+  whether a copy-back's version lies over it, a device-local twin holds it, a
+  GPU write is still to land on it, and whether it is mapped; the same buffer
+  bound again in the recording binds the first copy (the snapshots' memo); in
+  GX's upload heap and ring the lookups' answers are known and not asked. A
+  binding whose range an earlier draw of the run copied - and that copy is
+  still the memo's (this recording, this lap of the ring) - binds the copy
+  again without the lookups and the choice after them: inside a run no
+  copy-back's version can be made (copy tokens end the run), no YEBIS window
+  opened (YEBIS draws end it), and no other thread took the GPU mutex; the GPU
+  writes and the mapping are asked again, and the twins are watched by their
+  map's shape. The homes, GX's upload heap bound in place, the dedupe's
+  checks and the draw context keep it off. With no homes, 64-69% of the
+  command processor's 9,100-14,900 constant-buffer bindings a flip at Old
+  Yharnam, Central Yharnam, the Nightmare of Mensis and Cainhurst's courtyard
+  had an earlier one in their run (2-3% more elsewhere in the recording); the
+  copies' memo binds 39% of them on an RTX 4070 and on a Steam Deck (the rest
+  are bound where they are, or their first copy is of another run). Compared
+  (below) 45.2 million bindings on the RTX, 26.3 million on the Deck (pushed
+  at the copy), 29.7 million on an RTX 3070 Ti Laptop GPU with the run commit
+  forking three draws in four, 15.8 million on a Radeon 680M: none differed.
+  Where the command processor limits - the RTX held to 2,950 MiB, uncapped,
+  alternating runs, against the targets' sharing alone - Old Yharnam ran 97.5
+  -> 101.4 fps (+4.0%), Cainhurst's courtyard +1.7%, the Nightmare of Mensis
+  +1.0%, Central Yharnam (the main loop's) +0.6%; where the GPU limits (the
+  Deck uncapped and at 60, a 680M at 60) nothing moved beyond the runs'
+  spread.
 
 `BBHOST_RUN_BATCH=compare` draws as before - every target looked up, the
-notices drained at each vertex record - and checks every answer a run would
-have shared against the lookup: the targets, their layers and masks, the
-scissor, the depth target and the blends. The exit report counts the draws
-that shared, why the rest did not, and the disagreements.
+notices drained at each vertex record, every constant buffer through its
+lookups - and checks every answer a run would have shared against the
+lookup: the targets, their layers and masks, the scissor, the depth target
+and the blends, and each constant buffer's binding against the run's copy.
+The exit report counts the draws and bindings that shared, why the rest did
+not, and the disagreements.
 
 At the 18:11 save, 640x360 headless:
 

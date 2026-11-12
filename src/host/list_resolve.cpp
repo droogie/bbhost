@@ -85,8 +85,9 @@ bool lists_may_splice_from_env() {
 std::atomic<int> g_batch = [] {
     const char* e = std::getenv("BBHOST_RUN_BATCH");
     // On by default: a run's parts take its targets as batching shares them (the commit), stage 4b.1b's splice and
-    // 4b.2's segments find a run's first draw's targets, and in order a run's draws take the targets of the draws
-    // before them (docs/list-resolve.md) - with the run commit off too (Linux's default, where the homes are off).
+    // 4b.2's segments find a run's first draw's targets, and in order a run's draws take the targets and the
+    // constant-buffer copies of the draws before them (docs/list-resolve.md) - with the run commit off too (Linux's
+    // default, where the homes are off).
     if (!e || !*e) return 1;
     if (std::strcmp(e, "compare") == 0) return 2;
     return std::atoi(e) ? 1 : 0;
@@ -375,12 +376,14 @@ void log_batch() {
     host_log("list-resolve: run batching (%s): targets shared with the draw before for %llu of %llu draws (%.1f%%); not "
              "shared: something in order since %llu, the GPU mutex taken by another %llu, a target made or resized %llu, an HTILE fill "
              "noted or taken %llu, other targets or state %llu, a draw that does not share %llu; compared %llu, differed %llu; lite drains at a "
-             "draw's first vertex record %llu",
+             "draw's first vertex record %llu; constant-buffer bindings that took the copy an earlier draw of their run took %llu "
+             "(compared %llu, differed %llu)",
              batch_compare() ? "compare" : "on", static_cast<ull>(n(kBatchTargetsShared)), static_cast<ull>(asked),
              pct(n(kBatchTargetsShared), asked), static_cast<ull>(n(kBatchMissSplit)), static_cast<ull>(n(kBatchMissLock)),
              static_cast<ull>(n(kBatchMissRemade)), static_cast<ull>(n(kBatchMissFill)), static_cast<ull>(n(kBatchMissInputs)),
              static_cast<ull>(n(kBatchMissKind)),
-             static_cast<ull>(n(kBatchCompared)), static_cast<ull>(n(kBatchDiffered)), static_cast<ull>(n(kBatchDrains)));
+             static_cast<ull>(n(kBatchCompared)), static_cast<ull>(n(kBatchDiffered)), static_cast<ull>(n(kBatchDrains)),
+             static_cast<ull>(n(kBatchCbShared)), static_cast<ull>(n(kBatchCbCompared)), static_cast<ull>(n(kBatchCbDiffered)));
 }
 
 }  // namespace
