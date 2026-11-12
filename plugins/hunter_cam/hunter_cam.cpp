@@ -57,9 +57,8 @@
 // bit 2 says it is drawn (the Quake plugin's viewmodel); a model ins's file name
 // is at +0x148 -> +0x18 (WP_ the weapons, one slot a hand: 7 and 11; HD_, BD_,
 // AM_, LG_ the armour, FC_, HR_ and FG_ the face). In first person every
-// part but the weapons, the arms and the chest (whose coat carries the upper
-// arms) - the slots whose model is a WP_, AM_ or BD_ file - is hidden that
-// way, frame by frame (a change of equipment makes new ones), and shown again
+// part but the weapons and the arms (the gloves, bare or armoured) - the slots
+// whose model is a WP_ or AM_ file - is hidden that way, frame by frame (a change of equipment makes new ones), and shown again
 // as first person ends, the plugin goes off or the world loads. The hunter
 // faces where the camera looks there, as with Always face the camera, and the
 // aim camera that brings may turn 80 degrees up and down (Look up/down limit)
@@ -68,9 +67,9 @@
 // reaches it through LockCamParam's camFovY, read directly.
 //
 // The aim. With the precision-shooting bit set the game also hides X's prompt
-// and press (the action button's and the NPC talk's checks of it) and puts a
-// sight at the screen's middle; while the bit is the plugin's those checks
-// are passed, and the sight's only with the Crosshair on. The mouse turns the
+// and press (the action button's and the NPC talk's checks of it), refuses
+// items their effect, and puts a sight at the screen's middle; while the bit
+// is the plugin's those checks are passed, and the sight's only with the Crosshair on. The mouse turns the
 // aim camera itself (the host's mouse turns only the follow camera).
 //
 // Facing the camera. The monocular puts the hunter in its precision-shooting
@@ -120,7 +119,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "hunter_cam",
     "Hunter Cam",
-    "1.3.0",
+    "1.3.1",
     "Kyo",
     "The hunter from closer in: an over-the-shoulder camera (right or left, swapped with a key, zoomed with the wheel) "
     "or first person with only the arms and weapons drawn; the hunter can always face where the camera looks, the right "
@@ -434,6 +433,12 @@ const CodeSite kInteract[] = {{0x20d9323, {0xf6, 0xc6, 0x04}},
 // while the bit is set (0x1ffe4e1) - else while the monocular's stateInfo 15
 // is on, which still shows it when the monocular itself is in use.
 const CodeSite kSight[] = {{0x1ffe4e1, {0xf6, 0xc5, 0x04}}};
+// Items: the item's use (sub_197f200, reached once the animation gets to the
+// moment it takes effect) is refused while aiming - the bit, masked at
+// 0x197f9b4 (and rcx, 0x400), joins the other "not now" reasons - so a Blood
+// Vial is drunk, a paper rubbed on, a tool raised, and nothing heals, buffs or
+// is spent. Its mask made 0, items work as they do unaimed.
+const CodeSite kItems[] = {{0x197f9b6, {0xe1, 0x00, 0x04}}};
 
 struct SiteSet {
     const CodeSite* sites;
@@ -444,6 +449,7 @@ struct SiteSet {
 };
 SiteSet g_interact{kInteract, sizeof(kInteract) / sizeof(kInteract[0]), "X's action button and talk"};
 SiteSet g_sight{kSight, sizeof(kSight) / sizeof(kSight[0]), "the crosshair"};
+SiteSet g_items{kItems, sizeof(kItems) / sizeof(kItems[0]), "items"};
 // Until when (steady clock, ns) a roll runs unaimed. Aiming, the game holds
 // the hunter facing where the camera looks - it reads that before the script
 // runs - so a roll would only ever go straight ahead. The script's roll is
@@ -520,6 +526,7 @@ void face_camera_frame() {
     // Aiming as ours, X still opens doors, picks up and talks; the sight only
     // if wanted. The monocular itself keeps the game's checks.
     set_sites(g_interact, ours);
+    set_sites(g_items, ours);
     set_sites(g_sight, ours && !s.crosshair);
 }
 
@@ -620,8 +627,7 @@ bool name_starts(std::uint64_t at, const char* prefix) {
 bool part_kept(std::uint8_t* mi) {
     std::uint64_t res = 0, name = 0;
     return api->read(reinterpret_cast<std::uint64_t>(mi) + 0x148, &res, 8) == 0 && res >= 0x10000 &&
-           api->read(res + 0x18, &name, 8) == 0 &&
-           (name_starts(name, "WP_") || name_starts(name, "AM_") || name_starts(name, "BD_"));
+           api->read(res + 0x18, &name, 8) == 0 && (name_starts(name, "WP_") || name_starts(name, "AM_"));
 }
 
 std::uint8_t* part_mi(std::uint8_t* holder, int slot) {
