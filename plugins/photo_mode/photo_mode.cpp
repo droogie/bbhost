@@ -19,6 +19,12 @@
 // game's view back as it was. The game's HUD, menus and prompts are left out
 // of the picture while it runs (hud_hide).
 //
+// Its panel (panel_show) opens with it: six pages of its options - the
+// camera, the picture, depth of field, chromatic aberration, the fog and
+// motion blur - whose look goes over the area's own while photo mode runs
+// (post_look) and nowhere else. R3 or Tab shows it again once Circle or
+// Escape has hidden it; the camera flies either way.
+//
 // Only with nobody else in the world (world_state): it does not start while
 // another player is in it or on the way, nor in another player's world, and it
 // ends as soon as one is coming - when matchmaking finds one (the game hosts its
@@ -44,7 +50,7 @@ const BbHostApi* api = nullptr;
 enum Mode : int { kFrozen = 0, kStatic = 1, kLive = 2 };
 
 // SDL scancodes (the USB HID usages BbInput's keys are indexed by).
-constexpr std::uint16_t kKeyA = 4, kKeyD = 7, kKeyN = 17, kKeyP = 19, kKeyS = 22, kKeyW = 26;
+constexpr std::uint16_t kKeyA = 4, kKeyD = 7, kKeyE = 8, kKeyN = 17, kKeyP = 19, kKeyQ = 20, kKeyS = 22, kKeyW = 26;
 constexpr std::uint16_t kKeyEscape = 41, kKeyTab = 43, kKeySpace = 44;
 constexpr std::uint16_t kKeyLCtrl = 224, kKeyLShift = 225, kKeyLAlt = 226, kKeyRShift = 229, kKeyRAlt = 230;
 // The mouse's buttons in BbInput.buttons.
@@ -59,13 +65,36 @@ constexpr float kMouseTurn = 0.0035f;    // radians a count, as Dark Souls III's
 constexpr float kPitchLimit = 1.53f;     // short of straight up and down
 constexpr std::uint32_t kStepUpdates = 2;
 // The world up this long before photo mode starts: the loading screen's page
-// fades out over the world's first frames, and a held world would hold it there.
-constexpr float kWorldSettle = 2.0f;
+// stays and fades out over the world's first frames - some 75 of them, two
+// and a half seconds at 30 - and a held world would hold it there.
+constexpr float kWorldSettle = 3.0f;
+
+// The options (bb_plugin_options): what the panel's rows hold.
+struct Settings {
+    int mode = 0;            // Mode, as Mode
+    int fov_offset = 0;      // degrees more or less than the game's view
+    int roll = 0;            // degrees
+    bool hud = false;
+    int vignette = 0;        // Area's own, None, Light, Medium, Strong, Heavy
+    int saturation = 100, brightness = 100, exposure = 100, gamma = 100, contrast = 100;  // % of the area's
+    int dof = 0;             // Area's own, On, Off
+    int dof_focus = 30;      // (it / 10) squared metres
+    float dof_aperture = 5.6f;
+    int dof_near = 0, dof_far = 1;
+    int ca = 0;              // Area's own, On, Off
+    int ca_lateral[2] = {6, 0}, ca_uniform[2] = {0, 0};  // thousandths
+    int fog_distance = 100, fog_density = 100, fog_contrast = 100;  // % of the area's
+    int fog_start = 0, fog_height = 0;                              // metres added
+    int blur = 0;            // Area's own, On, Off
+    int blur_time = 9, blur_length = 19;  // hundredths
+    int blur_scale = 40;                  // tenths
+    int blur_samples = 4;
+} set;
 
 struct Camera {
     float pos[3] = {0, 0, 0};
     float yaw = 0, pitch = 0, roll = 0;  // radians: yaw about the world's up, pitch below the horizon positive
-    float fov = 43.0f * kPi / 180.0f;    // vertical, radians
+    float fov = 43.0f * kPi / 180.0f;    // vertical, radians: the game's at the start, then the Field of view row's
     float right_sign = 1.0f;             // the game's basis: right = up x forward, or its opposite
     float up_sign = 1.0f;
 };
@@ -82,7 +111,8 @@ struct State {
     std::chrono::steady_clock::time_point last;
     bool have_last = false;
     float look_x = 0, look_y = 0;  // the mouse's counts since the last frame
-    bool hud = false;              // the game's HUD shown in photo mode
+    float game_fov = 43.0f * kPi / 180.0f;  // the game's view's field of view when the camera started
+    bool panel = false;            // its panel up (as last asked or told)
     bool world_up = false;         // a world in and no loading screen, since world_since
     std::chrono::steady_clock::time_point world_since;
 } st;
@@ -134,13 +164,15 @@ void seed_from(const BbCamera* view) {
     c.pitch = std::clamp(c.pitch, -kPitchLimit, kPitchLimit);
     c.roll = 0;
     for (int i = 0; i < 3; ++i) c.pos[i] = st.start_pos[i] = view->position[i];
-    c.fov = view->fov_y > 0.05f && view->fov_y < 3.0f ? view->fov_y : c.fov;
+    st.game_fov = view->fov_y > 0.05f && view->fov_y < 3.0f ? view->fov_y : st.game_fov;
+    c.fov = std::clamp(st.game_fov + set.fov_offset * kPi / 180.0f, 10.0f * kPi / 180.0f, 120.0f * kPi / 180.0f);
     // Which way the game's right and up point against ours.
     c.right_sign = c.up_sign = 1.0f;
     float r[3], u[3], fw[3];
     basis(c, r, u, fw);
     c.right_sign = dot(r, view->right) < 0 ? -1.0f : 1.0f;
     c.up_sign = dot(u, view->up) < 0 ? -1.0f : 1.0f;
+    c.roll = set.roll * kPi / 180.0f;  // the Roll row's, now the signs are the game's
     st.seeded = true;
 }
 
@@ -177,12 +209,13 @@ void take_controls() {
     // open over the picture); the camera's too while it flies, when Shift and
     // Alt (the strong attack and the walk) do nothing either.
     static const std::uint16_t own[] = {kKeyP, kKeyEscape, kKeyTab};
-    static const std::uint16_t flying[] = {kKeyP,     kKeyEscape, kKeyTab,    kKeyN,      kKeyW,    kKeyA,   kKeyS, kKeyD,
-                                           kKeySpace, kKeyLCtrl,  kKeyLShift, kKeyRShift, kKeyLAlt, kKeyRAlt};
+    static const std::uint16_t flying[] = {kKeyP,     kKeyEscape, kKeyTab,    kKeyN,      kKeyW,    kKeyA,    kKeyS, kKeyD, kKeyQ,
+                                           kKeyE,     kKeySpace,  kKeyLCtrl,  kKeyLShift, kKeyRShift, kKeyLAlt, kKeyRAlt};
     if (st.mode == kStatic) {
         // The hunter plays: the controller is the game's but for Options (the
-        // game's menu would open over the picture) and the touchpad's.
-        api->pad_take(BB_PAD_OPTIONS | BB_PAD_TOUCHPAD, 0);
+        // game's menu would open over the picture), the touchpad's and R3,
+        // which shows the panel.
+        api->pad_take(BB_PAD_OPTIONS | BB_PAD_TOUCHPAD | BB_PAD_R3, 0);
         api->input_take(own, sizeof(own) / sizeof(own[0]), 0, 0, 0);
     } else {
         api->pad_take(0xffffffffu, BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS);
@@ -206,6 +239,85 @@ void set_mode(int m) {
     }
 }
 
+// The panel (panel_show): its guide for the controller and for the keyboard.
+constexpr const char* kGuide = "L1 R1: page    d-pad: choose and change    Circle: hide    R3: show";
+constexpr const char* kGuideKeys = "Q E: page    arrows: choose and change    Esc: hide    Tab: show";
+
+void show_panel(bool up) {
+    if (up) {
+        BbPanel p{};
+        p.size = sizeof(p);
+        p.flags = BB_PANEL_DEFAULTS;
+        p.page = nullptr;  // the page it showed last
+        p.guide = kGuide;
+        p.guide_keys = kGuideKeys;
+        st.panel = api->panel_show(kName, &p) == 0;
+    } else {
+        api->panel_show(kName, nullptr);
+        st.panel = false;
+    }
+}
+
+// The look the rows make (post_look): only what differs from the area's own.
+constexpr float kVignettePower[] = {0.0f, 0.0f, 0.3f, 0.6f, 1.0f, 1.5f};  // by the Vignette row, Area's own first
+void post_look() {
+    BbLook l{};
+    l.size = sizeof(l);
+    if (set.saturation != 100 || set.brightness != 100 || set.exposure != 100 || set.gamma != 100 || set.contrast != 100) {
+        l.set |= BB_LOOK_TONE;
+        l.exposure = set.exposure / 100.0f;
+        l.gamma = set.gamma / 100.0f;
+        l.saturation = set.saturation / 100.0f;
+        l.brightness = set.brightness / 100.0f;
+        l.contrast = set.contrast / 100.0f;
+    }
+    if (set.vignette > 0) {
+        l.set |= BB_LOOK_VIGNETTE;
+        l.vignette = kVignettePower[std::clamp(set.vignette, 0, 5)];
+    }
+    if (set.dof > 0) {
+        l.set |= BB_LOOK_DOF;
+        l.dof = set.dof == 1;
+        const float d = set.dof_focus / 10.0f;
+        l.dof_focus = d * d;
+        l.dof_aperture = set.dof_aperture;
+        l.dof_near_levels = set.dof_near;
+        l.dof_far_levels = set.dof_far;
+    }
+    if (set.ca > 0) {
+        l.set |= BB_LOOK_ABERRATION;
+        l.aberration = set.ca == 1;
+        for (int i = 0; i < 2; ++i) {
+            l.lateral[i] = set.ca_lateral[i] / 1000.0f;
+            l.uniform[i] = set.ca_uniform[i] / 1000.0f;
+        }
+    }
+    if (set.blur > 0) {
+        l.set |= BB_LOOK_MOTION_BLUR;
+        l.motion_blur = set.blur == 1;
+        l.blur_time = set.blur_time / 100.0f;
+        l.blur_length = set.blur_length / 100.0f;
+        l.blur_scale = set.blur_scale / 10.0f;
+        l.blur_samples = set.blur_samples;
+    }
+    if (set.fog_distance != 100 || set.fog_density != 100 || set.fog_contrast != 100 || set.fog_start != 0 || set.fog_height != 0) {
+        l.set |= BB_LOOK_FOG;
+        l.fog_distance = set.fog_distance / 100.0f;
+        l.fog_density = set.fog_density / 100.0f;
+        l.fog_contrast = set.fog_contrast / 100.0f;
+        l.fog_distance_offset = static_cast<float>(set.fog_start);
+        l.fog_height_offset = static_cast<float>(set.fog_height);
+    }
+    std::uint32_t available = 0;
+    api->post_look(kName, l.set ? &l : nullptr, &available);
+    static std::uint32_t told = 0;
+    const std::uint32_t missing = l.set & ~available & (BB_LOOK_DOF | BB_LOOK_MOTION_BLUR);
+    if (missing && missing != told)
+        api->log("photo mode: %s cannot show now (Performance mode leaves it out)",
+                 missing == BB_LOOK_DOF ? "depth of field" : missing == BB_LOOK_MOTION_BLUR ? "motion blur" : "depth of field and motion blur");
+    told = missing;
+}
+
 void start() {
     st.on = true;
     st.seed = true;
@@ -215,7 +327,10 @@ void start() {
     st.have_last = false;
     st.look_x = st.look_y = 0;
     apply_mode();
-    api->hud_hide(kName, st.hud ? 0 : 1);
+    api->option_set(kName, "mode", "Frozen");  // the panel's row says so too
+    api->hud_hide(kName, set.hud ? 0 : 1);
+    post_look();
+    show_panel(true);
     api->log("photo mode: on (%s)", mode_name(st.mode));
 }
 
@@ -229,6 +344,8 @@ void stop(const char* why) {
     api->world_pause(kName, 0);
     take_controls();
     api->hud_hide(kName, 0);
+    api->post_look(kName, nullptr, nullptr);
+    show_panel(false);
     if (seeded)
         api->log("photo mode: off (%s); the camera ended %.2f m from where it started", why, static_cast<double>(std::sqrt(d2)));
     else
@@ -312,7 +429,7 @@ void on_frame(void*) {
     // The keyboard's presses: on the frame a key goes down.
     static std::uint8_t prev_keys[512];
     auto key_down = [&](std::uint16_t k) { return have_keys && in.key[k] && !prev_keys[k]; };
-    const bool p_down = key_down(kKeyP), escape_down = key_down(kKeyEscape), n_down = key_down(kKeyN);
+    const bool p_down = key_down(kKeyP), escape_down = key_down(kKeyEscape), n_down = key_down(kKeyN), key_down_tab = key_down(kKeyTab);
     if (have_keys) std::memcpy(prev_keys, in.key, sizeof(prev_keys));
 
     // Start and end: hold Cross and press L3, or P; Escape ends it too.
@@ -339,6 +456,13 @@ void on_frame(void*) {
         return;
     }
 
+    // The panel: up or hidden (Circle and Escape hide it - the host's), and
+    // R3 or Tab to show or hide it.
+    BbPanelState ps{};
+    ps.size = sizeof(ps);
+    if (api->panel_state(kName, &ps) == 0) st.panel = ps.shown != 0;
+    if ((pad.pressed & BB_PAD_R3) || key_down_tab) show_panel(!st.panel);
+
     const auto now = std::chrono::steady_clock::now();
     float dt = st.have_last ? std::chrono::duration<float>(now - st.last).count() : 0.0f;
     st.last = now;
@@ -358,30 +482,162 @@ void on_frame(void*) {
     if (st.mode != kStatic && st.seeded) fly(pad, in, keys_ok, dt);
 }
 
-void on_option(const char* key, const char* value, void*) {
-    if (!key || !value) return;
-    if (std::strcmp(key, "mode") == 0) {
-        set_mode(std::strcmp(value, "Static") == 0 ? kStatic : std::strcmp(value, "Live") == 0 ? kLive : kFrozen);
-    } else if (std::strcmp(key, "hud") == 0) {
-        st.hud = std::strcmp(value, "true") == 0;
-        if (st.on) api->hud_hide(kName, st.hud ? 0 : 1);
-    }
+// A row's value into the settings; false for a key that is not one.
+bool take_option(const char* key, const char* value) {
+    std::string v = value ? value : "";
+    if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+    const auto num = [&](int lo, int hi, int* out) { *out = std::clamp(std::atoi(v.c_str()), lo, hi); };
+    const auto choice = [&](const char* const* names, int n, int* out) {
+        for (int i = 0; i < n; ++i) {
+            if (v == names[i]) *out = i;
+        }
+    };
+    static const char* const kModes[] = {"Frozen", "Static", "Live"};
+    static const char* const kVignettes[] = {"Area's own", "None", "Light", "Medium", "Strong", "Heavy"};
+    static const char* const kSwitch[] = {"Area's own", "On", "Off"};
+    const std::string k = key;
+    if (k == "mode") choice(kModes, 3, &set.mode);
+    else if (k == "fov") num(-40, 60, &set.fov_offset);
+    else if (k == "roll") num(-90, 90, &set.roll);
+    else if (k == "hud") set.hud = v == "true";
+    else if (k == "vignette") choice(kVignettes, 6, &set.vignette);
+    else if (k == "saturation") num(0, 200, &set.saturation);
+    else if (k == "brightness") num(20, 250, &set.brightness);
+    else if (k == "exposure") num(10, 250, &set.exposure);
+    else if (k == "gamma") num(50, 150, &set.gamma);
+    else if (k == "contrast") num(80, 120, &set.contrast);
+    else if (k == "dof") choice(kSwitch, 3, &set.dof);
+    else if (k == "dof_focus") num(5, 200, &set.dof_focus);
+    else if (k == "dof_aperture") set.dof_aperture = std::clamp(static_cast<float>(std::atof(v.c_str())), 0.7f, 32.0f);
+    else if (k == "dof_near") num(0, 7, &set.dof_near);
+    else if (k == "dof_far") num(0, 7, &set.dof_far);
+    else if (k == "ca") choice(kSwitch, 3, &set.ca);
+    else if (k == "ca_lateral_x") num(-100, 100, &set.ca_lateral[0]);
+    else if (k == "ca_lateral_y") num(-100, 100, &set.ca_lateral[1]);
+    else if (k == "ca_uniform_x") num(-100, 100, &set.ca_uniform[0]);
+    else if (k == "ca_uniform_y") num(-100, 100, &set.ca_uniform[1]);
+    else if (k == "fog_distance") num(10, 200, &set.fog_distance);
+    else if (k == "fog_density") num(0, 200, &set.fog_density);
+    else if (k == "fog_contrast") num(0, 200, &set.fog_contrast);
+    else if (k == "fog_start") num(-100, 100, &set.fog_start);
+    else if (k == "fog_height") num(-200, 200, &set.fog_height);
+    else if (k == "blur") choice(kSwitch, 3, &set.blur);
+    else if (k == "blur_time") num(0, 100, &set.blur_time);
+    else if (k == "blur_length") num(0, 100, &set.blur_length);
+    else if (k == "blur_scale") num(0, 100, &set.blur_scale);
+    else if (k == "blur_samples") num(1, 16, &set.blur_samples);
+    else return false;
+    return true;
 }
 
-void read_options() {
-    st.hud = std::strcmp(api->config("photo_mode.hud"), "true") == 0;
+void on_option(const char* key, const char* value, void*) {
+    if (!key || !value || !take_option(key, value)) return;
+    if (std::strcmp(key, "mode") == 0) {
+        set_mode(set.mode);
+    } else if (std::strcmp(key, "hud") == 0) {
+        if (st.on) api->hud_hide(kName, set.hud ? 0 : 1);
+    } else if (std::strcmp(key, "fov") == 0) {
+        st.cam.fov = std::clamp(st.game_fov + set.fov_offset * kPi / 180.0f, 10.0f * kPi / 180.0f, 120.0f * kPi / 180.0f);
+    } else if (std::strcmp(key, "roll") == 0) {
+        st.cam.roll = set.roll * kPi / 180.0f;
+    } else if (st.on) {
+        post_look();
+    }
 }
 
 }  // namespace
 
+// The menus show the first heading; the panel's six pages are BB_OPT_PANEL
+// headings and the rows under them. Every row is live, and every row says what
+// it does.
+#define PANEL(key, label, help) {BB_OPT_HEADING | BB_OPT_PANEL, key, label, help, "", 0, 0, nullptr}
+#define LIVE_INT(key, label, help, def, lo, hi) {BB_OPT_INT | BB_OPT_LIVE, key, label, help, def, lo, hi, nullptr}
+#define LIVE_INT_WHEN(key, label, help, def, lo, hi, when) {BB_OPT_INT | BB_OPT_LIVE | BB_OPT_WHEN, key, label, help, def, lo, hi, when}
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
+    {BB_OPT_HEADING, "about", "Photo mode",
+     "Hold Cross and press L3, or press P, to start photo mode and to end it (Escape ends it too). Its panel opens with it: "
+     "L1 and R1 (Q and E) turn its pages, the d-pad (the arrows) chooses and changes a row, Circle (Escape) hides it and R3 "
+     "(Tab) shows it again. Only with nobody else in your world.",
+     "", 0, 0, nullptr},
+
+    PANEL("camera", "Camera", "How photo mode's camera sees, and what the world does meanwhile."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "mode", "Mode",
-     "Frozen holds the world still while the camera flies; Static keeps the camera where it is while you play on; Live "
-     "flies the camera while the world runs. Photo mode always starts Frozen.",
+     "Frozen holds the world still while the camera flies (Cross or N lets it run two more updates). Static keeps the "
+     "camera where it is while you play on. Live flies the camera while the world runs. Photo mode always starts Frozen.",
      "Frozen", 0, 0, "Frozen|Static|Live"},
-    {BB_OPT_BOOL | BB_OPT_LIVE, "hud", "HUD", "Show the game's HUD, menus and prompts in photo mode. Off leaves them out of the picture.",
-     "false"},
-    {0}};
+    LIVE_INT("fov", "Field of view", "Degrees more or less than the game's own view: 0 keeps it, less zooms in.", "0", -40, 60),
+    LIVE_INT("roll", "Roll", "Tilts the camera, in degrees: 0 keeps it level.", "0", -90, 90),
+    {BB_OPT_BOOL | BB_OPT_LIVE, "hud", "HUD", "Shows the game's HUD, menus and prompts in photo mode. Off leaves them out of the picture.",
+     "false", 0, 0, nullptr},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "vignette", "Vignette",
+     "Darkens the picture's corners. Area's own keeps the area's (most have none).", "Area's own", 0, 0,
+     "Area's own|None|Light|Medium|Strong|Heavy"},
+
+    PANEL("picture", "Picture", "The picture's tone, in % of the area's own: 100 keeps the area's."),
+    LIVE_INT("saturation", "Saturation", "% of the area's own colour: 0 is black and white, 200 twice as vivid.", "100", 0, 200),
+    LIVE_INT("brightness", "Brightness", "% of the area's own brightness, after the tone map.", "100", 20, 250),
+    LIVE_INT("exposure", "Exposure", "% of the area's own exposure, before the tone map: the light the picture is made from.", "100", 10, 250),
+    LIVE_INT("gamma", "Gamma", "% of the area's own gamma: more lifts the shadows and pales the colours.", "100", 50, 150),
+    LIVE_INT("contrast", "Contrast",
+             "% of the area's own contrast. Steep: a few percent goes a long way, and 110 crushes most shadows to black.", "100", 80, 120),
+
+    PANEL("dof", "Depth of field",
+          "The blur away from the focus. Performance mode leaves it out, and with it these rows do nothing."),
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "dof", "Depth of field",
+     "Area's own keeps the area's depth of field. On uses the rows below; Off leaves it out. Performance mode leaves it out "
+     "whatever this says.",
+     "Area's own", 0, 0, "Area's own|On|Off"},
+    LIVE_INT_WHEN("dof_focus", "Focus", "Where it is sharp: 10 is 1 m, 30 is 9 m, 100 is 100 m (the number over ten, squared).",
+                  "30", 5, 200, "dof=On"),
+    {BB_OPT_FLOAT | BB_OPT_LIVE | BB_OPT_WHEN, "dof_aperture", "Aperture",
+     "The lens's f-number: the smaller, the more blurred away from the focus. The areas use 5.6.", "5.6", 0.7, 32, "dof=On"},
+    LIVE_INT_WHEN("dof_near", "Blur in front", "How far the blur in front of the focus spreads: 0 to 7.", "0", 0, 7, "dof=On"),
+    LIVE_INT_WHEN("dof_far", "Blur behind", "How far the blur behind the focus spreads: 0 to 7.", "1", 0, 7, "dof=On"),
+
+    PANEL("ca", "Chromatic aberration", "Colour fringes towards the picture's edges, as a lens makes them."),
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "ca", "Chromatic aberration",
+     "Area's own keeps the area's (most have none). On uses the rows below; Off leaves it out.", "Area's own", 0, 0,
+     "Area's own|On|Off"},
+    LIVE_INT_WHEN("ca_lateral_x", "Lateral, across", "Fringes growing towards the edges, across the picture, in thousandths (an area's is 6).",
+                  "6", -100, 100, "ca=On"),
+    LIVE_INT_WHEN("ca_lateral_y", "Lateral, up and down", "The same up and down, in thousandths.", "0", -100, 100, "ca=On"),
+    LIVE_INT_WHEN("ca_uniform_x", "Uniform, across", "Fringes the same all over, across the picture, in thousandths.", "0", -100, 100, "ca=On"),
+    LIVE_INT_WHEN("ca_uniform_y", "Uniform, up and down", "The same up and down, in thousandths.", "0", -100, 100, "ca=On"),
+
+    PANEL("fog", "Fog", "The area's fog and haze: 100% and 0 m keep the area's."),
+    LIVE_INT("fog_distance", "Distance", "% of the area's distance to the fog: less brings it closer.", "100", 10, 200),
+    LIVE_INT("fog_density", "Density", "% of the area's fog: 0 clears it, 200 doubles it.", "100", 0, 200),
+    LIVE_INT("fog_contrast", "Contrast", "% of the area's fog contrast: more darkens what the fog covers.", "100", 0, 200),
+    LIVE_INT("fog_start", "Start", "Metres added to where the fog begins: more pushes it away.", "0", -100, 100),
+    LIVE_INT("fog_height", "Height fog", "Metres added to the height fog's height: less raises the fog over the ground.", "0", -200, 200),
+
+    PANEL("blur", "Motion blur",
+          "The blur of what moves, as the camera sees it. Performance mode leaves it out, and with it these rows do nothing."),
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "blur", "Motion blur",
+     "Area's own keeps the area's. On uses the rows below; Off leaves it out. Performance mode leaves it out whatever this says.",
+     "Area's own", 0, 0, "Area's own|On|Off"},
+    LIVE_INT_WHEN("blur_time", "Time", "How long a moment the blur covers, in hundredths (an area's is about 9).", "9", 0, 100, "blur=On"),
+    LIVE_INT_WHEN("blur_length", "Length", "The longest a streak gets, in hundredths (an area's is about 19).", "19", 0, 100, "blur=On"),
+    LIVE_INT_WHEN("blur_scale", "Camera blur", "How much the camera's own turning blurs, in tenths (an area's is up to 40).", "40", 0, 100, "blur=On"),
+    LIVE_INT_WHEN("blur_samples", "Samples", "Steps along each streak: more is smoother and slower.", "4", 1, 16, "blur=On"),
+    {0, nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr}};
+#undef PANEL
+#undef LIVE_INT
+#undef LIVE_INT_WHEN
+
+namespace {
+
+// The rows as the player's config holds them, or their defaults.
+void read_options() {
+    for (const BbOption* o = bb_plugin_options; o->type != BB_OPT_END; ++o) {
+        if ((o->type & 0xffu) == BB_OPT_HEADING || !o->key) continue;
+        const std::string key = std::string(kName) + "." + o->key;
+        const char* v = api->config(key.c_str());
+        take_option(o->key, v && v[0] ? v : o->def);
+    }
+}
+
+}  // namespace
 
 extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_API_VERSION,
@@ -395,7 +651,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
 };
 
 extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
-    if (host->version < 29 || host->size < offsetof(BbHostApi, hud_hide) + sizeof(void*)) {
+    if (host->version < 29 || host->size < offsetof(BbHostApi, option_set) + sizeof(void*)) {
         host->log("photo mode: needs plugin API 29; this host has %u", host->version);
         return 1;
     }

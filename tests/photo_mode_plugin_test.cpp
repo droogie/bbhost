@@ -6,11 +6,13 @@
 // pressed, Frozen, with the world held, the controls taken and the HUD out of
 // the picture; the camera starts at the game's view and flies the way it looks;
 // Cross (once let go) and N advance a held world by two updates; Static gives
-// the controls back but Options and the touchpad, Live flies over a running
-// world; it ends on Escape, P and the chord, and at a loading screen, a
+// the controls back but Options, the touchpad and R3, Live flies over a
+// running world; it ends on Escape, P and the chord, and at a loading screen, a
 // cutscene or a menu, giving everything back; it does not start, and it ends,
 // with another player in the world or on the way, or in another's world; the
-// HUD option shows the HUD. Its options table is whole.
+// HUD option shows the HUD; its panel opens with it, R3 hides and shows it,
+// and the panel's rows go over the area's look while it runs and nowhere
+// else. Its options table is whole, every row with its help.
 //
 //   photo_mode_plugin_test <photo_mode.so>
 #include "bbhost_plugin.h"
@@ -44,7 +46,7 @@ static int g_failures = 0;
 
 namespace {
 
-constexpr std::uint16_t kP = 19, kN = 17, kW = 26, kEscape = 41;
+constexpr std::uint16_t kP = 19, kN = 17, kW = 26, kEscape = 41, kTab = 43;
 
 struct Host {
     std::map<std::string, std::string> config;
@@ -66,6 +68,13 @@ struct Host {
     BbPad pad{};
     BbInput input{};
     int calls = 0;  // every call that asks for something (pause, take, hide, step)
+    // The look and the panel.
+    int looks = 0;               // post_look calls
+    bool look_on = false;        // the last one set a look (not NULL)
+    BbLook look{};
+    bool panel_up = false;
+    std::uint32_t panel_flags = 0;
+    std::vector<std::pair<std::string, std::string>> sets;  // option_set calls
 } H;
 
 void fake_log(const char* fmt, ...) {
@@ -148,6 +157,40 @@ int fake_world_state(BbWorldState* out) {
     out->size = sizeof(BbWorldState);
     return 0;
 }
+int fake_post_look(const char* name, const BbLook* look, std::uint32_t* available) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    ++H.looks;
+    H.look_on = look != nullptr;
+    if (look) {
+        CHECK(look->size == sizeof(BbLook));
+        H.look = *look;
+    }
+    if (available) *available = 63;
+    return 0;
+}
+int fake_panel_show(const char* name, const BbPanel* panel) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    H.panel_up = panel != nullptr;
+    if (panel) {
+        CHECK(panel->size == sizeof(BbPanel));
+        H.panel_flags = panel->flags;
+        CHECK(panel->guide && panel->guide_keys);
+    }
+    return 0;
+}
+int fake_panel_state(const char* name, BbPanelState* out) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    CHECK(out->size == sizeof(BbPanelState));
+    out->shown = H.panel_up ? 1 : 0;
+    out->closed = 0;
+    std::snprintf(out->page, sizeof out->page, "camera");
+    return 0;
+}
+int fake_option_set(const char* name, const char* key, const char* value) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    H.sets.emplace_back(key, value);
+    return 0;
+}
 int fake_hud_hide(const char* name, int hidden) {
     CHECK(std::strcmp(name, "photo_mode") == 0);
     H.hud_hidden = hidden;
@@ -210,6 +253,10 @@ BbHostApi make_api(std::uint32_t version) {
         api.pad_take = &fake_pad_take;
         api.world_state = &fake_world_state;
         api.hud_hide = &fake_hud_hide;
+        api.post_look = &fake_post_look;
+        api.panel_show = &fake_panel_show;
+        api.panel_state = &fake_panel_state;
+        api.option_set = &fake_option_set;
     } else {
         api.size = static_cast<std::uint32_t>(offsetof(BbHostApi, on_camera_target) + sizeof(void*));
     }
@@ -238,7 +285,7 @@ void tap_pad(std::uint32_t b) {
 // fades out over its first frames).
 void settle() {
     frame();
-    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(3100));
     frame();
 }
 // The game's view, as on_view hands it: looking along +z from (1, 2, 3).
@@ -286,7 +333,21 @@ int main(int argc, char** argv) {
             CHECK(o->key && o->label && o->help && o->help[0]);  // every row says what it does
             CHECK(keys[o->key]++ == 0);
             if ((o->type & 0xff) == BB_OPT_CHOICE) CHECK(std::strstr(o->choices, o->def) != nullptr);
+            CHECK(o->type & BB_OPT_LIVE);  // the panel changes them as photo mode runs
         }
+        // Six pages, every row on one; the menus get only the first heading.
+        int pages = 0;
+        bool on_page = false;
+        for (const BbOption* o = p.options; o->type; ++o) {
+            if ((o->type & 0xff) == BB_OPT_HEADING) {
+                on_page = (o->type & BB_OPT_PANEL) != 0;
+                pages += on_page;
+                CHECK(o->key && o->label && o->help && o->help[0]);
+            } else {
+                CHECK(on_page);
+            }
+        }
+        CHECK(pages == 6);
     }
 
     // An API 28 host: refused before asking for anything.
@@ -304,7 +365,7 @@ int main(int argc, char** argv) {
     H.input.playing = 1;
     for (int i = 0; i < 5; ++i) frame();
     CHECK(H.calls == 0);  // asks for nothing until started
-    // Not in the world's first two seconds.
+    // Not in the world's first three seconds.
     tap_key(kP);
     CHECK(H.paused == 0 && logged("the world is still coming in"));
     settle();
@@ -341,6 +402,31 @@ int main(int argc, char** argv) {
     H.view_fn(&view, H.view_user);
     CHECK(view.position[0] > 1.01f);
 
+    // Its panel opened with it, the Mode row back to Frozen, and no look over
+    // the area's until a row says otherwise.
+    CHECK(H.panel_up && (H.panel_flags & BB_PANEL_DEFAULTS));
+    CHECK(!H.sets.empty() && H.sets.back().first == "mode" && H.sets.back().second == "Frozen");
+    CHECK(H.looks >= 1 && !H.look_on);
+    // The rows' look, as they change.
+    H.option_fn("saturation", "50", H.option_user);
+    CHECK(H.look_on && (H.look.set & BB_LOOK_TONE) && std::fabs(H.look.saturation - 0.5f) < 1e-6f && H.look.exposure == 1.0f);
+    H.option_fn("dof", "On", H.option_user);
+    CHECK((H.look.set & BB_LOOK_DOF) && H.look.dof == 1 && std::fabs(H.look.dof_focus - 9.0f) < 1e-4f && H.look.dof_far_levels == 1);
+    H.option_fn("fog_height", "-50", H.option_user);
+    CHECK((H.look.set & BB_LOOK_FOG) && H.look.fog_height_offset == -50.0f && H.look.fog_distance == 1.0f);
+    H.option_fn("vignette", "Strong", H.option_user);
+    CHECK((H.look.set & BB_LOOK_VIGNETTE) && std::fabs(H.look.vignette - 1.0f) < 1e-6f);
+    H.option_fn("saturation", "100", H.option_user);
+    H.option_fn("dof", "Area's own", H.option_user);
+    H.option_fn("fog_height", "0", H.option_user);
+    H.option_fn("vignette", "Area's own", H.option_user);
+    CHECK(!H.look_on);  // every row the area's again: no look
+    // R3 and Tab hide and show the panel.
+    tap_pad(BB_PAD_R3);
+    CHECK(!H.panel_up);
+    tap_key(kTab);
+    CHECK(H.panel_up);
+
     // The frame advance: Cross (it was not held to start) and N, two updates each.
     tap_pad(BB_PAD_CROSS);
     CHECK(H.steps == 2);
@@ -350,7 +436,7 @@ int main(int argc, char** argv) {
     // Static: the world runs, the controller is the game's but Options and the touchpad; Live flies over it.
     H.option_fn("mode", "Static", H.option_user);
     CHECK(H.paused == 0);
-    CHECK(H.take_buttons == (BB_PAD_OPTIONS | BB_PAD_TOUCHPAD) && H.take_axes == 0);
+    CHECK(H.take_buttons == (BB_PAD_OPTIONS | BB_PAD_TOUCHPAD | BB_PAD_R3) && H.take_axes == 0);
     CHECK(H.taken_motion == 0);
     view = game_view();
     H.view_fn(&view, H.view_user);
@@ -367,9 +453,18 @@ int main(int argc, char** argv) {
     tap_key(kN);
     CHECK(H.steps == steps_before);  // no frame advance over a running world
 
-    // Escape ends it: everything given back.
+    // Escape ends it: everything given back, the panel down and no look.
+    H.option_fn("exposure", "150", H.option_user);
+    CHECK(H.look_on);
     tap_key(kEscape);
     CHECK(H.paused == 0 && H.hud_hidden == 0 && H.take_buttons == 0 && H.take_axes == 0 && H.taken_keys.empty() && H.taken_motion == 0);
+    CHECK(!H.look_on && !H.panel_up);
+    {
+        // A row changed while it is off goes over nothing.
+        const int looks = H.looks;
+        H.option_fn("exposure", "100", H.option_user);
+        CHECK(H.looks == looks);
+    }
     view = game_view();
     H.view_fn(&view, H.view_user);
     CHECK(std::fabs(view.position[2] - 3) < 1e-5f);  // the game's view again
