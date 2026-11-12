@@ -30,6 +30,7 @@ std::string g_path;
 std::vector<std::uint8_t> g_bytes;
 std::vector<Function> g_functions;
 ElfImage g_image;
+std::size_t g_arena = 0;  // reserve_arena
 bool g_loaded = false;
 void* g_tcb = nullptr;
 
@@ -178,12 +179,16 @@ void host_fp() {
     asm volatile("fldcw %0" : : "m"(cw));
 }
 
+void reserve_arena(std::size_t bytes) { g_arena = bytes; }
+
+ElfImage* image() { return &g_image; }
+
 void load(const char* test) {
     if (g_loaded) return;
     bytes(test);
     g_stubs = static_cast<std::uint8_t*>(
         mmap(nullptr, kStubSpace, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (g_stubs == MAP_FAILED || !load_orbis_elf(g_path.c_str(), &g_image) || g_image.mem.slide != kBase) {
+    if (g_stubs == MAP_FAILED || !load_orbis_elf(g_path.c_str(), &g_image, g_arena) || g_image.mem.slide != kBase) {
         std::printf("%s: cannot load the eboot at 0x%llx\n", test, static_cast<unsigned long long>(kBase));
         std::exit(1);
     }

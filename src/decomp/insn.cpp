@@ -31,7 +31,9 @@ X86Insn x86_decode(const std::uint8_t* p, std::size_t avail) {
                  b != 0x65)
             break;
     }
+    std::uint8_t rex = 0;
     if ((p[i] & 0xf0) == 0x40) {
+        rex = p[i];
         rex_w = (p[i] & 0x08) != 0;
         if (++i >= avail) return {};
     }
@@ -42,11 +44,13 @@ X86Insn x86_decode(const std::uint8_t* p, std::size_t avail) {
         if (op == 0xc5) {
             if (i + 1 >= avail) return {};
             map = 1;
+            rex = static_cast<std::uint8_t>(0x40 | ((~p[i] & 0x80) >> 5));  // VEX2 has R only
             i += 1;
         } else {
             if (i + 2 >= avail) return {};
             map = p[i] & 0x1f;
             rex_w = (p[i + 1] & 0x80) != 0;
+            rex = static_cast<std::uint8_t>(0x40 | (rex_w ? 8 : 0) | ((~p[i] & 0xe0) >> 5));
             i += 2;
             if (map < 1 || map > 3) return {};
         }
@@ -178,8 +182,10 @@ X86Insn x86_decode(const std::uint8_t* p, std::size_t avail) {
         imm = map == 3 ? 1 : 0;
     }
 
+    r.rex = rex;
     if (modrm) {
         if (i >= avail) return {};
+        r.modrm_at = static_cast<std::uint8_t>(i);
         const std::uint8_t m = p[i++];
         const int mod = m >> 6, reg = (m >> 3) & 7, rm = m & 7;
         if (test_imm != None && reg <= 1) imm = test_imm == Test8 ? 1 : iz;

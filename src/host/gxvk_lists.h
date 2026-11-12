@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 
 struct GpuDrawInputs;
 struct GxDrawObjects;
@@ -119,8 +120,12 @@ extern std::atomic<bool> g_resting;
 inline bool resting() { return g_resting.load(std::memory_order_relaxed); }
 // The main loop's frame limiter, once a frame (engine/frame_rate.cpp): how long
 // it waited, the rate it held the frame to (0: none, as on a loading screen)
-// and whether a loading screen is up (engine/loading.h).
+// and whether a loading screen is up (engine/loading.h). It drives the pool's
+// duty, or where the pool is off and Windows' default turned the run commit on,
+// the run commit's by the same rule (host/list_resolve.h duty_on).
 void frame_paced(std::uint64_t wait_ns, float cap_fps, bool loading);
+// The run commit's rests and experiments for its report line (list_resolve's).
+std::string run_duty_report();
 // The command processor's queue 0 (bb-cp0) spent `ns` on a job (hle/gnm_exec.cpp):
 // its busy share, for the rest's lines.
 void cp_busy(std::uint64_t ns);
@@ -128,6 +133,12 @@ void cp_busy(std::uint64_t ns);
 // the back-pressure the bottleneck meter calls "held back by the command
 // processor"): counted always, for the rest's rule.
 void cp_held(std::uint64_t ns);
+// bb-cp0's CPU-time clock, noted at its start (hle/gnm_exec.cpp), and its CPU
+// time so far (0: not known): the command processor's own work, without the
+// waits its jobs take in - the recorder's rest reads its share of a window
+// (host/recorder.cpp).
+void cp_thread_note(std::uintptr_t clock);
+std::uint64_t cp_cpu_ns();
 
 // The pool's cores (stage 4b.1b, BBHOST_GXVK_LIST_CPUS: auto, the default
 // with splice - the last physical cores of the process's CPUs, one a pool

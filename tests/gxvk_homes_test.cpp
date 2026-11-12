@@ -13,6 +13,7 @@
 // gives way wherever the homes are bound, by the rule or BBHOST_GXVK_HOMES=1).
 #include "host/gxvk_homes.h"
 #include "host/gxvk_homes_index.h"
+#include "host/list_resolve.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -135,6 +136,21 @@ int main() {
                   !run_commit_gives_way(homes_bound(Mode::kCompare, 0, false, false, false), true) &&
                   !run_commit_gives_way(homes_bound(Mode::kTwins, 0, false, false, false), true),
               "BBHOST_GXVK_HOMES=0, compare and twins keep the run commit", 0, 2);
+        // Where Windows' default keeps the run commit (the homes not bound), its duty decides when it forks
+        // (host/list_resolve.h duty_wanted: on by the platform's default alone, still forking, BBHOST_RUN_COMMIT_REST not 0);
+        // where it gave way, with BBHOST_RUN_COMMIT set (or Linux's default) and with BBHOST_RUN_COMMIT_REST=0 there is none.
+        {
+            const bool kept_igpu = !run_commit_gives_way(homes_bound(Mode::kAuto, default_off(true, false, false, 60, false, true), true, false, false), true);
+            const bool kept_small = !run_commit_gives_way(homes_bound(Mode::kAuto, default_off(false, false, true, 60, false, true), false, false, true), true);
+            check(list_resolve::duty_wanted(true, kept_igpu, 1) && list_resolve::duty_wanted(true, kept_small, 1) &&
+                      list_resolve::duty_wanted(true, kept_small, 2),
+                  "the duty decides Windows' run commit on an integrated GPU and with small video memory refused", 8, 60);
+            const bool kept_room = !run_commit_gives_way(homes_bound(Mode::kAuto, default_off(false, false, false, 60, false, true), false, false, false), true);
+            check(!list_resolve::duty_wanted(true, kept_room, 1), "no duty where the run commit gave way to the homes", 16, 60);
+            check(!list_resolve::duty_wanted(false, true, 1) && !list_resolve::duty_wanted(false, true, 2),
+                  "no duty with BBHOST_RUN_COMMIT set or Linux's default", 0, 0);
+            check(!list_resolve::duty_wanted(true, true, 0), "BBHOST_RUN_COMMIT_REST=0: no duty", 0, 1);
+        }
     }
 
     std::mt19937_64 rng(4321);

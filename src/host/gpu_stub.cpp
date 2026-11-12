@@ -119,6 +119,10 @@ std::string host_gpu_occlusion_report() { return {}; }
 std::string host_gpu_image_heap_report() { return {}; }
 void host_gpu_resources_report() {}
 void host_gpu_texture_written(std::uint64_t, std::size_t) {}
+bool host_gpu_yebis_texture_update(std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t,
+                                   std::uint32_t, const void*, std::uint32_t, std::uint64_t) {
+    return false;
+}
 void host_gpu_targets_rebuild(bool) {}
 void host_gpu_shadow_gx_write(std::uint64_t, std::size_t) {}
 void host_gpu_shadow_gx_created(std::uint64_t, std::size_t) {}

@@ -110,6 +110,33 @@ it falls behind - where the kernel's half of a submission is costly, as on a
 Steam Deck, whose driver makes every import of the game's memory resident
 again at each one - the submissions queued behind each other go to the queue
 as one (`BBHOST_SUBMIT_MERGE=1` keeps them apart, to compare).
+Between two blocks `bb-record` spins (`BBHOST_RECORDER_SPIN`: 20,000 pauses
+with 16 hardware threads or more, 4,000 under) before it sleeps, which pays
+where the command processor limits the frame: a wake of a sleeping recorder is
+a system call on the command processor. Where something else holds the frame
+with room to spare, the recorder rests instead: a frame cap (two half-second
+windows with the limiter waiting 15% of the time, as the draw pool's rest at a
+cap) with the GPU busy under 85%, or the GPU under the cap (busy 90% of two
+windows) with the command processor's thread busy under 85%. Resting, it
+sleeps after 100 pauses, and the command processor wakes it at a submission or
+every 64 blocks, so it replays its blocks in batches; every wait of the
+command processor's on it wakes it at once (`src/host/recorder_rest.h`). At a
+true 60 that took the process 18-27 points of CPU under Windows on an RTX 3070
+Ti Laptop GPU (the recorder from 39-48% of a core to 13-16%), 25-34 on its
+Radeon 680M (GPU-bound) and 21-29 on an RTX 4070 under Linux, the frame rate
+and the slowest frames the same. Without that room the rest's delays land on
+the frame: its waits added to a command processor near its limit (Old Yharnam
+uncapped on that laptop, the thread busy 91-95%: 2-4% slower; a Steam Deck's
+60 fps profile at the Nightmare of Mensis, 94-95%: 0.8%), and a submission it
+delays at a cap with the GPU near full (the same profile at Central Yharnam,
+the GPU 88-91% busy: the 99th percentile frame from 17 to 20 ms in one run of
+two). The command processor's share is its thread's own CPU time, read once a
+window - not its jobs' time, which takes in its waits for the GPU (98-101% of
+the window on the 680M at 32-37 fps, the thread busy 29-44%). A cap's rest
+ends with the limiter waiting under 8% of a window or the GPU busy 92%, the
+GPU's with the GPU under 80% busy (the median of six windows), the command
+processor busy 92% or a cap holding the frame, both at a loading screen.
+`BBHOST_RECORDER_REST=0`: it never rests; `=always`: it always does.
 
 **Shaders.** GCN shaders are converted to SPIR-V when the game creates them,
 and GX creates every shader of the game's bundles at the start (1,663 vertex
@@ -888,7 +915,7 @@ segments without the run commit against the run commit:
 As shipped, the shared GPU memory stayed at 2.1 GB (whole imports, on the
 second row, pinned 4.95 GB). Where the rule does not hold - an integrated GPU,
 a card under 5,000 MiB free - the run commit
-stays on by Windows' default, as before. The homes are made as
+stays on by Windows' default, and works by the pool's duty rule (below). The homes are made as
 their buffers are, so the choice is made once, with the device at start: a
 frame rate changed in play (it changes at once, 30 included) leaves the
 choice as it was until the next start. Off, one line says why (`gxvk homes: off by
@@ -953,6 +980,24 @@ for 3 s (the title's menus meet an uncapped game's 960 cap).
 (what resting costs against the pool off); `=cycle:N` rests and works N frames
 each in turn (a check); `BBHOST_GXVK_LISTS_REST_LOG=1`: every window of the
 rule in the log.
+
+**The run commit's duty (`BBHOST_RUN_COMMIT_REST`).** Where Windows' default
+keeps the run commit - an integrated GPU, tight memory, a card under 5,000 MiB
+free - the same rule decides when it forks a run's parts, without the
+frame-rate experiments: it rests while a cap holds the frame and while the
+frame is the GPU's, and works anywhere else, as it did. Resting, no run is
+forked: the command processor draws every draw in order and the run commit's
+workers sleep (a run forked before the rest began is taken as it was). At a
+true 60 under Windows on an RTX 3070 Ti Laptop GPU held to a 4 GB card's 2,950
+MiB that took Central Yharnam from 235% of CPU to 207% and ran the GPU-bound
+Nightmare of Mensis at 38.8 fps against 35.5; on the laptop's Radeon 680M,
+GPU-bound at 30-34 fps, it took 21-31 points; with Windows' small-card default
+acted out on an RTX 4070 under Linux, 80-105 points at five places, the frame
+the same. An experiment (the other state for a few seconds) cannot see what
+its rests cost later: on that 4 GB card a working run commit came back slower
+after them. Its lines say `list-resolve:` where the pool's say `gxvk-lists:`.
+`BBHOST_RUN_COMMIT_REST=0`: it never rests (as before); `=always`: it always
+does; `BBHOST_RUN_COMMIT` set keeps its own answer.
 
 ### GX's objects as Vulkan objects (a design note)
 

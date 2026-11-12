@@ -35,7 +35,14 @@ struct ElfImage {
     // reach of all of the code: text that replaces the game's own
     // (engine/image_text.h). ELF addresses; read-write, never executed.
     std::uint64_t tail_va = 0, tail_size = 0, tail_used = 0;
+    // After the tail, the routines of core/legacy_cpu.h when the processor
+    // needs them (arena_size 0 when not): inside mem too, so in reach of all
+    // of the code and inside every range that counts as the guest's. ELF
+    // addresses.
+    std::uint64_t arena_va = 0, arena_size = 0;
 };
 
-bool load_orbis_elf(const char* path, ElfImage* image);
+// arena: the bytes to reserve after the tail for core/legacy_cpu.h's routines
+// (legacy_cpu_arena_size()).
+bool load_orbis_elf(const char* path, ElfImage* image, std::size_t arena = 0);
 void unload_elf(ElfImage* image);

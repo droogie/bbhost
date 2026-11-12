@@ -229,6 +229,7 @@ thread_local std::vector<Pending> t_pending;
 // The T# the builder produced on this thread, for the creator's return.
 thread_local std::uint32_t t_tsharp[8];
 thread_local bool t_tsharp_valid = false;
+thread_local std::uint8_t t_new_cpu = 0;  // the CPU access of the texture being registered (1 write, 2 read)
 // BBHOST_GX_TEX_AHEAD=0: do not create textures ahead of their first bind.
 const bool g_tex_ahead = [] {
     const char* e = std::getenv("BBHOST_GX_TEX_AHEAD");
@@ -489,6 +490,8 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
         return;
     }
     rd(holder + 0x3b, &e.info.bind);
+    t_new_cpu = 0;
+    rd(holder + 0x3a, &t_new_cpu);
     e.info.gen = g_gen_next.fetch_add(1, std::memory_order_relaxed);
     e.info.created_submit = hle_gnm_submitted_total();
     e.info.id = id & 0xffffff;
@@ -542,6 +545,25 @@ void register_holder(std::uint64_t key, std::uint64_t holder, Kind kind, bool in
     register_entry(key, e);
 }
 
+// BBHOST_TEX_POISON=1 (checks): a texture GX or YEBIS makes without data
+// starts with 0xff in every byte of its memory - what memory nothing wrote
+// often holds (YEBIS's private heap starts so, yebis_startup's fill): NaN in a
+// float texture, white in an 8-bit one - so a texture read before anything
+// writes it reads the same in every run. Not one the CPU reads back (staging,
+// or CPU-read access: the game's own reads would change).
+const bool g_tex_poison = [] {
+    const char* e = std::getenv("BBHOST_TEX_POISON");
+    return e && e[0] == '1';
+}();
+std::atomic<std::uint64_t> g_tex_poisoned{0};
+void poison_new_texture(const GxResourceInfo& r, std::uint8_t cpu) {
+    if (!g_tex_poison || r.type < 2 || r.type > 4 || r.initial_data || !r.memory || !r.bytes || r.usage == 3 || (cpu & 2) ||
+        !hle_kernel_va_mapped(r.memory, r.bytes))
+        return;
+    std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(r.memory)), 0xff, r.bytes);
+    if (g_tex_poisoned.fetch_add(1, std::memory_order_relaxed) == 0)
+        host_log("gx-resources: textures made without data start as 0xff in memory (BBHOST_TEX_POISON)");
+}
 // The registry takes a resource under `key`: indexed by its memory, a live
 // one there before it dead as far as the memory goes, the mirrors told.
 void register_entry(std::uint64_t key, Entry& e) {
@@ -606,6 +628,7 @@ void register_entry(std::uint64_t key, Entry& e) {
     // (host_gpu_shadow_gx_created takes a lock of its own, never the
     // registry's).
     if (e.info.memory && e.info.bytes) host_gpu_shadow_gx_created(e.info.memory, e.info.bytes);
+    poison_new_texture(e.info, t_new_cpu);
 }
 
 // Textures made ahead of their first bind are made on a thread of their own,
@@ -1018,10 +1041,63 @@ GUEST_ABI std::int64_t yebis_map_hook(std::uint64_t, const std::uint64_t* saved)
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
     return 0;
 }
+// UpdateSubresource of a YEBIS 2D texture (0x15d8d70: ctx, resource,
+// subresource, box*, data, row pitch): the texels are copied by a compute
+// copy YEBIS records, which some of its starts never run - the texture cache
+// keeps them for the texture made for this resource (host/tex_update.h). The
+// D3D11 description at +0x188: width, height, mips, array, format; block-
+// compressed formats (BC1-5 70-84, BC6H/BC7 94-99) are left to the copy.
+void yebis_written(std::uint64_t object, bool after_map, bool tell_cache);  // below
+bool keep_yebis_update(const std::uint64_t* saved) {
+    const std::uint64_t object = saved[4], box = saved[2], data = saved[1];
+    const std::uint32_t subresource = static_cast<std::uint32_t>(saved[3]), pitch = static_cast<std::uint32_t>(saved[0]);
+    std::uint32_t d[5] = {};
+    if (!g_res_yebis || !object || !data || !pitch || yebis_kind(object) != 3 ||
+        !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(object + 0x188)), d, sizeof(d)))
+        return false;
+    if ((d[4] >= 70 && d[4] <= 84) || (d[4] >= 94 && d[4] <= 99)) return false;
+    std::uint64_t memory = 0, gen = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        const auto it = g_by_holder.find(kYebisKey | object);
+        if (it == g_by_holder.end() || !it->second.info.alive) return false;
+        memory = it->second.info.memory;
+        gen = it->second.info.gen;
+    }
+    const std::uint32_t mips = std::max(1u, d[2]), mip = subresource % mips, slice = subresource / mips;
+    const std::uint32_t mw = std::max(1u, d[0] >> std::min(mip, 31u)), mh = std::max(1u, d[1] >> std::min(mip, 31u));
+    std::uint32_t x = 0, y = 0, w = mw, h = mh;
+    if (box) {
+        std::uint32_t b[6] = {};  // D3D11_BOX: left, top, front, right, bottom, back
+        if (!host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(box)), b, sizeof(b)) || b[3] <= b[0] || b[4] <= b[1]) return false;
+        x = b[0];
+        y = b[1];
+        w = b[3] - b[0];
+        h = b[4] - b[1];
+    }
+    const std::size_t bytes = static_cast<std::size_t>(pitch) * h;
+    if (bytes > (4u << 20)) return false;
+    std::vector<std::uint8_t> rows(bytes);
+    if (!host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(data)), rows.data(), bytes)) return false;
+    return host_gpu_yebis_texture_update(memory, gen, mip, slice, x, y, w, h, rows.data(), pitch, hle_gnm_submitted_total());
+}
 GUEST_ABI std::int64_t yebis_update_hook(std::uint64_t, const std::uint64_t* saved) {
     if (yebis_skip(saved[4])) return 0;
     Pending p{saved[6], kYebisUpdateCall, 0, 0, 0};
     p.extra = saved[4];
+    p.type = keep_yebis_update(saved) ? 1 : 0;  // kept: its texels reach the texture without the memory
+    // BBHOST_TEST_DROP_YEBIS_UPLOADS=1 (checks): the update does not run - no copy is recorded, as when one of
+    // YEBIS's starts loses its copies - so the texture has only what the cache kept (or nothing).
+    static const bool drop = [] {
+        const char* e = std::getenv("BBHOST_TEST_DROP_YEBIS_UPLOADS");
+        return e && e[0] == '1';
+    }();
+    if (drop) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) host_log("gx-resources: YEBIS's texture updates are not run (BBHOST_TEST_DROP_YEBIS_UPLOADS)");
+        yebis_written(p.extra, false, p.type == 0);
+        return 1;
+    }
     t_pending.push_back(p);
     const_cast<std::uint64_t*>(saved)[6] = reinterpret_cast<std::uint64_t>(&gx_res_ret);
     return 0;
@@ -1031,7 +1107,7 @@ GUEST_ABI std::int64_t yebis_update_hook(std::uint64_t, const std::uint64_t* sav
 // After a Map its memory is read again: a discard renames it (YEBIS's Map
 // hands out new memory from its ring and rebases the T#), and the registry
 // follows, as it does a GX holder's.
-void yebis_written(std::uint64_t object, bool after_map = false) {
+void yebis_written(std::uint64_t object, bool after_map = false, bool tell_cache = true) {
     if (!g_res_yebis || !object) return;
     std::uint64_t memory = 0, now = 0;
     std::uint32_t bytes = 0;
@@ -1054,7 +1130,9 @@ void yebis_written(std::uint64_t object, bool after_map = false) {
         e.info.write_seq = g_write_seq.fetch_add(1, std::memory_order_relaxed) + 1;
     }
     g_yebis_told.fetch_add(1, std::memory_order_relaxed);
-    if (memory && bytes) host_gpu_texture_written(memory, bytes);
+    // An update the texture cache keeps (host/tex_update.h) never reaches the
+    // memory: an upload from it would only bring the old texels back.
+    if (memory && bytes && tell_cache) host_gpu_texture_written(memory, bytes);
 }
 GUEST_ABI std::int64_t yebis_unmap_hook(std::uint64_t, const std::uint64_t* saved) {
     if (yebis_skip(saved[4])) return 0;
@@ -1228,6 +1306,7 @@ void register_yebis_2d(std::uint64_t object, bool initial_data) {
     e.info.type = 3;
     e.info.usage = static_cast<std::uint8_t>(d[7]);
     e.info.bind = static_cast<std::uint8_t>(d[8]);
+    t_new_cpu = static_cast<std::uint8_t>((d[9] >> 16) & 3);  // D3D11_CPU_ACCESS_WRITE/READ
     e.info.gen = g_gen_next.fetch_add(1, std::memory_order_relaxed);
     e.info.created_submit = hle_gnm_submitted_total();
     e.info.initial_data = initial_data;
@@ -1480,7 +1559,7 @@ extern "C" GUEST_ABI std::uint64_t gx_res_after(std::uint64_t result) {
         scaleform_unmapped(p.holder);
     } else if (p.kind == kYebisUpdateCall) {
         g_yebis_updates[yebis_kind(p.extra)].fetch_add(1, std::memory_order_relaxed);
-        yebis_written(p.extra);
+        yebis_written(p.extra, false, p.type == 0);
     } else if (p.kind == kYebisMapCall) {
         if (static_cast<std::uint32_t>(result) == 0) yebis_written(p.extra, true);
         const std::uint32_t kind = yebis_kind(p.extra);

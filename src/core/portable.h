@@ -19,6 +19,11 @@ std::uint64_t host_process_cpu_ms();
 // (CLOCK_THREAD_CPUTIME_ID; on Windows GetThreadTimes, which moves in the
 // scheduler's ticks - sum it over many frames, not one).
 std::uint64_t host_thread_cpu_ns();
+// The calling thread's CPU-time clock (0: none), whose time any thread then reads
+// with host_thread_cpu_ns_of (0 on failure): a thread watched from another, once
+// a window rather than at its every step.
+std::uintptr_t host_thread_cpu_clock();
+std::uint64_t host_thread_cpu_ns_of(std::uintptr_t clock);
 // Copies len bytes from addr, failing (false) instead of faulting when the
 // page is not mapped: on Linux a plain copy whose fault the SIGSEGV handler
 // hands back (host_read_safe_recover), on Windows ReadProcessMemory. Not from

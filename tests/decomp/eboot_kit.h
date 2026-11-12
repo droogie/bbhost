@@ -21,6 +21,8 @@
 #include <random>
 #include <vector>
 
+struct ElfImage;
+
 namespace eboot_kit {
 
 constexpr int kSkip = 77;
@@ -51,6 +53,10 @@ const std::uint8_t* file_at(const char* test, std::uint64_t bn);
 // The image, loaded and relocated, for running the game's code (above).
 // Exits with 1 when it cannot be mapped (0x400000 taken).
 void load(const char* test);
+// Before load(): bytes to reserve after the image for core/legacy_cpu.h's
+// routines (core/elf.h's arena). After it: the loaded image.
+void reserve_arena(std::size_t bytes);
+::ElfImage* image();
 // The pointers the loader relocated (R_X86_64_RELATIVE): where each sits
 // and what it points at, by Binary Ninja address - every vtable slot among
 // them. After load().

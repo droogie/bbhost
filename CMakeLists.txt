@@ -98,6 +98,8 @@ add_executable(bbhost
   src/host/shader_overrides.cpp
   src/host/scene_look.cpp
   src/core/tls_rewrite.cpp
+  src/core/legacy_cpu.cpp
+  src/core/legacy_cpu_code.cpp
   src/core/config.cpp
   src/core/config_move.cpp
   src/engine/image_text.cpp
@@ -730,6 +732,11 @@ if(UNIX)
     # one (BBHOST_EBOOT, or eboot-109-decrypted.bin in the checkout).
     add_test(NAME debug_menu_strings_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/debug_menu_strings.py check)
     set_tests_properties(debug_menu_strings_test PROPERTIES SKIP_RETURN_CODE 77)
+    # The legacy-CPU site table (core/legacy_cpu.h) against the eboot, and
+    # every instruction of its code against the supported processors: skipped
+    # without the eboot or capstone.
+    add_test(NAME legacy_cpu_sites_table_test COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/legacy_cpu_sites.py check)
+    set_tests_properties(legacy_cpu_sites_table_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
   endif()
   # The map-validation probe's tour steps (tools/area_check.py's) on a pretend
   # host. Built beside the tests, never into plugins/, where bbhost would load it.
@@ -985,6 +992,9 @@ if(UNIX)
   add_executable(gxvk_rest_test tests/gxvk_rest_test.cpp)
   target_include_directories(gxvk_rest_test PRIVATE src include)
   add_test(NAME gxvk_rest_test COMMAND gxvk_rest_test)
+  add_executable(recorder_rest_test tests/recorder_rest_test.cpp)
+  target_include_directories(recorder_rest_test PRIVATE src include)
+  add_test(NAME recorder_rest_test COMMAND recorder_rest_test)
   # Stage 4b.1b/4b.2: the list arena's memo binds a copy only while the guest's bytes are the ones it took (host/list_cb_memo.h).
   add_executable(list_cb_memo_test tests/list_cb_memo_test.cpp)
   target_include_directories(list_cb_memo_test PRIVATE src include)
@@ -1121,6 +1131,25 @@ if(UNIX)
   add_executable(engine_layout tests/engine_layout.cpp)
   target_include_directories(engine_layout PRIVATE src)
   add_test(NAME engine_layout COMMAND engine_layout)
+  # The routines a processor without BMI1, LZCNT or MOVBE runs for the game's
+  # instructions (core/legacy_cpu_code.h): every family, size, operand form and
+  # register aliasing against the instruction itself and legacy_apply, and
+  # mutants of them that must fail. No game files.
+  add_executable(legacy_cpu_test tests/legacy_cpu_test.cpp src/core/legacy_cpu_code.cpp src/decomp/insn.cpp)
+  target_include_directories(legacy_cpu_test PRIVATE src tests)
+  add_test(NAME legacy_cpu_test COMMAND legacy_cpu_test)
+  # The same on processors without them, where qemu-x86_64 is installed: its
+  # Ivy Bridge (no BMI1, LZCNT or MOVBE) and Bulldozer (no BMI1 or MOVBE) -
+  # the routines must need none of the three.
+  find_program(QEMU_X86_64 qemu-x86_64)
+  if(QEMU_X86_64)
+    add_test(NAME legacy_cpu_test_ivybridge COMMAND ${QEMU_X86_64} -cpu IvyBridge $<TARGET_FILE:legacy_cpu_test>)
+    add_test(NAME legacy_cpu_test_bulldozer COMMAND ${QEMU_X86_64} -cpu Opteron_G4 $<TARGET_FILE:legacy_cpu_test>)
+    # qemu's own LZCNT is no oracle: its Bulldozer claims LZCNT in CPUID and
+    # runs it as BSR. The routines are compared with legacy_apply there.
+    set_tests_properties(legacy_cpu_test_ivybridge legacy_cpu_test_bulldozer PROPERTIES TIMEOUT 1800
+                         ENVIRONMENT LEGACY_CPU_TEST_NO_NATIVE=1)
+  endif()
   add_executable(write_watch_test tests/write_watch_test.cpp src/core/write_watch.cpp)
   target_include_directories(write_watch_test PRIVATE src)
   target_link_libraries(write_watch_test PRIVATE pthread)
@@ -1151,6 +1180,20 @@ if(UNIX)
     add_test(NAME decomp_${name} COMMAND decomp_${name} ${T_ARGS})
     set_tests_properties(decomp_${name} PROPERTIES SKIP_RETURN_CODE 77)
   endfunction()
+  # Every site of the eboot rewritten in a loaded image as bbhost does it
+  # (core/legacy_cpu.h), each region run as the game's bytes and as rewritten,
+  # and the illegal-instruction path on what is left. Skips without the eboot.
+  add_executable(legacy_cpu_sites_test tests/legacy_cpu_sites_test.cpp src/core/legacy_cpu.cpp src/core/legacy_cpu_code.cpp
+                 src/decomp/insn.cpp)
+  target_link_libraries(legacy_cpu_sites_test PRIVATE eboot_kit pthread)
+  target_include_directories(legacy_cpu_sites_test PRIVATE src tests)
+  add_test(NAME legacy_cpu_sites_test COMMAND legacy_cpu_sites_test)
+  set_tests_properties(legacy_cpu_sites_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+  if(QEMU_X86_64)
+    add_test(NAME legacy_cpu_sites_test_ivybridge COMMAND ${QEMU_X86_64} -cpu IvyBridge $<TARGET_FILE:legacy_cpu_sites_test>)
+    set_tests_properties(legacy_cpu_sites_test_ivybridge PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600
+                         ENVIRONMENT LEGACY_CPU_TEST_NO_NATIVE=1)
+  endif()
   bbhost_decomp_test(insn SOURCES src/decomp/insn.cpp)
   bbhost_decomp_test(insn_eboot SOURCES src/decomp/insn.cpp)
   bbhost_decomp_test(event_interpreter SOURCES src/decomp/events/flag_store.cpp)
@@ -1228,6 +1271,10 @@ if(UNIX)
   add_executable(fill_pending_test tests/fill_pending_test.cpp)
   target_include_directories(fill_pending_test PRIVATE src)
   add_test(NAME fill_pending_test COMMAND fill_pending_test)
+  # A YEBIS texture's update kept for the texture made for it (tests/tex_update_test.cpp).
+  add_executable(tex_update_test tests/tex_update_test.cpp)
+  target_include_directories(tex_update_test PRIVATE src)
+  add_test(NAME tex_update_test COMMAND tex_update_test)
   # The engine's per-view block found at every screen shape and field of view (tests/view_block_test.cpp).
   add_executable(view_block_test tests/view_block_test.cpp)
   target_include_directories(view_block_test PRIVATE src)

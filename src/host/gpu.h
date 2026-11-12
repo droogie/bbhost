@@ -534,6 +534,9 @@ void host_gpu_import_waits(std::uint64_t* n, std::uint64_t* us);
 // Vulkan, and spinning for the next block before it sleeps. False without the
 // thread (recording in place or inline): the bottleneck meter's recorder load.
 bool host_gpu_recorder_ns(std::uint64_t* replay_ns, std::uint64_t* spin_ns);
+// The main loop's frame limiter, once a frame (engine/frame_rate.cpp): how long it waited, the rate it held the frame to
+// and whether a loading screen is up - the recorder's rest at a frame cap (host/recorder_rest.h, BBHOST_RECORDER_REST).
+void host_gpu_recorder_paced(std::uint64_t wait_ns, float cap_fps, bool loading);
 // A GX buffer was made over [memory, memory + bytes) with this usage, these
 // bind flags and the registry's generation: with BBHOST_GX_TWINS=1 one the
 // GPU writes (usage default, unordered-access bind) gets a device-local twin
@@ -641,6 +644,15 @@ void host_gpu_targets_rebuild(bool on);
 // GX mapped the texture whose memory is [base, base + bytes) for the CPU to
 // write: its surfaces upload it again at their next use.
 void host_gpu_texture_written(std::uint64_t base, std::size_t bytes);
+// YEBIS's UpdateSubresource of the texture of generation `gen` at `memory`:
+// mip `mip`, slice `slice`, the box (x, y, w, h) in texels, `h` rows of the
+// texels `pitch` bytes apart at `rows` (copied), with `submitted` the
+// submissions made then. The texture made for that
+// resource takes them as it is made (host/tex_update.h). False when they are
+// not kept - the caller then tells the cache as of a Map
+// (host_gpu_texture_written). Any thread, no lock held.
+bool host_gpu_yebis_texture_update(std::uint64_t memory, std::uint64_t gen, std::uint32_t mip, std::uint32_t slice, std::uint32_t x, std::uint32_t y,
+                                   std::uint32_t w, std::uint32_t h, const void* rows, std::uint32_t pitch, std::uint64_t submitted);
 // A CPU write GX makes over a buffer's memory - a creation's initial data -
 // or memory that stops being a buffer's: the buffer shadow invalidates the
 // mirror pages over it (they are not write-watched when GX buffers cover
