@@ -1,4 +1,5 @@
 #include "host/window.h"
+#include "host/plugin_panel.h"
 #include "core/host_clock.h"
 #include "core/portable.h"
 
@@ -1803,6 +1804,18 @@ void update_pad() {
     // (plugin API 29: host_plugin_pad, host_plugin_pad_take).
     PluginPad ctl;
     const std::uint32_t take_buttons = g_ppad_take_buttons.load(std::memory_order_relaxed);
+    // A plugin's panel up (host/plugin_panel.h): the buttons and keys it moves
+    // by are its own - neither the game nor the plugins' pad and input read them.
+    const bool panel = plugin_panel_shown();
+    // A button or key the panel had stays its own until let go: the Circle or
+    // Escape that closes it must not then press anything (end photo mode,
+    // open the game's menu).
+    static std::uint32_t panel_held_pad = 0;
+    // The same for a button a plugin takes (pad_take): one held as the take
+    // ends - the chord or Cross that ends a photo mode - stays the plugin's
+    // until let go, so the game never sees it go down.
+    static std::uint32_t taken_held_pad = 0;
+    std::uint32_t held_now = 0;
     const std::uint32_t take_axes = g_ppad_take_axes.load(std::memory_order_relaxed);
     for (SDL_Gamepad* g_gamepad : g_pads) {
         p.connected = true;
@@ -1851,8 +1864,14 @@ void update_pad() {
         // The plugin reads every button; one it takes presses nothing in the game.
         for (int i = 0; i < kPadInputs; ++i) {
             if (!held[i]) continue;
-            ctl.buttons |= host_pad_input_bit(i);
-            if (take_buttons & host_pad_input_bit(i)) held[i] = false;
+            const std::uint32_t bit = host_pad_input_bit(i);
+            held_now |= bit;
+            if ((panel && (bit & kPanelPadButtons)) || (panel_held_pad & bit)) {
+                held[i] = false;
+                continue;
+            }
+            ctl.buttons |= bit;
+            if ((take_buttons | taken_held_pad) & bit) held[i] = false;
         }
         for (int i = 0; i < kPadInputs; ++i) {
             if (!held[i]) continue;
@@ -1920,6 +1939,8 @@ void update_pad() {
             t.down = true;
         }
     }
+    panel_held_pad = ((panel ? kPanelPadButtons : 0u) | panel_held_pad) & held_now;
+    taken_held_pad = (take_buttons | taken_held_pad) & held_now;
     // The keyboard, DS3-shaped and rebindable (host/bindings.h): each action
     // held sets its pad bit or stick direction.
     //
@@ -1937,35 +1958,59 @@ void update_pad() {
     // The key that ended a text entry stays out of the pad until released.
     const int end_key = g_text_end_key.load(std::memory_order_relaxed);
     if (end_key >= 0 && !(keys && end_key < nkeys && keys[end_key])) g_text_end_key.store(-1, std::memory_order_relaxed);
+    // The panel's keys while it is up, and any of them still held since.
+    static bool panel_held_key[SDL_SCANCODE_COUNT] = {};
+    bool panel_keys = false;
+    for (int i = 0; i < SDL_SCANCODE_COUNT; ++i) {
+        const bool down_now = keys && i < nkeys && keys[i];
+        panel_held_key[i] = down_now && ((panel && plugin_panel_key(i)) || panel_held_key[i]);
+        panel_keys = panel_keys || panel_held_key[i];
+    }
     if (keys && (SDL_GetKeyboardFocus() == g_window || scripted)) {
         auto down = [&](SDL_Scancode sc) { return sc < nkeys && keys[sc] && static_cast<int>(sc) != g_text_end_key.load(std::memory_order_relaxed); };
-        if (down(SDL_SCANCODE_UP)) p.menu_buttons |= kUp;
-        if (down(SDL_SCANCODE_DOWN)) p.menu_buttons |= kDown;
-        if (down(SDL_SCANCODE_LEFT)) p.menu_buttons |= kLeft;
-        if (down(SDL_SCANCODE_RIGHT)) p.menu_buttons |= kRight;
+        // The panel's keys are the panel's while it is up, and until let go.
+        const auto menu_down = [&](SDL_Scancode sc) { return down(sc) && !panel_held_key[sc]; };
+        if (menu_down(SDL_SCANCODE_UP)) p.menu_buttons |= kUp;
+        if (menu_down(SDL_SCANCODE_DOWN)) p.menu_buttons |= kDown;
+        if (menu_down(SDL_SCANCODE_LEFT)) p.menu_buttons |= kLeft;
+        if (menu_down(SDL_SCANCODE_RIGHT)) p.menu_buttons |= kRight;
         // OK and Return are whichever buttons the game's region decides and
         // returns with (engine/menu_pointer.h).
-        if (down(SDL_SCANCODE_RETURN) || down(SDL_SCANCODE_KP_ENTER)) p.menu_buttons |= menu_confirm_button();
+        if (menu_down(SDL_SCANCODE_RETURN) || menu_down(SDL_SCANCODE_KP_ENTER)) p.menu_buttons |= menu_confirm_button();
         if (down(SDL_SCANCODE_BACKSPACE)) p.menu_buttons |= menu_back_button();
-        if (down(SDL_SCANCODE_ESCAPE)) p.menu_buttons |= kOptions;
+        if (menu_down(SDL_SCANCODE_ESCAPE)) p.menu_buttons |= kOptions;
         if (p.menu_buttons) p.connected = true;
         // A plugin's own read of the keys, and the ones it takes from the game
         // while the mouse turns the camera.
         const bool take = g_take_any_key.load(std::memory_order_relaxed) &&
-                          g_mouse_relative_applied.load(std::memory_order_relaxed);
+                          (g_mouse_relative_applied.load(std::memory_order_relaxed) || panel);
+        // A key a plugin takes stays its own until let go, even once the take
+        // ends (the Escape that ends a photo mode must not open the game's menu).
+        static bool taken_held_key[SDL_SCANCODE_COUNT] = {};
+        bool taken_keys = false;
         {
             std::lock_guard<std::mutex> lock(g_take_mu);
-            for (int i = 0; i < 512; ++i) g_plugin_keys[i] = i < nkeys && keys[i] ? 1 : 0;
+            for (int i = 0; i < SDL_SCANCODE_COUNT; ++i) {
+                const bool down_now = i < nkeys && keys[i];
+                taken_held_key[i] = down_now && ((take && i < 512 && g_take_key[i]) || taken_held_key[i]);
+                taken_keys = taken_keys || taken_held_key[i];
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_take_mu);
+            for (int i = 0; i < 512; ++i) g_plugin_keys[i] = i < nkeys && keys[i] && !(i < SDL_SCANCODE_COUNT && panel_held_key[i]) ? 1 : 0;
         }
         bool held[kBindCount];
         const int masked_key = g_text_end_key.load(std::memory_order_relaxed);
-        if (((masked_key >= 0 && masked_key < nkeys) || take) && nkeys <= SDL_SCANCODE_COUNT) {
+        if (((masked_key >= 0 && masked_key < nkeys) || taken_keys || panel_keys) && nkeys <= SDL_SCANCODE_COUNT) {
             bool masked[SDL_SCANCODE_COUNT];
             std::memcpy(masked, keys, static_cast<std::size_t>(nkeys) * sizeof(bool));
             if (masked_key >= 0 && masked_key < nkeys) masked[masked_key] = false;
-            if (take) {
-                std::lock_guard<std::mutex> lock(g_take_mu);
-                for (int i = 0; i < nkeys && i < 512; ++i) masked[i] = masked[i] && !g_take_key[i];
+            if (taken_keys) {
+                for (int i = 0; i < nkeys; ++i) masked[i] = masked[i] && !taken_held_key[i];
+            }
+            if (panel_keys) {
+                for (int i = 0; i < nkeys; ++i) masked[i] = masked[i] && !panel_held_key[i];
             }
             host_bindings_keys_held(masked, nkeys, held);
         } else {

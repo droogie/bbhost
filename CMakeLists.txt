@@ -174,6 +174,7 @@ add_executable(bbhost
   src/host/overlay.cpp
   src/host/present_pass.cpp
   src/host/ingame_menu.cpp
+  src/host/plugin_panel.cpp
   src/host/controls_page.cpp
   src/host/framegen.cpp
   src/host/options.cpp

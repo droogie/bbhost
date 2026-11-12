@@ -163,6 +163,10 @@ typedef struct BbPluginInfo {
                               plugin's option `key` holds that value (older hosts
                               show it as always). On a HEADING it covers the rows
                               under it, up to the next heading. */
+#define BB_OPT_PANEL 0x400u /* version 29, or-ed into a HEADING's type: it and the rows
+                              under it, up to the next heading, are a page of the
+                              plugin's panel (panel_show) - drawn over the game while
+                              the plugin shows it - and not in the menus */
 typedef struct BbOption {
     uint32_t type;        /* BB_OPT_*, maybe | BB_OPT_LIVE */
     const char* key;      /* the config key; an action's id */
@@ -441,6 +445,22 @@ typedef struct BbLook {
     float fog_distance_offset, fog_height_offset;    /* metres added */
 } BbLook;
 
+/* Version 29: a plugin's panel (panel_show, panel_state). */
+#define BB_PANEL_DEFAULTS 1u  /* each page ends with a Defaults row: its rows back to their defaults */
+typedef struct BbPanel {
+    uint32_t size;           /* sizeof(BbPanel) as the plugin knows it */
+    uint32_t flags;          /* BB_PANEL_* */
+    const char* page;        /* the page to show: its heading's key; NULL or "" for the one shown last */
+    const char* guide;       /* a line under the rows while the controller is in use (may be NULL) */
+    const char* guide_keys;  /* the same while the keyboard and mouse are (may be NULL) */
+} BbPanel;
+typedef struct BbPanelState {
+    uint32_t size;      /* set to sizeof(BbPanelState) before the call: the host fills as much as both know */
+    int32_t shown;      /* 1 while the panel is up */
+    int32_t closed;     /* 1 when the player closed it (Circle, Escape) since the last call */
+    char page[32];      /* the page shown or shown last: its heading's key */
+} BbPanelState;
+
 typedef struct BbWorldState {
     uint32_t size;      /* set to sizeof(BbWorldState) before the call: the host fills as much as both know */
     uint32_t flags;     /* BB_WORLD_* */
@@ -691,7 +711,8 @@ typedef struct BbHostApi {
      * `wheel` nonzero keeps the wheel's notches from the game, and `motion`
      * nonzero keeps the mouse from turning the game's camera. The menus keep
      * every key. A call replaces the last; nothing taken gives everything
-     * back. Any thread. 0 on success. */
+     * back - a key held then stays taken until it is let go (version 29), so
+     * the game never sees it go down. Any thread. 0 on success. */
     int (*input_take)(const uint16_t* scancodes, size_t n, uint32_t buttons, int wheel, int motion);
     /* fn(cam, user) each frame once the game has placed the player's camera
      * (its follow camera and the blend of the cameras it owns) and before
@@ -1005,7 +1026,8 @@ typedef struct BbHostApi {
      * BB_PAD_RIGHT_STICK, BB_PAD_TRIGGERS) from the game: the game reads them
      * let go and at rest - whatever they are bound to in play is not pressed -
      * while pad still reads them. Keys are input_take's. A call replaces the last;
-     * 0, 0 gives everything back. Any thread. 0 on success. */
+     * 0, 0 gives everything back - a button held then stays taken until it is
+     * let go, so the game never sees it go down. Any thread. 0 on success. */
     int (*pad_take)(uint32_t buttons, uint32_t axes);
     /* What the world is doing and who else is in it (BbWorldState), into *out
      * (set out->size first). Main thread. 0 on success; 1 for another eboot or
@@ -1034,6 +1056,29 @@ typedef struct BbHostApi {
      * Values outside what the post effect takes are clamped. Any thread. 0 on
      * success; 1 for an unknown plugin or a size under 8. */
     int (*post_look)(const char* name, const BbLook* look, uint32_t* available);
+    /* The plugin's panel up (BbPanel) or down (NULL): the pages of its options
+     * table it marks with BB_OPT_PANEL, drawn over the game at the bottom
+     * right with the rows' own widgets, their changes going to on_option as
+     * the menus' do (the rows want BB_OPT_LIVE). The controller drives it -
+     * the d-pad up and down to a row, left and right to change it, Cross to
+     * set a switch or press a button, L1 and R1 the pages, Circle closes it -
+     * as do the keyboard (the arrows, Enter, Page Up and Page Down or Q and E,
+     * Escape) and the pointer, which is free while it is up. While it is up
+     * the game reads none of those buttons and keys, and neither do the
+     * plugin's pad and input: the panel has them. One panel at a time - a
+     * later call replaces another plugin's - and the plugin being turned off
+     * takes it down. Main thread. 0 on success; 1 for an unknown plugin, a
+     * size under 8, a page it has not got, or none at all. */
+    int (*panel_show)(const char* name, const BbPanel* panel);
+    /* Whether the plugin's panel is up, whether the player closed it since
+     * the last call, and its page (BbPanelState; set out->size first). Main
+     * thread. 0 on success; 1 for an unknown plugin or a size under 8. */
+    int (*panel_state)(const char* name, BbPanelState* out);
+    /* One of the plugin's options set to `value` (text, as the config holds
+     * it) as the menus set it: kept in the player's config, and on_option
+     * called with it from the next frame. Any thread. 0 on success; 1 for an
+     * unknown plugin or option. */
+    int (*option_set)(const char* name, const char* key, const char* value);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

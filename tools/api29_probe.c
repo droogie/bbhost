@@ -141,6 +141,21 @@ static void on_frame(void* user) {
         s->done = 1;
         g_api->log("api29 t %.1f step %s -> %d", t, s->text, run_step(s->text));
     }
+    if (getenv("BBHOST_API29_KEYS")) {
+        /* BBHOST_API29_KEYS=1: P, Escape and Tab as the plugins' input reads them, at each change */
+        static int was[3] = {-1, -1, -1};
+        static const int codes[3] = {19, 41, 43};
+        BbInput in;
+        memset(&in, 0, sizeof(in));
+        if (g_api->input(&in) == 0) {
+            for (int i = 0; i < 3; ++i) {
+                if (in.key[codes[i]] != was[i]) {
+                    g_api->log("api29 t %.1f key %d %s (playing %d)", t, codes[i], in.key[codes[i]] ? "down" : "up", in.playing);
+                    was[i] = in.key[codes[i]];
+                }
+            }
+        }
+    }
     BbPad pad;
     memset(&pad, 0, sizeof(pad));
     pad.size = sizeof(pad);

@@ -328,11 +328,15 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), p.enabled ? "starts with the next launch" : "stops at the next launch");
         }
-        if (!p.options.empty()) {
+        // A panel's pages (BB_OPT_PANEL) are the plugin's to show over the game.
+        const bool any = std::any_of(p.options.begin(), p.options.end(), [](const PluginOptionDesc& o) { return o.page.empty(); });
+        if (any) {
             ImGui::Spacing();
-            for (const PluginOptionDesc& o : p.options) option_row(ui, p, o, scale);
+            for (const PluginOptionDesc& o : p.options) {
+                if (o.page.empty()) option_row(ui, p, o, scale);
+            }
         } else {
-            ImGui::TextDisabled("No settings.");
+            ImGui::TextDisabled(p.options.empty() ? "No settings." : "Its settings are in its own panel, over the game.");
         }
     }
     ImGui::EndChild();

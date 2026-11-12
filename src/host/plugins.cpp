@@ -38,6 +38,7 @@
 #include "host/audio_crush.h"
 #include "host/bindings.h"
 #include "host/options.h"
+#include "host/plugin_panel.h"
 #include "host/ruleset.h"
 #include "host/pixel_cutaway.h"
 #include "host/render_api.h"
@@ -1636,6 +1637,51 @@ void drop_look(const std::string& name) {
     host_log("plugin: %s turned off; its look taken away", name.c_str());
 }
 
+// The plugin's panel (host/plugin_panel.h).
+int api_panel_show(const char* name, const BbPanel* panel) {
+    if (!plugin_named(name)) return 1;
+    if (!panel) {
+        plugin_panel_hide(name);
+        return 0;
+    }
+    if (panel->size < 8) return 1;
+    BbPanel b{};
+    std::memcpy(&b, panel, std::min<std::size_t>(panel->size, sizeof(BbPanel)));
+    PluginPanelShow how;
+    how.page = b.page ? b.page : "";
+    how.guide = b.guide ? b.guide : "";
+    how.guide_keys = b.guide_keys ? b.guide_keys : "";
+    how.defaults = (b.flags & BB_PANEL_DEFAULTS) != 0;
+    return plugin_panel_show(name, how) ? 0 : 1;
+}
+
+int api_panel_state(const char* name, BbPanelState* out) {
+    if (!out || out->size < 8 || !plugin_named(name)) return 1;
+    PluginPanelState st;
+    plugin_panel_state(name, st);
+    BbPanelState o{};
+    o.shown = st.shown ? 1 : 0;
+    o.closed = st.closed ? 1 : 0;
+    std::snprintf(o.page, sizeof(o.page), "%s", st.page.c_str());
+    o.size = std::min<std::uint32_t>(out->size, sizeof(BbPanelState));
+    std::memcpy(out, &o, o.size);
+    return 0;
+}
+
+int api_option_set(const char* name, const char* key, const char* value) {
+    if (!key || !value || !plugin_named(name)) return 1;
+    for (const Plugin& p : g_plugins) {
+        if (p.name != name || p.visitor) continue;
+        for (const BbOption* o = p.options; o && o->type != BB_OPT_END; ++o) {
+            if (o->key && std::strcmp(o->key, key) == 0 && (o->type & 0xffu) != BB_OPT_HEADING && (o->type & 0xffu) != BB_OPT_ACTION) {
+                plugins_set_option(name, key, value);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 int api_hud_hide(const char* name, int hidden) {
     if (!plugin_named(name)) return 1;
     const bool was = scene_look_hud_hidden();
@@ -1710,6 +1756,7 @@ const BbHostApi g_api = {
     &api_shader_override, &api_shader_folder, &api_shader_state, &api_shader_source, &api_shader_data,
     &api_on_camera_target,
     &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state, &api_hud_hide, &api_post_look,
+    &api_panel_show, &api_panel_state, &api_option_set,
 };
 
 std::string read_file(const std::string& path) {
@@ -1758,6 +1805,7 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
     }
     if (e.title.empty()) e.title = e.name;
     std::string group_when;  // the last heading's BB_OPT_WHEN
+    std::string group_page;  // the last heading's key, when it starts a panel page (BB_OPT_PANEL)
     for (const BbOption* o = options; o && o->type != BB_OPT_END; ++o) {
         PluginOptionDesc d;
         d.type = o->type & 0xffu;
@@ -1771,6 +1819,9 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
         // A heading's condition covers the rows under it, up to the next heading.
         if (d.type == BB_OPT_HEADING) group_when = d.when;
         else if (d.when.empty()) d.when = group_when;
+        // A panel page: its heading and the rows under it, up to the next heading.
+        if (d.type == BB_OPT_HEADING) group_page = (o->type & BB_OPT_PANEL) && !d.key.empty() ? d.key : std::string();
+        d.page = group_page;
         d.min = o->min;
         d.max = o->max;
         e.options.push_back(std::move(d));
@@ -2017,6 +2068,7 @@ void plugins_frame() {
                 world_pause_drop(r.name);  // and its hold on the world
                 scene_look_drop_hud(r.name.c_str());  // and on the HUD
                 drop_look(r.name);  // and its look
+                plugin_panel_hide(r.name);  // and its panel
             }
             host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
             if (render_hooks_plugin_on(r.name, on)) republish_settings();

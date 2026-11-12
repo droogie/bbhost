@@ -167,7 +167,9 @@ gives the Binary Ninja address.
   playing, those keys and mouse buttons stop pressing what they are bound to,
   the wheel's notches stay out of the game, and the mouse stops turning the
   game's camera - the plugin reads them all through `input`. The menus keep
-  every key. A call replaces the last; nothing taken gives everything back.
+  every key. A call replaces the last; nothing taken gives everything back,
+  but a key held then stays taken until it is let go (since v29), so the
+  game never sees it go down.
 - `on_camera(fn, user)`: each frame once the game has placed the player's
   camera - the follow camera's update and the camera manager's blend of the
   cameras it owns - and before the scene is drawn from it or a scripted camera
@@ -191,12 +193,13 @@ gives the Binary Ninja address.
   recompiled one, a plugin still needs its own camera hooks. One plugin owns
   it: 1 outside image setup, for NULL, or once taken; 0 otherwise.
 
-**The world held still, the controller, who else is in the world, the HUD and the look** (v29)
+**The world held still, the controller, who else is in the world, the HUD, the look and a panel** (v29)
 
 What a photo mode needs: the world stopped while its own camera flies, the
 controller read as the plugin's own while the game reads none of what it
 takes, a way to know that nobody else is in the world, the HUD out of the
-picture and a look of its own over the area's.
+picture, a look of its own over the area's, and a panel of its settings
+over the game.
 
 - `world_pause(name, paused)`: holds the world - its characters, physics, AI,
   events, effects and cloth - while frames go on being drawn and `on_view`
@@ -221,7 +224,7 @@ picture and a look of its own over the area's.
   axes (`BB_PAD_LEFT_STICK`, `BB_PAD_RIGHT_STICK`, `BB_PAD_TRIGGERS`) at rest -
   whatever they are bound to in play is not pressed - while `pad` still reads
   them. Keys stay `input_take`'s. A call replaces the last; `0, 0` gives
-  everything back.
+  everything back, but a button held then stays taken until it is let go.
 - `world_state(&state)`: `BbWorldState` (set `state.size` first). `flags`:
   `BB_WORLD_IN` (a world is loaded and running, or held), `BB_WORLD_LOADING`,
   `BB_WORLD_CUTSCENE` (one plays or is queued), `BB_WORLD_MENU` (one of the
@@ -261,6 +264,28 @@ picture and a look of its own over the area's.
   depth of field pass and leaves the scene's motion blur off, so `available`
   (may be `NULL`) leaves those two out then. Values outside what the post
   effect takes are clamped.
+- `panel_show(name, &panel)`: the plugin's panel up (`BbPanel`) or down
+  (`NULL`). Its pages are the plugin's own options table: a `BB_OPT_HEADING`
+  with `BB_OPT_PANEL` or-ed in starts a page, the rows under it up to the next
+  heading are on it, and neither shows in the menus. It is drawn over the game
+  at the bottom right with the rows' own widgets, its changes going to
+  `on_option` as the menus' do (so its rows want `BB_OPT_LIVE`), the help of
+  the row in use under them, then `guide` or `guide_keys` - whichever device
+  the player used last. The controller drives it (the d-pad up and down to a
+  row, left and right to change it, Cross to set a switch or press a button,
+  L1 and R1 the pages, Circle closes it), as do the keyboard (the arrows,
+  Enter, Page Up and Page Down or Q and E, Escape) and the pointer, which is
+  free while it is up. While it is up neither the game nor the plugins' `pad`
+  and `input` read those buttons and keys; everything else is as it was.
+  `BB_PANEL_DEFAULTS` ends each page with a Defaults row. One panel at a time;
+  turning the plugin off takes it down.
+- `panel_state(name, &state)`: `BbPanelState` (set `state.size` first) -
+  whether the panel is up, whether the player closed it (Circle, Escape) since
+  the last call, and the page shown or shown last, by its heading's key.
+- `option_set(name, key, value)`: one of the plugin's options set as the menus
+  set it - kept in the player's config, and handed to `on_option` from the
+  next frame - for a row the plugin changes itself (a mode it always starts
+  in).
 
 **Settings, UI and files**
 

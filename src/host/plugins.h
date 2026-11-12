@@ -31,6 +31,7 @@ struct PluginOptionDesc {
     std::string key, label, help, def, choices;
     std::string when;        // BB_OPT_WHEN: "key=a|b", greyed out unless that option is one of them
     double min = 0, max = 0;
+    std::string page;        // BB_OPT_PANEL: the key of the panel page's heading it is on (or is); empty in the menus
 };
 // A plugin file the manager shows: its info, settings and state.
 struct PluginEntry {

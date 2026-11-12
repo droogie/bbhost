@@ -20,6 +20,7 @@
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/window.h"
+#include "host/plugin_panel.h"
 #include "net/account.h"
 #include "net/session.h"
 #include "core/config.h"
@@ -1749,7 +1750,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         // who wants the pad to own the camera.
         const HostSettings& hs = host_settings_ref();  // the snapshot as published: no copy, no lock
         const bool want = hs.mouse_camera && !host_options_open() && !ingame_menu_open() &&
-                          !menu_pointer_in_menu() && !host_text_entry_open();
+                          !menu_pointer_in_menu() && !host_text_entry_open() && !plugin_panel_shown();
         // What the follow camera turns by, and whether its own turns as the
         // character moves are held: the keyboard and mouse used last, the
         // mouse turning the camera, and Mouse auto-rotation off. A controller
