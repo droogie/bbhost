@@ -8,7 +8,8 @@
 // Cross (once let go) and N advance a held world by two updates; Static gives
 // the controls back but Options, the touchpad and R3, Live flies over a
 // running world; it ends on Escape, P and the chord, and at a loading screen, a
-// cutscene or a menu, giving everything back; it does not start, and it ends,
+// cutscene or a menu, giving everything back; its takes and reads of the
+// keyboard and mouse are its own (input_take_as, input_as); it does not start, and it ends,
 // with another player in the world or on the way, or in another's world; the
 // HUD option shows the HUD; its panel opens with it, R3 hides and shows it,
 // and the panel's rows go over the area's look while it runs and nowhere
@@ -61,6 +62,8 @@ struct Host {
     int paused = 0, hud_hidden = 0, steps = 0;
     std::uint32_t take_buttons = 0, take_axes = 0;
     std::vector<std::uint16_t> taken_keys;
+    int unnamed_takes = 0;  // input_take calls: photo mode names its takes (input_take_as)
+    int unnamed_reads = 0;  // input calls: photo mode reads as itself (input_as)
     std::uint32_t taken_mouse = 0;
     int taken_motion = 0;
     // What the host reports.
@@ -132,19 +135,30 @@ int fake_pad(BbPad* out) {
     H.pad.pressed = 0;  // the frame's presses, read once a frame
     return 0;
 }
-int fake_pad_take(std::uint32_t buttons, std::uint32_t axes) {
+int fake_pad_take(const char* name, std::uint32_t buttons, std::uint32_t axes) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
     H.take_buttons = buttons;
     H.take_axes = axes;
     ++H.calls;
     return 0;
 }
-int fake_input(BbInput* out) {
+int fake_input(BbInput*) {
+    ++H.unnamed_reads;
+    return 1;
+}
+int fake_input_as(const char* name, BbInput* out) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
     *out = H.input;
     H.input.pressed = 0;
     H.input.dx = H.input.dy = 0;
     return 0;
 }
-int fake_input_take(const std::uint16_t* sc, std::size_t n, std::uint32_t buttons, int, int motion) {
+int fake_input_take(const std::uint16_t*, std::size_t, std::uint32_t, int, int) {
+    ++H.unnamed_takes;
+    return 0;
+}
+int fake_input_take_as(const char* name, const std::uint16_t* sc, std::size_t n, std::uint32_t buttons, int, int motion) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
     H.taken_keys.assign(sc, sc + n);
     H.taken_mouse = buttons;
     H.taken_motion = motion;
@@ -257,6 +271,8 @@ BbHostApi make_api(std::uint32_t version) {
         api.panel_show = &fake_panel_show;
         api.panel_state = &fake_panel_state;
         api.option_set = &fake_option_set;
+        api.input_take_as = &fake_input_take_as;
+        api.input_as = &fake_input_as;
     } else {
         api.size = static_cast<std::uint32_t>(offsetof(BbHostApi, on_camera_target) + sizeof(void*));
     }
@@ -545,6 +561,9 @@ int main(int argc, char** argv) {
     tap_key(kP);
     CHECK(H.paused == 0);
     H.config["photo_mode.hud"] = "true";
+
+    CHECK(H.unnamed_takes == 0);  // every take its own (input_take_as), never another plugin's
+    CHECK(H.unnamed_reads == 0);  // and every read (input_as): the mouse's motion is never taken from another
 
     if (g_failures) {
         std::fprintf(stderr, "photo_mode_plugin_test: %d failure(s)\n", g_failures);

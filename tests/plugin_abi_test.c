@@ -53,7 +53,9 @@ _Static_assert(offsetof(BbHostApi, post_look) == offsetof(BbHostApi, hud_hide) +
 _Static_assert(offsetof(BbHostApi, panel_show) == offsetof(BbHostApi, post_look) + sizeof(void*), "panel_show after post_look");
 _Static_assert(offsetof(BbHostApi, panel_state) == offsetof(BbHostApi, panel_show) + sizeof(void*), "panel_state after panel_show");
 _Static_assert(offsetof(BbHostApi, option_set) == offsetof(BbHostApi, panel_state) + sizeof(void*), "option_set after panel_state");
-_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, option_set) + sizeof(void*), "option_set ends the API table");
+_Static_assert(offsetof(BbHostApi, input_take_as) == offsetof(BbHostApi, option_set) + sizeof(void*), "input_take_as after option_set");
+_Static_assert(offsetof(BbHostApi, input_as) == offsetof(BbHostApi, input_take_as) + sizeof(void*), "input_as after input_take_as");
+_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, input_as) + sizeof(void*), "input_as ends the API table");
 _Static_assert(BB_OPT_PANEL == 0x400u && BB_PANEL_DEFAULTS == 1u, "the panel's flags");
 _Static_assert(offsetof(BbPanel, page) == 8 && sizeof(BbPanel) == 8 + 3 * sizeof(void*), "BbPanel");
 _Static_assert(sizeof(BbPanelState) == 44 && offsetof(BbPanelState, page) == 12, "BbPanelState");
@@ -62,7 +64,7 @@ _Static_assert(offsetof(BbLook, vignette) == 28 && offsetof(BbLook, dof) == 32 &
 _Static_assert(offsetof(BbLook, motion_blur) == 72 && offsetof(BbLook, blur_samples) == 88 && offsetof(BbLook, fog_distance) == 92 &&
                    offsetof(BbLook, fog_height_offset) == 108,
                "BbLook's last groups");
-_Static_assert(sizeof(BbPad) == 40, "BbPad");
+_Static_assert(sizeof(BbPad) == 44 && offsetof(BbPad, play) == 40, "BbPad");
 _Static_assert(offsetof(BbPad, pressed) == 8 && offsetof(BbPad, connected) == 12, "BbPad's presses");
 _Static_assert(offsetof(BbPad, lx) == 16 && offsetof(BbPad, r2) == 36, "BbPad's axes");
 _Static_assert(sizeof(BbWorldState) == 20, "BbWorldState");

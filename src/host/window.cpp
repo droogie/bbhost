@@ -36,6 +36,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -97,8 +98,23 @@ std::atomic<bool> g_mouse_relative_applied{false};
 // keys, mouse buttons, wheel and motion it takes from the game while the
 // mouse turns the camera, and its own reads of them - the keys as the last pad
 // update saw them, and the motion, wheel and presses since it last read.
+// Each plugin's take is its own (host_plugin_input_take's owner, "" for the
+// plugins that do not name themselves) and the game loses what any of them
+// takes: g_take_key and the atomics below are the takes added up.
+struct TakeSlot {
+    std::vector<std::uint16_t> keys;
+    std::uint32_t mouse = 0;
+    bool wheel = false, motion = false;
+    std::uint32_t pad = 0, axes = 0;  // plugin API 29's pad_take
+    bool empty() const { return keys.empty() && !mouse && !wheel && !motion && !pad && !axes; }
+};
 std::mutex g_take_mu;
+std::map<std::string, TakeSlot> g_take_slots;  // under g_take_mu: by owner
 bool g_take_key[512] = {};                     // under g_take_mu
+// Keys a take left out while it goes on taking others (under g_take_mu): given
+// back at once, held or not - Quake's movement keys on a ladder. A key held as
+// a take ends altogether stays taken until let go instead.
+bool g_take_give_key[512] = {};
 std::uint8_t g_plugin_keys[512] = {};          // under g_take_mu
 std::atomic<bool> g_take_any_key{false};
 std::atomic<std::uint32_t> g_take_buttons{0};
@@ -111,14 +127,24 @@ PluginPad g_ppad_test;              // under g_ppad_mu: a test's taps at the las
 std::uint32_t g_ppad_prev = 0;      // under g_ppad_mu: what was held, for the presses
 std::uint32_t g_ppad_pressed = 0;   // under g_ppad_mu: went down since the frame began
 std::uint32_t g_ppad_frame = 0;     // under g_ppad_mu: the frame's presses (host_plugin_pad_frame)
-std::atomic<std::uint32_t> g_ppad_take_buttons{0}, g_ppad_take_axes{0};
+std::atomic<std::uint32_t> g_ppad_take_buttons{0}, g_ppad_take_axes{0};  // the owners' takes added up
+// Buttons a take left out while it goes on taking others: given back at once
+// (g_take_give_key's for the controller), at the next pad update.
+std::atomic<std::uint32_t> g_ppad_give{0};
 static void ppad_latch_locked() {
     const std::uint32_t held = g_ppad.buttons | g_ppad_test.buttons;
     g_ppad_pressed |= held & ~g_ppad_prev;
     g_ppad_prev = held;
 }
-float g_plugin_dx = 0.0f, g_plugin_dy = 0.0f, g_plugin_wheel = 0.0f;  // under g_mouse_mu
-std::uint32_t g_plugin_pressed = 0;                                   // under g_mouse_mu
+// The plugins' reads of the mouse (plugin API 13's input, 29's input_as): each
+// reader's presses, motion and wheel since its own last read - "" input's, the
+// plugins that do not name themselves - so one reading never takes them from
+// another (photo mode's every frame from the Quake plugin's mouse look).
+struct PluginReads {
+    float dx = 0.0f, dy = 0.0f, wheel = 0.0f;
+    std::uint32_t pressed = 0;
+};
+std::map<std::string, PluginReads> g_plugin_reads = {{"", PluginReads{}}};  // under g_mouse_mu
 // BBHOST_IME_TEST: opens the text box once at startup and again on F11.
 std::atomic<bool> g_ime_test_reopen{true};
 
@@ -1812,9 +1838,11 @@ void update_pad() {
     // open the game's menu).
     static std::uint32_t panel_held_pad = 0;
     // The same for a button a plugin takes (pad_take): one held as the take
-    // ends - the chord or Cross that ends a photo mode - stays the plugin's
-    // until let go, so the game never sees it go down.
+    // ends - the L3 or Cross that ends a photo mode - stays the plugin's until
+    // let go, so the game never sees it go down. One a take leaves out while
+    // it goes on taking others is the game's at once (g_ppad_give).
     static std::uint32_t taken_held_pad = 0;
+    taken_held_pad &= ~g_ppad_give.exchange(0, std::memory_order_relaxed);
     std::uint32_t held_now = 0;
     const std::uint32_t take_axes = g_ppad_take_axes.load(std::memory_order_relaxed);
     for (SDL_Gamepad* g_gamepad : g_pads) {
@@ -1871,6 +1899,7 @@ void update_pad() {
                 continue;
             }
             ctl.buttons |= bit;
+            ctl.play |= host_pad_play_bit(i);
             if ((take_buttons | taken_held_pad) & bit) held[i] = false;
         }
         for (int i = 0; i < kPadInputs; ++i) {
@@ -1928,7 +1957,10 @@ void update_pad() {
     // where the keyboard's Gestures key puts one (bindings.cpp), since the game
     // reads the side from the finger. Its own stable id, so holding it is one
     // touch and it can be held with the key.
-    if (back_held) ctl.buttons |= kTouchPad;
+    if (back_held) {
+        ctl.buttons |= kTouchPad;
+        ctl.play |= kTouchPad;
+    }
     if (back_held && !(take_buttons & kTouchPad)) {
         p.buttons |= kTouchPad;
         if (p.touch_count < 2) {
@@ -1985,14 +2017,18 @@ void update_pad() {
         const bool take = g_take_any_key.load(std::memory_order_relaxed) &&
                           (g_mouse_relative_applied.load(std::memory_order_relaxed) || panel);
         // A key a plugin takes stays its own until let go, even once the take
-        // ends (the Escape that ends a photo mode must not open the game's menu).
+        // ends (the Escape that ends a photo mode must not open the game's
+        // menu) - but for one a take leaves out while it goes on taking
+        // others, which is the game's at once (g_take_give_key).
         static bool taken_held_key[SDL_SCANCODE_COUNT] = {};
         bool taken_keys = false;
         {
             std::lock_guard<std::mutex> lock(g_take_mu);
             for (int i = 0; i < SDL_SCANCODE_COUNT; ++i) {
                 const bool down_now = i < nkeys && keys[i];
-                taken_held_key[i] = down_now && ((take && i < 512 && g_take_key[i]) || taken_held_key[i]);
+                const bool give = i < 512 && g_take_give_key[i];
+                if (i < 512) g_take_give_key[i] = false;
+                taken_held_key[i] = down_now && ((take && i < 512 && g_take_key[i]) || (taken_held_key[i] && !give));
                 taken_keys = taken_keys || taken_held_key[i];
             }
         }
@@ -2521,8 +2557,10 @@ bool host_window_pump() {
                     if (!g_take_motion.load(std::memory_order_relaxed)) {
                         mouse_camera::add(mouse_camera::g_counts, e.motion.xrel, e.motion.yrel);
                     }
-                    g_plugin_dx += e.motion.xrel;
-                    g_plugin_dy += e.motion.yrel;
+                    for (auto& [reader, r] : g_plugin_reads) {
+                        r.dx += e.motion.xrel;
+                        r.dy += e.motion.yrel;
+                    }
                 }
                 if (!g_mouse_relative.load(std::memory_order_relaxed)) {
                     mouse_moved_locked(e.motion.x, e.motion.y);
@@ -2551,7 +2589,7 @@ bool host_window_pump() {
                 if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
                     g_mouse.buttons |= bit;
                     g_mouse.pressed |= bit;
-                    g_plugin_pressed |= bit;
+                    for (auto& [reader, r] : g_plugin_reads) r.pressed |= bit;
                 } else {
                     g_mouse.buttons &= ~bit;
                     g_mouse.released |= bit;
@@ -2569,7 +2607,7 @@ bool host_window_pump() {
                 }
                 std::lock_guard<std::mutex> lock(g_mouse_mu);
                 g_mouse.wheel += e.wheel.y;
-                g_plugin_wheel += e.wheel.y;
+                for (auto& [reader, r] : g_plugin_reads) r.wheel += e.wheel.y;
                 g_mouse_last_motion = std::chrono::steady_clock::now();
                 break;
             }
@@ -3230,20 +3268,21 @@ MouseState host_mouse_state() {
     return m;
 }
 
-bool host_plugin_input(PluginInput& out) {
+bool host_plugin_input(const char* reader, PluginInput& out) {
     {
         std::lock_guard<std::mutex> lock(g_take_mu);
         std::memcpy(out.key, g_plugin_keys, sizeof(out.key));
     }
     std::lock_guard<std::mutex> lock(g_mouse_mu);
+    // A reader's first read starts its own count of what comes after.
+    PluginReads& r = g_plugin_reads[reader ? reader : ""];
     out.buttons = g_mouse.buttons;
-    out.pressed = g_plugin_pressed;
-    out.dx = g_plugin_dx;
-    out.dy = g_plugin_dy;
-    out.wheel = g_plugin_wheel;
+    out.pressed = r.pressed;
+    out.dx = r.dx;
+    out.dy = r.dy;
+    out.wheel = r.wheel;
     out.playing = g_mouse_relative_applied.load(std::memory_order_relaxed);
-    g_plugin_pressed = 0;
-    g_plugin_dx = g_plugin_dy = g_plugin_wheel = 0.0f;
+    r = PluginReads{};
 #if defined(BBHOST_HAVE_SDL3)
     return g_window != nullptr;
 #else
@@ -3251,18 +3290,68 @@ bool host_plugin_input(PluginInput& out) {
 #endif
 }
 
-void host_plugin_input_take(const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel, bool motion) {
-    {
-        std::lock_guard<std::mutex> lock(g_take_mu);
-        std::memset(g_take_key, 0, sizeof(g_take_key));
-        for (std::size_t i = 0; i < n; ++i) {
-            if (scancodes[i] < 512) g_take_key[scancodes[i]] = true;
+namespace {
+// The owners' takes added up (under g_take_mu).
+void take_sum_locked() {
+    std::memset(g_take_key, 0, sizeof(g_take_key));
+    bool any = false, wheel = false, motion = false;
+    std::uint32_t mouse = 0, pad = 0, axes = 0;
+    for (const auto& [owner, s] : g_take_slots) {
+        for (const std::uint16_t k : s.keys) {
+            if (k >= 512) continue;
+            g_take_key[k] = true;
+            g_take_give_key[k] = false;  // taken (again): nothing to give back
+            any = true;
         }
-        g_take_any_key.store(n > 0, std::memory_order_relaxed);
+        mouse |= s.mouse;
+        wheel = wheel || s.wheel;
+        motion = motion || s.motion;
+        pad |= s.pad;
+        axes |= s.axes;
     }
-    g_take_buttons.store(buttons, std::memory_order_relaxed);
+    g_take_any_key.store(any, std::memory_order_relaxed);
+    g_take_buttons.store(mouse, std::memory_order_relaxed);
     g_take_wheel.store(wheel, std::memory_order_relaxed);
     g_take_motion.store(motion, std::memory_order_relaxed);
+    const std::uint32_t was_b = g_ppad_take_buttons.exchange(pad, std::memory_order_relaxed);
+    const std::uint32_t was_a = g_ppad_take_axes.exchange(axes, std::memory_order_relaxed);
+    if (was_b != pad || was_a != axes)
+        host_log("pad: the plugins take buttons %05x and axes %x from the game (was %05x, %x)", pad, axes, was_b, was_a);
+}
+
+void take_settle_locked(const std::string& owner) {
+    const auto it = g_take_slots.find(owner);
+    if (it != g_take_slots.end() && it->second.empty()) g_take_slots.erase(it);
+    take_sum_locked();
+}
+}  // namespace
+
+void host_plugin_input_take(const char* owner, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel,
+                            bool motion) {
+    const std::string who = owner ? owner : "";
+    std::lock_guard<std::mutex> lock(g_take_mu);
+    TakeSlot& s = g_take_slots[who];
+    std::vector<std::uint16_t> keys;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (scancodes[i] < 512) keys.push_back(scancodes[i]);
+    }
+    // A key left out of a take that goes on is the game's again at once; one
+    // held as the take ends altogether stays taken until let go.
+    if (!keys.empty()) {
+        for (const std::uint16_t k : s.keys) {
+            if (std::find(keys.begin(), keys.end(), k) == keys.end()) g_take_give_key[k] = true;
+        }
+    }
+    const bool changed = s.keys != keys || s.mouse != buttons || s.wheel != wheel || s.motion != motion;
+    s.keys = std::move(keys);
+    s.mouse = buttons;
+    s.wheel = wheel;
+    s.motion = motion;
+    if (changed) {
+        host_log("input: %s takes %zu key(s), mouse buttons %x%s%s", who.empty() ? "a plugin" : who.c_str(), s.keys.size(), buttons,
+                 wheel ? ", the wheel" : "", motion ? ", the motion" : "");
+    }
+    take_settle_locked(who);
 }
 
 void host_plugin_pad(PluginPad& out) {
@@ -3272,6 +3361,7 @@ void host_plugin_pad(PluginPad& out) {
     // A test's tap holds a stick over for the controller it stands for.
     const auto pick = [](std::uint8_t pad, std::uint8_t tap) { return tap != kStickRest ? tap : pad; };
     out.buttons = a.buttons | t.buttons;
+    out.play = a.play | t.buttons;  // a test's taps are the game's buttons already
     out.lx = pick(a.lx, t.lx);
     out.ly = pick(a.ly, t.ly);
     out.rx = pick(a.rx, t.rx);
@@ -3288,11 +3378,21 @@ void host_plugin_pad_frame() {
     g_ppad_pressed = 0;
 }
 
-void host_plugin_pad_take(std::uint32_t buttons, std::uint32_t axes) {
-    const std::uint32_t was_b = g_ppad_take_buttons.exchange(buttons, std::memory_order_relaxed);
-    const std::uint32_t was_a = g_ppad_take_axes.exchange(axes, std::memory_order_relaxed);
-    if (was_b != buttons || was_a != axes)
-        host_log("pad: a plugin takes buttons %05x and axes %x from the game (was %05x, %x)", buttons, axes, was_b, was_a);
+void host_plugin_pad_take(const char* owner, std::uint32_t buttons, std::uint32_t axes) {
+    const std::string who = owner ? owner : "";
+    std::lock_guard<std::mutex> lock(g_take_mu);
+    TakeSlot& s = g_take_slots[who];
+    // As the keys: left out of a take that goes on, given back at once.
+    if (buttons) g_ppad_give.fetch_or(s.pad & ~buttons, std::memory_order_relaxed);
+    s.pad = buttons;
+    s.axes = axes;
+    take_settle_locked(who);
+}
+
+void host_plugin_take_drop(const char* owner) {
+    const std::string who = owner ? owner : "";
+    std::lock_guard<std::mutex> lock(g_take_mu);
+    if (g_take_slots.erase(who)) take_sum_locked();
 }
 
 std::uint32_t host_plugin_pad_taken_buttons() { return g_ppad_take_buttons.load(std::memory_order_relaxed); }

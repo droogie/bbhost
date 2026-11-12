@@ -127,13 +127,20 @@ struct PluginInput {
     float dx = 0.0f, dy = 0.0f, wheel = 0.0f;
     bool playing = false;
 };
-bool host_plugin_input(PluginInput& out);
+// Each reader's presses, motion and wheel are its own: since its own last read
+// ("" for API 13's input, the plugins that do not name themselves).
+bool host_plugin_input(const char* reader, PluginInput& out);
 // What a plugin takes from the game while the mouse turns the camera: these
 // keys no longer press what they are bound to, nor these mouse buttons (bit 0
 // left, 1 right, 2 middle, 3 back, 4 forward), the wheel's notches when
-// `wheel`, and the mouse no longer turns the game's camera when `motion`. A
-// call replaces the last; nothing taken gives everything back.
-void host_plugin_input_take(const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel, bool motion);
+// `wheel`, and the mouse no longer turns the game's camera when `motion`.
+// Each owner's take is its own - "" for the plugins that do not name
+// themselves (API 13's input_take) - and the game loses what any takes; a
+// call replaces its owner's last. Nothing taken gives the owner's back, but a
+// key held then stays taken until it is let go; a key left out of a take that
+// goes on is the game's again at once.
+void host_plugin_input_take(const char* owner, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel,
+                            bool motion);
 // The controller as a plugin reads it (plugin API 29's pad): its own buttons
 // (BB_PAD_* bits - the menus' bits, whatever the bindings make of them in
 // play), sticks and triggers as the last pad update saw them, before
@@ -143,6 +150,7 @@ void host_plugin_input_take(const std::uint16_t* scancodes, std::size_t n, std::
 // (host_plugin_pad_test).
 struct PluginPad {
     std::uint32_t buttons = 0, pressed = 0;
+    std::uint32_t play = 0;  // the buttons held as what each presses in play (the player's bindings)
     std::uint8_t lx = kStickRest, ly = kStickRest, rx = kStickRest, ry = kStickRest;
     std::uint8_t l2 = 0, r2 = 0;
     bool connected = false;
@@ -153,9 +161,15 @@ void host_plugin_pad(PluginPad& out);
 void host_plugin_pad_frame();
 // What a plugin takes from the game (plugin API 29's pad_take): those buttons
 // read let go, those sticks centred and the triggers at rest - the press
-// they are bound to in play never made. A call replaces the last.
+// they are bound to in play never made. Owners as host_plugin_input_take's:
+// the takes add up, a call replaces its owner's last, a button held as an
+// owner's take ends stays taken until let go, one left out of a take that
+// goes on is the game's at once.
 constexpr std::uint32_t kPadTakeLeftStick = 1, kPadTakeRightStick = 2, kPadTakeTriggers = 4;
-void host_plugin_pad_take(std::uint32_t buttons, std::uint32_t axes);
+void host_plugin_pad_take(const char* owner, std::uint32_t buttons, std::uint32_t axes);
+// Everything an owner takes - keys, mouse, controller - given back (a plugin
+// switched off); a key or button held then stays taken until let go.
+void host_plugin_take_drop(const char* owner);
 std::uint32_t host_plugin_pad_taken_buttons();
 std::uint32_t host_plugin_pad_taken_axes();
 // A test's presses (the pad read's taps and BBHOST_AUTOPRESS, which stand for

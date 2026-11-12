@@ -10,7 +10,7 @@
 //           controller and the keys are the game's again, but for photo mode's
 //           own.
 //   Live    the camera flies while the world runs; the hunter stands, since
-//           the camera has the controls (pad_take, input_take).
+//           the camera has the controls (pad_take, input_take_as).
 // The left stick (WASD) moves the camera the way it looks, the right stick (the
 // mouse) turns it, L2 and R2 (Left Ctrl and Space) take it down and up, L1 and
 // R1 (the right and left mouse buttons) make it slower and faster. The view is
@@ -201,8 +201,8 @@ void on_view(BbCamera* view, void*) {
 // What photo mode takes from the game in each mode.
 void take_controls() {
     if (!st.on) {
-        api->pad_take(0, 0);
-        api->input_take(nullptr, 0, 0, 0, 0);
+        api->pad_take(kName, 0, 0);
+        api->input_take_as(kName, nullptr, 0, 0, 0, 0);
         return;
     }
     // Photo mode's own keys always (Escape ends it, so the game's menu does not
@@ -215,11 +215,11 @@ void take_controls() {
         // The hunter plays: the controller is the game's but for Options (the
         // game's menu would open over the picture), the touchpad's and R3,
         // which shows the panel.
-        api->pad_take(BB_PAD_OPTIONS | BB_PAD_TOUCHPAD | BB_PAD_R3, 0);
-        api->input_take(own, sizeof(own) / sizeof(own[0]), 0, 0, 0);
+        api->pad_take(kName, BB_PAD_OPTIONS | BB_PAD_TOUCHPAD | BB_PAD_R3, 0);
+        api->input_take_as(kName, own, sizeof(own) / sizeof(own[0]), 0, 0, 0);
     } else {
-        api->pad_take(0xffffffffu, BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS);
-        api->input_take(flying, sizeof(flying) / sizeof(flying[0]), kMouseLeft | kMouseRight, 1, 1);
+        api->pad_take(kName, 0xffffffffu, BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS);
+        api->input_take_as(kName, flying, sizeof(flying) / sizeof(flying[0]), kMouseLeft | kMouseRight, 1, 1);
     }
 }
 
@@ -425,7 +425,7 @@ void on_frame(void*) {
     pad.size = sizeof(pad);
     api->pad(&pad);
     BbInput in{};
-    const bool have_keys = api->input(&in) == 0;
+    const bool have_keys = api->input_as(kName, &in) == 0;  // its own reads: never another plugin's motion
     // The keyboard's presses: on the frame a key goes down.
     static std::uint8_t prev_keys[512];
     auto key_down = [&](std::uint16_t k) { return have_keys && in.key[k] && !prev_keys[k]; };
@@ -651,7 +651,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
 };
 
 extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
-    if (host->version < 29 || host->size < offsetof(BbHostApi, option_set) + sizeof(void*)) {
+    if (host->version < 29 || host->size < offsetof(BbHostApi, input_as) + sizeof(void*)) {
         host->log("photo mode: needs plugin API 29; this host has %u", host->version);
         return 1;
     }

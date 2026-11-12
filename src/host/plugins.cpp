@@ -11,6 +11,7 @@
 #include "engine/addr.h"
 #include "engine/camera.h"
 #include "engine/camera_target.h"
+#include "engine/debug_menu.h"
 #include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
 #include "engine/gx_state.h"
@@ -1095,10 +1096,9 @@ int api_on_world_rules(const char* name, void (*fn)(const char*, void*), void* u
 }
 
 // Version 13: controls and a view of a plugin's own.
-int api_input(BbInput* out) {
-    if (!out) return 1;
+int input_read(const char* reader, BbInput* out) {
     PluginInput in;
-    const bool ok = host_plugin_input(in);
+    const bool ok = host_plugin_input(reader, in);
     std::memcpy(out->key, in.key, sizeof(out->key));
     out->buttons = in.buttons;
     out->pressed = in.pressed;
@@ -1109,9 +1109,13 @@ int api_input(BbInput* out) {
     return ok ? 0 : 1;
 }
 
+// The read of the plugins that do not name themselves (input_as names one).
+int api_input(BbInput* out) { return out ? input_read("", out) : 1; }
+
+// The take of the plugins that do not name themselves (input_take_as names one).
 int api_input_take(const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, int wheel, int motion) {
     if (n && !scancodes) return 1;
-    host_plugin_input_take(scancodes, n, buttons, wheel != 0, motion != 0);
+    host_plugin_input_take("", scancodes, n, buttons, wheel != 0, motion != 0);
     return 0;
 }
 
@@ -1509,6 +1513,7 @@ int api_pad(BbPad* out) {
     BbPad o{};
     o.buttons = pad.buttons;
     o.pressed = pad.pressed;
+    o.play = pad.play;
     o.connected = pad.connected ? 1 : 0;
     o.lx = axis(pad.lx);
     o.ly = axis(pad.ly);
@@ -1521,12 +1526,24 @@ int api_pad(BbPad* out) {
     return 0;
 }
 
-int api_pad_take(std::uint32_t buttons, std::uint32_t axes) {
+int api_pad_take(const char* name, std::uint32_t buttons, std::uint32_t axes) {
     static_assert(BB_PAD_LEFT_STICK == kPadTakeLeftStick && BB_PAD_RIGHT_STICK == kPadTakeRightStick &&
                       BB_PAD_TRIGGERS == kPadTakeTriggers,
                   "pad_take's axes");
-    host_plugin_pad_take(buttons, axes & (BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS));
+    if (!plugin_named(name)) return 1;
+    host_plugin_pad_take(name, buttons, axes & (BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS));
     return 0;
+}
+
+int api_input_take_as(const char* name, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, int wheel, int motion) {
+    if ((n && !scancodes) || !plugin_named(name)) return 1;
+    host_plugin_input_take(name, scancodes, n, buttons, wheel != 0, motion != 0);
+    return 0;
+}
+
+int api_input_as(const char* name, BbInput* out) {
+    if (!out || !plugin_named(name)) return 1;
+    return input_read(name, out);
 }
 
 // Other players' characters in this world: the player set's entries after the
@@ -1696,7 +1713,7 @@ int api_world_state(BbWorldState* out) {
     if (loading_in_world()) w.flags |= BB_WORLD_IN;
     if (loading_screen_up()) w.flags |= BB_WORLD_LOADING;
     if (loading_cutscene()) w.flags |= BB_WORLD_CUTSCENE;
-    if (menu_pointer_in_menu()) w.flags |= BB_WORLD_MENU;
+    if (menu_pointer_in_menu() || debug_menu_open()) w.flags |= BB_WORLD_MENU;
     if (world_pause_held()) w.flags |= BB_WORLD_PAUSED;
     w.others = other_players();
     // Who is on the way: the matchmaking room's other members - the earliest a
@@ -1756,7 +1773,7 @@ const BbHostApi g_api = {
     &api_shader_override, &api_shader_folder, &api_shader_state, &api_shader_source, &api_shader_data,
     &api_on_camera_target,
     &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state, &api_hud_hide, &api_post_look,
-    &api_panel_show, &api_panel_state, &api_option_set,
+    &api_panel_show, &api_panel_state, &api_option_set, &api_input_take_as, &api_input_as,
 };
 
 std::string read_file(const std::string& path) {
@@ -2069,6 +2086,7 @@ void plugins_frame() {
                 scene_look_drop_hud(r.name.c_str());  // and on the HUD
                 drop_look(r.name);  // and its look
                 plugin_panel_hide(r.name);  // and its panel
+                host_plugin_take_drop(r.name.c_str());  // and the controls it takes
             }
             host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
             if (render_hooks_plugin_on(r.name, on)) republish_settings();

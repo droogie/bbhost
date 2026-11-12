@@ -392,13 +392,15 @@ typedef struct BbPad {
     int32_t connected;    /* 1 while a controller is there */
     float lx, ly, rx, ry; /* the sticks, -1..1, right and down positive, the player's dead zones applied */
     float l2, r2;         /* the triggers' travel, 0..1 */
+    uint32_t play;        /* BB_PAD_* the held buttons press in play under the player's bindings (Key Bindings'
+                             controller column): a plugin whose controls follow the game's own reads these */
 } BbPad;
 
 /* Version 29: what the world is doing and who else is in it (world_state). */
 #define BB_WORLD_IN 1u         /* a world is loaded and running - or held by world_pause */
 #define BB_WORLD_LOADING 2u    /* a loading screen is up */
 #define BB_WORLD_CUTSCENE 4u   /* a cutscene plays, or one is queued */
-#define BB_WORLD_MENU 8u       /* one of the game's menus or dialogs has the controls */
+#define BB_WORLD_MENU 8u       /* one of the game's menus or dialogs has the controls (its debug menu too) */
 #define BB_WORLD_PAUSED 16u    /* world_pause holds the world (any plugin's) */
 #define BB_WORLD_VISITING 32u  /* the player is in another player's world, or on the way there */
 #define BB_WORLD_OPEN 64u      /* the world's own session is up: players matched to it, or in it */
@@ -702,8 +704,10 @@ typedef struct BbHostApi {
 
     /* Version 13: controls and a view of a plugin's own (a first-person mode). */
     /* What the keyboard and mouse hold now, and the presses, motion and wheel
-     * since the last read (one reader: two plugins reading would share them).
-     * Main thread. 0 on success; 1 without a window (headless). */
+     * since the last read (one reader: two plugins reading would share them -
+     * since version 29 input_as gives a plugin reads of its own, and this is
+     * the read of the plugins that do not name themselves). Main thread. 0 on
+     * success; 1 without a window (headless). */
     int (*input)(BbInput* out);
     /* Takes inputs from the game while the player is playing
      * (BbInput.playing): the keys listed (scancodes) no longer press what they
@@ -712,7 +716,11 @@ typedef struct BbHostApi {
      * nonzero keeps the mouse from turning the game's camera. The menus keep
      * every key. A call replaces the last; nothing taken gives everything
      * back - a key held then stays taken until it is let go (version 29), so
-     * the game never sees it go down. Any thread. 0 on success. */
+     * the game never sees it go down, while a key a call leaves out as it
+     * goes on taking others is the game's again at once. Since version 29 this
+     * is the take of the plugins that do not name themselves: input_take_as's
+     * named takes add to it, and nothing a plugin does here gives theirs
+     * back. Any thread. 0 on success. */
     int (*input_take)(const uint16_t* scancodes, size_t n, uint32_t buttons, int wheel, int motion);
     /* fn(cam, user) each frame once the game has placed the player's camera
      * (its follow camera and the blend of the cameras it owns) and before
@@ -1016,19 +1024,26 @@ typedef struct BbHostApi {
     int (*world_step)(const char* name, uint32_t updates);
     /* The controller, into *out (set out->size first): its own buttons and
      * sticks - the dead zones applied, the player's key bindings not - pressed
-     * or not, as the game would read them before pad_take takes any; a test's
-     * taps (BBHOST_AUTOPRESS, the "tap" request) count as the controller's. The
-     * presses are the frame's: every plugin reading in it sees the same. While
-     * bbhost's own menus or a text box have the controller it reads nothing
-     * held. Main thread (on_frame). 0 on success; 1 for a size under 8. */
+     * or not, as the game would read them before pad_take takes any, and
+     * (BbPad.play) what the held buttons press in play under the player's
+     * bindings; a test's taps (BBHOST_AUTOPRESS, the "tap" request) count as
+     * the controller's. The presses are the frame's: every plugin reading in
+     * it sees the same. While bbhost's own menus or a text box have the
+     * controller it reads nothing held. Main thread (on_frame). 0 on success;
+     * 1 for a size under 8. */
     int (*pad)(BbPad* out);
-    /* Takes the controller's buttons (BB_PAD_*) and axes (BB_PAD_LEFT_STICK,
-     * BB_PAD_RIGHT_STICK, BB_PAD_TRIGGERS) from the game: the game reads them
-     * let go and at rest - whatever they are bound to in play is not pressed -
-     * while pad still reads them. Keys are input_take's. A call replaces the last;
-     * 0, 0 gives everything back - a button held then stays taken until it is
-     * let go, so the game never sees it go down. Any thread. 0 on success. */
-    int (*pad_take)(uint32_t buttons, uint32_t axes);
+    /* Takes the controller's buttons (BB_PAD_*, the controller's own) and axes
+     * (BB_PAD_LEFT_STICK, BB_PAD_RIGHT_STICK, BB_PAD_TRIGGERS) from the game
+     * for the plugin named `name`: the game reads them let go and at rest -
+     * whatever they are bound to in play is not pressed - while pad still
+     * reads them. Keys are input_take_as's. Each plugin's take is its own and
+     * the game loses what any plugin takes; a call replaces the plugin's last.
+     * 0, 0 gives its buttons back - one held then stays taken until it is let
+     * go, so the game never sees it go down - while a button a call leaves
+     * out as it goes on taking others is the game's again at once. The plugin
+     * being turned off gives its take back. Any thread. 0 on success; 1 for
+     * an unknown plugin. */
+    int (*pad_take)(const char* name, uint32_t buttons, uint32_t axes);
     /* What the world is doing and who else is in it (BbWorldState), into *out
      * (set out->size first). Main thread. 0 on success; 1 for another eboot or
      * a size under 8. */
@@ -1079,6 +1094,22 @@ typedef struct BbHostApi {
      * called with it from the next frame. Any thread. 0 on success; 1 for an
      * unknown plugin or option. */
     int (*option_set)(const char* name, const char* key, const char* value);
+    /* input_take for the plugin named `name`: the plugins' takes add up, each
+     * call replacing only that plugin's last, so one plugin giving its keys
+     * back leaves another's taken (input_take's own is the take of every
+     * plugin that does not name itself). Nothing taken gives the plugin's
+     * back - a key held then stays taken until it is let go - while a key a
+     * call leaves out as it goes on taking others is the game's again at
+     * once. The plugin being turned off gives its take back. Any thread. 0 on
+     * success; 1 for an unknown plugin. */
+    int (*input_take_as)(const char* name, const uint16_t* scancodes, size_t n, uint32_t buttons, int wheel, int motion);
+    /* input for the plugin named `name`: the presses, motion and wheel since
+     * that plugin's own last read, so plugins reading each frame never take
+     * them from one another (input's own are the read of every plugin that
+     * does not name itself). The first read starts its count. Main thread or
+     * the game's, as input. 0 on success; 1 for an unknown plugin or without
+     * a window (headless). */
+    int (*input_as)(const char* name, BbInput* out);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

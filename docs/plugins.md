@@ -162,14 +162,19 @@ gives the Binary Ninja address.
   Space, 224 Left Ctrl), the mouse's buttons held and pressed since the last
   read, its motion in its own counts and the wheel's notches - and `playing`,
   1 while the mouse turns the camera (in the world, no menu up). One reader:
-  the motion, presses and notches are the caller's once read.
+  the motion, presses and notches are the caller's once read - since v29
+  `input_as` gives a plugin reads of its own, and `input` is the read of the
+  plugins that do not name themselves.
 - `input_take(scancodes, n, buttons, wheel, motion)`: while the player is
   playing, those keys and mouse buttons stop pressing what they are bound to,
   the wheel's notches stay out of the game, and the mouse stops turning the
   game's camera - the plugin reads them all through `input`. The menus keep
   every key. A call replaces the last; nothing taken gives everything back,
   but a key held then stays taken until it is let go (since v29), so the
-  game never sees it go down.
+  game never sees it go down, while a key a call leaves out as it goes on
+  taking others is the game's again at once. Since v29 this is the take of
+  the plugins that do not name themselves: `input_take_as` gives a plugin a
+  take of its own, and the takes add up.
 - `on_camera(fn, user)`: each frame once the game has placed the player's
   camera - the follow camera's update and the camera manager's blend of the
   cameras it owns - and before the scene is drawn from it or a scripted camera
@@ -216,19 +221,42 @@ over the game.
   play, the sticks from -1 to 1 with the player's dead zones applied, the
   triggers from 0 to 1, and the presses since the last frame, latched so that
   a press shorter than a frame still counts - the same for every plugin that
-  reads in that frame. From the main thread (`on_frame`). While bbhost's own
-  menus, a binding being chosen or a text box have the controller, nothing
-  reads as held. A test's taps (`BBHOST_AUTOPRESS`, the `tap` request) count
-  as the controller's.
-- `pad_take(buttons, axes)`: the game reads those buttons let go and those
-  axes (`BB_PAD_LEFT_STICK`, `BB_PAD_RIGHT_STICK`, `BB_PAD_TRIGGERS`) at rest -
-  whatever they are bound to in play is not pressed - while `pad` still reads
-  them. Keys stay `input_take`'s. A call replaces the last; `0, 0` gives
-  everything back, but a button held then stays taken until it is let go.
+  reads in that frame. `play` is the held buttons as what they press in play
+  under the player's bindings (Key Bindings' controller column), for controls
+  that follow the game's own: photo mode's L3 is whichever button presses the
+  game's L3. From the main thread (`on_frame`). While bbhost's own menus, a
+  binding being chosen or a text box have the controller, nothing reads as
+  held. A test's taps (`BBHOST_AUTOPRESS`, the `tap` request) count as the
+  controller's.
+- `pad_take(name, buttons, axes)`: the game reads those buttons (the
+  controller's own) let go and those axes (`BB_PAD_LEFT_STICK`,
+  `BB_PAD_RIGHT_STICK`, `BB_PAD_TRIGGERS`) at rest - whatever they are bound
+  to in play is not pressed - while `pad` still reads them. Keys are
+  `input_take_as`'s. Each plugin's take is its own and the game loses what any
+  plugin takes; a call replaces the plugin's last. `0, 0` gives its buttons
+  back, but a button held then stays taken until it is let go, so the game
+  never sees it go down; a button a call leaves out as it goes on taking
+  others is the game's again at once. Turning the plugin off gives its take
+  back.
+- `input_take_as(name, scancodes, n, buttons, wheel, motion)`: `input_take`
+  for the plugin named `name`. The plugins' takes add up, each call replacing
+  only that plugin's last, so a plugin giving its keys back leaves another's
+  taken - photo mode ending leaves the Quake plugin's movement keys and mouse
+  its own. `input_take` is the take of every plugin that does not name
+  itself. Nothing taken gives the plugin's back, but a key held then stays
+  taken until it is let go; a key a call leaves out as it goes on taking
+  others is the game's again at once (the Quake plugin's movement keys on a
+  ladder). Turning the plugin off gives its take back.
+- `input_as(name, &in)`: `input` for the plugin named `name`: the presses,
+  motion and wheel since that plugin's own last read, so plugins reading every
+  frame never take them from one another - photo mode looking for P each frame
+  leaves the Quake plugin's mouse look whole. `input`'s are the read of every
+  plugin that does not name itself; a plugin's first read starts its count.
 - `world_state(&state)`: `BbWorldState` (set `state.size` first). `flags`:
   `BB_WORLD_IN` (a world is loaded and running, or held), `BB_WORLD_LOADING`,
   `BB_WORLD_CUTSCENE` (one plays or is queued), `BB_WORLD_MENU` (one of the
-  game's menus or dialogs has the controls), `BB_WORLD_PAUSED` (a plugin holds
+  game's menus or dialogs has the controls, its debug menu included),
+  `BB_WORLD_PAUSED` (a plugin holds
   the world), `BB_WORLD_VISITING` (the player is in another player's world or
   on the way there) and `BB_WORLD_OPEN` (the world's own session is up:
   players matched to it, or in it - a bell rung alone does not open it; the
