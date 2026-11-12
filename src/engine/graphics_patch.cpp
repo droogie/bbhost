@@ -14,6 +14,7 @@
 #include "engine/sf_text_layout.h"
 #include "engine/frame_rate.h"
 #include "engine/live_resolution.h"
+#include "engine/loading.h"
 #include "engine/menu_memory.h"
 #include "engine/sf_heap_probe.h"
 #include "hle/modules.h"
@@ -860,6 +861,106 @@ void log_dof_table(const std::uint8_t* yebis) {
              static_cast<unsigned long long>(h), neg, pos, static_cast<double>(lo), static_cast<double>(hi), static_cast<double>(at[0]),
              static_cast<double>(at[1]), static_cast<double>(at[2]), static_cast<double>(at[3]), static_cast<double>(at[4]),
              static_cast<double>(at[5]));
+}
+
+// Depth of field's blend at the 1080-line look, at any Resolution. YEBIS
+// blends a level's blurred image in by t = clamp(k * CoC + b): for the first
+// level k = s / (1.25 r0 - 0.25 r0) and b = -0.25 r0 / (1.25 r0 - 0.25 r0) =
+// -0.250125 (sub_1055af0, from the level's radius r0 in pixels and s, the
+// circle of confusion's size in pixels, which grows with the height: k is
+// 0.291 at 360 lines, 0.874 at 1080, 1.747 at 2160). The circle is the same
+// share of the picture at every size, and a level's blur is a fixed number
+// of pixels in a target a fixed share of the picture's size, so on the screen
+// it is a smaller blur the larger the picture: the look stays the same only if
+// t grows with the height. k * CoC does, b does not - so the areas' faint far
+// blur faded below 1080 lines (none at 640x360, two thirds of it at 720p) and
+// came out up to 18% stronger above (1440p; t clamps at 1 by 2160p). With b
+// times height / 1080, t = (height / 1080) * its 1080-line value for every
+// circle: the 1080-line look at every size.
+// Where: CDepthOfField's aperture-filter levels (sub_1068b60, called only from
+// its ApplyDepthOfField right after sub_1055af0 writes the levels' factors
+// afresh), each level's two (k, b) pairs - behind the focus at +0xd0/+0xd4,
+// in front at +0xd8/+0xdc of the level's 0x108 bytes, the array at the
+// object's +0x470, the count at +0xc0 - which the level choice and the
+// composites' constants read after it. Once a call, from values written that
+// call: nothing compounds. Only the world's view: the source's height (its
+// +0x54) is the picture's - a menu's preview keeps its look - and no Remo
+// cutscene runs (a cutscene's blur stays as YEBIS draws it), and only on a
+// side drawn with one level (below). Nothing at 1080 lines, and with Depth of
+// field off YEBIS never calls the function. With an upscaler the height is
+// the picture's, the one YEBIS works at: the blend is the native size's, and
+// what the upscaler's picture lacks before the blur is the upscaler's.
+constexpr std::uint64_t kDofLevels = 0x1068b60;
+// push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x148
+const std::uint8_t kDofLevelsPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                           0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x48, 0x01, 0x00, 0x00};
+constexpr std::size_t kDofLevelCount = 0xc0, kDofLevelArray = 0x470, kDofLevelSize = 0x108;
+constexpr std::size_t kDofLevelFarB = 0xd4, kDofLevelNearB = 0xdc, kGpuTextureHeight = 0x54;
+
+// BBHOST_DOF_1080_LOOK=0 (a test): the blend as YEBIS has it at every size.
+const bool g_dof_1080_look = [] {
+    const char* e = std::getenv("BBHOST_DOF_1080_LOOK");
+    return !(e && e[0] == '0');
+}();
+
+GUEST_ABI std::int64_t dof_levels_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (!g_dof_1080_look) return 0;
+    // A cutscene's blur as YEBIS draws it: said once each time one starts.
+    static std::atomic<bool> in_cutscene{false};
+    const bool cutscene = loading_cutscene();
+    if (in_cutscene.exchange(cutscene, std::memory_order_relaxed) != cutscene && cutscene) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 8)
+            host_log("graphics: a cutscene plays: its depth of field's blend left as YEBIS has it at this size");
+    }
+    if (cutscene) return 0;
+    const std::uint64_t dof = saved[5], src = saved[4];
+    if (!dof || !src) return 0;
+    std::uint32_t height = 0;
+    std::memcpy(&height, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src + kGpuTextureHeight)), 4);
+    unsigned picture_h = 0;
+    live_resolution_current(nullptr, &picture_h);
+    if (height != picture_h || height < 64 || height > 16384 || height == 1080) return 0;
+    std::int32_t n = 0;
+    std::uint64_t levels = 0;
+    std::memcpy(&n, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(dof + kDofLevelCount)), 4);
+    std::memcpy(&levels, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(dof + kDofLevelArray)), 8);
+    if (n <= 0 || n > 16 || !levels || !g_post_block) return 0;
+    // Only a side the view draws with one level (the block's level counts,
+    // the areas' own far blur: near 0, far 1). With more, a circle that grows
+    // with the picture moves on to the next level, twice as large, which keeps
+    // the look by itself - a look's lens (photo mode's 7 and 7) and the
+    // cutscenes' come out at 0.92-1.00x of 1080p's at 2160p as YEBIS has them,
+    // and larger offsets would hold the circle back on the smaller levels
+    // (0.64x).
+    std::int32_t near_levels = 0, far_levels = 0;
+    std::memcpy(&near_levels, g_post_block + kDofNear, 4);
+    std::memcpy(&far_levels, g_post_block + kDofFar, 4);
+    const bool far_one = far_levels == 1, near_one = near_levels == 1;
+    if (!far_one && !near_one) return 0;
+    const float f = static_cast<float>(height) / 1080.0f;
+    float b0 = 0;
+    for (std::int32_t i = 0; i < n; ++i) {
+        auto* l = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(levels + static_cast<std::uint64_t>(i) * kDofLevelSize));
+        float far_b = 0, near_b = 0;
+        std::memcpy(&far_b, l + kDofLevelFarB, 4);
+        std::memcpy(&near_b, l + kDofLevelNearB, 4);
+        if (i == 0) b0 = far_one ? far_b : near_b;
+        if (far_one) far_b *= f;
+        if (near_one) near_b *= f;
+        std::memcpy(l + kDofLevelFarB, &far_b, 4);
+        std::memcpy(l + kDofLevelNearB, &near_b, 4);
+    }
+    static std::atomic<std::uint64_t> logged{0};
+    static std::atomic<int> lines{0};
+    std::uint32_t bb = 0;
+    std::memcpy(&bb, &b0, 4);
+    const std::uint64_t key = (static_cast<std::uint64_t>(height) << 40) ^ (static_cast<std::uint64_t>(far_one * 2 + near_one) << 32) ^ bb;
+    if (logged.exchange(key, std::memory_order_relaxed) != key && lines.fetch_add(1, std::memory_order_relaxed) < 16)
+        host_log("graphics: depth of field's blend at the 1080-line look: the picture %u lines high, the %s side%s drawn with one "
+                 "level, its first offset %g given, %g used",
+                 height, far_one && near_one ? "far and near" : far_one ? "far" : "near", far_one && near_one ? "s" : "", b0, b0 * f);
+    return 0;
 }
 
 // sub_25d4860's entry: the YEBIS object in rdi.
@@ -1770,6 +1871,12 @@ void live_install(ElfImage* image) {
                  static_cast<unsigned long long>(kYebisRecord));
     } else {
         g_post_block = static_cast<std::uint8_t*>(guest_ptr(image->mem, at(kPostBlock)));
+    }
+    if (!install_prologue_hook(image, at(kDofLevels), kDofLevelsPrologue, sizeof(kDofLevelsPrologue),
+                               reinterpret_cast<void*>(&dof_levels_hook))) {
+        host_log("graphics: refused, 0x%llx is not the depth of field levels' prologue (or no room for its hook); its blend "
+                 "stays as the size has it",
+                 static_cast<unsigned long long>(kDofLevels));
     }
     if (!install_prologue_hook(image, at(kSsaoDraw), kSsaoDrawPrologue, sizeof(kSsaoDrawPrologue),
                                reinterpret_cast<void*>(&ssao_draw_hook))) {

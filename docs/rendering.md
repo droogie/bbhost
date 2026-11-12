@@ -440,6 +440,15 @@ path at all:
 
 - YEBIS, the post-processing library (bloom, glare, depth of field, tone
   mapping): every stage's resources and constants are built by bbhost.
+  Its depth of field blends each blurred level in by the circle of
+  confusion in pixels, which grows with the picture, against an offset that
+  does not. A blur drawn with several levels keeps its look by itself, as a
+  growing circle moves on to the next, larger level (the cutscenes, a
+  plugin's lens), but the areas' own faint far blur has one level, so it
+  faded out below 1080 lines and grew above them. On a side drawn with one
+  level the offset now scales with the picture's height over 1080, which
+  keeps the 1080-line look at every Resolution; with an upscaler the height
+  is the picture's, the one YEBIS works at.
 - Scaleform, the menu renderer: its draws are taken from its hardware
   abstraction layer.
 - Depth snapshots, the on-screen overlay and FSR 1 upscaling are bbhost's
