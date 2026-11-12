@@ -103,6 +103,12 @@ void host_overlay_commit() {
 
 bool host_overlay_empty() { return g_shown_count.load(std::memory_order_acquire) == 0; }
 
+std::size_t host_overlay_room() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    const std::size_t cap = static_cast<std::size_t>(kVboBytes) / sizeof(Vertex);
+    return g_verts.size() >= cap ? 0 : cap - g_verts.size();
+}
+
 void host_overlay_tri(float x0, float y0, float x1, float y1, float x2, float y2, std::uint32_t rgba) {
     std::lock_guard<std::mutex> lk(g_mu);
     push(x0, y0, rgba);
