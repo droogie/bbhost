@@ -27000,15 +27000,40 @@ static bool draw_impl(const GpuDraw& d) {
         const std::uint64_t dst = s.color[0]->base;
         if (hle_video_is_display_buffer(dst)) {
             if (s.rect) {
+                RtImage* shown = nullptr;
                 for (const StageImages::Image& im : stage_images[1].images) {
                     if (!im.resolved) continue;
-                    const RtImage* t = find_render_target(image_base(im));
+                    RtImage* t = find_render_target(image_base(im));
                     if (t && t->width == s.color[0]->width && t->height == s.color[0]->height) {
-                        if (hud_target != t->base) host_log("framegen: the HUD's target is 0x%llx", static_cast<unsigned long long>(t->base));
-                        hud_target = t->base;
-                        shown_write = t->last_write;
+                        shown = t;
                         break;
                     }
+                }
+                // A frame whose HUD drew nothing - the HUD hidden: no triangle
+                // list came into the target, so no copy was taken below, and
+                // with no HUD-less picture frame generation switched off until
+                // the HUD was back (Kyo's log, 2026-11-12: off at flip 894 and
+                // every frame after it "shown before"). The target as this pass
+                // reads it, written since the last display buffer's pass, is
+                // that frame's HUD-less picture: copied here, before the bind.
+                if (shown && upscale_pass_hudless_due_locked() && !upscale_pass_hudless_copied_locked() && !hud_begun &&
+                    (target_written || shown->last_write != shown_write)) {
+                    if (part) {
+                        run_part_stop(kRunStopOrder);
+                        return false;
+                    }
+                    upscale_pass_hudless_locked(*shown);
+                    static bool told = false;
+                    if (!told)
+                        host_log("framegen: a frame with no HUD drawn (flip %llu): the HUD's target 0x%llx as the display buffer's pass reads it "
+                                 "is its HUD-less picture",
+                                 static_cast<unsigned long long>(hle_video_flip_count()), static_cast<unsigned long long>(shown->base));
+                    told = true;
+                }
+                if (shown) {
+                    if (hud_target != shown->base) host_log("framegen: the HUD's target is 0x%llx", static_cast<unsigned long long>(shown->base));
+                    hud_target = shown->base;
+                    shown_write = shown->last_write;
                 }
                 if (upscale_pass_hudless_due_locked()) upscale_pass_hudless_bind_locked(dst, s.color[0]->width, s.color[0]->height);
             }
