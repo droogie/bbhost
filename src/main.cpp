@@ -1218,6 +1218,11 @@ int main(int argc, char** argv) {
             }
         }
         if (rounds) {
+            // Its lines written: what differed, the cost table, the validation
+            // layer's messages. The log's decision otherwise waits for the
+            // configuration, which a self-test never reads, and the lines held
+            // until then went with its exit.
+            decide_log(true);
             const int rc = host_gpu_stream_selftest(rounds);
             std::fflush(nullptr);
             std::_Exit(rc);  // the recorder and submission threads run on: no static destructors under them
@@ -1228,6 +1233,7 @@ int main(int argc, char** argv) {
     // the exit code says.
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--options-selftest") == 0) {
+            decide_log(true);  // its lines written (the stream self-test's note)
             const int rc = host_options_selftest(argv[i + 1]);
             std::fflush(nullptr);
             std::_Exit(rc);
