@@ -2009,6 +2009,12 @@ void upscale_pass_hudless_locked(RtImage& display);
 // HUD's target then goes to (the frame's prepare done with).
 bool upscale_pass_hudless_copied_locked();
 void upscale_pass_hudless_bind_locked(std::uint64_t display_va, std::uint32_t display_w, std::uint32_t display_h);
+// Plugin API 29's hud_hide (host/scene_look.h scene_look_hud_hidden): the
+// picture in the game's 2D's target kept before its first 2D draw, then put
+// back before the display buffer's pass reads that target.
+void hud_hide_save_locked(RtImage& target);
+bool hud_hide_saved_locked();
+void hud_hide_restore_locked(RtImage& target);
 // Under render scale: the upscaler's picture, at the output size, for YEBIS's
 // copy to sample in place of a scene of scene_w x scene_h; null when there is
 // none (no upscale of that size has run, or the picture went back into the

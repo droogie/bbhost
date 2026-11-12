@@ -1202,6 +1202,14 @@ void hle_register_np_matching2() {
     REG("sceNpMatching2SignalingGetPingInfo", m2_signaling_get_ping_info);
 }
 
+std::uint32_t hle_np_room_others() {
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (!g.in_room) return 0;
+    std::uint32_t n = 0;
+    for (const net::Peer& p : room_peers()) n += p.member_id != g.member_id;
+    return n;
+}
+
 void hle_np_matching2_peer_closed(const std::string& online_id) {
     std::uint64_t room = 0;
     std::uint16_t member = 0;

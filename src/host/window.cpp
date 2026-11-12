@@ -108,7 +108,8 @@ std::mutex g_ppad_mu;
 PluginPad g_ppad;                   // under g_ppad_mu: the controller at the last pad update
 PluginPad g_ppad_test;              // under g_ppad_mu: a test's taps at the last pad read
 std::uint32_t g_ppad_prev = 0;      // under g_ppad_mu: what was held, for the presses
-std::uint32_t g_ppad_pressed = 0;   // under g_ppad_mu: went down since the reader's last call
+std::uint32_t g_ppad_pressed = 0;   // under g_ppad_mu: went down since the frame began
+std::uint32_t g_ppad_frame = 0;     // under g_ppad_mu: the frame's presses (host_plugin_pad_frame)
 std::atomic<std::uint32_t> g_ppad_take_buttons{0}, g_ppad_take_axes{0};
 static void ppad_latch_locked() {
     const std::uint32_t held = g_ppad.buttons | g_ppad_test.buttons;
@@ -3233,7 +3234,12 @@ void host_plugin_pad(PluginPad& out) {
     out.l2 = std::max(a.l2, t.l2);
     out.r2 = std::max(a.r2, t.r2);
     out.connected = a.connected || t.connected;
-    out.pressed = g_ppad_pressed;
+    out.pressed = g_ppad_frame;
+}
+
+void host_plugin_pad_frame() {
+    std::lock_guard<std::mutex> lock(g_ppad_mu);
+    g_ppad_frame = g_ppad_pressed;
     g_ppad_pressed = 0;
 }
 

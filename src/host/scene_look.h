@@ -53,6 +53,17 @@ bool scene_look_scale(std::uint32_t* lines = nullptr);
 // API 25, host/upscale_pass.cpp scene_dither_locked): 0 off.
 void scene_look_set_dither(std::uint32_t bits);
 std::uint32_t scene_look_dither();
+// The game's HUD, menus and prompts left out of the picture (plugin API 29
+// hud_hide), held by each plugin that asks, by name: render.cpp keeps the
+// picture as it was before the game's first 2D draw into its target (frame
+// generation's HUD-less point) and puts it back before the display buffer's
+// pass composites that target (host/upscale_pass.cpp hud_hide_*_locked). The
+// game's own state - its HUD option - is untouched.
+void scene_look_set_hud_hidden(const char* owner, bool hidden);
+bool scene_look_hud_hidden();
+// Every hold of `owner` let go (the plugin turned off).
+void scene_look_drop_hud(const char* owner);
+
 // The scene's colour targets RGBA8.
 void scene_look_set_colour_8bit(bool on);
 bool scene_look_colour_8bit();

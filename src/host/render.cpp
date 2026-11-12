@@ -27069,8 +27069,12 @@ static bool draw_impl(const GpuDraw& d) {
     // is in it, and the copy handed over with the display buffer the pass then
     // writes. A plugin's dither (scene_dither) goes over the target at the
     // same point, before the copy.
+    // A plugin's hidden HUD (hud_hide) the same way: the picture kept at the
+    // HUD's first draw, and put back into the target before the display
+    // buffer's pass reads it.
     const std::uint32_t dither = scene_look_dither();
-    if ((upscale_pass_hudless_due_locked() || dither) && s.color[0]) {
+    const bool hud_hidden = scene_look_hud_hidden();
+    if ((upscale_pass_hudless_due_locked() || dither || hud_hidden || hud_hide_saved_locked()) && s.color[0]) {
         static std::uint64_t hud_target = 0;
         // The target's last write (RtImage::last_write) as the display
         // buffer's pass read it: a write since is the next frame's.
@@ -27088,6 +27092,13 @@ static bool draw_impl(const GpuDraw& d) {
                         shown_write = t->last_write;
                         break;
                     }
+                }
+                if (hud_hide_saved_locked()) {
+                    if (part) {
+                        run_part_stop(kRunStopOrder);
+                        return false;
+                    }
+                    if (RtImage* t = hud_target ? find_render_target(hud_target) : nullptr) hud_hide_restore_locked(*t);
                 }
                 if (upscale_pass_hudless_due_locked()) upscale_pass_hudless_bind_locked(dst, s.color[0]->width, s.color[0]->height);
             }
@@ -27112,6 +27123,7 @@ static bool draw_impl(const GpuDraw& d) {
                 hud_begun = true;
                 if (dither) scene_dither_locked(*s.color[0], dither);
                 if (upscale_pass_hudless_due_locked() && !upscale_pass_hudless_copied_locked()) upscale_pass_hudless_locked(*s.color[0]);
+                if (hud_hidden) hud_hide_save_locked(*s.color[0]);
             }
         }
     }

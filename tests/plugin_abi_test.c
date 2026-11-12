@@ -48,7 +48,8 @@ _Static_assert(offsetof(BbHostApi, world_step) == offsetof(BbHostApi, world_paus
 _Static_assert(offsetof(BbHostApi, pad) == offsetof(BbHostApi, world_step) + sizeof(void*), "pad after world_step");
 _Static_assert(offsetof(BbHostApi, pad_take) == offsetof(BbHostApi, pad) + sizeof(void*), "pad_take after pad");
 _Static_assert(offsetof(BbHostApi, world_state) == offsetof(BbHostApi, pad_take) + sizeof(void*), "world_state after pad_take");
-_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, world_state) + sizeof(void*), "world_state ends the API table");
+_Static_assert(offsetof(BbHostApi, hud_hide) == offsetof(BbHostApi, world_state) + sizeof(void*), "hud_hide after world_state");
+_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, hud_hide) + sizeof(void*), "hud_hide ends the API table");
 _Static_assert(sizeof(BbPad) == 40, "BbPad");
 _Static_assert(offsetof(BbPad, pressed) == 8 && offsetof(BbPad, connected) == 12, "BbPad's presses");
 _Static_assert(offsetof(BbPad, lx) == 16 && offsetof(BbPad, r2) == 36, "BbPad's axes");

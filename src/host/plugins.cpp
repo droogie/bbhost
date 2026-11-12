@@ -34,6 +34,7 @@
 #include "guest_abi.h"
 #include "hle/fs.h"
 #include "hle/modules.h"
+#include "hle/np.h"
 #include "host/audio_crush.h"
 #include "host/bindings.h"
 #include "host/options.h"
@@ -1555,6 +1556,14 @@ std::uint32_t session_members(std::uint64_t sm) {
     return routes > 1 ? routes - 1 : 0;
 }
 
+int api_hud_hide(const char* name, int hidden) {
+    if (!plugin_named(name)) return 1;
+    const bool was = scene_look_hud_hidden();
+    scene_look_set_hud_hidden(name, hidden != 0);
+    if (was != scene_look_hud_hidden()) host_log("plugin: the game's HUD %s (%s)", scene_look_hud_hidden() ? "left out of the picture" : "shown", name);
+    return 0;
+}
+
 int api_world_state(BbWorldState* out) {
     if (!out || out->size < 8 || !g_image || !api_eboot_is_109()) return 1;
     BbWorldState w{};
@@ -1564,11 +1573,14 @@ int api_world_state(BbWorldState* out) {
     if (menu_pointer_in_menu()) w.flags |= BB_WORLD_MENU;
     if (world_pause_held()) w.flags |= BB_WORLD_PAUSED;
     w.others = other_players();
-    std::uint32_t members = 0;
+    // Who is on the way: the matchmaking room's other members - the earliest a
+    // player coming in shows, at the server's member-joined event - or the
+    // game's session's, whichever counts more.
+    std::uint32_t members = hle_np_room_others();
     if (const std::uint64_t sm = rp(runtime_of(bb::SPRJ_SESSION_MANAGER_SINGLETON_PTR.bn(), 8))) {
         std::int32_t role = 0;
         if (rd(sm + 0x124, &role) && role >= BB_SESSION_NONE && role <= BB_SESSION_LEAVING) w.session = role;
-        members = session_members(sm);
+        members = std::max(members, session_members(sm));
     }
     if (w.session == BB_SESSION_JOINING || w.session == BB_SESSION_GUEST) w.flags |= BB_WORLD_VISITING;
     if (w.session == BB_SESSION_HOSTING || w.session == BB_SESSION_HOST || w.others) w.flags |= BB_WORLD_OPEN;
@@ -1617,7 +1629,7 @@ const BbHostApi g_api = {
     &api_aa_claim,
     &api_shader_override, &api_shader_folder, &api_shader_state, &api_shader_source, &api_shader_data,
     &api_on_camera_target,
-    &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state,
+    &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state, &api_hud_hide,
 };
 
 std::string read_file(const std::string& path) {
@@ -1921,7 +1933,10 @@ void plugins_frame() {
                 p.dormant = !on;
                 gpu::overrides_owner_on(p.shader_owner, on);  // its shader overrides with it
             }
-            if (!on) world_pause_drop(r.name);  // and its hold on the world
+            if (!on) {
+                world_pause_drop(r.name);  // and its hold on the world
+                scene_look_drop_hud(r.name.c_str());  // and on the HUD
+            }
             host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
             if (render_hooks_plugin_on(r.name, on)) republish_settings();
             aa_update();
@@ -1948,6 +1963,7 @@ void plugins_frame() {
             for (const WorldLoadCallback& c : loads) c.fn(block, c.user);
         }
     }
+    host_plugin_pad_frame();  // the controller's presses since the last frame, the same for every reader (pad)
     for (const FrameCallback& c : now) c.fn(c.user);
 }
 

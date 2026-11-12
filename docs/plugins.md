@@ -210,11 +210,12 @@ takes, and a way to know that nobody else is in the world.
 - `pad(&pad)`: the controller as `BbPad` (set `pad.size` first): its own
   buttons as `BB_PAD_*` bits, whatever the player's bindings make of them in
   play, the sticks from -1 to 1 with the player's dead zones applied, the
-  triggers from 0 to 1, and the presses since the last read, latched so that
-  a press shorter than a frame still counts. One reader, from the main
-  thread. While bbhost's own menus, a binding being chosen or a text box have
-  the controller, nothing reads as held. A test's taps (`BBHOST_AUTOPRESS`,
-  the `tap` request) count as the controller's.
+  triggers from 0 to 1, and the presses since the last frame, latched so that
+  a press shorter than a frame still counts - the same for every plugin that
+  reads in that frame. From the main thread (`on_frame`). While bbhost's own
+  menus, a binding being chosen or a text box have the controller, nothing
+  reads as held. A test's taps (`BBHOST_AUTOPRESS`, the `tap` request) count
+  as the controller's.
 - `pad_take(buttons, axes)`: the game reads those buttons let go and those
   axes (`BB_PAD_LEFT_STICK`, `BB_PAD_RIGHT_STICK`, `BB_PAD_TRIGGERS`) at rest -
   whatever they are bound to in play is not pressed - while `pad` still reads
@@ -225,11 +226,21 @@ takes, and a way to know that nobody else is in the world.
   `BB_WORLD_CUTSCENE` (one plays or is queued), `BB_WORLD_MENU` (one of the
   game's menus or dialogs has the controls), `BB_WORLD_PAUSED` (a plugin holds
   the world), `BB_WORLD_VISITING` (the player is in another player's world or
-  on the way there) and `BB_WORLD_OPEN` (the player's world is open to others:
-  a sign or a bell is up, or others are in it). `others`: other players'
-  characters in this world now - co-operators, invaders, the host one visits.
-  `arriving`: players on their way in, members of the world's session who are
-  not in it yet. `session`: the game's own session role (`BB_SESSION_*`).
+  on the way there) and `BB_WORLD_OPEN` (the world's own session is up:
+  players matched to it, or in it - a bell rung alone does not open it; the
+  game makes the session when matchmaking finds a player). `others`: other
+  players' characters in this world now - co-operators, invaders, the host one
+  visits. `arriving`: players on their way in - members of the world's session
+  or of its matchmaking room who are not in the world yet, counted from the
+  server's word that one joined the room. `session`: the game's own session
+  role (`BB_SESSION_*`).
+- `hud_hide(name, hidden)`: the game's HUD, menus and prompts left out of the
+  picture. The game draws them as always; they are left out where the
+  picture is put together for the screen - the point frame generation takes
+  its picture without the HUD from - so nothing of the game's own state
+  changes, and its HUD option keeps its value. bbhost's overlay and menus are
+  drawn as always. The HUD is left out while any plugin asks; turning the
+  plugin off lets go. It costs two copies of the picture a frame while on.
 
 **Settings, UI and files**
 

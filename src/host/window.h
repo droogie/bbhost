@@ -137,9 +137,10 @@ void host_plugin_input_take(const std::uint16_t* scancodes, std::size_t n, std::
 // The controller as a plugin reads it (plugin API 29's pad): its own buttons
 // (BB_PAD_* bits - the menus' bits, whatever the bindings make of them in
 // play), sticks and triggers as the last pad update saw them, before
-// host_plugin_pad_take takes any, and the presses since the last call - one
-// reader. Nothing held while bbhost's menus, a binding capture or a text box
-// have the controller. A test's taps join it (host_plugin_pad_test).
+// host_plugin_pad_take takes any, and the frame's presses (host_plugin_pad_frame),
+// the same for every reader. Nothing held while bbhost's menus, a binding
+// capture or a text box have the controller. A test's taps join it
+// (host_plugin_pad_test).
 struct PluginPad {
     std::uint32_t buttons = 0, pressed = 0;
     std::uint8_t lx = kStickRest, ly = kStickRest, rx = kStickRest, ry = kStickRest;
@@ -147,6 +148,9 @@ struct PluginPad {
     bool connected = false;
 };
 void host_plugin_pad(PluginPad& out);
+// A new frame for the plugins (before their on_frame callbacks): the presses
+// latched since the last one become the frame's.
+void host_plugin_pad_frame();
 // What a plugin takes from the game (plugin API 29's pad_take): those buttons
 // read let go, those sticks centred and the triggers at rest - the press
 // they are bound to in play never made. A call replaces the last.

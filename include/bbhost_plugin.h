@@ -383,8 +383,8 @@ typedef void (*BbRenderFn)(const BbRenderCall* call, void* user);
 typedef struct BbPad {
     uint32_t size;        /* set to sizeof(BbPad) before the call: the host fills as much as both know */
     uint32_t buttons;     /* BB_PAD_* held */
-    uint32_t pressed;     /* BB_PAD_* that went down since the last read - latched, so a press shorter than a
-                             frame is still seen */
+    uint32_t pressed;     /* BB_PAD_* that went down since the last frame - latched, so a press shorter than a
+                             frame is still seen, and the same for every plugin reading in that frame */
     int32_t connected;    /* 1 while a controller is there */
     float lx, ly, rx, ry; /* the sticks, -1..1, right and down positive, the player's dead zones applied */
     float l2, r2;         /* the triggers' travel, 0..1 */
@@ -397,13 +397,13 @@ typedef struct BbPad {
 #define BB_WORLD_MENU 8u       /* one of the game's menus or dialogs has the controls */
 #define BB_WORLD_PAUSED 16u    /* world_pause holds the world (any plugin's) */
 #define BB_WORLD_VISITING 32u  /* the player is in another player's world, or on the way there */
-#define BB_WORLD_OPEN 64u      /* the player's world is open to others: a sign or a bell is up, or others are in it */
+#define BB_WORLD_OPEN 64u      /* the world's own session is up: players matched to it, or in it */
 
 /* BbWorldState.session: the game's own session role. */
 #define BB_SESSION_NONE 0
-#define BB_SESSION_HOSTING 1       /* the world being opened to others (a bell rung, a sign seen) */
+#define BB_SESSION_HOSTING 1       /* the world's session being made for players matched to it - before they join */
 #define BB_SESSION_HOST_FAILED 2
-#define BB_SESSION_HOST 3          /* the world's own session, others in it or let in */
+#define BB_SESSION_HOST 3          /* the world's own session, others in it or matched to come */
 #define BB_SESSION_JOINING 4       /* on the way into another player's world */
 #define BB_SESSION_JOIN_FAILED 5
 #define BB_SESSION_GUEST 6         /* in another player's world */
@@ -413,7 +413,8 @@ typedef struct BbWorldState {
     uint32_t size;      /* set to sizeof(BbWorldState) before the call: the host fills as much as both know */
     uint32_t flags;     /* BB_WORLD_* */
     uint32_t others;    /* other players' characters in this world now: co-operators, invaders, the host one visits */
-    uint32_t arriving;  /* players on their way in: members of the world's session who are not in it yet */
+    uint32_t arriving;  /* players on their way in: members of the world's session or of its matchmaking room
+                           who are not in the world yet (from the server's word that one joined the room) */
     int32_t session;    /* BB_SESSION_* */
 } BbWorldState;
 
@@ -963,10 +964,10 @@ typedef struct BbHostApi {
     /* The controller, into *out (set out->size first): its own buttons and
      * sticks - the dead zones applied, the player's key bindings not - pressed
      * or not, as the game would read them before pad_take takes any; a test's
-     * taps (BBHOST_AUTOPRESS, the "tap" request) count as the controller's. One
-     * reader: the presses are the caller's once read. While bbhost's own menus
-     * or a text box have the controller it reads nothing held. Main thread. 0
-     * on success; 1 for a size under 8. */
+     * taps (BBHOST_AUTOPRESS, the "tap" request) count as the controller's. The
+     * presses are the frame's: every plugin reading in it sees the same. While
+     * bbhost's own menus or a text box have the controller it reads nothing
+     * held. Main thread (on_frame). 0 on success; 1 for a size under 8. */
     int (*pad)(BbPad* out);
     /* Takes the controller's buttons (BB_PAD_*) and axes (BB_PAD_LEFT_STICK,
      * BB_PAD_RIGHT_STICK, BB_PAD_TRIGGERS) from the game: the game reads them
@@ -978,6 +979,16 @@ typedef struct BbHostApi {
      * (set out->size first). Main thread. 0 on success; 1 for another eboot or
      * a size under 8. */
     int (*world_state)(BbWorldState* out);
+    /* The game's HUD, menus and prompts left out of the picture: the game
+     * draws them as always and they are left out where the picture is put
+     * together for the screen (the point frame generation takes its picture
+     * without the HUD from), so nothing of the game's own state changes - its
+     * HUD option keeps its value. bbhost's own overlay and menus are drawn as
+     * always. `hidden` 1 asks for it for the plugin named `name`, 0 lets it
+     * go; it is left out while any plugin asks, and the plugin being turned
+     * off lets go. From the next frame; while on, two copies of the picture a
+     * frame. Any thread. 0 on success; 1 for an unknown plugin. */
+    int (*hud_hide)(const char* name, int hidden);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */
