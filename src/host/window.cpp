@@ -102,6 +102,19 @@ std::uint8_t g_plugin_keys[512] = {};          // under g_take_mu
 std::atomic<bool> g_take_any_key{false};
 std::atomic<std::uint32_t> g_take_buttons{0};
 std::atomic<bool> g_take_wheel{false}, g_take_motion{false};
+// Plugin API 29: the controller as a plugin reads it (host_plugin_pad), a test's
+// taps beside it, the presses latched for the reader, and what it takes.
+std::mutex g_ppad_mu;
+PluginPad g_ppad;                   // under g_ppad_mu: the controller at the last pad update
+PluginPad g_ppad_test;              // under g_ppad_mu: a test's taps at the last pad read
+std::uint32_t g_ppad_prev = 0;      // under g_ppad_mu: what was held, for the presses
+std::uint32_t g_ppad_pressed = 0;   // under g_ppad_mu: went down since the reader's last call
+std::atomic<std::uint32_t> g_ppad_take_buttons{0}, g_ppad_take_axes{0};
+static void ppad_latch_locked() {
+    const std::uint32_t held = g_ppad.buttons | g_ppad_test.buttons;
+    g_ppad_pressed |= held & ~g_ppad_prev;
+    g_ppad_prev = held;
+}
 float g_plugin_dx = 0.0f, g_plugin_dy = 0.0f, g_plugin_wheel = 0.0f;  // under g_mouse_mu
 std::uint32_t g_plugin_pressed = 0;                                   // under g_mouse_mu
 // BBHOST_IME_TEST: opens the text box once at startup and again on F11.
@@ -1760,6 +1773,13 @@ void update_pad() {
     if (host_options_open() || ingame_menu_open() || binding || typing) {
         p.connected = true;
         g_key_strong.store(false, std::memory_order_relaxed);
+        {
+            // A plugin reads the controller let go while these have it.
+            std::lock_guard<std::mutex> lock(g_ppad_mu);
+            g_ppad = PluginPad{};
+            g_ppad.connected = !g_pads.empty();
+            ppad_latch_locked();
+        }
         std::lock_guard<std::mutex> lock(g_pad_mu);
         g_pad = p;
         return;
@@ -1778,8 +1798,14 @@ void update_pad() {
     // Each pad's buttons are or-ed together, and each stick axis and trigger
     // is whichever pad pushes it furthest, so two pads never fight.
     bool touch_done = false, back_held = false;
+    // A plugin's view of the controller, before what it takes from the game
+    // (plugin API 29: host_plugin_pad, host_plugin_pad_take).
+    PluginPad ctl;
+    const std::uint32_t take_buttons = g_ppad_take_buttons.load(std::memory_order_relaxed);
+    const std::uint32_t take_axes = g_ppad_take_axes.load(std::memory_order_relaxed);
     for (SDL_Gamepad* g_gamepad : g_pads) {
         p.connected = true;
+        ctl.connected = true;
         // The sixteen buttons, the triggers past a quarter of their travel, each
         // giving in play the press it is bound to (host/bindings.h host_pad_*):
         // a rebound one's play press goes to play_buttons, which a menu takes
@@ -1801,14 +1827,32 @@ void update_pad() {
                        hs.stick_inner[0], hs.stick_outer[0], &lx, &ly);
         stick_deadzone(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTX), SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHTY),
                        hs.stick_inner[1], hs.stick_outer[1], &rx, &ry);
-        p.lx = further(p.lx, lx);
-        p.ly = further(p.ly, ly);
-        p.rx = further(p.rx, rx);
-        p.ry = further(p.ry, ry);
-        const std::int16_t lt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
-        const std::int16_t rt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+        ctl.lx = further(ctl.lx, lx);
+        ctl.ly = further(ctl.ly, ly);
+        ctl.rx = further(ctl.rx, rx);
+        ctl.ry = further(ctl.ry, ry);
+        // A stick a plugin takes stays centred for the game.
+        if (!(take_axes & kPadTakeLeftStick)) {
+            p.lx = further(p.lx, lx);
+            p.ly = further(p.ly, ly);
+        }
+        if (!(take_axes & kPadTakeRightStick)) {
+            p.rx = further(p.rx, rx);
+            p.ry = further(p.ry, ry);
+        }
+        std::int16_t lt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+        std::int16_t rt = SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
         held[kPadL2] = lt > 8000;
         held[kPadR2] = rt > 8000;
+        ctl.l2 = std::max(ctl.l2, static_cast<std::uint8_t>(std::max<int>(lt, 0) / 128));
+        ctl.r2 = std::max(ctl.r2, static_cast<std::uint8_t>(std::max<int>(rt, 0) / 128));
+        if (take_axes & kPadTakeTriggers) lt = rt = 0;
+        // The plugin reads every button; one it takes presses nothing in the game.
+        for (int i = 0; i < kPadInputs; ++i) {
+            if (!held[i]) continue;
+            ctl.buttons |= host_pad_input_bit(i);
+            if (take_buttons & host_pad_input_bit(i)) held[i] = false;
+        }
         for (int i = 0; i < kPadInputs; ++i) {
             if (!held[i]) continue;
             const std::uint32_t play = host_pad_play_bit(i), menu = host_pad_menu_bit(i);
@@ -1864,7 +1908,8 @@ void update_pad() {
     // where the keyboard's Gestures key puts one (bindings.cpp), since the game
     // reads the side from the finger. Its own stable id, so holding it is one
     // touch and it can be held with the key.
-    if (back_held) {
+    if (back_held) ctl.buttons |= kTouchPad;
+    if (back_held && !(take_buttons & kTouchPad)) {
         p.buttons |= kTouchPad;
         if (p.touch_count < 2) {
             PadState::Touch& t = p.touch[p.touch_count++];
@@ -1950,6 +1995,11 @@ void update_pad() {
     }
     if (!g_pads.empty() || g_window) {
         p.connected = true;  // a window means a player is present
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_ppad_mu);
+        g_ppad = ctl;
+        ppad_latch_locked();
     }
     std::lock_guard<std::mutex> lock(g_pad_mu);
     g_pad = p;
@@ -3167,6 +3217,45 @@ void host_plugin_input_take(const std::uint16_t* scancodes, std::size_t n, std::
     g_take_buttons.store(buttons, std::memory_order_relaxed);
     g_take_wheel.store(wheel, std::memory_order_relaxed);
     g_take_motion.store(motion, std::memory_order_relaxed);
+}
+
+void host_plugin_pad(PluginPad& out) {
+    std::lock_guard<std::mutex> lock(g_ppad_mu);
+    const PluginPad& a = g_ppad;
+    const PluginPad& t = g_ppad_test;
+    // A test's tap holds a stick over for the controller it stands for.
+    const auto pick = [](std::uint8_t pad, std::uint8_t tap) { return tap != kStickRest ? tap : pad; };
+    out.buttons = a.buttons | t.buttons;
+    out.lx = pick(a.lx, t.lx);
+    out.ly = pick(a.ly, t.ly);
+    out.rx = pick(a.rx, t.rx);
+    out.ry = pick(a.ry, t.ry);
+    out.l2 = std::max(a.l2, t.l2);
+    out.r2 = std::max(a.r2, t.r2);
+    out.connected = a.connected || t.connected;
+    out.pressed = g_ppad_pressed;
+    g_ppad_pressed = 0;
+}
+
+void host_plugin_pad_take(std::uint32_t buttons, std::uint32_t axes) {
+    const std::uint32_t was_b = g_ppad_take_buttons.exchange(buttons, std::memory_order_relaxed);
+    const std::uint32_t was_a = g_ppad_take_axes.exchange(axes, std::memory_order_relaxed);
+    if (was_b != buttons || was_a != axes)
+        host_log("pad: a plugin takes buttons %05x and axes %x from the game (was %05x, %x)", buttons, axes, was_b, was_a);
+}
+
+std::uint32_t host_plugin_pad_taken_buttons() { return g_ppad_take_buttons.load(std::memory_order_relaxed); }
+std::uint32_t host_plugin_pad_taken_axes() { return g_ppad_take_axes.load(std::memory_order_relaxed); }
+
+void host_plugin_pad_test(std::uint32_t buttons, std::uint8_t lx, std::uint8_t ly, std::uint8_t rx, std::uint8_t ry) {
+    std::lock_guard<std::mutex> lock(g_ppad_mu);
+    g_ppad_test.buttons = buttons;
+    g_ppad_test.lx = lx;
+    g_ppad_test.ly = ly;
+    g_ppad_test.rx = rx;
+    g_ppad_test.ry = ry;
+    if (buttons || lx != kStickRest || ly != kStickRest || rx != kStickRest || ry != kStickRest) g_ppad_test.connected = true;
+    ppad_latch_locked();
 }
 
 std::uint32_t host_plugin_taken_buttons() { return g_take_buttons.load(std::memory_order_relaxed); }

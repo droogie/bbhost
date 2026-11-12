@@ -1,8 +1,9 @@
-/* The plugin API's version 28 structures as a C compiler lays them out - the
+/* The plugin API's version 29 structures as a C compiler lays them out - the
  * layout plugins are built against, which a host may append to and never
  * move: their sizes, the places of the fields read most, and the API table's
  * version 27 calls right after version 26's camera_zoom - the frame's three,
- * then the shaders' five, followed by version 28's camera target hook.
+ * then the shaders' five, followed by version 28's camera target hook and
+ * version 29's world pause, controller and world state.
  * Built as C99, so the header stays C. */
 #include "bbhost_plugin.h"
 
@@ -42,7 +43,21 @@ _Static_assert(offsetof(BbHostApi, shader_state) == offsetof(BbHostApi, shader_f
 _Static_assert(offsetof(BbHostApi, shader_source) == offsetof(BbHostApi, shader_state) + sizeof(void*), "shader_source after shader_state");
 _Static_assert(offsetof(BbHostApi, shader_data) == offsetof(BbHostApi, shader_source) + sizeof(void*), "shader_data after shader_source");
 _Static_assert(offsetof(BbHostApi, on_camera_target) == offsetof(BbHostApi, shader_data) + sizeof(void*), "on_camera_target after shader_data");
-_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, on_camera_target) + sizeof(void*), "on_camera_target ends the API table");
+_Static_assert(offsetof(BbHostApi, world_pause) == offsetof(BbHostApi, on_camera_target) + sizeof(void*), "world_pause after on_camera_target");
+_Static_assert(offsetof(BbHostApi, world_step) == offsetof(BbHostApi, world_pause) + sizeof(void*), "world_step after world_pause");
+_Static_assert(offsetof(BbHostApi, pad) == offsetof(BbHostApi, world_step) + sizeof(void*), "pad after world_step");
+_Static_assert(offsetof(BbHostApi, pad_take) == offsetof(BbHostApi, pad) + sizeof(void*), "pad_take after pad");
+_Static_assert(offsetof(BbHostApi, world_state) == offsetof(BbHostApi, pad_take) + sizeof(void*), "world_state after pad_take");
+_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, world_state) + sizeof(void*), "world_state ends the API table");
+_Static_assert(sizeof(BbPad) == 40, "BbPad");
+_Static_assert(offsetof(BbPad, pressed) == 8 && offsetof(BbPad, connected) == 12, "BbPad's presses");
+_Static_assert(offsetof(BbPad, lx) == 16 && offsetof(BbPad, r2) == 36, "BbPad's axes");
+_Static_assert(sizeof(BbWorldState) == 20, "BbWorldState");
+_Static_assert(offsetof(BbWorldState, others) == 8 && offsetof(BbWorldState, session) == 16, "BbWorldState's fields");
+_Static_assert(BB_PAD_CROSS == 0x4000u && BB_PAD_CIRCLE == 0x2000u && BB_PAD_L1 == 0x400u && BB_PAD_R1 == 0x800u &&
+                   BB_PAD_L3 == 0x2u && BB_PAD_R3 == 0x4u && BB_PAD_OPTIONS == 0x8u && BB_PAD_TOUCHPAD == 0x100000u,
+               "the controller's buttons");
+_Static_assert(BB_SESSION_NONE == 0 && BB_SESSION_HOST == 3 && BB_SESSION_GUEST == 6 && BB_SESSION_LEAVING == 7, "the session roles");
 _Static_assert(BB_SHADER_NONE == 0 && BB_SHADER_WAITING == 1 && BB_SHADER_TAKEN == 2 && BB_SHADER_REFUSED == 3 && BB_SHADER_SHADOWED == 4 &&
                    BB_SHADER_OFF == 5,
                "shader_state's values");
@@ -50,5 +65,5 @@ _Static_assert(BB_SHADER_DATA_BYTES == 65536u, "a plugin's shader data");
 
 int main(void) {
     printf("plugin_abi_test: version %d's structures as plugins see them\n", BB_PLUGIN_API_VERSION);
-    return BB_PLUGIN_API_VERSION >= 28 ? 0 : 1;
+    return BB_PLUGIN_API_VERSION >= 29 ? 0 : 1;
 }

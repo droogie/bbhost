@@ -21,6 +21,7 @@ constexpr std::uint64_t kNowLoadingHelper = 0x593e8b8;     // CSNowLoadingHelper
 // load it follows keeps the cap.
 constexpr std::uint64_t kSprjRemo = 0x5940058;
 std::atomic<bool> g_fast{false};
+std::atomic<bool> g_cutscene{false};
 const bool g_fast_enabled = [] {
     const char* e = std::getenv("BBHOST_FAST_LOADING");
     return !(e && e[0] == '0');
@@ -48,6 +49,7 @@ void loading_bind(std::uint64_t slide) {
 bool loading_screen_up() { return g_loading.load(std::memory_order_relaxed); }
 bool loading_in_world() { return g_in_world.load(std::memory_order_relaxed); }
 bool loading_fast_now() { return g_fast.load(std::memory_order_relaxed); }
+bool loading_cutscene() { return g_cutscene.load(std::memory_order_relaxed); }
 
 void loading_tick(std::uint64_t flip) {
     if (!g_slide) return;
@@ -68,6 +70,7 @@ void loading_tick(std::uint64_t flip) {
             cutscene = (at<std::uint32_t>(man + 0x168) & 1) != 0 || at<std::uint64_t>(man + 0xf8) != 0;
         }
     }
+    g_cutscene.store(cutscene, std::memory_order_relaxed);
     const bool fast = g_fast_enabled && loading && !cutscene && frame_rate_converted();  // every converted rate
     if (g_fast.exchange(fast, std::memory_order_relaxed) != fast) hle_video_set_loading_uncapped(fast);
     if (loading && !was) {

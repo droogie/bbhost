@@ -145,6 +145,7 @@ add_executable(bbhost
   src/engine/live_resolution.cpp
   src/engine/render_scale.cpp
   src/engine/loading.cpp
+  src/engine/world_pause.cpp
   src/engine/camera.cpp
   src/engine/mouse_camera.cpp
   src/engine/mouse_camera_stubs.cpp
@@ -750,6 +751,12 @@ if(UNIX)
   add_dependencies(mapval_probe_test mapval_probe)
   add_test(NAME mapval_probe_test COMMAND mapval_probe_test $<TARGET_FILE:mapval_probe>)
   set_tests_properties(mapval_probe_test PROPERTIES SKIP_RETURN_CODE 77)
+  # Plugin API 29's world_pause, world_step, pad, pad_take and world_state in a
+  # running game, for a harness (tools/api29_probe.c). Built beside the tests,
+  # never into plugins/, where bbhost would load it.
+  add_library(api29_probe MODULE tools/api29_probe.c)
+  target_include_directories(api29_probe PRIVATE include)
+  set_target_properties(api29_probe PROPERTIES PREFIX "")
   # The boss rush plugin's travel and fog warp on a pretend host whose loads
   # are slow (plugins/boss_rush): nothing moves the player inside a loading
   # screen, and only a travel that truly fails stops the run.

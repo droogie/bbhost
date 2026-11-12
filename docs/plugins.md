@@ -82,7 +82,7 @@ log line. Everything a plugin logs is prefixed with `plugin:`.
 
 The API only ever grows. A plugin checks that `api->version` is at least the
 version whose calls it makes, and `api->size` for fields a newer host
-appended. The current version is 28 (`BB_PLUGIN_API_VERSION`).
+appended. The current version is 29 (`BB_PLUGIN_API_VERSION`).
 
 ## Addresses
 
@@ -190,6 +190,46 @@ gives the Binary Ninja address.
   camera this way; where the game's own follow camera runs instead of the
   recompiled one, a plugin still needs its own camera hooks. One plugin owns
   it: 1 outside image setup, for NULL, or once taken; 0 otherwise.
+
+**The world held still, the controller, and who else is in the world** (v29)
+
+What a photo mode needs: the world stopped while its own camera flies, the
+controller read as the plugin's own while the game reads none of what it
+takes, and a way to know that nobody else is in the world.
+
+- `world_pause(name, paused)`: holds the world - its characters, physics, AI,
+  events, effects and cloth - while frames go on being drawn and `on_view`
+  goes on being called. It is the game's own pause, the one it holds while it
+  leaves a world, taken at the world's next update. `name` is the plugin's
+  `BbPluginInfo` name; the world is held while any plugin asks. A load lets
+  every hold go, so a world never starts held, and so does turning the plugin
+  off. `set_time_scale` cannot do this: it stops at 0.1, and at frame rates
+  above 30 what the game counts in frames keeps real time.
+- `world_step(name, updates)`: while the plugin holds the world, that many
+  more updates run, one a frame, and then it is held again - a frame advance.
+- `pad(&pad)`: the controller as `BbPad` (set `pad.size` first): its own
+  buttons as `BB_PAD_*` bits, whatever the player's bindings make of them in
+  play, the sticks from -1 to 1 with the player's dead zones applied, the
+  triggers from 0 to 1, and the presses since the last read, latched so that
+  a press shorter than a frame still counts. One reader, from the main
+  thread. While bbhost's own menus, a binding being chosen or a text box have
+  the controller, nothing reads as held. A test's taps (`BBHOST_AUTOPRESS`,
+  the `tap` request) count as the controller's.
+- `pad_take(buttons, axes)`: the game reads those buttons let go and those
+  axes (`BB_PAD_LEFT_STICK`, `BB_PAD_RIGHT_STICK`, `BB_PAD_TRIGGERS`) at rest -
+  whatever they are bound to in play is not pressed - while `pad` still reads
+  them. Keys stay `input_take`'s. A call replaces the last; `0, 0` gives
+  everything back.
+- `world_state(&state)`: `BbWorldState` (set `state.size` first). `flags`:
+  `BB_WORLD_IN` (a world is loaded and running, or held), `BB_WORLD_LOADING`,
+  `BB_WORLD_CUTSCENE` (one plays or is queued), `BB_WORLD_MENU` (one of the
+  game's menus or dialogs has the controls), `BB_WORLD_PAUSED` (a plugin holds
+  the world), `BB_WORLD_VISITING` (the player is in another player's world or
+  on the way there) and `BB_WORLD_OPEN` (the player's world is open to others:
+  a sign or a bell is up, or others are in it). `others`: other players'
+  characters in this world now - co-operators, invaders, the host one visits.
+  `arriving`: players on their way in, members of the world's session who are
+  not in it yet. `session`: the game's own session role (`BB_SESSION_*`).
 
 **Settings, UI and files**
 

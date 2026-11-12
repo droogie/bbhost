@@ -134,6 +134,31 @@ bool host_plugin_input(PluginInput& out);
 // `wheel`, and the mouse no longer turns the game's camera when `motion`. A
 // call replaces the last; nothing taken gives everything back.
 void host_plugin_input_take(const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, bool wheel, bool motion);
+// The controller as a plugin reads it (plugin API 29's pad): its own buttons
+// (BB_PAD_* bits - the menus' bits, whatever the bindings make of them in
+// play), sticks and triggers as the last pad update saw them, before
+// host_plugin_pad_take takes any, and the presses since the last call - one
+// reader. Nothing held while bbhost's menus, a binding capture or a text box
+// have the controller. A test's taps join it (host_plugin_pad_test).
+struct PluginPad {
+    std::uint32_t buttons = 0, pressed = 0;
+    std::uint8_t lx = kStickRest, ly = kStickRest, rx = kStickRest, ry = kStickRest;
+    std::uint8_t l2 = 0, r2 = 0;
+    bool connected = false;
+};
+void host_plugin_pad(PluginPad& out);
+// What a plugin takes from the game (plugin API 29's pad_take): those buttons
+// read let go, those sticks centred and the triggers at rest - the press
+// they are bound to in play never made. A call replaces the last.
+constexpr std::uint32_t kPadTakeLeftStick = 1, kPadTakeRightStick = 2, kPadTakeTriggers = 4;
+void host_plugin_pad_take(std::uint32_t buttons, std::uint32_t axes);
+std::uint32_t host_plugin_pad_taken_buttons();
+std::uint32_t host_plugin_pad_taken_axes();
+// A test's presses (the pad read's taps and BBHOST_AUTOPRESS, which stand for
+// the controller): `buttons` held and the sticks they hold over (kStickRest
+// where they hold none), joined to the plugin's view of the controller.
+void host_plugin_pad_test(std::uint32_t buttons, std::uint8_t lx, std::uint8_t ly, std::uint8_t rx, std::uint8_t ry);
+
 // For the pad read (hle/system.cpp).
 std::uint32_t host_plugin_taken_buttons();
 bool host_plugin_taken_wheel();

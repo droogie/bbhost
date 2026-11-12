@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 28.
+/* bbhost plugin API, version 29.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 28
+#define BB_PLUGIN_API_VERSION 29
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -356,6 +356,66 @@ typedef void (*BbRenderFn)(const BbRenderCall* call, void* user);
 #define BB_AA_TAKE 2   /* the plugin does it: while it is on, bbhost moves no draws (no jitter) and runs no TAA, FSR or
                           DLSS nor the game's own anti-aliasing pass, and draws the 3D at the Resolution, as with
                           Upscaling Off; the menus name the plugin */
+
+/* Version 29: the controller as a plugin with controls of its own reads it
+ * (pad) - its own buttons, sticks and triggers, whatever the player's bindings
+ * make of them in the game - and what it takes from the game (pad_take). */
+#define BB_PAD_L3 0x0002u
+#define BB_PAD_R3 0x0004u
+#define BB_PAD_OPTIONS 0x0008u
+#define BB_PAD_UP 0x0010u
+#define BB_PAD_RIGHT 0x0020u
+#define BB_PAD_DOWN 0x0040u
+#define BB_PAD_LEFT 0x0080u
+#define BB_PAD_L2 0x0100u        /* the trigger past a quarter of its travel */
+#define BB_PAD_R2 0x0200u
+#define BB_PAD_L1 0x0400u
+#define BB_PAD_R1 0x0800u
+#define BB_PAD_TRIANGLE 0x1000u
+#define BB_PAD_CIRCLE 0x2000u
+#define BB_PAD_CROSS 0x4000u
+#define BB_PAD_SQUARE 0x8000u
+#define BB_PAD_TOUCHPAD 0x100000u /* the touchpad's press, or a controller's Back (Select, Share) */
+#define BB_PAD_LEFT_STICK 1u     /* pad_take's axes */
+#define BB_PAD_RIGHT_STICK 2u
+#define BB_PAD_TRIGGERS 4u       /* L2's and R2's travel (their presses are BB_PAD_L2 and BB_PAD_R2) */
+
+typedef struct BbPad {
+    uint32_t size;        /* set to sizeof(BbPad) before the call: the host fills as much as both know */
+    uint32_t buttons;     /* BB_PAD_* held */
+    uint32_t pressed;     /* BB_PAD_* that went down since the last read - latched, so a press shorter than a
+                             frame is still seen */
+    int32_t connected;    /* 1 while a controller is there */
+    float lx, ly, rx, ry; /* the sticks, -1..1, right and down positive, the player's dead zones applied */
+    float l2, r2;         /* the triggers' travel, 0..1 */
+} BbPad;
+
+/* Version 29: what the world is doing and who else is in it (world_state). */
+#define BB_WORLD_IN 1u         /* a world is loaded and running - or held by world_pause */
+#define BB_WORLD_LOADING 2u    /* a loading screen is up */
+#define BB_WORLD_CUTSCENE 4u   /* a cutscene plays, or one is queued */
+#define BB_WORLD_MENU 8u       /* one of the game's menus or dialogs has the controls */
+#define BB_WORLD_PAUSED 16u    /* world_pause holds the world (any plugin's) */
+#define BB_WORLD_VISITING 32u  /* the player is in another player's world, or on the way there */
+#define BB_WORLD_OPEN 64u      /* the player's world is open to others: a sign or a bell is up, or others are in it */
+
+/* BbWorldState.session: the game's own session role. */
+#define BB_SESSION_NONE 0
+#define BB_SESSION_HOSTING 1       /* the world being opened to others (a bell rung, a sign seen) */
+#define BB_SESSION_HOST_FAILED 2
+#define BB_SESSION_HOST 3          /* the world's own session, others in it or let in */
+#define BB_SESSION_JOINING 4       /* on the way into another player's world */
+#define BB_SESSION_JOIN_FAILED 5
+#define BB_SESSION_GUEST 6         /* in another player's world */
+#define BB_SESSION_LEAVING 7
+
+typedef struct BbWorldState {
+    uint32_t size;      /* set to sizeof(BbWorldState) before the call: the host fills as much as both know */
+    uint32_t flags;     /* BB_WORLD_* */
+    uint32_t others;    /* other players' characters in this world now: co-operators, invaders, the host one visits */
+    uint32_t arriving;  /* players on their way in: members of the world's session who are not in it yet */
+    int32_t session;    /* BB_SESSION_* */
+} BbWorldState;
 
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
@@ -883,6 +943,41 @@ typedef struct BbHostApi {
      * Native-camera builds still require the plugin's native camera hooks.
      * 0 on success; 1 outside image setup, for NULL, or if already owned. */
     int (*on_camera_target)(void* (*fn)(void* character, void* user), void* user);
+
+    /* Version 29: the world held still, the controller, and who else is in
+     * the world (a photo mode's). */
+    /* The world held still - its characters, physics, AI, events, effects and
+     * cloth - while frames go on being drawn and on_view goes on being called:
+     * the game's own pause, the one it holds while it leaves a world. `paused`
+     * 1 asks for it for the plugin named `name` (its BbPluginInfo name), 0 lets
+     * it go; the world is held while any plugin asks. It takes hold at the
+     * world's next update. A load lets every hold go (a new world starts
+     * running), and so does the plugin being turned off. Any thread. 0 on
+     * success; 1 for another eboot or an unknown plugin. */
+    int (*world_pause)(const char* name, int paused);
+    /* While the plugin holds the world: `updates` more of its updates run, one
+     * a frame, and then it is held again (a frame advance). A later call adds
+     * to what is left. Any thread. 0 on success; 1 when the plugin holds no
+     * pause. */
+    int (*world_step)(const char* name, uint32_t updates);
+    /* The controller, into *out (set out->size first): its own buttons and
+     * sticks - the dead zones applied, the player's key bindings not - pressed
+     * or not, as the game would read them before pad_take takes any; a test's
+     * taps (BBHOST_AUTOPRESS, the "tap" request) count as the controller's. One
+     * reader: the presses are the caller's once read. While bbhost's own menus
+     * or a text box have the controller it reads nothing held. Main thread. 0
+     * on success; 1 for a size under 8. */
+    int (*pad)(BbPad* out);
+    /* Takes the controller's buttons (BB_PAD_*) and axes (BB_PAD_LEFT_STICK,
+     * BB_PAD_RIGHT_STICK, BB_PAD_TRIGGERS) from the game: the game reads them
+     * let go and at rest - whatever they are bound to in play is not pressed -
+     * while pad still reads them. Keys are input_take's. A call replaces the last;
+     * 0, 0 gives everything back. Any thread. 0 on success. */
+    int (*pad_take)(uint32_t buttons, uint32_t axes);
+    /* What the world is doing and who else is in it (BbWorldState), into *out
+     * (set out->size first). Main thread. 0 on success; 1 for another eboot or
+     * a size under 8. */
+    int (*world_state)(BbWorldState* out);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

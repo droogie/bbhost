@@ -23,6 +23,8 @@
 #include "engine/world_chr.h"
 #include "engine/lua_events.h"
 #include "engine/loading.h"
+#include "engine/menu_pointer.h"
+#include "engine/world_pause.h"
 #include "engine/paramdef.h"
 #include "engine/params.h"
 #include "engine/patch_manifest.h"
@@ -1475,6 +1477,115 @@ void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
                   static_cast<double>(lowpass_hz));
 }
 
+// Version 29: the world held still, the controller, and who else is in the
+// world.
+bool plugin_named(const char* name) {
+    if (!name || !name[0]) return false;
+    for (const Plugin& p : g_plugins) {
+        if (p.name == name && !p.visitor) return true;
+    }
+    return false;
+}
+
+int api_world_pause(const char* name, int paused) {
+    if (!g_image || !api_eboot_is_109() || !plugin_named(name)) return 1;
+    return world_pause_set(name, paused != 0) ? 0 : 1;
+}
+
+int api_world_step(const char* name, std::uint32_t updates) {
+    if (!plugin_named(name)) return 1;
+    return world_pause_step(name, updates) ? 0 : 1;
+}
+
+int api_pad(BbPad* out) {
+    if (!out || out->size < 8) return 1;
+    PluginPad pad;
+    host_plugin_pad(pad);
+    const auto axis = [](std::uint8_t v) {
+        return std::clamp((static_cast<float>(v) - static_cast<float>(kStickRest)) / 127.0f, -1.0f, 1.0f);
+    };
+    BbPad o{};
+    o.buttons = pad.buttons;
+    o.pressed = pad.pressed;
+    o.connected = pad.connected ? 1 : 0;
+    o.lx = axis(pad.lx);
+    o.ly = axis(pad.ly);
+    o.rx = axis(pad.rx);
+    o.ry = axis(pad.ry);
+    o.l2 = static_cast<float>(pad.l2) / 255.0f;
+    o.r2 = static_cast<float>(pad.r2) / 255.0f;
+    o.size = std::min<std::uint32_t>(out->size, sizeof(BbPad));
+    std::memcpy(out, &o, o.size);
+    return 0;
+}
+
+int api_pad_take(std::uint32_t buttons, std::uint32_t axes) {
+    static_assert(BB_PAD_LEFT_STICK == kPadTakeLeftStick && BB_PAD_RIGHT_STICK == kPadTakeRightStick &&
+                      BB_PAD_TRIGGERS == kPadTakeTriggers,
+                  "pad_take's axes");
+    host_plugin_pad_take(buttons, axes & (BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS));
+    return 0;
+}
+
+// Other players' characters in this world: the player set's entries after the
+// main player's (WorldChrMan +0x30: the local player, then up to four remote
+// ones, bbhost/engine/sprj/world_chr_man.hpp), each a character still there.
+std::uint32_t other_players() {
+    const std::uint64_t man = world_chr_man();
+    const std::uint64_t main = man ? rp(man + 0x60) : 0;
+    if (!main) return 0;
+    std::uint32_t cap = 0;
+    const std::uint64_t entries = rp(man + 0x38);
+    if (!entries || !rd(man + 0x30, &cap) || cap > 16) return 0;
+    std::uint32_t n = 0;
+    for (std::uint32_t k = 0; k < cap; ++k) {
+        const std::uint64_t ins = rp(entries + k * 0x38);
+        if (ins && ins != main && rp(ins)) ++n;
+    }
+    return n;
+}
+
+// The session's members besides the player: SprjSessionManager's route
+// configurations (+0xf0, one a member, 0x20 bytes each - the in-game update's
+// own "two or more" test at its start reads them) less one.
+std::uint32_t session_members(std::uint64_t sm) {
+    const std::uint64_t begin = rp(sm + 0xf8), end = rp(sm + 0x100);
+    if (!begin || end < begin || (end - begin) % 0x20 || (end - begin) > 0x20 * 16) return 0;
+    const std::uint32_t routes = static_cast<std::uint32_t>((end - begin) / 0x20);
+    return routes > 1 ? routes - 1 : 0;
+}
+
+int api_world_state(BbWorldState* out) {
+    if (!out || out->size < 8 || !g_image || !api_eboot_is_109()) return 1;
+    BbWorldState w{};
+    if (loading_in_world()) w.flags |= BB_WORLD_IN;
+    if (loading_screen_up()) w.flags |= BB_WORLD_LOADING;
+    if (loading_cutscene()) w.flags |= BB_WORLD_CUTSCENE;
+    if (menu_pointer_in_menu()) w.flags |= BB_WORLD_MENU;
+    if (world_pause_held()) w.flags |= BB_WORLD_PAUSED;
+    w.others = other_players();
+    std::uint32_t members = 0;
+    if (const std::uint64_t sm = rp(runtime_of(bb::SPRJ_SESSION_MANAGER_SINGLETON_PTR.bn(), 8))) {
+        std::int32_t role = 0;
+        if (rd(sm + 0x124, &role) && role >= BB_SESSION_NONE && role <= BB_SESSION_LEAVING) w.session = role;
+        members = session_members(sm);
+    }
+    if (w.session == BB_SESSION_JOINING || w.session == BB_SESSION_GUEST) w.flags |= BB_WORLD_VISITING;
+    if (w.session == BB_SESSION_HOSTING || w.session == BB_SESSION_HOST || w.others) w.flags |= BB_WORLD_OPEN;
+    w.arriving = members > w.others ? members - w.others : 0;
+    // Logged as who else is in the world changes (the menus, loads and cutscenes
+    // come and go too often to log each).
+    static BbWorldState logged{};
+    if (w.others != logged.others || w.arriving != logged.arriving || w.session != logged.session) {
+        host_log("plugin: world state: session %d, %u other player(s), %u arriving (flags %x)", w.session, w.others, w.arriving,
+                 w.flags);
+        logged = w;
+    }
+    w.size = std::min<std::uint32_t>(out->size, sizeof(BbWorldState));
+    std::memcpy(out, &w, w.size);
+    return 0;
+}
+
 const BbHostApi g_api = {
     BB_PLUGIN_API_VERSION, sizeof(BbHostApi), &api_log, &api_config, &api_data_dir, &api_mods_dir, &api_register_hle,
     &api_eboot_sha256, &api_eboot_is_109, &api_guest_addr, &api_read, &api_write, &api_patch, &api_hook,
@@ -1506,6 +1617,7 @@ const BbHostApi g_api = {
     &api_aa_claim,
     &api_shader_override, &api_shader_folder, &api_shader_state, &api_shader_source, &api_shader_data,
     &api_on_camera_target,
+    &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state,
 };
 
 std::string read_file(const std::string& path) {
@@ -1736,6 +1848,7 @@ void plugins_load() {
 void plugins_image(ElfImage* image) {
     g_image = image;
     if (!g_plugins.empty() && api_eboot_is_109()) {
+        world_pause_install(image);  // plugin API 29's world_pause
         static const std::uint8_t prologue[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
                                                   0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28};
         if (api_hook2(0x18235e0, prologue, sizeof(prologue), &layout_request_hook, nullptr) != 0)
@@ -1808,6 +1921,7 @@ void plugins_frame() {
                 p.dormant = !on;
                 gpu::overrides_owner_on(p.shader_owner, on);  // its shader overrides with it
             }
+            if (!on) world_pause_drop(r.name);  // and its hold on the world
             host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
             if (render_hooks_plugin_on(r.name, on)) republish_settings();
             aa_update();
