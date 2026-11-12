@@ -21,6 +21,7 @@
 #include "host/plugins.h"
 #include "host/scene_look.h"
 #include "host/settings.h"
+#include "host/shader_patch.h"
 #include "host/upscaler.h"
 #include "host/window.h"
 #include "log.h"
@@ -224,6 +225,42 @@ constexpr std::size_t kDofEnable = 0x1ac;
 std::uint8_t* g_post_block = nullptr;
 std::atomic<float> g_bloom{1.0f}, g_saturation{1.0f};
 std::atomic<bool> g_vignette{true}, g_dof{true};
+
+// A plugin's look (plugin API 29's post_look, graphics_look_set): the fields
+// it writes in the block, each a 4-byte cell, as YEBIS's apply (sub_25d5f80)
+// hands them to the post effect's setters (decomp/yebis/ppfx_setters.cpp):
+//
+//   +0x50  auto exposure on; +0x54 its middle grey (0..1: what the eye
+//          adaptation brings the scene's luminance to;
+//          SetAutoExposureMiddleGray)
+//   +0x98  the exposure while auto exposure is off (with it on, the apply
+//          writes the adapted one there itself); +0x9c gamma (both
+//          SetTonemapParameters)
+//   +0xc8  saturation, +0xcc value ("Yebis-ColorS", "-ColorV"), +0x248
+//          contrast ("-Contrust"): colour-matrix multiplies, skipped at 1
+//   +0xd0  the vignette's power (ppfx_sub_fb3670, with +0xd4)
+//   +0xac  chromatic aberration on (1.0 where an area's lens has it -
+//          Central Yharnam's has not; SetChromaticAberrationEnable),
+//          +0xb4/+0xb8 its lateral and +0xbc/+0xc0 its uniform dispersion
+//   +0x1ac depth of field on (the cmp before the je at 0x25d7bbc), +0x188
+//          its auto focus (0: the focus distance below), +0x1b0 the focus
+//          distance, +0x1b4 the aperture (an f-number), +0x1d0 and +0x1d4 the
+//          blur's levels in front of and behind the focus
+//   +0x1dc motion blur on (SetMotionBlurEnable), +0x1e4 and +0x1e8 its two
+//          times, +0x1ec its sample count (an int), +0x350 what the apply
+//          multiplies +0x1e8 by into the camera blur's amount
+constexpr std::size_t kAutoExposure = 0x50, kMiddleGrey = 0x54, kExposure = 0x98, kGamma = 0x9c, kValue = 0xcc,
+                      kContrast = 0x248;
+constexpr std::size_t kAberration = 0xac, kAberrationDispersion = 0xb4;
+// kDofOn is the setting's switch (kDofEnable): the look writes it after the
+// setting's Off has cleared it, so the look's depth of field wins either way.
+constexpr std::size_t kDofAuto = 0x188, kDofOn = kDofEnable, kDofFocus = 0x1b0, kDofAperture = 0x1b4, kDofNear = 0x1d0,
+                      kDofFar = 0x1d4;
+constexpr std::size_t kBlurOn = 0x1dc, kBlurTime = 0x1e4, kBlurLength = 0x1e8, kBlurSamples = 0x1ec, kBlurScale = 0x350;
+std::mutex g_look_mu;
+GraphicsLook g_look;                       // under g_look_mu
+std::atomic<std::uint32_t> g_look_set{0};  // its groups: one load a view while there is none
+std::atomic<bool> g_look_logged{true};     // the area's own values logged since the look changed
 
 // Ambient occlusion strength. The SSAO bank (+0x5968) is blended the same way
 // (sub_1285500, into a 0x6c-byte block) and copied into the SSAO object the
@@ -457,6 +494,23 @@ void graphics_ssr_live_in() {
 
 namespace {
 
+// Motion blur's velocity switch (motion_blur_apply): the setting's, unless a
+// plugin's look sets motion blur on or off (graphics_look_set). Called from
+// the settings' thread and the look's, one at a time.
+std::atomic<bool> g_blur_setting{true};
+std::atomic<int> g_blur_look{-1};
+void blur_update() {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    static bool was = true;  // the constructor's own
+    const int look = g_blur_look.load(std::memory_order_relaxed);
+    const bool want = look >= 0 ? look != 0 : g_blur_setting.load(std::memory_order_relaxed);
+    if (want != was) {
+        was = want;
+        motion_blur_apply(want);
+    }
+}
+
 // The settings' listener (host_settings_listen, from live_install): told each
 // change once, on the thread that made it (the store calls its listeners one
 // at a time), it keeps the values the hooks below apply - the hooks read these
@@ -502,13 +556,9 @@ void settings_changed(const HostSettings& hs) {
     g_ssr_off.store(!hs.ssr, std::memory_order_relaxed);
     g_dyn_shadows_off.store(!hs.dynamic_shadows || hs.performance_mode, std::memory_order_relaxed);
     // Performance mode's blur off (its velocity map kept for the upscaler).
-    static bool blur_was = true;
     // Rebuilt motion vectors hold what the blur cannot read: it goes too.
-    const bool blur = hs.motion_blur && !hs.performance_mode && !host_opt_motion_rebuilt_bits();
-    if (blur != blur_was) {
-        blur_was = blur;
-        motion_blur_apply(blur);
-    }
+    g_blur_setting.store(hs.motion_blur && !hs.performance_mode && !host_opt_motion_rebuilt_bits());
+    blur_update();
     set_chromatic_aberration(hs.chromatic_aberration && !hs.performance_mode);
     g_bloom.store(hs.bloom);
     g_saturation.store(hs.saturation);
@@ -662,6 +712,83 @@ void log_glare(float glare, float power, float bloom, bool vignette) {
     l.skipped = skipped;
 }
 
+int yebis_dof_ready();  // below, beside the slide they read
+int yebis_dof_on();
+
+// A plugin's look over this view's block (graphics_look_set), after the
+// settings: the area's numbers times its factors, or its own where it sets
+// them.
+void apply_look(std::uint8_t* b) {
+    GraphicsLook l;
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        l = g_look;
+    }
+    const auto getf = [b](std::size_t at) {
+        float v = 0;
+        std::memcpy(&v, b + at, 4);
+        return v;
+    };
+    const auto geti = [b](std::size_t at) {
+        std::int32_t v = 0;
+        std::memcpy(&v, b + at, 4);
+        return v;
+    };
+    const auto setf = [b](std::size_t at, float v) { std::memcpy(b + at, &v, 4); };
+    const auto seti = [b](std::size_t at, std::int32_t v) { std::memcpy(b + at, &v, 4); };
+    if (!g_look_logged.exchange(true)) {
+        host_log("graphics: a look over the area's exposure %g (auto %d, middle grey %g), gamma %g, saturation %g, value %g, "
+                 "contrast %g, vignette %g; aberration %g (%g %g, %g %g); depth of field %d (auto focus %d, focus %g, aperture "
+                 "%g, levels %d %d; the post effect's part %d, on %d); motion blur %d (%g %g, %d samples, scale %g)",
+                 getf(kExposure), geti(kAutoExposure), getf(kMiddleGrey), getf(kGamma), getf(kSaturation), getf(kValue),
+                 getf(kContrast), getf(kVignettePower), getf(kAberration), getf(kAberrationDispersion),
+                 getf(kAberrationDispersion + 4), getf(kAberrationDispersion + 8), getf(kAberrationDispersion + 12),
+                 geti(kDofOn), geti(kDofAuto), getf(kDofFocus), getf(kDofAperture), geti(kDofNear), geti(kDofFar),
+                 yebis_dof_ready(), yebis_dof_on(), geti(kBlurOn), getf(kBlurTime), getf(kBlurLength), geti(kBlurSamples),
+                 getf(kBlurScale));
+    }
+    if (l.set & kLookTone) {
+        // The exposure: the adapted one's target with auto exposure on (the
+        // middle grey, which SetAutoExposureMiddleGray keeps inside 0..1),
+        // the fixed one with it off.
+        if (geti(kAutoExposure) != 0)
+            setf(kMiddleGrey, std::clamp(getf(kMiddleGrey) * l.exposure, 0.001f, 0.999f));
+        else
+            setf(kExposure, getf(kExposure) * l.exposure);
+        setf(kGamma, getf(kGamma) * l.gamma);
+        setf(kSaturation, getf(kSaturation) * l.saturation);
+        setf(kValue, getf(kValue) * l.brightness);
+        setf(kContrast, getf(kContrast) * l.contrast);
+    }
+    if (l.set & kLookVignette) setf(kVignettePower, l.vignette);
+    if (l.set & kLookAberration) {
+        setf(kAberration, l.aberration ? 1.0f : 0.0f);
+        setf(kAberrationDispersion, l.lateral[0]);
+        setf(kAberrationDispersion + 4, l.lateral[1]);
+        setf(kAberrationDispersion + 8, l.uniform[0]);
+        setf(kAberrationDispersion + 12, l.uniform[1]);
+    }
+    if (l.set & kLookDof) {
+        seti(kDofOn, l.dof ? 1 : 0);
+        if (l.dof) {
+            seti(kDofAuto, 0);
+            setf(kDofFocus, l.dof_focus);
+            setf(kDofAperture, l.dof_aperture);
+            seti(kDofNear, l.dof_near_levels);
+            seti(kDofFar, l.dof_far_levels);
+        }
+    }
+    if (l.set & kLookMotionBlur) {
+        seti(kBlurOn, l.motion_blur ? 1 : 0);
+        if (l.motion_blur) {
+            setf(kBlurTime, l.blur_time);
+            setf(kBlurLength, l.blur_length);
+            seti(kBlurSamples, l.blur_samples);
+            setf(kBlurScale, l.blur_scale);
+        }
+    }
+}
+
 // sub_25d4860's entry: the YEBIS object in rdi.
 GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* saved) {
     const auto* yebis = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5]));
@@ -697,6 +824,7 @@ GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* sav
     for (int i = 0; i < g_post_poke.n; ++i) {
         std::memcpy(g_post_block + g_post_poke.off[i], &g_post_poke.value[i], 4);
     }
+    if (g_look_set.load(std::memory_order_acquire)) apply_look(g_post_block);
     return 0;
 }
 
@@ -736,6 +864,25 @@ const BankLookup kBanks[12] = {
     {0x59c0, 0x1274bd0, 0x2ad0, 0x2b38, 0x2b74, 0x1f0}, {0x59c8, 0x127dad0, 0x2ad8, 0x2b40, 0x2b78, 0x1c0},
 };
 std::uint64_t g_slide = 0;
+
+// YEBIS's post effect (s_pSinglePostEffect) and its +0x140 byte: depth of
+// field's part made at its initialisation. Without it the effect's setters
+// keep the pass off whatever they are handed (sub_fd2a90 writes its enable
+// byte, +0x940, only while it is set).
+constexpr std::uint64_t kSinglePostEffect = 0x5865ed0;
+constexpr std::size_t kEffectDofReady = 0x140, kEffectDofOn = 0x940;
+std::uint64_t yebis_effect() {
+    std::uint64_t effect = 0;
+    if (g_slide)
+        std::memcpy(&effect, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_slide + (kSinglePostEffect - kPreferredGuestSlide))), 8);
+    return effect;
+}
+int yebis_effect_byte(std::size_t at) {  // -1 before the effect is made
+    const std::uint64_t effect = yebis_effect();
+    return effect ? *reinterpret_cast<const volatile std::uint8_t*>(static_cast<std::uintptr_t>(effect + at)) : -1;
+}
+int yebis_dof_ready() { return yebis_effect_byte(kEffectDofReady) > 0 ? 1 : yebis_effect_byte(kEffectDofReady); }
+int yebis_dof_on() { return yebis_effect_byte(kEffectDofOn); }  // as the last view's apply left it
 
 // BBHOST_DRAWPARAM_POKE=<bank>:<offset>:<float>:<expect>: write that float
 // into both entries a view asks that bank for, every view - to see whether a
@@ -903,7 +1050,13 @@ void drawparam_probe(const std::uint8_t* mgr, const std::uint8_t* r) {
 // written.
 GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved) {
     const float k = g_fog.load(std::memory_order_relaxed);
-    if (k == 1.0f && g_fog_test.n == 0) return 0;
+    GraphicsLook look;
+    if (g_look_set.load(std::memory_order_acquire) & kLookFog) {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        look = g_look;
+    }
+    const bool look_fog = look.set & kLookFog;
+    if (k == 1.0f && g_fog_test.n == 0 && !look_fog) return 0;
     std::uint64_t gm = 0, fm = 0;
     std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_slide + (kGraphicsManager - kPreferredGuestSlide))), 8);
     if (gm) std::memcpy(&fm, reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(gm)) + kFogManager, 8);
@@ -919,6 +1072,21 @@ GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved
     for (std::uint32_t i = 0; i < count; ++i) {
         float* b = blocks + i * (kFogBlock / 4);
         for (int o : kFogOpacity) b[o] *= k;
+        if (look_fog) {
+            // A plugin's look (post_look): the distance (1/Dist at [1] and
+            // [10]), the density (the three opacities), the contrast ([7], the
+            // colour's, and [19], the height colour's) and the offsets
+            // (DistOffset [9], HeightOffset [13]).
+            if (look.fog_distance > 0.0f) {
+                b[1] /= look.fog_distance;
+                b[10] /= look.fog_distance;
+            }
+            for (int o : kFogOpacity) b[o] *= look.fog_density;
+            b[7] *= look.fog_contrast;
+            b[19] *= look.fog_contrast;
+            b[9] += look.fog_distance_offset;
+            b[13] += look.fog_height_offset;
+        }
         for (int t = 0; t < g_fog_test.n; ++t) {
             float& v = b[g_fog_test.index[t]];
             v = g_fog_test.add[t] ? v + g_fog_test.mul[t] : v * g_fog_test.mul[t];
@@ -1797,6 +1965,35 @@ std::string graphics_glare_report() {
     last_views = views;
     last_skipped = skipped;
     return buf;
+}
+
+std::uint32_t graphics_look_available() {
+    const HostSettings& hs = host_settings_ref();
+    std::uint32_t a = kLookAll;
+    if (hs.performance_mode || yebis_dof_ready() == 0) a &= ~kLookDof;
+    if (hs.performance_mode) a &= ~kLookMotionBlur;
+    if (host_opt_motion_rebuilt_bits()) a &= ~kLookMotionBlur;  // what the blur cannot read
+    return a;
+}
+
+void graphics_look_set(const GraphicsLook& look) {
+    const std::uint32_t avail = graphics_look_available();
+    GraphicsLook l = look;
+    l.set &= kLookAll;
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        g_look = l;
+    }
+    g_look_logged.store(l.set == 0);
+    g_look_set.store(l.set, std::memory_order_release);
+    // Motion blur on or off whatever its setting says: its shader patches
+    // (host/shader_patch.h) and the blur's velocity switch, where it can show
+    // at all. Depth of field needs nothing here: apply_look writes the
+    // block's enable after the setting's Off has cleared it (kDofOn).
+    const int blur = (l.set & kLookMotionBlur) && (avail & kLookMotionBlur) ? (l.motion_blur ? 1 : 0) : -1;
+    shader_patch_look(blur);
+    g_blur_look.store(blur, std::memory_order_relaxed);
+    blur_update();
 }
 
 void graphics_patch_install(ElfImage* image) {

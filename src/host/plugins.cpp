@@ -1556,6 +1556,86 @@ std::uint32_t session_members(std::uint64_t sm) {
     return routes > 1 ? routes - 1 : 0;
 }
 
+// The picture's look over the area's own (engine/graphics_patch.h): one for
+// all plugins, the last call's, and its plugin, whose turning off takes it away.
+std::mutex g_look_mu;
+std::string g_look_owner;  // under g_look_mu
+
+float look_value(float v, float lo, float hi, float otherwise) { return std::isfinite(v) ? std::clamp(v, lo, hi) : otherwise; }
+
+int api_post_look(const char* name, const BbLook* look, std::uint32_t* available) {
+    static_assert(BB_LOOK_TONE == kLookTone && BB_LOOK_VIGNETTE == kLookVignette && BB_LOOK_DOF == kLookDof &&
+                      BB_LOOK_ABERRATION == kLookAberration && BB_LOOK_MOTION_BLUR == kLookMotionBlur && BB_LOOK_FOG == kLookFog,
+                  "post_look's groups");
+    if (!plugin_named(name) || (look && look->size < 8)) return 1;
+    GraphicsLook l;
+    if (look && look->set) {
+        BbLook b{};
+        std::memcpy(&b, look, std::min<std::size_t>(look->size, sizeof(BbLook)));
+        // A group the plugin's BbLook does not reach to the end of stays the area's.
+        const std::uint32_t size = look->size;
+        std::uint32_t set = b.set & kLookAll;
+        if (size < offsetof(BbLook, vignette)) set &= ~kLookTone;
+        if (size < offsetof(BbLook, dof)) set &= ~kLookVignette;
+        if (size < offsetof(BbLook, aberration)) set &= ~kLookDof;
+        if (size < offsetof(BbLook, motion_blur)) set &= ~kLookAberration;
+        if (size < offsetof(BbLook, fog_distance)) set &= ~kLookMotionBlur;
+        if (size < sizeof(BbLook)) set &= ~kLookFog;
+        l.set = set;
+        // Inside what the post effect's setters take (some assert outside it).
+        l.exposure = look_value(b.exposure, 0.0f, 16.0f, 1.0f);
+        l.gamma = look_value(b.gamma, 0.05f, 16.0f, 1.0f);
+        l.saturation = look_value(b.saturation, 0.0f, 16.0f, 1.0f);
+        l.brightness = look_value(b.brightness, 0.0f, 16.0f, 1.0f);
+        l.contrast = look_value(b.contrast, 0.0f, 16.0f, 1.0f);
+        l.vignette = look_value(b.vignette, 0.0f, 4.0f, 0.0f);
+        l.dof = b.dof != 0;
+        l.dof_focus = look_value(b.dof_focus, 0.01f, 10000.0f, 10.0f);
+        l.dof_aperture = look_value(b.dof_aperture, 0.5f, 64.0f, 5.6f);
+        l.dof_near_levels = std::clamp(b.dof_near_levels, 0, 7);
+        l.dof_far_levels = std::clamp(b.dof_far_levels, 0, 7);
+        l.aberration = b.aberration != 0;
+        for (int i = 0; i < 2; ++i) {
+            l.lateral[i] = look_value(b.lateral[i], -1.0f, 1.0f, 0.0f);
+            l.uniform[i] = look_value(b.uniform[i], -1.0f, 1.0f, 0.0f);
+        }
+        l.motion_blur = b.motion_blur != 0;
+        l.blur_time = look_value(b.blur_time, 0.0f, 100.0f, 0.0f);
+        l.blur_length = look_value(b.blur_length, 0.0f, 100.0f, 0.0f);
+        l.blur_scale = look_value(b.blur_scale, 0.0f, 100.0f, 0.0f);
+        l.blur_samples = std::clamp(b.blur_samples, 1, 16);
+        l.fog_distance = look_value(b.fog_distance, 0.01f, 100.0f, 1.0f);
+        l.fog_density = look_value(b.fog_density, 0.0f, 16.0f, 1.0f);
+        l.fog_contrast = look_value(b.fog_contrast, 0.0f, 16.0f, 1.0f);
+        l.fog_distance_offset = look_value(b.fog_distance_offset, -10000.0f, 10000.0f, 0.0f);
+        l.fog_height_offset = look_value(b.fog_height_offset, -10000.0f, 10000.0f, 0.0f);
+    }
+    std::uint32_t was = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        static std::uint32_t groups = 0;
+        was = groups;
+        groups = l.set;
+        g_look_owner = l.set ? name : std::string();
+    }
+    graphics_look_set(l);
+    const std::uint32_t avail = graphics_look_available();
+    if (available) *available = avail;
+    if (was != l.set) host_log("plugin: %s's look over the area's: groups %x (%x can show now)", name, l.set, avail);
+    return 0;
+}
+
+// The plugin's look taken away as it is turned off.
+void drop_look(const std::string& name) {
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        if (g_look_owner != name) return;
+        g_look_owner.clear();
+    }
+    graphics_look_set(GraphicsLook{});
+    host_log("plugin: %s turned off; its look taken away", name.c_str());
+}
+
 int api_hud_hide(const char* name, int hidden) {
     if (!plugin_named(name)) return 1;
     const bool was = scene_look_hud_hidden();
@@ -1629,7 +1709,7 @@ const BbHostApi g_api = {
     &api_aa_claim,
     &api_shader_override, &api_shader_folder, &api_shader_state, &api_shader_source, &api_shader_data,
     &api_on_camera_target,
-    &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state, &api_hud_hide,
+    &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state, &api_hud_hide, &api_post_look,
 };
 
 std::string read_file(const std::string& path) {
@@ -1936,6 +2016,7 @@ void plugins_frame() {
             if (!on) {
                 world_pause_drop(r.name);  // and its hold on the world
                 scene_look_drop_hud(r.name.c_str());  // and on the HUD
+                drop_look(r.name);  // and its look
             }
             host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
             if (render_hooks_plugin_on(r.name, on)) republish_settings();

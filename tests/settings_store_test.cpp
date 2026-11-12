@@ -89,6 +89,17 @@ int main() {
     CHECK(shader_patch_mask() == 3);
     store().publish(HostSettings{});
     CHECK(shader_patch_mask() == 0);
+    // A plugin's look over them (post_look): motion blur shown or left out
+    // whatever the setting says, and back to it after.
+    shader_patch_look(0);
+    CHECK(shader_patch_mask() == 3);
+    store().publish(blur_off);
+    shader_patch_look(1);
+    CHECK(shader_patch_mask() == 0);
+    shader_patch_look(-1);
+    CHECK(shader_patch_mask() == 3);
+    store().publish(HostSettings{});
+    CHECK(shader_patch_mask() == 0);
 
     // A full table refuses the next listener rather than dropping one.
     int added = 0;

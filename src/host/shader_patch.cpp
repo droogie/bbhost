@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 namespace {
 
@@ -39,6 +40,23 @@ const Patch kPatches[] = {
 constexpr std::size_t kCount = sizeof(kPatches) / sizeof(kPatches[0]);
 
 std::atomic<std::uint32_t> g_mask{0};
+std::atomic<std::uint32_t> g_settings_mask{0};  // what the settings call for
+std::atomic<int> g_look_blur{-1};  // shader_patch_look
+
+// The settings' mask with a plugin's look over it (the settings' thread and
+// the look's call it, one at a time).
+void mask_update() {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    std::uint32_t m = g_settings_mask.load(std::memory_order_acquire);
+    const int blur = g_look_blur.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < kCount; ++i) {
+        const int look = kPatches[i].setting == &HostSettings::motion_blur ? blur : -1;
+        if (look == 1) m &= ~(1u << i);
+        if (look == 0) m |= 1u << i;
+    }
+    g_mask.store(m, std::memory_order_release);
+}
 
 // The settings' listener: which patches they call for, kept for every draw.
 void settings_changed(const HostSettings& hs) {
@@ -51,7 +69,8 @@ void settings_changed(const HostSettings& hs) {
                                                           (hs.performance_mode || host_opt_motion_rebuilt_bits()));
         if (off) m |= 1u << i;
     }
-    g_mask.store(m, std::memory_order_release);
+    g_settings_mask.store(m, std::memory_order_release);
+    mask_update();
 }
 
 }  // namespace
@@ -61,6 +80,12 @@ std::uint32_t shader_patch_mask() {
     static const bool listening = (host_settings_listen(&settings_changed), true);
     (void)listening;
     return g_mask.load(std::memory_order_acquire);
+}
+
+void shader_patch_look(int motion_blur) {
+    (void)shader_patch_mask();  // the settings' listener in first
+    g_look_blur.store(motion_blur, std::memory_order_relaxed);
+    mask_update();
 }
 
 bool shader_patch_touches(const std::string& name) {

@@ -1,6 +1,6 @@
-/* Plugin API 29 probe: world_pause, world_step, pad, pad_take and world_state
- * in a running game, for a test harness. Test-only: built beside the tests,
- * never into plugins/.
+/* Plugin API 29 probe: world_pause, world_step, pad, pad_take, world_state and
+ * post_look in a running game, for a test harness. Test-only: built beside the
+ * tests, never into plugins/.
  *
  * From the first frame in the world it logs, once a second and whenever one
  * changes,
@@ -12,6 +12,13 @@
  *     pause / run         world_pause(name, 1 / 0)
  *     step <n>            world_step(name, n)
  *     take <hex> <axes>   pad_take(buttons, axes); "take 0 0" gives them back
+ *     look <group> <numbers...>   post_look with that one group (the rest the
+ *                         area's): tone <exposure gamma saturation brightness
+ *                         contrast>, vignette <power>, dof <on focus aperture
+ *                         near far>, ca <on lateral0 lateral1 uniform0
+ *                         uniform1>, blur <on time length scale samples>, fog
+ *                         <distance density contrast distance_offset
+ *                         height_offset>; "look off" gives the area's own
  * For example "8:pause,14:step 2,16:step 2,20:run,24:take 4000 1,32:take 0 0".
  * Each step's result is logged: api29 t <s> step <text> -> <return>. */
 #include "bbhost_plugin.h"
@@ -29,7 +36,7 @@ static float g_last_pos[3];
 
 BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_API_VERSION, 0, "api29_probe", "API 29 probe", "1", "bbhost",
-    "Test-only: plugin API 29's world_pause, world_step, pad, pad_take and world_state in a running game."};
+    "Test-only: plugin API 29's world_pause, world_step, pad, pad_take, world_state and post_look in a running game."};
 
 static double now_s(void) {
     struct timespec t;
@@ -40,7 +47,7 @@ static double now_s(void) {
 /* The steps, parsed once. */
 typedef struct {
     double at;
-    char text[48];
+    char text[64];
     int done;
 } Step;
 static Step g_steps[64];
@@ -62,12 +69,56 @@ static void parse_steps(void) {
     }
 }
 
+static int run_look(const char* spec) {
+    BbLook l;
+    float v[5] = {0, 0, 0, 0, 0};
+    char group[16] = "";
+    uint32_t avail = 0;
+    int rc;
+    memset(&l, 0, sizeof(l));
+    l.size = sizeof(l);
+    if (sscanf(spec, "%15s %f %f %f %f %f", group, &v[0], &v[1], &v[2], &v[3], &v[4]) < 1) return -1;
+    if (strcmp(group, "off") == 0) {
+        rc = g_api->post_look("api29_probe", NULL, &avail);
+        g_api->log("api29 look off -> %d (available %x)", rc, avail);
+        return rc;
+    }
+    if (strcmp(group, "tone") == 0) {
+        l.set = BB_LOOK_TONE;
+        l.exposure = v[0], l.gamma = v[1], l.saturation = v[2], l.brightness = v[3], l.contrast = v[4];
+    } else if (strcmp(group, "vignette") == 0) {
+        l.set = BB_LOOK_VIGNETTE;
+        l.vignette = v[0];
+    } else if (strcmp(group, "dof") == 0) {
+        l.set = BB_LOOK_DOF;
+        l.dof = (int32_t)v[0], l.dof_focus = v[1], l.dof_aperture = v[2], l.dof_near_levels = (int32_t)v[3],
+        l.dof_far_levels = (int32_t)v[4];
+    } else if (strcmp(group, "ca") == 0) {
+        l.set = BB_LOOK_ABERRATION;
+        l.aberration = (int32_t)v[0], l.lateral[0] = v[1], l.lateral[1] = v[2], l.uniform[0] = v[3], l.uniform[1] = v[4];
+    } else if (strcmp(group, "blur") == 0) {
+        l.set = BB_LOOK_MOTION_BLUR;
+        l.motion_blur = (int32_t)v[0], l.blur_time = v[1], l.blur_length = v[2], l.blur_scale = v[3],
+        l.blur_samples = (int32_t)v[4];
+    } else if (strcmp(group, "fog") == 0) {
+        l.set = BB_LOOK_FOG;
+        l.fog_distance = v[0], l.fog_density = v[1], l.fog_contrast = v[2], l.fog_distance_offset = v[3],
+        l.fog_height_offset = v[4];
+    } else {
+        return -1;
+    }
+    rc = g_api->post_look("api29_probe", &l, &avail);
+    g_api->log("api29 look %s -> %d (available %x)", spec, rc, avail);
+    return rc;
+}
+
 static int run_step(const char* text) {
     unsigned a = 0, b = 0;
     if (strcmp(text, "pause") == 0) return g_api->world_pause("api29_probe", 1);
     if (strcmp(text, "run") == 0) return g_api->world_pause("api29_probe", 0);
     if (sscanf(text, "step %u", &a) == 1) return g_api->world_step("api29_probe", a);
     if (sscanf(text, "take %x %u", &a, &b) == 2) return g_api->pad_take(a, b);
+    if (strncmp(text, "look ", 5) == 0) return run_look(text + 5);
     return -1;
 }
 
@@ -110,7 +161,7 @@ static void on_frame(void* user) {
 }
 
 BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
-    if (api->version < 29 || api->size < offsetof(BbHostApi, world_state) + sizeof(void*)) {
+    if (api->version < 29 || api->size < offsetof(BbHostApi, post_look) + sizeof(void*)) {
         api->log("api29 probe: this host is older than plugin API 29");
         return 1;
     }

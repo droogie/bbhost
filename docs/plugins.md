@@ -191,11 +191,12 @@ gives the Binary Ninja address.
   recompiled one, a plugin still needs its own camera hooks. One plugin owns
   it: 1 outside image setup, for NULL, or once taken; 0 otherwise.
 
-**The world held still, the controller, and who else is in the world** (v29)
+**The world held still, the controller, who else is in the world, the HUD and the look** (v29)
 
 What a photo mode needs: the world stopped while its own camera flies, the
 controller read as the plugin's own while the game reads none of what it
-takes, and a way to know that nobody else is in the world.
+takes, a way to know that nobody else is in the world, the HUD out of the
+picture and a look of its own over the area's.
 
 - `world_pause(name, paused)`: holds the world - its characters, physics, AI,
   events, effects and cloth - while frames go on being drawn and `on_view`
@@ -241,6 +242,25 @@ takes, and a way to know that nobody else is in the world.
   changes, and its HUD option keeps its value. bbhost's overlay and menus are
   drawn as always. The HUD is left out while any plugin asks; turning the
   plugin off lets go. It costs two copies of the picture a frame while on.
+- `post_look(name, &look, &available)`: the picture's look over the area's
+  own, as `BbLook` (set `look.size` first): the groups in `set` apply - tone
+  (exposure, gamma, saturation, brightness and contrast, each times the
+  area's; the exposure is the eye adaptation's target while it adapts, the
+  fixed exposure otherwise), the vignette's power, depth of field (off, or on
+  with a focus distance, an aperture and the blur's levels in front of and
+  behind the focus), chromatic aberration (off, or on with its lateral and
+  uniform dispersions), motion blur (off, or on with its times, scale and
+  samples) and the fog (its distance, density and contrast times the area's,
+  its distance and height offsets added) - and the rest stay the area's. It is
+  written every view into the numbers the area gives the post-processing and
+  the fog, so nothing of the game's is kept or put back: `NULL` or `set` 0 is
+  the area's own from the next frame. One look for all plugins - the last
+  call's - and turning its plugin off takes it away. Depth of field and motion
+  blur show while the look sets them on whatever the Graphics settings say,
+  and are left out while it sets them off; Performance mode jumps past every
+  depth of field pass and leaves the scene's motion blur off, so `available`
+  (may be `NULL`) leaves those two out then. Values outside what the post
+  effect takes are clamped.
 
 **Settings, UI and files**
 

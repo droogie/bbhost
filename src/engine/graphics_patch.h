@@ -54,6 +54,35 @@ void graphics_scene_context_made(std::uint64_t ctx);
 // have taken it from the patched code.
 void graphics_ssr_live_in();
 
+// Plugin API 29's post_look (host/plugins.cpp): a look over the area's own,
+// written each view into the numbers the area gives YEBIS (the post-process
+// block, at its record) and the fog (its table, at the upload) - nothing kept,
+// nothing restored; `set` 0 is the area's own from the next view. The groups
+// are BbLook's (kLook* = BB_LOOK_*). Depth of field and motion blur show
+// while the look sets them on, whatever their settings say, and are left out
+// while it sets them off.
+constexpr std::uint32_t kLookTone = 1, kLookVignette = 2, kLookDof = 4, kLookAberration = 8, kLookMotionBlur = 16,
+                        kLookFog = 32, kLookAll = 63;
+struct GraphicsLook {
+    std::uint32_t set = 0;
+    float exposure = 1, gamma = 1, saturation = 1, brightness = 1, contrast = 1;  // times the area's
+    float vignette = 0;                                                           // the vignette's power
+    bool dof = false;
+    float dof_focus = 0, dof_aperture = 0;
+    std::int32_t dof_near_levels = 0, dof_far_levels = 0;
+    bool aberration = false;
+    float lateral[2] = {0, 0}, uniform[2] = {0, 0};
+    bool motion_blur = false;
+    float blur_time = 0, blur_length = 0, blur_scale = 0;
+    std::int32_t blur_samples = 0;
+    float fog_distance = 1, fog_density = 1, fog_contrast = 1;  // times the area's
+    float fog_distance_offset = 0, fog_height_offset = 0;       // metres added
+};
+void graphics_look_set(const GraphicsLook& look);
+// The groups a look can show now: Performance mode jumps past every depth of
+// field pass (0x25d7bbc) and leaves the scene's motion blur off.
+std::uint32_t graphics_look_available();
+
 // A hook at a guest function's entry (core/thunk.h's prologue stub): `host`
 // runs with the argument registers first. `prologue` is the `n` (>= 14) bytes
 // expected there, none rip-relative; false when they are not. Only after the

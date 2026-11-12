@@ -409,6 +409,38 @@ typedef struct BbPad {
 #define BB_SESSION_GUEST 6         /* in another player's world */
 #define BB_SESSION_LEAVING 7
 
+/* Version 29: the picture's look over the area's own (post_look): each group
+ * applies while its bit is in `set`, every view, on the numbers the area gives
+ * the post-processing and the fog that view; the rest stay the area's. */
+#define BB_LOOK_TONE 1u          /* exposure, gamma, saturation, brightness and contrast: times the area's */
+#define BB_LOOK_VIGNETTE 2u      /* the vignette's power (0 is none) */
+#define BB_LOOK_DOF 4u           /* depth of field: off, or on with the focus, the aperture and the blur levels */
+#define BB_LOOK_ABERRATION 8u    /* chromatic aberration: off, or on with its four dispersions */
+#define BB_LOOK_MOTION_BLUR 16u  /* motion blur: off, or on with its two times, the camera blur's scale and samples */
+#define BB_LOOK_FOG 32u          /* the fog: its distance, density and contrast times the area's, its offsets added */
+
+typedef struct BbLook {
+    uint32_t size;          /* sizeof(BbLook) as the plugin knows it */
+    uint32_t set;           /* BB_LOOK_* */
+    float exposure, gamma, saturation, brightness, contrast;  /* BB_LOOK_TONE: 1 is the area's own; the exposure is
+                                                                the eye adaptation's target while it adapts; the
+                                                                contrast is steep (1.1 crushes Central Yharnam's
+                                                                shadows to black) */
+    float vignette;         /* BB_LOOK_VIGNETTE */
+    int32_t dof;            /* BB_LOOK_DOF: 0 off, 1 on with the four below */
+    float dof_focus;        /* the distance in focus (Central Yharnam's 1) */
+    float dof_aperture;     /* an f-number: the smaller, the more blurred away from the focus (Central Yharnam's 5.6) */
+    int32_t dof_near_levels, dof_far_levels;  /* the blur's levels in front of and behind the focus, 0-7 */
+    int32_t aberration;     /* BB_LOOK_ABERRATION: 0 off, 1 on with the four below */
+    float lateral[2], uniform[2];  /* its dispersions, -1..1 (Central Yharnam's lateral[0] is 0.006) */
+    int32_t motion_blur;    /* BB_LOOK_MOTION_BLUR: 0 off, 1 on with the four below */
+    float blur_time, blur_length;  /* the blur's two times (0.06-0.095 and 0.1-0.2 in Central Yharnam's views) */
+    float blur_scale;       /* times blur_length, the camera blur's amount (0-4 there) */
+    int32_t blur_samples;   /* 1-16 (3 or 4 there) */
+    float fog_distance, fog_density, fog_contrast;   /* BB_LOOK_FOG: times the area's */
+    float fog_distance_offset, fog_height_offset;    /* metres added */
+} BbLook;
+
 typedef struct BbWorldState {
     uint32_t size;      /* set to sizeof(BbWorldState) before the call: the host fills as much as both know */
     uint32_t flags;     /* BB_WORLD_* */
@@ -989,6 +1021,19 @@ typedef struct BbHostApi {
      * off lets go. From the next frame; while on, two copies of the picture a
      * frame. Any thread. 0 on success; 1 for an unknown plugin. */
     int (*hud_hide)(const char* name, int hidden);
+    /* The picture's look over the area's own (BbLook): written every view
+     * into the numbers the area gives the post-processing and the fog, so
+     * nothing of the game's is kept or written back - `look` NULL (or `set`
+     * 0) gives the area's own from the next frame. One look for all plugins:
+     * the last call holds, and the plugin being turned off takes its look
+     * away. Depth of field and motion blur show while the look sets them on
+     * whatever the Graphics settings say, and are left out while it sets
+     * them off; Performance mode jumps past every depth of field pass and
+     * leaves the scene's motion blur off, so those two cannot show then.
+     * `available` (may be NULL) gets the BB_LOOK_* groups that can show now.
+     * Values outside what the post effect takes are clamped. Any thread. 0 on
+     * success; 1 for an unknown plugin or a size under 8. */
+    int (*post_look)(const char* name, const BbLook* look, uint32_t* available);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

@@ -34,3 +34,8 @@ void shader_patch_apply(const std::string& name, std::vector<std::uint32_t>& wor
 std::uint32_t shader_patch_mask();
 // Whether a program with this name is one a patch applies to.
 bool shader_patch_touches(const std::string& name);
+// A plugin's look (plugin API 29's post_look, engine/graphics_patch.h) over
+// the settings' motion blur: 1 shows the blur (its patches off), 0 leaves it
+// out (its patches on), -1 leaves it to its setting. (A look's depth of field
+// is the block's own enable, written after the setting's Off has cleared it.)
+void shader_patch_look(int motion_blur);
