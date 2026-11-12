@@ -1,9 +1,9 @@
 // Hunter Cam: the hunter seen from closer in. Over the shoulder - a close
 // third-person camera behind one shoulder, as Silent Hill 2's remake frames its
 // hero, swapped on the fly with a key and zoomed with the wheel - or first
-// person, where only the hunter's weapons are drawn; a mode that keeps the
-// hunter facing where the camera looks at full speed; and the dodge as a roll
-// or a sidestep.
+// person, where only the hunter's arms and weapons are drawn and the mouse
+// turns the view; a mode that keeps the hunter facing where the camera looks
+// at full speed; the right stick's speed; and the dodge as a roll or a sidestep.
 //
 //   [plugins]
 //   hunter_cam = true
@@ -14,13 +14,18 @@
 //   distance = 1.7           # metres behind the shoulder (the wheel zooms from it)
 //   offset = 0.55            # metres to the side
 //   height = 0.15            # metres above the game's look-at point
-//   fov = 0                  # vertical field of view, degrees (0: the game's)
+//   field_of_view = 0        # % wider than the game's, as F10's Field of view
 //   swap_time = 0.25         # seconds a swap takes
 //   first_person = false     # the view from the hunter's eyes
 //   first_person_key = "Z"   # toggles first person while playing
 //   eye_height = 1.55        # metres above the feet, in first person
-//   first_person_fov = 0     # first person's field of view, degrees (0: the game's)
+//   first_person_field_of_view = 0  # % wider, in first person
+//   look_limit = 80          # degrees up or down in first person (the game's aim: 35 up, 40 down)
+//   stick_speed = 1.0        # the right stick's turning, times the game's
+//   mouse_sensitivity = 50   # the mouse in the aim (first person, facing the camera), F10's scale
+//   mouse_invert_y = false   # and its up and down reversed
 //   face_camera = false      # always face where the camera looks
+//   crosshair = true         # the monocular's sight while facing the camera
 //   dodge = 1                # 0 the roll, 1 a sidestep in the stick's direction
 //
 // The camera. The game keeps its own follow camera (ChrFollowCam, the camera
@@ -50,10 +55,18 @@
 // bit 2 says it is drawn (the Quake plugin's viewmodel); a model ins's file name
 // is at +0x148 -> +0x18 (WP_ the weapons, one slot a hand: 7 and 11; HD_, BD_,
 // AM_, LG_ the armour, FC_, HR_ and FG_ the face). In first person every
-// part but the weapons - the slots whose model is a WP_ file - is hidden that
-// way, frame by frame (a change of equipment makes new ones), and shown again
-// as first person ends, the plugin goes off or the world loads. The hunter
-// faces where the camera looks there, as with Always face the camera.
+// part but the weapons and the arms - the slots whose model is a WP_ or AM_
+// file - is hidden that way, frame by frame (a change of equipment makes new
+// ones), and shown again as first person ends, the plugin goes off or the
+// world loads. The hunter faces where the camera looks there, as with Always
+// face the camera, and the aim camera that brings may turn 80 degrees up and
+// down (Look up/down limit) where the game holds it to 35 and 40.
+//
+// The aim. With the precision-shooting bit set the game also hides X's prompt
+// and press (the action button's and the NPC talk's checks of it) and puts a
+// sight at the screen's middle; while the bit is the plugin's those checks
+// are passed, and the sight's only with the Crosshair on. The mouse turns the
+// aim camera itself (the host's mouse turns only the follow camera).
 //
 // Facing the camera. The monocular puts the hunter in its precision-shooting
 // state: ChrIns +0x1e2 bit 2, which the HKS env query 0x18 (精密射撃中か) reads
@@ -97,11 +110,11 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "hunter_cam",
     "Hunter Cam",
-    "1.1.0",
+    "1.2.0",
     "Kyo",
     "The hunter from closer in: an over-the-shoulder camera (right or left, swapped with a key, zoomed with the wheel) "
-    "or first person with only the weapons drawn; the hunter can always face where the camera looks, and the dodge can "
-    "be a roll or a sidestep.",
+    "or first person with only the arms and weapons drawn; the hunter can always face where the camera looks, the right "
+    "stick's speed is yours, and the dodge can be a roll or a sidestep.",
 };
 
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
@@ -120,8 +133,10 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      nullptr},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "height", "Height", "Metres above the point the game's camera looks at.", "0.15", -0.5, 1.0,
      nullptr},
-    {BB_OPT_FLOAT | BB_OPT_LIVE, "fov", "Field of view", "Vertical field of view in degrees; 0 keeps the game's.", "0", 0, 90,
-     nullptr},
+    {BB_OPT_INT | BB_OPT_LIVE, "field_of_view", "Field of view (+%)",
+     "How much wider the camera sees, as F10's Field of view widens it: 0 is the game's (with F10's own on top); +50 "
+     "about 97 degrees across.",
+     "0", 0, 100, nullptr},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "swap_time", "Swap time", "Seconds the camera takes to move to the other shoulder.", "0.25",
      0, 1, nullptr},
     {BB_OPT_HEADING, "h_first", "First person", "The view from the hunter's eyes: only their weapons are drawn.", nullptr, 0,
@@ -131,13 +146,28 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_CHOICE | BB_OPT_LIVE, "first_person_key", "First person key",
      "Switches between first person and the camera above while playing (keyboard and mouse).", "Z", 0, 0, KEY_CHOICES},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "eye_height", "Eye height", "Metres above the hunter's feet.", "1.55", 1.2, 1.9, nullptr},
-    {BB_OPT_FLOAT | BB_OPT_LIVE, "first_person_fov", "First-person field of view",
-     "Vertical field of view in degrees; 0 keeps the game's.", "0", 0, 100, nullptr},
+    {BB_OPT_INT | BB_OPT_LIVE, "first_person_field_of_view", "First-person field of view (+%)",
+     "How much wider the view from the eyes is, as F10's Field of view widens it: 0 is the game's.", "0", 0, 100, nullptr},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "look_limit", "Look up/down limit",
+     "Degrees the view turns up or down from level in first person.", "80", 45, 89, nullptr},
+    {BB_OPT_HEADING, "h_controls", "Turning", nullptr, nullptr, 0, 0, nullptr},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "stick_speed", "Right stick speed",
+     "How fast the right stick turns the camera, times the game's own (its Camera speed option still applies).", "1.0",
+     0.25, 4.0, nullptr},
+    {BB_OPT_INT | BB_OPT_LIVE, "mouse_sensitivity", "Mouse sensitivity (facing the camera)",
+     "How far the mouse turns the view in first person and with Always face the camera, on F10's Mouse sensitivity "
+     "scale (50 its default); elsewhere F10's own applies.",
+     "50", 0, 100, nullptr},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "mouse_invert_y", "Reverse mouse Y-axis (facing the camera)",
+     "Reverses the mouse's up and down there, as F10's Reverse mouse Y-axis does elsewhere.", "false", 0, 0, nullptr},
     {BB_OPT_HEADING, "h_movement", "Movement", nullptr, nullptr, 0, 0, nullptr},
     {BB_OPT_BOOL | BB_OPT_LIVE, "face_camera", "Always face the camera",
      "The hunter always faces where the camera looks and strafes by the stick, at full speed (they run and sprint as "
-     "when locked on), with the monocular's crosshair up.",
+     "when locked on).",
      "false", 0, 0, nullptr},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "crosshair", "Crosshair",
+     "The monocular's sight at the middle of the screen while the hunter faces the camera (and in first person).", "true",
+     0, 0, nullptr},
     {BB_OPT_INT | BB_OPT_LIVE, "dodge", "Dodge (0 Roll, 1 Sidestep)",
      "0: always the roll, locked on too. 1: a quick sidestep in the stick's direction, as when locked on, without a "
      "lock. The Modern Movement Lite patch keeps working beside it.",
@@ -168,10 +198,15 @@ struct Settings {
     bool camera = true;
     float shoulder = 1.0f;  // +1 right, -1 left
     Key swap_key = Key::Tab, first_key = Key::Z;
-    float distance = 1.7f, offset = 0.55f, height = 0.15f, fov = 0.0f, swap_time = 0.25f;
+    float distance = 1.7f, offset = 0.55f, height = 0.15f, swap_time = 0.25f;
+    int fov = 0;  // +% wider
     bool first_person = false;
-    float eye_height = 1.55f, first_fov = 0.0f;
-    bool face_camera = false;
+    float eye_height = 1.55f, look_limit = 80.0f;
+    int first_fov = 0;  // +% wider
+    float stick_speed = 1.0f;
+    int mouse_sensitivity = 50;
+    bool mouse_invert_y = false;
+    bool face_camera = false, crosshair = true;
     int dodge = 1;
 } s;
 
@@ -229,12 +264,17 @@ void read_options() {
     s.distance = number("hunter_cam.distance", 1.7f, 0.8f, 4.0f);
     s.offset = number("hunter_cam.offset", 0.55f, 0.0f, 1.2f);
     s.height = number("hunter_cam.height", 0.15f, -0.5f, 1.0f);
-    s.fov = number("hunter_cam.fov", 0.0f, 0.0f, 90.0f);
+    s.fov = static_cast<int>(number("hunter_cam.field_of_view", 0.0f, 0.0f, 100.0f) + 0.5f);
     s.swap_time = number("hunter_cam.swap_time", 0.25f, 0.0f, 1.0f);
     s.first_person = flag("hunter_cam.first_person", false);
     s.eye_height = number("hunter_cam.eye_height", 1.55f, 1.2f, 1.9f);
-    s.first_fov = number("hunter_cam.first_person_fov", 0.0f, 0.0f, 100.0f);
+    s.first_fov = static_cast<int>(number("hunter_cam.first_person_field_of_view", 0.0f, 0.0f, 100.0f) + 0.5f);
+    s.look_limit = number("hunter_cam.look_limit", 80.0f, 45.0f, 89.0f);
+    s.stick_speed = number("hunter_cam.stick_speed", 1.0f, 0.25f, 4.0f);
+    s.mouse_sensitivity = static_cast<int>(number("hunter_cam.mouse_sensitivity", 50.0f, 0.0f, 100.0f) + 0.5f);
+    s.mouse_invert_y = flag("hunter_cam.mouse_invert_y", false);
     s.face_camera = flag("hunter_cam.face_camera", false);
+    s.crosshair = flag("hunter_cam.crosshair", true);
     s.dodge = static_cast<int>(number("hunter_cam.dodge", 1.0f, 0.0f, 1.0f) + 0.5f);
 }
 
@@ -356,6 +396,61 @@ void omni_roll(bool on) {
         api->log("hunter_cam: sidestep's own sites given back (%d)", written);
 }
 
+// ---- the game's own checks of the precision-shooting bit ---------------------
+//
+// Each is `test <r>h, 4` on ChrIns +0x1e1's dword (the bit +0x1e2 & 4); its
+// immediate made 0, the check passes as if the hunter were not aiming.
+
+struct CodeSite {
+    std::uint64_t at;
+    std::uint8_t game[3];
+};
+// What X does: the action button's two checks (SprjActionButtonMan, 0x20d91f0's
+// query and its update: no prompt, no press while aiming) and the NPC talk's
+// three (SprjWorldTalkMan's).
+const CodeSite kInteract[] = {{0x20d9323, {0xf6, 0xc6, 0x04}},
+                              {0x20d992a, {0xf6, 0xc5, 0x04}},
+                              {0x1d3d1f1, {0xf6, 0xc4, 0x04}},
+                              {0x1d3d3c5, {0xf6, 0xc4, 0x04}},
+                              {0x243e787, {0xf6, 0xc4, 0x04}}};
+// The sight: the HUD puts the lock cursor at the screen's middle (960, 540)
+// while the bit is set (0x1ffe4e1) - else while the monocular's stateInfo 15
+// is on, which still shows it when the monocular itself is in use.
+const CodeSite kSight[] = {{0x1ffe4e1, {0xf6, 0xc5, 0x04}}};
+
+struct SiteSet {
+    const CodeSite* sites;
+    std::size_t n;
+    const char* what;
+    bool on = false;
+    bool refused = false;
+};
+SiteSet g_interact{kInteract, sizeof(kInteract) / sizeof(kInteract[0]), "X's action button and talk"};
+SiteSet g_sight{kSight, sizeof(kSight) / sizeof(kSight[0]), "the crosshair"};
+
+// The checks passed (on) or the game's again (off).
+void set_sites(SiteSet& g, bool on) {
+    if (on == g.on || g.refused) return;
+    std::size_t done = 0;
+    for (; done < g.n; ++done) {
+        const CodeSite& t = g.sites[done];
+        const std::uint8_t ours[3] = {t.game[0], t.game[1], 0};
+        if (api->patch(t.at, on ? t.game : ours, on ? ours : t.game, 3) != 0) break;
+    }
+    if (done < g.n) {  // not the code we know: put back what was changed and leave it be
+        for (std::size_t k = 0; k < done; ++k) {
+            const CodeSite& t = g.sites[k];
+            const std::uint8_t ours[3] = {t.game[0], t.game[1], 0};
+            api->patch(t.at, on ? ours : t.game, on ? t.game : ours, 3);
+        }
+        g.refused = true;
+        api->log("hunter_cam: 0x%llx is not the code expected; %s stays the game's", static_cast<unsigned long long>(g.sites[done].at),
+                 g.what);
+        return;
+    }
+    g.on = on;
+}
+
 // ---- facing the camera: the precision-shooting bit ---------------------------
 
 constexpr std::size_t kAimFlags = 0x1e2;  // ChrIns: bit 2 precision shooting
@@ -389,8 +484,13 @@ void face_camera_frame() {
             g_aim_ours = false;
         }
     }
-    g_answer_aim.store(g_aim_ours && !g_monocular.load());
+    const bool ours = g_aim_ours && !g_monocular.load();
+    g_answer_aim.store(ours);
     g_force_roll.store(s.on && s.dodge == 0);
+    // Aiming as ours, X still opens doors, picks up and talks; the sight only
+    // if wanted. The monocular itself keeps the game's checks.
+    set_sites(g_interact, ours);
+    set_sites(g_sight, ours && !s.crosshair);
 }
 
 // The aim is ours and the monocular is not in use: our camera keeps the view.
@@ -462,7 +562,7 @@ struct Parts {
     std::uint8_t* hidden[kPartSlots] = {};  // display entities hidden here, shown again on release
     std::uint8_t* seen[kPartSlots] = {};    // the model ins last looked at in each slot
     std::uint8_t* chr = nullptr;
-    std::uint32_t weapons = 0;  // a bit a slot: the ones holding a WP_ model
+    std::uint32_t weapons = 0;  // a bit a slot: the ones kept drawn (a WP_ or AM_ model)
 } parts;
 
 // A UTF-16 name at a runtime address: whether it starts with `prefix`.
@@ -474,13 +574,13 @@ bool name_starts(std::uint64_t at, const char* prefix) {
     return true;
 }
 
-// Whether a part's model is a weapon's: its file name (model ins +0x148 ->
-// +0x18 -> UTF-16: WP_A_1000, HD_F_8000, FG_A_7003 - FG the face's parts)
-// starts with WP_.
-bool part_is_weapon(std::uint8_t* mi) {
+// Whether a part stays drawn in first person: its file name (model ins +0x148
+// -> +0x18 -> UTF-16: WP_A_1000, AM_M_8000, HD_F_8000, FG_A_7003 - FG the
+// face's parts) starts with WP_ (a weapon) or AM_ (the arms, bare or armoured).
+bool part_kept(std::uint8_t* mi) {
     std::uint64_t res = 0, name = 0;
     return api->read(reinterpret_cast<std::uint64_t>(mi) + 0x148, &res, 8) == 0 && res >= 0x10000 &&
-           api->read(res + 0x18, &name, 8) == 0 && name_starts(name, "WP_");
+           api->read(res + 0x18, &name, 8) == 0 && (name_starts(name, "WP_") || name_starts(name, "AM_"));
 }
 
 std::uint8_t* part_mi(std::uint8_t* holder, int slot) {
@@ -520,7 +620,7 @@ void parts_hide(std::uint8_t* chr) {
         if (mi != parts.seen[k]) {  // a new model in the slot: what it is, again
             parts.seen[k] = mi;
             changed = true;
-            if (mi && part_is_weapon(mi)) parts.weapons |= 1u << k;
+            if (mi && part_kept(mi)) parts.weapons |= 1u << k;
             else parts.weapons &= ~(1u << k);
         }
         std::uint8_t* disp = mi ? get<std::uint8_t*>(mi, 0x18) : nullptr;
@@ -534,7 +634,7 @@ void parts_hide(std::uint8_t* chr) {
             parts.hidden[k] = disp;
         }
     }
-    if (changed) api->log("hunter_cam: first person keeps the weapon parts 0x%06x drawn", parts.weapons);
+    if (changed) api->log("hunter_cam: first person keeps the weapon and arm parts 0x%06x drawn", parts.weapons);
 }
 
 // ---- the camera --------------------------------------------------------------
@@ -555,6 +655,7 @@ struct View {
     float game_zoom = 1.0f;   // the wheel's on the game's camera, once we took the keys
     float game_reach = -1.0f; // its eased distance
     bool zoom_taken = false;
+    float mouse_dx = 0.0f, mouse_dy = 0.0f;  // this frame's mouse counts while playing
     std::chrono::steady_clock::time_point last;
     bool started = false;
 } view;
@@ -589,6 +690,8 @@ void banner(const char* text) {
 void read_keys() {
     BbInput in;
     const bool ok = api->input(&in) == 0 && in.playing;
+    view.mouse_dx = ok ? in.dx : 0.0f;
+    view.mouse_dy = ok ? in.dy : 0.0f;
     const Key keys[2] = {s.swap_key, s.first_key};
     for (int i = 0; i < 2; ++i) {
         bool down = false, pressed = false;
@@ -605,7 +708,6 @@ void read_keys() {
         if (!pressed) continue;
         if (i == 0 && !g_first) {
             swap_to(-view.side_want);
-            banner(view.side_want > 0 ? "Right shoulder" : "Left shoulder");
         } else if (i == 1) {
             g_first = !g_first;
             view.reach = -1.0f;
@@ -644,6 +746,112 @@ void read_zoom(bool ours) {
     }
 }
 
+// ---- turning: the stick's speed, the mouse in the aim, first person's pitch ---
+//
+// The follow camera (ChrExFollowCam) turns at speeds it eases between its
+// param's minimum and maximum by the Camera speed option (+0x20c..+0x218, the
+// fast turn's +0x224..+0x230); the aim camera (ChrAimCam, the manager's +0x68,
+// sub_1833860) the same way from +0x104..+0x110, its pitch (+0x148) and yaw
+// (+0x14c) turned by them and the pitch held within +0xf4..+0xf0 degrees. The
+// plugin scales the speeds by the Right stick speed, sets the aim's pitch
+// limits in first person, and turns the aim by the mouse as the host turns the
+// follow camera; what it wrote is put back when it is no longer wanted, and a
+// value it did not write is the game's new one.
+
+constexpr std::size_t kAimCam = 0x68;  // the camera manager's ChrAimCam
+constexpr std::size_t kAimPitch = 0x148, kAimYaw = 0x14c, kAimPitchMax = 0xf0, kAimPitchMin = 0xf4;
+constexpr float kTwoPi = 2 * kPi;
+
+struct Held {
+    std::size_t off;
+    int n;
+    std::uint8_t* cam = nullptr;
+    float game[4]{}, ours[4]{};
+    bool held = false;
+};
+Held g_follow_speed{0x20c, 4}, g_follow_fast{0x224, 4}, g_aim_speed{0x104, 4}, g_aim_limits{kAimPitchMax, 2};
+
+// The game's values back, if they are still ours and the camera is the same.
+void release(Held& v, std::uint8_t* cam) {
+    if (v.held && cam && cam == v.cam) {
+        float now[4];
+        std::memcpy(now, cam + v.off, 4 * static_cast<std::size_t>(v.n));
+        if (std::memcmp(now, v.ours, 4 * static_cast<std::size_t>(v.n)) == 0)
+            std::memcpy(cam + v.off, v.game, 4 * static_cast<std::size_t>(v.n));
+    }
+    v.held = false;
+    v.cam = cam;
+}
+
+// Ours in place of the game's: f(the game's value, its index).
+template <typename F>
+void hold(Held& v, std::uint8_t* cam, F f) {
+    if (!cam) {
+        v.held = false;
+        v.cam = nullptr;
+        return;
+    }
+    const std::size_t bytes = 4 * static_cast<std::size_t>(v.n);
+    float now[4];
+    std::memcpy(now, cam + v.off, bytes);
+    if (cam != v.cam || !v.held || std::memcmp(now, v.ours, bytes) != 0) std::memcpy(v.game, now, bytes);
+    v.cam = cam;
+    v.held = true;
+    for (int i = 0; i < v.n; ++i) v.ours[i] = f(v.game[i], i);
+    std::memcpy(cam + v.off, v.ours, bytes);
+}
+
+// The host's Mouse sensitivity scale (engine/mouse_camera_step.h): 0.005 to 0.4
+// degrees a count over 0..100, 0.045 at 50.
+float degrees_per_count(int setting) {
+    const float t = static_cast<float>(setting < 0 ? 0 : setting > 100 ? 100 : setting) * 0.01f;
+    return 0.005f * std::pow(0.4f / 0.005f, t);
+}
+
+// The mouse turns the aim, after the stick (the next update draws it): as the
+// host turns the follow camera, down looks down unless reversed.
+void mouse_turn(std::uint8_t* aim) {
+    if (!aim || (view.mouse_dx == 0.0f && view.mouse_dy == 0.0f)) return;
+    const float k = degrees_per_count(s.mouse_sensitivity) * kPi / 180.0f;
+    float pitch = get<float>(aim, kAimPitch) + (s.mouse_invert_y ? -1.0f : 1.0f) * view.mouse_dy * k;
+    float yaw = get<float>(aim, kAimYaw) + view.mouse_dx * k;
+    const float hi = get<float>(aim, kAimPitchMax) * kPi / 180.0f, lo = get<float>(aim, kAimPitchMin) * kPi / 180.0f;
+    if (lo < hi) pitch = pitch < lo ? lo : pitch > hi ? hi : pitch;
+    for (int i = 0; i < 64 && yaw > kPi; ++i) yaw -= kTwoPi;
+    for (int i = 0; i < 64 && yaw < -kPi; ++i) yaw += kTwoPi;
+    std::memcpy(aim + kAimPitch, &pitch, 4);
+    std::memcpy(aim + kAimYaw, &yaw, 4);
+}
+
+// Once a frame while the plugin is on: the speeds, the limits and the mouse.
+void turning(std::uint8_t* follow, std::uint8_t* aim) {
+    const float k = s.stick_speed;
+    if (k != 1.0f) {
+        const auto scale = [k](float game, int) { return game * k; };
+        hold(g_follow_speed, follow, scale);
+        hold(g_follow_fast, follow, scale);
+        hold(g_aim_speed, aim, scale);
+    } else {
+        release(g_follow_speed, follow);
+        release(g_follow_fast, follow);
+        release(g_aim_speed, aim);
+    }
+    if (g_first && aim) {  // the game's: 35 degrees up and 40 down
+        const float deg = s.look_limit;
+        hold(g_aim_limits, aim, [deg](float, int i) { return i == 0 ? deg : -deg; });
+    } else {
+        release(g_aim_limits, aim);
+    }
+    if (aim_is_ours()) mouse_turn(aim);
+}
+
+void turning_off(std::uint8_t* follow, std::uint8_t* aim) {
+    release(g_follow_speed, follow);
+    release(g_follow_fast, follow);
+    release(g_aim_speed, aim);
+    release(g_aim_limits, aim);
+}
+
 // HUNTER_CAM_LOG=1: every 8th frame, the camera, the hunter and the aim.
 void trace(const BbCamera* c, V3 pos) {
     static const bool logging = std::getenv("HUNTER_CAM_LOG") != nullptr;
@@ -665,6 +873,14 @@ void trace(const BbCamera* c, V3 pos) {
              static_cast<double>(c->near_z), static_cast<double>(view_yaw), static_cast<double>(off),
              (g_aim_chr ? (g_aim_chr[kAimFlags] & kAimBit) : 0) | (g_monocular.load() ? 16 : 0), static_cast<double>(feet[0]),
              static_cast<double>(feet[1]), static_cast<double>(feet[2]));
+    const std::uint8_t* aim = get<std::uint8_t*>(reinterpret_cast<const std::uint8_t*>(c) - 0x10, kAimCam);
+    if (aim)
+        api->log("hunter_cam: aim pitch %.3f yaw %.3f limits %.4f %.4f speeds %.3f %.3f %.3f %.3f fwd %.3f %.3f %.3f",
+                 static_cast<double>(get<float>(aim, kAimPitch)), static_cast<double>(get<float>(aim, kAimYaw)),
+                 static_cast<double>(get<float>(aim, kAimPitchMax)), static_cast<double>(get<float>(aim, kAimPitchMin)),
+                 static_cast<double>(get<float>(aim, 0x104)), static_cast<double>(get<float>(aim, 0x108)),
+                 static_cast<double>(get<float>(aim, 0x10c)), static_cast<double>(get<float>(aim, 0x110)),
+                 static_cast<double>(fwd.x), static_cast<double>(fwd.y), static_cast<double>(fwd.z));
 }
 
 // The game's own camera, zoomed by the wheel as the host zoomed it: along the
@@ -698,7 +914,10 @@ void on_camera(BbCamera* c, void*) {
     view.last = now;
     if (!(dt >= 0) || dt > 0.25f) dt = 0.25f;
     const bool loading = api->loading_screen && api->loading_screen();
+    std::uint8_t* const follow = const_cast<std::uint8_t*>(f);
+    std::uint8_t* const aim_cam = get<std::uint8_t*>(reinterpret_cast<std::uint8_t*>(c) - 0x10, kAimCam);
     if (!s.on || loading) {
+        turning_off(follow, aim_cam);
         view.started = false;
         view.reach = -1.0f;
         view.have_focus = false;
@@ -717,6 +936,7 @@ void on_camera(BbCamera* c, void*) {
                  static_cast<double>(s.distance), static_cast<double>(s.offset), static_cast<double>(s.height));
     }
     read_keys();
+    turning(follow, aim_cam);
     const bool first = g_first;
     if (!first && !s.camera) {  // the game's camera (first person off, the shoulder camera off)
         view.reach = -1.0f;
@@ -817,13 +1037,16 @@ void on_camera(BbCamera* c, void*) {
         pos = pos + (v3(c->position) - pos) * t;
     }
     put(c->position, pos);
-    const float deg = first ? s.first_fov : s.fov;
-    if (deg > 0) {
-        const float ours = deg * kPi / 180.0f;
-        c->fov_y = ours + (c->fov_y - ours) * view.away;
-    } else if (aim && view.fov > 0) {
-        c->fov_y = view.fov;  // the aim camera zooms in; ours keeps the follow camera's
+    // The field of view: the follow camera's (the aim camera zooms in; ours
+    // keeps the follow camera's), widened as F10's widens it.
+    float base = c->fov_y;
+    if (aim) {
+        if (own->fov_y > 0.1f && own->fov_y < 2.5f) base = own->fov_y;
+        else if (view.fov > 0) base = view.fov;
     }
+    float ours_fov = base * (1.0f + 0.01f * static_cast<float>(first ? s.first_fov : s.fov));
+    if (ours_fov > 2.6f) ours_fov = 2.6f;
+    c->fov_y = ours_fov + (c->fov_y - ours_fov) * view.away;
     trace(c, pos);
 }
 
