@@ -17168,6 +17168,70 @@ const bool g_cb_prefetch = [] {
     const char* e = std::getenv("BBHOST_CB_PREFETCH");
     return !(e && e[0] == '0');
 }();
+// BBHOST_CB_SNAPSHOT_DEDUPE (resolve_stage_buffers): 0 off, 1 on (unset), 2 check, 3 compare.
+enum { kDedupeOff, kDedupeOn, kDedupeCheck, kDedupeCompare };
+int cb_dedupe_mode() {
+    static const int mode = [] {
+        const char* e = std::getenv("BBHOST_CB_SNAPSHOT_DEDUPE");
+        if (!e || !*e) return int{kDedupeOn};
+        if (std::strcmp(e, "check") == 0) return int{kDedupeCheck};
+        if (std::strcmp(e, "compare") == 0) return int{kDedupeCompare};
+        return e[0] == '0' ? int{kDedupeOff} : int{kDedupeOn};
+    }();
+    return mode;
+}
+// The run batching's constant buffers (BBHOST_RUN_BATCH, host/list_resolve.h).
+// A buffer an earlier draw of the run copied as it recorded - its lookups said
+// a snapshot: no copy-back's version over it, no twin, no GPU write still to
+// land, mapped (or, in GX's upload heap or ring, those answers known) - binds
+// that copy again without the lookups and the choice after them, as the
+// snapshots' memo would bind it once they had said the same. Within a run
+// nothing is done in order - a copy-back's version is made only at a copy
+// token and a draw's windows open only for YEBIS's draws, and both end the run
+// (list_resolve::split) - and nobody else takes the GPU mutex (its count of
+// takes, as the targets' sharing has it). What a draw of the run can still
+// change is asked again at the binding - a GPU write noted over the range, the
+// memory unmapped - or watched: a twin made or let go moves the twins' shape.
+// The copy is the snapshots' memo's, which must still hold it: this
+// recording's, this lap of the ring. At Old Yharnam with no homes (a 4 GB
+// card's state on an RTX 4070) 67% of the command processor's ~12,900
+// constant-buffer bindings a flip had an earlier one in their run.
+struct CbRunEntry {
+    std::uint64_t base = 0, bytes = 0, epoch = 0, twins = 0;
+};
+CbRunEntry g_cb_run[1024];
+std::uint64_t g_cb_run_epoch = 1;                  // moved by cb_run_draw: another run, or another's take of the GPU mutex
+std::uint64_t g_cb_run_serial = 0, g_cb_run_mu = 0;  // the last draw's run and count of the mutex's takes
+thread_local bool t_cb_run = false;                // the draw t_cb_run_draw names shares its run's copies (cb_run_draw)
+thread_local std::uint64_t t_cb_run_draw = 0;      // that draw's number (g.draw_calls when it asked)
+inline CbRunEntry& cb_run_for(std::uint64_t base) { return g_cb_run[((base >> 4) ^ (base >> 14)) & 1023]; }
+VkBuffer g_cb_ring = VK_NULL_HANDLE;               // the copies' ring (resolve_stage_buffers' scratch, made at the first copy)
+constexpr VkDeviceSize kCbRingBytes = 64ull << 20;
+
+// A draw of the command processor's own, in order and batched, with its GPU
+// mutex's count of takes (run_targets, from draw_impl's targets, before any of
+// its bindings): whether its constant buffers take its run's copies (CbRunEntry)
+// - none of what the copies' lookups answer otherwise: the homes made, GX's
+// upload heap bound in place, the dedupe's checks, the draw context, the
+// checks' and censuses' own paths. The run's epoch moves where this draw is of
+// another run than the draw before, or another took the mutex in between. (Kept
+// out of draw_impl: a change of its code drops its part of the Windows build's
+// PGO profile.)
+void cb_run_draw(std::uint64_t mu_taken) {
+    const std::uint64_t serial = list_resolve::run_serial();
+    if (serial != g_cb_run_serial || mu_taken != g_cb_run_mu + 1) ++g_cb_run_epoch;
+    g_cb_run_serial = serial;
+    g_cb_run_mu = mu_taken;
+    t_cb_run = !gxvk_homes::made_on() && !gxvk::arena_wanted() && cb_dedupe_mode() == kDedupeOn && !cb_proof::g_on && !gxvk::census() &&
+               !list_resolve::g_draw_ctx && !run_digest_on();
+    t_cb_run_draw = g.draw_calls.load(std::memory_order_relaxed);
+}
+// Whether this stage's bindings take their run's copies: a GX-native draw's (its
+// records: not a dispatch's, YEBIS's or Scaleform's) of the command processor's
+// own (not a run part's, not the pool's), the very draw cb_run_draw was told of.
+bool cb_run_stage(const GxStageRecords* gx) {
+    return t_cb_run && gx && !t_run_draw && t_cb_run_draw == g.draw_calls.load(std::memory_order_relaxed);
+}
 }  // namespace
 
 // TranslateOptions::cb_ssbo: bind each constant buffer the shader reads
@@ -17369,7 +17433,26 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
     enum { kBound, kNoBase, kUnaligned, kUnmapped, kTooLong, kOutcomes };
     static std::uint64_t outcomes[kOutcomes] = {};
     static std::uint64_t resolves = 0;
+    const auto log_outcomes = [] {
+        host_log("render: storage-buffer constants: %llu bound; page-table path: %llu no base, %llu unaligned, %llu not imported, %llu too long",
+                 static_cast<unsigned long long>(outcomes[kBound]), static_cast<unsigned long long>(outcomes[kNoBase]),
+                 static_cast<unsigned long long>(outcomes[kUnaligned]), static_cast<unsigned long long>(outcomes[kUnmapped]),
+                 static_cast<unsigned long long>(outcomes[kTooLong]));
+        host_log("render:   YEBIS windows written by the CPU %llu, bound from their draw's copy %llu, read past their window %llu",
+                 static_cast<unsigned long long>(g_windows_given.load()), static_cast<unsigned long long>(g_windows_bound.load()),
+                 static_cast<unsigned long long>(g_windows_past.load()));
+        host_log("render:   %llu of them copied to an aligned scratch (%llu MiB): a base that is not on a vec4 is read wrongly "
+                 "through the binding, which is the menu flash; %llu of those a Scaleform draw's, copied as recorded "
+                 "(BBHOST_SF_SNAPSHOT); %llu memory the game writes, copied as recorded (BBHOST_CB_SNAPSHOT)",
+                 static_cast<unsigned long long>(g_cb_realigned.load()), static_cast<unsigned long long>(g_cb_realigned_bytes.load() >> 20),
+                 static_cast<unsigned long long>(g_sf_cb_snapshots.load()), static_cast<unsigned long long>(g_cb_snapshots.load()));
+        host_log("render:   %llu of those snapshots bound the copy an earlier binding of the same recording made (BBHOST_CB_SNAPSHOT_DEDUPE); "
+                 "compared with the guest's bytes %llu, changed since the copy %llu",
+                 static_cast<unsigned long long>(g_cb_snapshots_shared.load()), static_cast<unsigned long long>(g_cb_snapshots_compared.load()),
+                 static_cast<unsigned long long>(g_cb_snapshots_changed.load()));
+    };
     const GxStagePlan* plan = gx && g_binding_plans ? &stage_plan(meta, *gx) : nullptr;
+    const bool run_share = cb_run_stage(gx);  // the run batching's copies (CbRunEntry)
     for (std::size_t i = 0; i < meta.buffers.size(); ++i) {
         const gcn::BufferBinding& b = meta.buffers[i];
         VkDescriptorBufferInfo info{g.dummy_ssbo, 0, VK_WHOLE_SIZE};
@@ -17417,6 +17500,37 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         const std::uint64_t hi = b.pointer ? words[1] : (words[1] & 0xff);
         const std::uint64_t base = resolved ? static_cast<std::uint64_t>(words[0]) | (hi << 32) : 0;
         if (bases) bases[i] = base;
+        // The run batching: the copy an earlier draw of this run took of the buffer (CbRunEntry). Its compare mode
+        // resolves the binding as before and checks it against that copy (`run_at`).
+        std::uint64_t run_at = ~0ull;
+        if (run_share && !b.pointer && !b.written && base && !(base & 3) && shape && bytes && bytes <= (1u << 20) &&
+            (exact || g.ssbo_max_range >= kCbRingBytes) && !t_snapshot_cbs && t_draw_windows.empty() && !glitch_watching_draw()) {
+            const CbRunEntry& e = cb_run_for(base);
+            const SnapMemo& m = snap_memo_for(base);
+            if (e.base == base && e.epoch == g_cb_run_epoch && e.bytes >= bytes && e.twins == twins_shape_locked() && m.base == base &&
+                m.serial == g.record_serial && m.lap == g_scratch_lap && m.bytes >= bytes && hle_kernel_va_mapped(base, bytes) &&
+                !gpu_writes_pending_locked(base, bytes)) {
+                if (list_resolve::batch_compare()) {
+                    run_at = m.at;
+                } else {
+                    // As the snapshots' memo binds it (below): the whole ring at the copy's dword bias, or pushed at the copy.
+                    const bool whole = !exact;
+                    info = whole ? VkDescriptorBufferInfo{g_cb_ring, 0, kCbRingBytes} : VkDescriptorBufferInfo{g_cb_ring, m.at, bytes};
+                    params.cb_valid |= 1u << i;
+                    params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(m.at / 4) : 0;
+                    if (!whole) note_copy_binding_locked(info, base);
+                    if (host_tooling()) {
+                        bump(g_cb_snapshots);
+                        bump(g_cb_snapshots_shared);
+                    }
+                    list_resolve::count(list_resolve::kBatchCbShared);
+                    ++outcomes[kBound];
+                    infos.push_back(info);
+                    if (host_tooling() && ++resolves % 200000 == 0) log_outcomes();
+                    continue;
+                }
+            }
+        }
         // A buffer the game writes on the CPU is copied as the draw records
         // (BBHOST_CB_SNAPSHOT, below), from memory a game thread has just
         // written - its lines in that core's cache. Asked for here, ahead of
@@ -17774,6 +17888,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 if (!scratch.buffer) {
                     MemOwner own_mem("constant-buffer copies ring");
                     create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
+                    static_assert(kScratch == kCbRingBytes, "the run batching binds the ring by its size");
+                    g_cb_ring = scratch.buffer;
                     g_cb_ring_made = scratch.map != nullptr;  // (stage 1d.1 takes the heap's answers only once there is a ring to copy into)
                     if (g_cb_ring_made) gxvk::heap_copy_ring_made();  // (and 1d.2a's versions from the heap need it for their homes' bindings)
                     if (g_cb_ring_made && gxvk_lists::splice()) {  // stage 4b.1b/4b.2: the pool's copies in its last 16 MiB
@@ -17801,14 +17917,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 // since (the report's "changed"); =compare: shares only a copy
                 // whose bytes still match, and copies again otherwise. Both
                 // read the write-combined ring back: slow, for checks.
-                enum { kDedupeOff, kDedupeOn, kDedupeCheck, kDedupeCompare };
-                static const int dedupe = [] {
-                    const char* e = std::getenv("BBHOST_CB_SNAPSHOT_DEDUPE");
-                    if (!e || !*e) return int{kDedupeOn};
-                    if (std::strcmp(e, "check") == 0) return int{kDedupeCheck};
-                    if (std::strcmp(e, "compare") == 0) return int{kDedupeCompare};
-                    return e[0] == '0' ? int{kDedupeOff} : int{kDedupeOn};
-                }();
+                const int dedupe = cb_dedupe_mode();
                 SnapMemo* memo = nullptr;
                 // Pushed (`exact`), each draw's ranges go into the command
                 // buffer anyway: the snapshot is bound where it is.
@@ -18021,6 +18130,11 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         bump(g_cb_realigned_bytes, bytes);
                     }
                 }
+                // The run batching: a later binding in this draw's run takes this copy without the lookups (CbRunEntry) -
+                // GX's upload heap's and ring's too, whose answers were known (their later bindings ask the GPU writes
+                // and the mapping again all the same).
+                if (run_share && memo && outcome == kBound && copy_from == base && !draw_ctx())
+                    cb_run_for(base) = CbRunEntry{base, bytes, g_cb_run_epoch, twins_shape_locked()};
             }
             if (outcome == kBound) {
                 // already handled by the realign path
@@ -18112,27 +18226,28 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             if (t_run_digest.nbuffers < 6) std::memcpy(t_run_digest.first[t_run_digest.nbuffers], what, sizeof(what));
             ++t_run_digest.nbuffers;
         }
-        infos.push_back(info);
-        if (host_tooling() && !run_part() && ++resolves % 200000 == 0) {
-            host_log("render: storage-buffer constants: %llu bound; page-table path: %llu no base, %llu unaligned, %llu not imported, %llu too long",
-                     static_cast<unsigned long long>(outcomes[kBound]), static_cast<unsigned long long>(outcomes[kNoBase]),
-                     static_cast<unsigned long long>(outcomes[kUnaligned]), static_cast<unsigned long long>(outcomes[kUnmapped]),
-                     static_cast<unsigned long long>(outcomes[kTooLong]));
-            host_log("render:   YEBIS windows written by the CPU %llu, bound from their draw's copy %llu, read past their window %llu",
-                     static_cast<unsigned long long>(g_windows_given.load()), static_cast<unsigned long long>(g_windows_bound.load()),
-                     static_cast<unsigned long long>(g_windows_past.load()));
-            host_log("render:   %llu of them copied to an aligned scratch (%llu MiB): a base that is not on a vec4 is read wrongly "
-                     "through the binding, which is the menu flash; %llu of those a Scaleform draw's, copied as recorded "
-                     "(BBHOST_SF_SNAPSHOT); %llu memory the game writes, copied as recorded (BBHOST_CB_SNAPSHOT)",
-                     static_cast<unsigned long long>(g_cb_realigned.load()),
-                     static_cast<unsigned long long>(g_cb_realigned_bytes.load() >> 20),
-                     static_cast<unsigned long long>(g_sf_cb_snapshots.load()), static_cast<unsigned long long>(g_cb_snapshots.load()));
-            host_log("render:   %llu of those snapshots bound the copy an earlier binding of the same recording made (BBHOST_CB_SNAPSHOT_DEDUPE); "
-                     "compared with the guest's bytes %llu, changed since the copy %llu",
-                     static_cast<unsigned long long>(g_cb_snapshots_shared.load()),
-                     static_cast<unsigned long long>(g_cb_snapshots_compared.load()),
-                     static_cast<unsigned long long>(g_cb_snapshots_changed.load()));
+        if (run_at != ~0ull) {
+            // BBHOST_RUN_BATCH=compare: what the run's copy would have bound against what was.
+            list_resolve::count(list_resolve::kBatchCbCompared);
+            const bool whole = !exact;
+            const bool same = ((params.cb_valid >> i) & 1) && info.buffer == g_cb_ring &&
+                              (whole ? info.offset == 0 && info.range == kCbRingBytes && params.cb_bias_dw[i] == run_at / 4
+                                     : info.offset == run_at && info.range == bytes && params.cb_bias_dw[i] == 0);
+            if (!same) {
+                list_resolve::count(list_resolve::kBatchCbDiffered);
+                static int logs = 0;  // under g.mu
+                if (logs++ < 8) {
+                    host_log("list-resolve: run batching: a constant buffer at 0x%llx (%llu bytes) bound %p +0x%llx (%llu bytes, bias %u dwords), "
+                             "its run's copy at 0x%llx in %p (flip %llu)",
+                             static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<void*>(info.buffer),
+                             static_cast<unsigned long long>(info.offset), static_cast<unsigned long long>(info.range), params.cb_bias_dw[i],
+                             static_cast<unsigned long long>(run_at), static_cast<void*>(g_cb_ring),
+                             static_cast<unsigned long long>(hle_video_flip_count()));
+                }
+            }
         }
+        infos.push_back(info);
+        if (host_tooling() && !run_part() && ++resolves % 200000 == 0) log_outcomes();
     }
 }
 
@@ -23316,6 +23431,7 @@ void run_targets_written_locked() {
 // before and counts where the taken answers would have differed.
 void run_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, std::uint64_t mu_taken) {
     using namespace list_resolve;
+    cb_run_draw(mu_taken);  // its constant buffers' run (resolve_stage_buffers, CbRunEntry)
     RunTargets& m = t_run_targets;
     count(kBatchTargetsAsked);
     const std::uint64_t serial = run_serial();

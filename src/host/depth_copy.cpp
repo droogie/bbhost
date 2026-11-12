@@ -118,11 +118,24 @@ bool depth_copy_record_locked(VkImage depth, VkFormat depth_format, VkImage dst,
     w[2].pImageInfo = &dst_info;
     vkUpdateDescriptorSets(g.device, 3, w, 0, nullptr);
     const Push push{width, height};
-    VkCommandBuffer cmd = g_cmd();
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, &set, 0, nullptr);
-    vkCmdPushConstants(cmd, g_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+    // The pass as the stream's ops (host/recorder.cpp): recorded in place it drained the recorder, the last such site in
+    // play - once or twice a flip, on an RTX 4070 ~127 us a drain at Old Yharnam. BBHOST_STREAM_DEPTH_COPY=0: in place.
+    static const bool as_ops = [] {
+        const char* e = std::getenv("BBHOST_STREAM_DEPTH_COPY");
+        return !(e && e[0] == '0');
+    }();
+    if (as_ops) {
+        rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, g_pipeline);
+        rec().bind_sets(VK_PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, &set);
+        rec().push_constants(g_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        rec().dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    } else {
+        VkCommandBuffer cmd = g_cmd();
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_layout, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cmd, g_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+    }
     defer_destroy_private_view(depth_view);
     defer_destroy_private_view(dst_view);
     return true;

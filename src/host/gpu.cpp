@@ -11858,6 +11858,8 @@ bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkD
     return true;
 }
 
+std::uint64_t twins_shape_locked() { return g_twin_live.shape(); }
+
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes) {
     if (gxvk_homes::bind_on() && homes_meet_locked(va, bytes)) return true;  // a home's guest bytes are stale too (stage 4b.3c)
     if (!g_twins || g_twin_live.empty() || !bytes) return false;
