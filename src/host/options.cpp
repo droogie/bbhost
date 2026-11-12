@@ -367,8 +367,12 @@ Setting g_set[kSettingCount] = {
      "The game's own anti-aliasing pass, over the finished picture. Off while TAA, FSR, DLSS or a plugin's own anti-aliasing "
      "takes its place: they do the anti-aliasing, and this pass after them would only soften the picture again.",
      false},
+    // Off is YEBIS's own switch, cleared each view (engine/graphics_patch.cpp):
+    // none of the blur's passes run.
     {"depth_of_field", "Depth of field", {"Off", "On"}, 1,
-     "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
+     "Blurs distant scenery, and what is out of focus in cutscenes; indoors there is rarely anything far enough to "
+     "blur. Off leaves it out everywhere, and its passes are not drawn.",
+     false},
     {"chromatic_aberration", "Chromatic aberration", {"Off", "On"}, 1,
      "The colour fringing at the edges of the frame.", false},
     // Two of the area's draw parameters (param/drawparam), scaled or cleared

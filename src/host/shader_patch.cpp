@@ -31,15 +31,10 @@ const Patch kPatches[] = {
     // Motion blur setting left this blur on, and rebuilt motion vectors' map
     // (raw NDC motion, which it reads as 0.5 off centre) smeared every mesh.
     {"157a299c", &HostSettings::motion_blur, "motion blur (camera blur)", {0x7c061420, 0xbea0246a}, {0x7c001420, 0xbea0246a}},
-    // YEBIS depth of field's composite (d3ca03f3+111fce32):
-    //   v_mad_f32 v0, v5, s0, v0 clamp       ; t = clamp(scene.a * k + b)
-    //   rgb = scene + t * (blurred - scene)
-    // t = 0 - v_mov_b32 v0, 0 and an s_nop for the second word - leaves the
-    // scene as it was. The game's own switch (the je at 0x25d7bbc the
-    // community patch forces) stops YEBIS being fed its focus parameters,
-    // which is only "off" if it never had any: turned off later, the last
-    // ones stay. The blend is where the effect lands, so it is off here.
-    {"111fce32", &HostSettings::depth_of_field, "depth of field", {0xd2820800, 0x04000105}, {0x7e000280, 0xbf800000}},
+    // Depth of field is not a patch: YEBIS's own enable, cleared each view
+    // (engine/graphics_patch.cpp, kDofEnable). Zeroing one composite's blend
+    // (d3ca03f3+111fce32) left the multi-level ones - lower resolutions,
+    // cutscenes, strong blur - and every pass before them running.
 };
 constexpr std::size_t kCount = sizeof(kPatches) / sizeof(kPatches[0]);
 

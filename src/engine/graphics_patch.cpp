@@ -83,7 +83,8 @@ namespace {
 //     a jump to a stub that does the same copy with the amount ANDed with a
 //     mask the host owns: all ones for on, 0 for off. The code is written
 //     once, at load; turning it on or off is one store to the mask.
-//   - Motion blur and depth of field are shader patches (host/shader_patch.h).
+//   - Motion blur is a shader patch (host/shader_patch.h); depth of field is
+//     YEBIS's own switch, cleared in the block each view (kDofEnable below).
 //   - Bloom and vignette are two of the area's draw parameters, changed in the
 //     block the game hands YEBIS each frame - "Draw parameters" below.
 constexpr std::uint64_t kRenderView = 0x269e990;
@@ -204,9 +205,22 @@ const std::uint8_t kYebisRecordPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57,
 constexpr std::uint64_t kPostBlock = 0x59406e0;
 constexpr std::size_t kSaturation = 0xc8, kVignettePower = 0xd0, kGlareLuminance = 0xdc;
 constexpr std::size_t kYebisHeld = 0x2710;  // on the YEBIS object: the block was not refreshed
+// Depth of field's switch: the block's +0x1ac, the area's "Yebis-DepthOfField:
+// Enable", which the game copies in every view (0x25d541e). The flip pass
+// (0x25d5f80) hands it to YEBIS's own enable at 0x25d7a98 (ppfx_sub_fb2960:
+// the effect's +0x940) and skips the depth of field's parameters on 0 (the
+// je at 0x25d7bbc). With the enable 0, YEBIS's effective switch (+0xc4b, set
+// in sub_fdb120 from +0x940) stays 0 and the effect chain never calls its
+// depth of field (sub_fe6c60, from 0xfec146/0xfec519 only while +0xc4b is
+// set): no circle of confusion, downsample, aperture-filter levels or
+// composite - the single-level one (d3ca03f3+111fce32) the world's faint far
+// blur uses at 1080p, the multi-level ones (+6e2d87e3, +8fcc561d, +b9167b53:
+// a smaller picture, the cutscenes, a strong blur). A 1 the next view copies
+// in turns it back on, with its parameters fed again from that view.
+constexpr std::size_t kDofEnable = 0x1ac;
 std::uint8_t* g_post_block = nullptr;
 std::atomic<float> g_bloom{1.0f}, g_saturation{1.0f};
-std::atomic<bool> g_vignette{true};
+std::atomic<bool> g_vignette{true}, g_dof{true};
 
 // Ambient occlusion strength. The SSAO bank (+0x5968) is blended the same way
 // (sub_1285500, into a 0x6c-byte block) and copied into the SSAO object the
@@ -498,6 +512,7 @@ void settings_changed(const HostSettings& hs) {
     g_fog.store(hs.fog);
     g_ao_strength.store(hs.ao_strength);
     g_vignette.store(hs.vignette);
+    g_dof.store(hs.depth_of_field);
     g_motion_blur.store(hs.motion_blur);
     if (!g_lod_bias_env) g_lod_bias.store(hs.lod_bias);
     g_shadow_scale.store(hs.shadow_scale > 1.0f ? hs.shadow_scale
@@ -670,6 +685,11 @@ GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* sav
     if (!vignette && power != 0.0f) {
         power = 0.0f;
         std::memcpy(g_post_block + kVignettePower, &power, 4);
+    }
+    // Depth of field off: YEBIS's own switch, every view (kDofEnable).
+    if (!g_dof.load(std::memory_order_relaxed)) {
+        const std::int32_t off = 0;
+        std::memcpy(g_post_block + kDofEnable, &off, 4);
     }
     for (int i = 0; i < g_post_poke.n; ++i) {
         std::memcpy(g_post_block + g_post_poke.off[i], &g_post_poke.value[i], 4);
@@ -1501,7 +1521,7 @@ void live_install(ElfImage* image) {
     if (!install_prologue_hook(image, at(kYebisRecord), kYebisRecordPrologue, sizeof(kYebisRecordPrologue),
                                reinterpret_cast<void*>(&yebis_record_hook))) {
         host_log("graphics: refused, 0x%llx is not the YEBIS record's prologue (or no room for its hook); "
-                 "bloom and vignette stay as the area has them",
+                 "bloom, vignette and depth of field stay as the area has them",
                  static_cast<unsigned long long>(kYebisRecord));
     } else {
         g_post_block = static_cast<std::uint8_t*>(guest_ptr(image->mem, at(kPostBlock)));

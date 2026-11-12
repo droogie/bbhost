@@ -15,11 +15,11 @@
 // (e0305cef) blurs only where |vx| + |vy| >= C#[0x2f2], and the patch makes
 // that compare always false.
 //
-// Depth of field: its composite (111fce32) blends the blurred copy in by a
-// clamped factor, and the patch makes that factor 0.
+// (Depth of field is not a patch here: its setting clears YEBIS's own enable
+// each view - engine/graphics_patch.cpp - so none of its passes run.)
 //
-// Both follow their settings live: the programs are read again when the mask
-// below changes (render.cpp's program_at - both are pixel shaders), and
+// The patches follow their settings live: the programs are read again when the
+// mask below changes (render.cpp's program_at - both are pixel shaders), and
 // the patched and unpatched words are simply two programs, each with its own
 // pipelines.
 
