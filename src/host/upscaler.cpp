@@ -52,13 +52,13 @@ constexpr float kTaaMipBias = 0.0f;
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include "host/pe_loader.h"
 #endif
 
 #include "host/upscaler_ffx.h"
 #include "upscaler_bridge.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -75,6 +75,7 @@ namespace {
 const ub_api* g_ub = nullptr;
 ub_context* g_ctx = nullptr;
 bool g_attached = false;
+static bool g_is_pe = false;
 #if !defined(_WIN32)
 // FSR on Linux: bbhost's FidelityFX library behind the same API, in bbhost itself (host/upscaler_ffx.h).
 const ub_api* g_fsr = nullptr;
@@ -89,6 +90,7 @@ struct Route {
 };
 Route route(int method) {
 #if !defined(_WIN32)
+    if (g_is_pe) return {g_ub, g_ctx, g_attached};
     if (method == 2) return {g_fsr, g_fsr_ctx, g_fsr_attached};
 #else
     (void)method;
@@ -125,6 +127,15 @@ bool bridge_beside_exe() {
             if (std::filesystem::is_regular_file(std::filesystem::path(config_exe_dir()) / name, ec)) return true;
         }
         return false;
+    }();
+    return beside;
+}
+
+bool fsr_bridge_beside_exe() {
+    static const bool beside = [] {
+        const std::filesystem::path dir = config_exe_dir();
+        std::error_code ec;
+        return std::filesystem::is_regular_file(dir / "upscaler_bridge.dll", ec);
     }();
     return beside;
 }
@@ -200,6 +211,35 @@ bool upscaler_open() {
     host_log("upscaler: %s loaded", dll.string().c_str());
     return true;
 #else
+    // Check for Windows upscaler_bridge.dll beside the executable via PE loader first
+    const std::filesystem::path dir_path = config_exe_dir();
+    const std::filesystem::path pe_dll = dir_path / "upscaler_bridge.dll";
+    std::error_code pe_ec;
+    if (std::filesystem::is_regular_file(pe_dll, pe_ec)) {
+        pe_add_search_dir(dir_path.string().c_str());
+        void* pe_h = pe_load_library(pe_dll.string().c_str());
+        if (pe_h) {
+            auto get_api = reinterpret_cast<PFN_ub_get_api>(pe_get_proc_address(pe_h, "ub_get_api"));
+            const ub_api* api = get_api ? get_api(UB_API_VERSION) : nullptr;
+            if (api) {
+                const std::string folder_str = dir_path.string();
+                const std::string data = config_user_dir() + "/ngx";
+                ub_open_desc od{};
+                od.struct_size = sizeof(od);
+                od.vendor_folder = folder_str.c_str();
+                od.data_folder = data.c_str();
+                od.engine_version = BBHOST_VERSION;
+                od.log = &bridge_log;
+                if (api->open_context(&od, &g_ctx) == UB_OK) {
+                    g_ub = api;
+                    g_is_pe = true;
+                    host_log("upscaler: %s loaded via PE loader", pe_dll.string().c_str());
+                    return true;
+                }
+            }
+        }
+    }
+
     // From the executable's own folder (/proc/self/exe's, never a library
     // path), RTLD_LOCAL: nothing of the bridge's reaches anything else.
     const std::string dir = config_exe_dir();
@@ -243,6 +283,7 @@ bool upscaler_open() {
         return fsr;
     }
     g_ub = api;
+    g_is_pe = false;
     host_log("upscaler: %s loaded", path.c_str());
     return true;
 #endif
@@ -251,7 +292,12 @@ bool upscaler_open() {
 const VkInstanceCreateInfo* upscaler_prepare_instance(const VkInstanceCreateInfo* in) {
     if (!g_ub) return in;
     const VkInstanceCreateInfo* out = in;
+#if defined(_WIN32)
     g_ub->prepare_instance(g_ctx, vkGetInstanceProcAddr, in, &out);
+#else
+    PFN_vkGetInstanceProcAddr gipa = g_is_pe ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(pe_vk_get_instance_proc_addr) : vkGetInstanceProcAddr;
+    g_ub->prepare_instance(g_ctx, gipa, in, &out);
+#endif
     return out ? out : in;
 }
 
@@ -279,8 +325,13 @@ void upscaler_attach(VkInstance instance, VkPhysicalDevice phys, VkDevice device
     dd.instance = instance;
     dd.physical_device = phys;
     dd.device = device;
+#if defined(_WIN32)
     dd.get_instance_proc_addr = vkGetInstanceProcAddr;
     dd.get_device_proc_addr = vkGetDeviceProcAddr;
+#else
+    dd.get_instance_proc_addr = g_is_pe ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(pe_vk_get_instance_proc_addr) : vkGetInstanceProcAddr;
+    dd.get_device_proc_addr = g_is_pe ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(pe_vk_get_device_proc_addr) : vkGetDeviceProcAddr;
+#endif
     UpscalerCaps c;
     if (g_ub && g_ub->attach_device(g_ctx, &dd) != UB_OK) {
         host_log("upscaler: attach failed: %s", g_ub->last_error(g_ctx));
@@ -303,34 +354,45 @@ void upscaler_attach(VkInstance instance, VkPhysicalDevice phys, VkDevice device
                      c.fsr ? "available: " : "not available", c.fsr ? caps.fsr_versions : "", c.fsr4 ? " (FSR 4 here)" : "",
                      c.fsr || !caps.fsr_reason[0] ? "" : (std::string(" (") + caps.fsr_reason + ")").c_str());
 #else
-            host_log("upscaler: bridge %s; DLSS %s%s%s", caps.bridge_version, c.dlss ? "available " : "not available",
-                     c.dlss ? caps.dlss_version : "", c.dlss || !caps.dlss_reason[0] ? "" : (std::string(" (") + caps.dlss_reason + ")").c_str());
+            if (g_is_pe) {
+                host_log("upscaler: bridge %s; DLSS %s%s%s; FSR %s%s%s%s", caps.bridge_version, c.dlss ? "available " : "not available",
+                         c.dlss ? caps.dlss_version : "", c.dlss || !caps.dlss_reason[0] ? "" : (std::string(" (") + caps.dlss_reason + ")").c_str(),
+                         c.fsr ? "available: " : "not available", c.fsr ? caps.fsr_versions : "", c.fsr4 ? " (FSR 4 here)" : "",
+                         c.fsr || !caps.fsr_reason[0] ? "" : (std::string(" (") + caps.fsr_reason + ")").c_str());
+            } else {
+                host_log("upscaler: bridge %s; DLSS %s%s%s", caps.bridge_version, c.dlss ? "available " : "not available",
+                         c.dlss ? caps.dlss_version : "", c.dlss || !caps.dlss_reason[0] ? "" : (std::string(" (") + caps.dlss_reason + ")").c_str());
+            }
 #endif
         }
     }
 #if !defined(_WIN32)
-    // FSR on Linux: bbhost's FidelityFX library, whatever the bridge says of FSR (its own FSR, should a bridge have one,
-    // is not used: one FSR, the same everywhere on Linux).
-    c.fsr = c.fsr4 = false;
-    c.fsr_versions.clear();
-    c.fsr_reason = "no " + std::string(kFfxLibrary) + " beside bbhost";
-    if (g_fsr && g_fsr->attach_device(g_fsr_ctx, &dd) != UB_OK) {
-        c.fsr_reason = g_fsr->last_error(g_fsr_ctx);
-        host_log("upscaler: FSR 3's attach failed: %s", c.fsr_reason.c_str());
-    } else if (g_fsr) {
-        g_fsr_attached = true;
-        ub_caps caps{};
-        caps.struct_size = sizeof(caps);
-        if (g_fsr->get_caps(g_fsr_ctx, &caps) == UB_OK) {
-            c.fsr_loaded = true;
-            c.fsr = caps.fsr_available != 0;
-            c.fsr_versions = caps.fsr_versions;
-            c.fsr_reason = caps.fsr_reason;
+    if (!g_is_pe) {
+        // FSR on Linux: bbhost's FidelityFX library, whatever the bridge says of FSR (its own FSR, should a bridge have one,
+        // is not used: one FSR, the same everywhere on Linux).
+        c.fsr = c.fsr4 = false;
+        c.fsr_versions.clear();
+        c.fsr_reason = "no " + std::string(kFfxLibrary) + " beside bbhost";
+        if (g_fsr && g_fsr->attach_device(g_fsr_ctx, &dd) != UB_OK) {
+            c.fsr_reason = g_fsr->last_error(g_fsr_ctx);
+            host_log("upscaler: FSR 3's attach failed: %s", c.fsr_reason.c_str());
+        } else if (g_fsr) {
+            g_fsr_attached = true;
+            ub_caps caps{};
+            caps.struct_size = sizeof(caps);
+            if (g_fsr->get_caps(g_fsr_ctx, &caps) == UB_OK) {
+                c.fsr_loaded = true;
+                c.fsr = caps.fsr_available != 0;
+                c.fsr_versions = caps.fsr_versions;
+                c.fsr_reason = caps.fsr_reason;
+            }
+            host_log("upscaler: FSR %s%s%s", c.fsr ? "available: " : "not available", c.fsr ? c.fsr_versions.c_str() : "",
+                     c.fsr || c.fsr_reason.empty() ? "" : (" (" + c.fsr_reason + ")").c_str());
         }
-        host_log("upscaler: FSR %s%s%s", c.fsr ? "available: " : "not available", c.fsr ? c.fsr_versions.c_str() : "",
-                 c.fsr || c.fsr_reason.empty() ? "" : (" (" + c.fsr_reason + ")").c_str());
+        host_log("upscaler: the Upscaling list offers Off, TAA%s%s", c.fsr ? ", FSR 3" : "", c.dlss ? ", DLSS" : "");
+    } else {
+        host_log("upscaler: the Upscaling list offers Off, TAA%s%s", c.fsr ? (c.fsr4 ? ", FSR 4, FSR 3" : ", FSR 3") : "", c.dlss ? ", DLSS" : "");
     }
-    host_log("upscaler: the Upscaling list offers Off, TAA%s%s", c.fsr ? ", FSR 3" : "", c.dlss ? ", DLSS" : "");
 #endif
     std::lock_guard<std::mutex> lk(g_caps_mu);
     g_caps = c;
@@ -420,6 +482,14 @@ bool upscaler_offered(int index) {
 #else
     if (index == 0 || index == 1) return true;  // Off, TAA
     const bool tried = g_tried.load(std::memory_order_acquire);
+    if (fsr_bridge_beside_exe()) {
+        if (index == 2 || index == 3) {
+            return tried ? g_caps_fsr.load(std::memory_order_relaxed) : true;
+        }
+        if (index == 4) {
+            return tried ? g_caps_dlss.load(std::memory_order_relaxed) : true;
+        }
+    }
     // FSR 3: the device's answer, or before there is one (the setup window) bbhost's FidelityFX library beside bbhost.
     if (index == 2) return tried ? g_caps_fsr.load(std::memory_order_relaxed) : ffx_beside_exe();
     if (index != 4) return false;  // FSR 4: AMD's Windows library's alone
@@ -450,24 +520,23 @@ int upscaler_method() {
     return (asked == 1 && g_caps_dlss.load(std::memory_order_relaxed)) || (asked == 2 && g_caps_fsr.load(std::memory_order_relaxed)) ? asked : 0;
 }
 
-void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h, std::uint32_t frame, float* x,
-                     float* y) {
+void upscaler_jitter(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h, std::uint32_t frame,
+                     float* x, float* y) {
     *x = *y = 0.0f;
     if (method == kUpscaleTaa) return taa_jitter(frame, x, y);
     const Route r = route(method);
-    if (!r.api || !method) return;
+    if (!r.api || !r.attached || !method) return;
     ub_render_info ri{};
     ri.struct_size = sizeof(ri);
-    if (r.api->get_render_info(r.ctx, method == 1 ? UB_METHOD_DLSS : UB_METHOD_FSR, quality, output_w, output_h, &ri) != UB_OK ||
-        !ri.jitter_phases)
-        return;
-    r.api->get_jitter(frame % ri.jitter_phases, ri.jitter_phases, x, y);
+    if (r.api->get_render_info(r.ctx, method == 1 ? UB_METHOD_DLSS : UB_METHOD_FSR, quality, output_w, output_h, &ri) != UB_OK) return;
+    const auto phases = static_cast<std::uint32_t>(std::max(8u, ri.jitter_phases));
+    r.api->get_jitter(frame % phases, phases, x, y);
 }
 
 float upscaler_mip_bias(int method, std::uint32_t quality, std::uint32_t output_w, std::uint32_t output_h) {
     if (method == kUpscaleTaa) return kTaaMipBias;
     const Route r = route(method);
-    if (!r.api || !method) return 0.0f;
+    if (!r.api || !r.attached || !method) return 0.0f;
     ub_render_info ri{};
     ri.struct_size = sizeof(ri);
     if (r.api->get_render_info(r.ctx, method == 1 ? UB_METHOD_DLSS : UB_METHOD_FSR, quality, output_w, output_h, &ri) != UB_OK) return 0.0f;

@@ -366,6 +366,15 @@ if(Vulkan_FOUND)
                                 src/host/copy_census.cpp src/host/copy_compare.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp src/host/dxc.cpp src/host/shader_bundles.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+    target_sources(bbhost PRIVATE src/host/pe_loader.cpp)
+  endif()
+  file(GLOB FSR_DLLS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/upscaler_bridge/bin/*.dll")
+  foreach(dll ${FSR_DLLS})
+    add_custom_command(TARGET bbhost POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "${CMAKE_BINARY_DIR}/"
+      COMMENT "Copying ${dll} to binary dir")
+  endforeach()
   # The render probe (plugin API 27's frame info, render hooks and
   # anti-aliasing claim checked on the GPU: examples/plugins/render_probe): an
   # example and a test aid, built beside bbhost, never into plugins/ - where
@@ -581,7 +590,7 @@ if(UNIX AND NOT APPLE AND Vulkan_FOUND)
       # -fms-extensions, src/ffx_vk/ffx_linux.h the rest; its MSVC pragmas and
       # deprecations are AMD's. A float handed to int abs() fails the build
       # (ffx_linux.h says why).
-      target_compile_options(bbhost_fidelityfx_vk PRIVATE -fms-extensions -include ${CMAKE_SOURCE_DIR}/src/ffx_vk/ffx_linux.h
+      target_compile_options(bbhost_fidelityfx_vk PRIVATE -fms-extensions -fext-numeric-literals -include ${CMAKE_SOURCE_DIR}/src/ffx_vk/ffx_linux.h
         -Wno-unknown-pragmas -Wno-unknown-warning-option -Wno-deprecated-declarations -Werror=absolute-value)
       target_link_libraries(bbhost_fidelityfx_vk PRIVATE Vulkan::Vulkan ZLIB::ZLIB Threads::Threads m)
       # The five API functions out, libstdc++ and libgcc inside, nothing left
@@ -796,6 +805,9 @@ if(UNIX)
     target_include_directories(ngx_bridge_test PRIVATE src third_party/upscaler_bridge)
     target_link_libraries(ngx_bridge_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     add_executable(upscaler_load_test tests/upscaler_load_test.cpp src/host/upscaler.cpp src/host/upscaler_ffx.cpp)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+      target_sources(upscaler_load_test PRIVATE src/host/pe_loader.cpp)
+    endif()
     target_include_directories(upscaler_load_test PRIVATE src third_party/upscaler_bridge third_party/fidelityfx ${CMAKE_BINARY_DIR}/gen)
     target_link_libraries(upscaler_load_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     add_dependencies(upscaler_load_test bbhost_version)
@@ -1486,6 +1498,11 @@ if(UNIX)
       target_link_libraries(indirect_clamp_test PRIVATE Vulkan::Vulkan)
       add_test(NAME indirect_clamp_test COMMAND indirect_clamp_test)
       set_tests_properties(indirect_clamp_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+      add_executable(fsr_hardware_test tests/fsr_hardware_test.cpp src/host/upscaler.cpp src/host/upscaler_ffx.cpp src/host/pe_loader.cpp)
+      target_include_directories(fsr_hardware_test PRIVATE src include ${CMAKE_BINARY_DIR}/gen third_party/upscaler_bridge third_party/fidelityfx)
+      target_link_libraries(fsr_hardware_test PRIVATE Vulkan::Vulkan)
+      add_dependencies(fsr_hardware_test bbhost_version)
+      add_test(NAME fsr_hardware_test COMMAND fsr_hardware_test)
     endif()
   endif()
 endif()

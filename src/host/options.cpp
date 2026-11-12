@@ -500,13 +500,13 @@ Setting g_set[kSettingCount] = {
      "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 "
      "(any GPU) or DLSS (NVIDIA RTX) in place of the game's own anti-aliasing. FSR and DLSS need upscaler_bridge.dll and "
      "AMD's FidelityFX files beside bbhost.exe, and for DLSS nvngx_dlss.dll; without them they stay off. FSR 4 runs as "
-     "FSR 3 where it cannot run. Changes at once.",
+     "FSR 3 where it cannot run. Frame generation runs on Windows only. Changes at once.",
 #else
-     // (host/upscaler.h upscaler_offered: FSR 3 and DLSS where they run, never FSR 4.)
-     "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 3 (AMD's, any GPU: the same FSR 3.1.6 as on Windows) or "
-     "DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of the game's own anti-aliasing. FSR 3 needs "
-     "libbbhost_fidelityfx_vk.so beside bbhost, DLSS libbbhost_ngx_bridge.so and NVIDIA's libnvidia-ngx-dlss.so, as the "
-     "packages have them. FSR 4 and frame generation run on Windows only. Changes at once.",
+     // (host/upscaler.h upscaler_offered: FSR 4, FSR 3 and DLSS where they run.)
+     "TAA (bbhost's own temporal anti-aliasing, any GPU), FSR 4 (AMD's newest, where the GPU and driver offer it), FSR 3 "
+     "(AMD's, any GPU) or DLSS (an NVIDIA RTX card with NVIDIA's driver) in place of the game's own anti-aliasing. FSR and "
+     "DLSS need their libraries beside bbhost; without them they stay off. FSR 4 runs as FSR 3 where it cannot run. "
+     "Frame generation runs on Windows only. Changes at once.",
 #endif
      false},
     // TAA's blend (host/upscale_pass.cpp record_taa): how much of each new
@@ -551,7 +551,7 @@ Setting g_set[kSettingCount] = {
     // size (host/upscale_pass.cpp).
     {"frame_generation", "Frame generation", {"Off", "On"}, 0,
      "AMD FidelityFX frame generation: a frame made between each two of the game's, from the 3D alone - "
-     "the HUD and the menus are never interpolated. Works with any Upscaling choice, Off included, on any GPU. "
+     "the HUD and the menus are never interpolated. Works with any Upscaling choice, Off included, on any GPU (Windows only). "
      "While on, the game runs at most half your monitor's refresh rate and frame generation doubles it to the refresh rate (90 + 90 at 180 Hz): higher Frame rates are greyed out, and one set higher comes down to half as it turns on. Display-Limited runs the game at half the refresh rate and generates the frames between. Loading screens stay uncapped. Needs AMD's amd_fidelityfx_framegeneration_vk.dll and its loader beside bbhost.exe. Changes at once.",
      false},
     // Where the upscaler's motion for what moves of itself comes from
@@ -579,6 +579,8 @@ Setting g_set[kSettingCount] = {
     {"char_motion", "Character motion", {"Precise", "Off"}, 0,
 #if defined(_WIN32)
      "How TAA, FSR, DLSS and frame generation follow the hunter, enemies and other moving characters (the camera's own "
+#elif defined(__linux__) && defined(__x86_64__)
+     "How TAA, FSR and DLSS follow the hunter, enemies and other moving characters (the camera's own "
 #else
      "How TAA, FSR 3 and DLSS follow the hunter, enemies and other moving characters (the camera's own "
 #endif
@@ -2053,11 +2055,7 @@ const char* const* value_tips(int id, bool dlss) {
         "The game's own anti-aliasing; the 3D at the Resolution.",
         "TAA: bbhost's own temporal anti-aliasing - steadier edges and less shimmer, a little softer. Any GPU, the 3D at the "
         "Resolution; one below the window keeps the HUD at the window's size. The fastest of these.",
-#if defined(_WIN32)
         "AMD FSR 3: any GPU.",
-#else
-        "AMD FSR 3: any GPU, the same FSR 3.1.6 as on Windows. FSR 4 and frame generation run on Windows only.",
-#endif
         "AMD FSR 4: AMD's newest, where the GPU and driver run it; FSR 3 where they do not.",
         "NVIDIA DLSS: RTX cards only.",
     };
@@ -2547,29 +2545,7 @@ const char* upscaler_note() {
     if (u <= 1 || g_setup_page) return g_set[kUpscaler].note;
     const UpscalerCaps caps = upscaler_caps();
     const bool dlss = u == 4;
-#if !defined(_WIN32)
-    // Linux: FSR 3 through bbhost's FidelityFX library, DLSS through the NGX bridge, no FSR 4 (a Windows choice kept
-    // runs FSR 3).
-    if (!dlss && !caps.fsr_loaded) {
-        note = "Not running: libbbhost_fidelityfx_vk.so did not load (it belongs beside bbhost, as the packages have it). The game's "
-               "own anti-aliasing runs instead.";
-    } else if (!dlss && !caps.fsr) {
-        note = "FSR 3 is not available here" + (caps.fsr_reason.empty() ? std::string() : " (" + caps.fsr_reason + ")") +
-               ": the game's own anti-aliasing runs instead.";
-    } else if (!dlss && u == 3) {
-        note = "FSR 4 runs on Windows only: FSR 3 runs here instead.";
-    } else if (!dlss) {
-        return g_set[kUpscaler].note;
-    } else if (!caps.loaded) {
-        note = "Not running: libbbhost_ngx_bridge.so did not load (it and NVIDIA's libnvidia-ngx-dlss.so belong beside "
-               "bbhost, as the Linux package has them). The game's own anti-aliasing runs instead.";
-    } else if (!caps.dlss) {
-        note = "DLSS is not available here" + (caps.dlss_reason.empty() ? std::string() : " (" + caps.dlss_reason + ")") +
-               ": the game's own anti-aliasing runs instead.";
-    } else {
-        return g_set[kUpscaler].note;
-    }
-#else
+#if defined(_WIN32)
     if (!caps.loaded) {
         note = "Not running: upscaler_bridge.dll did not load (it and AMD's FidelityFX files belong beside bbhost.exe). The "
                "game's own anti-aliasing runs instead; Frame generation works without it.";
@@ -2578,6 +2554,36 @@ const char* upscaler_note() {
         note = std::string(dlss ? "DLSS" : "FSR") + " is not available here" + (why.empty() ? "" : " (" + why + ")") +
                ": the game's own anti-aliasing runs instead. Frame generation works without it." +
                (dlss ? " On an AMD or Intel GPU choose FSR 4 or FSR 3." : "");
+    } else {
+        return g_set[kUpscaler].note;
+    }
+#else
+    if (caps.loaded && caps.fsr4) {
+        // Linux with PE loader upscaler_bridge.dll (FSR 4 available)
+        if (dlss ? !caps.dlss : !caps.fsr) {
+            const std::string why = dlss ? caps.dlss_reason : caps.fsr_reason;
+            note = std::string(dlss ? "DLSS" : "FSR") + " is not available here" + (why.empty() ? "" : " (" + why + ")") +
+                   ": the game's own anti-aliasing runs instead." +
+                   (dlss ? " On an AMD or Intel GPU choose FSR 4 or FSR 3." : "");
+        } else {
+            return g_set[kUpscaler].note;
+        }
+    } else if (!dlss && !caps.fsr_loaded) {
+        note = "Not running: libbbhost_fidelityfx_vk.so or upscaler_bridge.dll did not load. The game's "
+               "own anti-aliasing runs instead.";
+    } else if (!dlss && !caps.fsr) {
+        note = "FSR 3 is not available here" + (caps.fsr_reason.empty() ? std::string() : " (" + caps.fsr_reason + ")") +
+               ": the game's own anti-aliasing runs instead.";
+    } else if (!dlss && u == 3) {
+        note = "FSR 4 is not available on this GPU or driver: FSR 3 runs here instead.";
+    } else if (!dlss) {
+        return g_set[kUpscaler].note;
+    } else if (!caps.loaded) {
+        note = "Not running: libbbhost_ngx_bridge.so did not load (it and NVIDIA's libnvidia-ngx-dlss.so belong beside "
+               "bbhost, as the Linux package has them). The game's own anti-aliasing runs instead.";
+    } else if (!caps.dlss) {
+        note = "DLSS is not available here" + (caps.dlss_reason.empty() ? std::string() : " (" + caps.dlss_reason + ")") +
+               ": the game's own anti-aliasing runs instead.";
     } else {
         return g_set[kUpscaler].note;
     }
