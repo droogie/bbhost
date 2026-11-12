@@ -15,6 +15,8 @@
  *     keys <code...>      input_take_as(name, the scancodes); "keys" alone gives them back
  *     legacy <code...>    input_take (the take of the plugins that do not name
  *                         themselves) with the scancodes; "legacy" alone gives them back
+ *     hp <n>              the hunter's HP set to n (player_stat_set): a run among
+ *                         enemies kept alive while it checks something else
  *     look <group> <numbers...>   post_look with that one group (the rest the
  *                         area's): tone <exposure gamma saturation brightness
  *                         contrast>, vignette <power>, dof <on focus aperture
@@ -139,6 +141,7 @@ static int run_step(const char* text) {
     if (strncmp(text, "keys", 4) == 0) return run_keys(text, 1);
     if (strncmp(text, "legacy", 6) == 0) return run_keys(text, 0);
     if (strncmp(text, "look ", 5) == 0) return run_look(text + 5);
+    if (sscanf(text, "hp %u", &a) == 1) return g_api->player_stat_set("hp", (int64_t)a);
     return -1;
 }
 
