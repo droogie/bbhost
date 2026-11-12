@@ -136,7 +136,6 @@ struct HostSettings {
     bool skip_logos = false;
     bool performance_mode = false;  // the post-effects and YEBIS passes off (engine/patch_manifest.cpp)
     bool debug_menu = false;
-    bool debug_camera = false;  // patches/debug-camera.toml (Lance McDonald's free camera)
     // The PC enhancements (also read once, through config_set_enhancements)
     bool change_appearance = true;
     bool rebirth = true;

@@ -352,13 +352,12 @@ bool toml_bool(const char* key, bool fallback) {
     return v.empty() ? fallback : v == "true" || v == "1";
 }
 
-// The switch a patch follows: a setting for the four that follow one (the
-// setup window's same four), [patches] <name> for the rest.
+// The switch a patch follows: a setting for those that follow one (the setup
+// window's same ones), [patches] <name> for the rest.
 bool switch_of(const PatchListing& p) {
     const std::string& o = p.option;
     if (o == "startup.skip_intro") return host_opt_get("skip_logos");
     if (o == "startup.performance_mode") return host_opt_get("performance_mode");
-    if (o == "debug.free_camera") return host_opt_get("debug_camera");
     if (o == "loading.quick_reentry") return toml_bool("loading.quick_reentry", config().quick_reentry);
     if (o == "streaming.all_post_processors") return toml_bool("streaming.all_post_processors", config().all_post_processors);
     return patch_manifest_on(p.name, p.enabled);
@@ -370,7 +369,6 @@ void save_switch(const PatchRow& r) {
     host_options_post([o = r.p.option, name = r.p.name, on = r.on] {
         if (o == "startup.skip_intro") return host_opt_set("skip_logos", on);
         if (o == "startup.performance_mode") return host_opt_set("performance_mode", on);
-        if (o == "debug.free_camera") return host_opt_set("debug_camera", on);
         std::string section = "patches", key = name;
         if (o == "loading.quick_reentry") section = "loading", key = "quick_reentry";
         if (o == "streaming.all_post_processors") section = "streaming", key = "all_post_processors";

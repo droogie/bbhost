@@ -317,7 +317,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool stay_borderless = host_opt_get("stay_borderless");  // Windows' switch under the Window row, for Borderless
     bool skip_logos = host_opt_get("skip_logos");
     bool performance_mode = host_opt_get("performance_mode");
-    bool debug_camera = host_opt_get("debug_camera");
     int frame_cap = host_opt_frame_cap();
     // The Native frame clock (experimental, off): F10's DISPLAY row, read as the
     // game starts (engine/frame_rate.cpp; BBHOST_FRAME_CLOCK=0|1 wins).
@@ -406,7 +405,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // The Patches page: every manifest the loader would read
     // (engine/patch_manifest.h), each with its switch. One that follows a
     // setting (its `option`) shows that setting - the Game page's Skip company
-    // logos, the debug camera - so a patch has one switch; the rest (The Old
+    // logos, Performance mode - so a patch has one switch; the rest (The Old
     // Hunters among them) are [patches] <name> = true or false in bbhost.toml.
     bool quick_reentry = cfg.quick_reentry, all_post_processors = cfg.all_post_processors;
     bool quick_reentry_was = quick_reentry, all_post_processors_was = all_post_processors;
@@ -434,7 +433,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         const std::string& o = r.p.option;
         if (o == "startup.skip_intro") return &skip_logos;
         if (o == "startup.performance_mode") return &performance_mode;
-        if (o == "debug.free_camera") return &debug_camera;
         if (o == "loading.quick_reentry") return &quick_reentry;
         if (o == "streaming.all_post_processors") return &all_post_processors;
         return &r.on;
@@ -611,7 +609,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("stay_borderless", stay_borderless);
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("performance_mode", performance_mode);
-        host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);  // unticks Custom limit, set again next
         host_opt_set_frame_cap_custom(cap_custom, cap_custom_fps);
         host_opt_set("frame_clock", frame_clock);
