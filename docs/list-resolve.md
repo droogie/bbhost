@@ -10,10 +10,10 @@ at a place where it limits the frame rate, which parts of a draw could be
 resolved per list and which must stay in the command processor's order, how
 its token stream falls into the runs a list's resolution would cover, and the
 order to build it in. `BBHOST_LIST_RESOLVE=runs` counts the runs
-(`src/host/list_resolve.cpp`), and `BBHOST_RUN_BATCH=1` has a run's draws
-share their targets' lookups on the command processor (+3% where it limits);
-nothing that resolves or commits a draw off the command processor is built
-yet.
+(`src/host/list_resolve.cpp`), and the run batching (`BBHOST_RUN_BATCH`, on
+by default) has a run's draws share their targets' lookups on the command
+processor (+3% where it limits); nothing that resolves or commits a draw off
+the command processor is built yet.
 
 ## Where it was measured
 
@@ -392,6 +392,21 @@ At the 18:11 save, 640x360 headless:
   runs as 81cc83bb (173.8 against 173.4, 170.0 against 170.3).
 - The batched run's frames at 60 and 80 s show what the compare run's do.
 
+**On by default everywhere (2026-11-11).** The batching came on with the run
+commit (Windows' default) and with the constant buffers' homes; on Linux
+without the homes - a Steam Deck, an integrated GPU, a card with under 5,000
+MiB free - every draw still looked its targets up. Now it is on wherever
+`BBHOST_RUN_BATCH` is unset. On an RTX 4070 held to a 4 GB card's 2,950 MiB
+(`BBHOST_TEST_VRAM_MB`: no homes, no pool - the command processor draws every
+draw in order and limits the frame rate; Linux, 1080p uncapped, alternating
+runs, two series): Old Yharnam 89.8 -> 92.4 fps (+2.9%) and 94.8 -> 97.7
+(+3.0%), Cainhurst's courtyard +2.2% and +1.5%, the Nightmare of Mensis 94.0
+-> 97.8 (+4.0%) where its GPU time held still (the small card's memory moved
+it in the other series), Central Yharnam, held by the main loop, -0.1% and
++1.1%. 73-76% of the draws took the draw before's targets. The static title's
+frames are identical with it and without, and a timeline of the Nightmare of
+Mensis (eight frames a run, four runs) shows the same scene, light and colour.
+
 Tried and dropped: handing the draw packets to `bb-record` sixteen at a time
 instead of one, to save most of the hand-over (1.1% of `bb-cp0`, a store
 fence among it, at every draw). Alternating runs with it were 2.2% slower
@@ -686,8 +701,8 @@ on the live save), 182.4 and 177.4 off against 182.0 and 184.5, and 200.9 on.
   command processor takes one more predictable branch a packet.
 - `BBHOST_RUN_BATCH=1|compare`: the batching above, on the census's run
   tracking (`list_resolve::run_serial`, which the per-run commit will start
-  from). On with the run commit (so by default on Windows, and kept on where
-  that default gives way to the constant buffers' homes); `=0` off.
+  from). On by default (since 2026-11-11; before, only with the run commit -
+  Windows' default - and the constant buffers' homes); `=0` off.
 - `BBHOST_DRAW_CONTEXT=chunks|compare`: the draw's own context above, with its
   census and checks. Off by default.
 - `BBHOST_RUN_COMMIT=fork|on|compare` (`BBHOST_RUN_COMMIT_THREADS`,

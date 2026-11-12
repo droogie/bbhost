@@ -881,9 +881,8 @@ each draw of a segment that would have been spliced with its commit. On an RTX
 where the command processor had been the limit.
 
 **On by default above 60 fps, and on Windows at any rate (`BBHOST_GXVK_HOMES`
-unset).** The constant buffers' homes - and with them the segments, and the
-run batching (`BBHOST_RUN_BATCH`) and copy-back captures they take - are on by
-default only where the frame rate can gain from them: a graphics card with
+unset).** The constant buffers' homes - and with them the segments and the
+copy-back captures they take - are on by default only where the frame rate can gain from them: a graphics card with
 room, or one with small video memory that has 5,000 MiB or more free at the
 start (the homes' own rule below: not an integrated GPU, no tight memory), and
 a frame rate above 60 (a fixed rate above 60, or Display-Limited on a display

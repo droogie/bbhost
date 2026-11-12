@@ -25,14 +25,14 @@ namespace list_resolve {
 
 // BBHOST_LIST_RESOLVE: 0 off, 1 (`runs`) the run census.
 extern const int g_mode;
-// BBHOST_RUN_BATCH: 0 off, 1 on, unset on with the run commit (with
-// BBHOST_RUN_COMMIT on or compare, so by default on Windows, and kept on
-// where that default gives way to the homes), 2 (`compare`) today's work
-// with every answer a run would have shared checked against it. What a draw
-// of a run takes from the draw before it: its targets' lookups (render.cpp
+// BBHOST_RUN_BATCH: 0 off, 1 on (unset: on - since 2026-11-11 also where the
+// run commit is off, Linux's default, and the homes are not on; before, only
+// with the run commit or the homes), 2 (`compare`) today's work with every
+// answer a run would have shared checked against it. What a draw of a run
+// takes from the draw before it: its targets' lookups (render.cpp
 // draw_targets); and, on, the lite shadow drains GX's notices once a draw
 // rather than once a vertex record (no answer to check: compare drains as
-// before). Unset, also on where the homes are on by default (follow_homes).
+// before).
 extern std::atomic<int> g_batch;
 inline int batch_mode() { return g_batch.load(std::memory_order_relaxed); }
 inline bool batching() { return batch_mode() != 0; }

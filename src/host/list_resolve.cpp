@@ -84,12 +84,10 @@ bool lists_may_splice_from_env() {
 
 std::atomic<int> g_batch = [] {
     const char* e = std::getenv("BBHOST_RUN_BATCH");
-    // A run's parts take its targets as batching shares them: on with the commit.
-    if (!e || !*e) {
-        if (run_commit_from_env() >= 2) return 1;
-        // And with stage 4b.1b's splice and 4b.2's segments: a run's later draws find its first's targets.
-        return lists_may_splice_from_env() ? 1 : 0;
-    }
+    // On by default: a run's parts take its targets as batching shares them (the commit), stage 4b.1b's splice and
+    // 4b.2's segments find a run's first draw's targets, and in order a run's draws take the targets of the draws
+    // before them (docs/list-resolve.md) - with the run commit off too (Linux's default, where the homes are off).
+    if (!e || !*e) return 1;
     if (std::strcmp(e, "compare") == 0) return 2;
     return std::atoi(e) ? 1 : 0;
 }();
