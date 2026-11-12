@@ -682,10 +682,6 @@ void swap_to(float side) {
     view.swap_t = 0.0f;
 }
 
-void banner(const char* text) {
-    if (has_field(offsetof(BbHostApi, show_text))) api->show_text(text, 1.0f, 0.5f, 0.85f, 1.0f, BB_TEXT_CENTRE);
-}
-
 // The keys' presses, once per press while playing (one read of the input a frame).
 void read_keys() {
     BbInput in;
@@ -712,7 +708,6 @@ void read_keys() {
             g_first = !g_first;
             view.reach = -1.0f;
             view.have_focus = false;
-            banner(g_first ? "First person" : (s.camera ? "Over the shoulder" : "Game camera"));
         }
     }
 }
