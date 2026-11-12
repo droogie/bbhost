@@ -1761,7 +1761,7 @@ void host_options_load() {
             // (patches/debug-camera.toml), and photo mode (plugins/photo_mode)
             // took its place. A saved one is set aside; the next save drops it.
             if (key == "debug_camera") {
-                if (val == "On") host_log("options: the Debug camera is gone - photo mode is its place (P, or hold Cross and press L3); the saved On is set aside");
+                if (val == "On") host_log("options: the Debug camera is gone - photo mode is its place (P, or hold L3); the saved On is set aside");
                 continue;
             }
             // Looked at again once the file's version is known (below).

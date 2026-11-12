@@ -2,15 +2,19 @@
 // bbphoto, rebuilt on bbhost's plugin API: nothing in it writes the game's code
 // or reads an address of its own.
 //
-// Hold Cross and press L3, or press P, to start it; the same again (or Escape)
-// ends it. Three modes:
+// Hold L3 for half a second, or press P, to start it; the same again (or
+// Escape) ends it. L3 is the button that presses the game's L3 - the left
+// stick's, unless Key Bindings moved it (BbPad.play) - which the game itself
+// does nothing with, so holding it never moves the hunter. Three modes:
 //   Frozen  the world held still (world_pause) while the camera flies; Cross
 //           (N on the keyboard) lets it run two more updates - a frame advance.
 //   Static  the camera stays where it is and the hunter plays on: the
 //           controller and the keys are the game's again, but for photo mode's
 //           own.
 //   Live    the camera flies while the world runs; the hunter stands, since
-//           the camera has the controls (pad_take, input_take_as).
+//           the camera has the controls (pad_take, input_take_as), and the
+//           enemies can still attack: the first hit holds the world again
+//           (Frozen), so a second cannot follow.
 // The left stick (WASD) moves the camera the way it looks, the right stick (the
 // mouse) turns it, L2 and R2 (Left Ctrl and Space) take it down and up, L1 and
 // R1 (the right and left mouse buttons) make it slower and faster. The view is
@@ -64,6 +68,7 @@ constexpr float kTurnRate = 2.2f;        // radians a second at a full stick, at
 constexpr float kMouseTurn = 0.0035f;    // radians a count, as Dark Souls III's mouse (at 60 degrees)
 constexpr float kPitchLimit = 1.53f;     // short of straight up and down
 constexpr std::uint32_t kStepUpdates = 2;
+constexpr float kHoldToggle = 0.5f;  // seconds L3 is held to start or end photo mode
 // The world up this long before photo mode starts: the loading screen's page
 // stays and fades out over the world's first frames - some 75 of them, two
 // and a half seconds at 30 - and a held world would hold it there.
@@ -107,7 +112,10 @@ struct State {
     Camera cam;
     float start_pos[3] = {0, 0, 0};  // where the camera started, for the log
     int speed = kSpeedStart;
-    bool cross_armed = false;   // Cross let go since the start (it was held to start)
+    bool l3_down = false;       // L3 held (as the game has it)
+    bool l3_used = false;       // this hold started or ended photo mode: let go before the next
+    std::chrono::steady_clock::time_point l3_since;
+    std::int64_t live_hp = -1;  // the hunter's HP as Live last saw it; -1 outside Live
     std::chrono::steady_clock::time_point last;
     bool have_last = false;
     float look_x = 0, look_y = 0;  // the mouse's counts since the last frame
@@ -233,9 +241,11 @@ const char* mode_name(int m) { return m == kFrozen ? "Frozen" : m == kStatic ? "
 void set_mode(int m) {
     if (m == st.mode) return;
     st.mode = m;
+    st.live_hp = -1;
     if (st.on) {
         apply_mode();
         api->log("photo mode: %s", mode_name(m));
+        if (m == kLive) api->show_message("Live: the world keeps running, and enemies can still attack your hunter", 4.0f);
     }
 }
 
@@ -323,7 +333,7 @@ void start() {
     st.seed = true;
     st.seeded = false;
     st.mode = kFrozen;  // it always starts with the world held
-    st.cross_armed = false;
+    st.live_hp = -1;
     st.have_last = false;
     st.look_x = st.look_y = 0;
     apply_mode();
@@ -431,10 +441,18 @@ void on_frame(void*) {
     auto key_down = [&](std::uint16_t k) { return have_keys && in.key[k] && !prev_keys[k]; };
     const bool p_down = key_down(kKeyP), escape_down = key_down(kKeyEscape), n_down = key_down(kKeyN), key_down_tab = key_down(kKeyTab);
     if (have_keys) std::memcpy(prev_keys, in.key, sizeof(prev_keys));
+    const auto now = std::chrono::steady_clock::now();
 
-    // Start and end: hold Cross and press L3, or P; Escape ends it too.
-    const bool chord = (pad.buttons & BB_PAD_CROSS) && (pad.pressed & BB_PAD_L3);
-    const bool toggle = chord || p_down;
+    // Start and end: L3 held half a second - the button the player's bindings
+    // make the game's L3, which does nothing in play - or P; Escape ends it
+    // too. One hold does one: it is let go before the next.
+    const bool l3 = (pad.play & BB_PAD_L3) != 0;
+    if (l3 && !st.l3_down) st.l3_since = now;
+    if (!l3) st.l3_used = false;
+    st.l3_down = l3;
+    const bool held = l3 && !st.l3_used && std::chrono::duration<float>(now - st.l3_since).count() >= kHoldToggle;
+    if (held) st.l3_used = true;
+    const bool toggle = held || p_down;
     if (!st.on) {
         if (toggle) {
             if (const char* why = refused(w)) {
@@ -463,16 +481,31 @@ void on_frame(void*) {
     if (api->panel_state(kName, &ps) == 0) st.panel = ps.shown != 0;
     if ((pad.pressed & BB_PAD_R3) || key_down_tab) show_panel(!st.panel);
 
-    const auto now = std::chrono::steady_clock::now();
     float dt = st.have_last ? std::chrono::duration<float>(now - st.last).count() : 0.0f;
     st.last = now;
     st.have_last = true;
     dt = std::clamp(dt, 0.0f, 0.25f);  // a hitch moves the camera no further than a quarter second's way
 
-    // The frame advance: Cross (once let go since the start) or N.
-    if (!(pad.buttons & BB_PAD_CROSS)) st.cross_armed = true;
-    const bool step = (st.cross_armed && (pad.pressed & BB_PAD_CROSS) && !chord) || n_down;
+    // The frame advance: Cross or N.
+    const bool step = (pad.pressed & BB_PAD_CROSS) || n_down;
     if (step && st.mode == kFrozen) api->world_step(kName, kStepUpdates);
+
+    // Live: the hunter stands while the enemies come on. The first hit holds
+    // the world again, so a second cannot follow.
+    if (st.mode == kLive) {
+        std::int64_t hp = -1;
+        if (api->player_stat_get("hp", &hp) == 0 && hp >= 0) {
+            if (st.live_hp >= 0 && hp < st.live_hp) {
+                api->log("photo mode: the hunter was hit in Live (%lld -> %lld HP); the world held again", static_cast<long long>(st.live_hp),
+                         static_cast<long long>(hp));
+                set_mode(kFrozen);
+                api->option_set(kName, "mode", "Frozen");  // the panel's row says so too
+                api->show_message("Photo mode: your hunter was hit - the world is held again (Frozen)", 3.0f);
+            } else {
+                st.live_hp = hp;
+            }
+        }
+    }
 
     const bool keys_ok = have_keys && in.playing;
     if (keys_ok) {
@@ -555,7 +588,7 @@ void on_option(const char* key, const char* value, void*) {
 #define LIVE_INT_WHEN(key, label, help, def, lo, hi, when) {BB_OPT_INT | BB_OPT_LIVE | BB_OPT_WHEN, key, label, help, def, lo, hi, when}
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_HEADING, "about", "Photo mode",
-     "Hold Cross and press L3, or press P, to start photo mode and to end it (Escape ends it too). Its panel opens with it: "
+     "Hold L3 for half a second, or press P, to start photo mode and to end it (Escape ends it too). Its panel opens with it: "
      "L1 and R1 (Q and E) turn its pages, the d-pad (the arrows) chooses and changes a row, Circle (Escape) hides it and R3 "
      "(Tab) shows it again. Only with nobody else in your world.",
      "", 0, 0, nullptr},
@@ -563,7 +596,9 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     PANEL("camera", "Camera", "How photo mode's camera sees, and what the world does meanwhile."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "mode", "Mode",
      "Frozen holds the world still while the camera flies (Cross or N lets it run two more updates). Static keeps the "
-     "camera where it is while you play on. Live flies the camera while the world runs. Photo mode always starts Frozen.",
+     "camera where it is while you play on. Live flies the camera while the world keeps running: enemies can still attack "
+     "your hunter, who stands still meanwhile, and the first hit holds the world again (Frozen). Photo mode always starts "
+     "Frozen.",
      "Frozen", 0, 0, "Frozen|Static|Live"},
     LIVE_INT("fov", "Field of view", "Degrees more or less than the game's own view: 0 keeps it, less zooms in.", "0", -40, 60),
     LIVE_INT("roll", "Roll", "Tilts the camera, in degrees: 0 keeps it level.", "0", -90, 90),
@@ -647,7 +682,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     "1.0.0",
     "Nox-",
     "A free camera for pictures: the world held still or running, the camera flown by the controller or the keyboard "
-    "and mouse, the HUD out of the way. Hold Cross and press L3, or press P. Only with nobody else in your world.",
+    "and mouse, the HUD out of the way. Hold L3 for half a second, or press P. Only with nobody else in your world.",
 };
 
 extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
@@ -667,6 +702,6 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
         return 1;
     }
     if (api->key_bound(kKeyP)) api->log("photo mode: P is also one of the game's keys; it starts photo mode as well");
-    api->log("photo mode: ready - hold Cross and press L3, or press P");
+    api->log("photo mode: ready - hold L3 for half a second, or press P");
     return 0;
 }

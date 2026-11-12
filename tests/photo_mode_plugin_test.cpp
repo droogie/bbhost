@@ -2,14 +2,17 @@
 // loaded as the host loads plugins and driven frame by frame - the world's
 // state, the controller and the keyboard as the test sets them - while every
 // plugin API 29 call it makes is recorded. Checked: on a host older than API 29
-// it refuses before asking anything; it starts on P and on Cross held with L3
-// pressed, Frozen, with the world held, the controls taken and the HUD out of
-// the picture; the camera starts at the game's view and flies the way it looks;
-// Cross (once let go) and N advance a held world by two updates; Static gives
-// the controls back but Options, the touchpad and R3, Live flies over a
-// running world; it ends on Escape, P and the chord, and at a loading screen, a
-// cutscene or a menu, giving everything back; its takes and reads of the
-// keyboard and mouse are its own (input_take_as, input_as); it does not start, and it ends,
+// it refuses before asking anything; it starts on P and on L3 held half a
+// second (the game's L3, as the player's bindings make it), Frozen, with the
+// world held, the controls taken as its own and the HUD out of the picture; a
+// shorter press does nothing and one hold does one thing; the camera starts at
+// the game's view and flies the way it looks; Cross and N advance a held world
+// by two updates; its takes and reads of the keyboard and mouse are its own
+// (input_take_as, input_as); Static gives the controls back but Options, the touchpad and
+// R3, Live flies over a running world, warns that enemies can still attack,
+// and holds the world again at the hunter's first hit; it ends on Escape, P
+// and L3 held, and at a loading screen, a cutscene or a menu, giving
+// everything back, and does not start in a menu; it does not start, and it ends,
 // with another player in the world or on the way, or in another's world; the
 // HUD option shows the HUD; its panel opens with it, R3 hides and shows it,
 // and the panel's rows go over the area's look while it runs and nowhere
@@ -64,6 +67,7 @@ struct Host {
     std::vector<std::uint16_t> taken_keys;
     int unnamed_takes = 0;  // input_take calls: photo mode names its takes (input_take_as)
     int unnamed_reads = 0;  // input calls: photo mode reads as itself (input_as)
+    std::int64_t hp = 100;  // the hunter's, as player_stat_get("hp") reads it
     std::uint32_t taken_mouse = 0;
     int taken_motion = 0;
     // What the host reports.
@@ -211,6 +215,11 @@ int fake_hud_hide(const char* name, int hidden) {
     ++H.calls;
     return 0;
 }
+int fake_player_stat_get(const char* name, std::int64_t* value) {
+    if (std::strcmp(name, "hp") != 0) return 1;
+    *value = H.hp;
+    return 0;
+}
 int fake_player_position(float xyz[3], float* yaw) {
     if (xyz) xyz[0] = xyz[1] = xyz[2] = 0;
     if (yaw) *yaw = 0;
@@ -260,6 +269,7 @@ BbHostApi make_api(std::uint32_t version) {
     api.input = &fake_input;
     api.input_take = &fake_input_take;
     api.player_position = &fake_player_position;
+    api.player_stat_get = &fake_player_stat_get;
     if (version >= 29) {
         api.world_pause = &fake_world_pause;
         api.world_step = &fake_world_step;
@@ -292,9 +302,23 @@ void tap_key(std::uint16_t k) {
 }
 void tap_pad(std::uint32_t b) {
     H.pad.buttons |= b;
+    H.pad.play |= b;
     H.pad.pressed |= b;
     frame();
     H.pad.buttons &= ~b;
+    H.pad.play &= ~b;
+    frame();
+}
+// A button held for `seconds`, frame by frame, then let go: `button` the
+// controller's own, `play` what the player's bindings make it in the game.
+void hold(float seconds, std::uint32_t button = BB_PAD_L3, std::uint32_t play = BB_PAD_L3) {
+    H.pad.buttons |= button;
+    H.pad.play |= play;
+    H.pad.pressed |= button;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<int>(seconds * 1000.0f));
+    while (std::chrono::steady_clock::now() < until) frame();
+    H.pad.buttons &= ~button;
+    H.pad.play &= ~play;
     frame();
 }
 // The world in for longer than the plugin's settle (the loading screen's page
@@ -465,9 +489,35 @@ int main(int argc, char** argv) {
     CHECK(std::fabs(view.position[2] - static_z) < 1e-5f);  // the camera stays
     H.option_fn("mode", "Live", H.option_user);
     CHECK(H.paused == 0 && H.take_axes == (BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS));
+    CHECK(!H.messages.empty() && H.messages.back().find("enemies can still attack") != std::string::npos);
     const int steps_before = H.steps;
     tap_key(kN);
     CHECK(H.steps == steps_before);  // no frame advance over a running world
+    // The hunter hit in Live: the world held again (Frozen) at once, the
+    // panel's row says so, and the player is told.
+    H.hp = 80;
+    frame();
+    CHECK(H.paused == 1);
+    CHECK(!H.sets.empty() && H.sets.back().first == "mode" && H.sets.back().second == "Frozen");
+    CHECK(H.messages.back().find("was hit") != std::string::npos);
+    CHECK(logged("hit in Live (100 -> 80 HP)"));
+    H.hp = 60;  // held now: no second notice
+    const std::size_t notices = H.messages.size();
+    frame();
+    CHECK(H.paused == 1 && H.messages.size() == notices);
+    // Healed in Live, then hit: the drop counts from where it was.
+    H.option_fn("mode", "Live", H.option_user);
+    CHECK(H.paused == 0);
+    frame();
+    H.hp = 90;
+    frame();
+    frame();
+    CHECK(H.paused == 0);
+    H.hp = 89;
+    frame();
+    CHECK(H.paused == 1);
+    H.hp = 100;
+    H.option_fn("mode", "Live", H.option_user);
 
     // Escape ends it: everything given back, the panel down and no look.
     H.option_fn("exposure", "150", H.option_user);
@@ -485,17 +535,30 @@ int main(int argc, char** argv) {
     H.view_fn(&view, H.view_user);
     CHECK(std::fabs(view.position[2] - 3) < 1e-5f);  // the game's view again
 
-    // The chord: Cross held, L3 pressed - it starts Frozen whatever the mode was.
-    H.pad.buttons = BB_PAD_CROSS;
-    frame();
-    H.pad.pressed = BB_PAD_L3;
-    H.pad.buttons = BB_PAD_CROSS | BB_PAD_L3;
-    frame();
-    H.pad.buttons = 0;
-    frame();
+    // L3 held half a second starts it, Frozen whatever the mode was; a shorter
+    // press does nothing, and one hold does one thing however long it lasts.
+    hold(0.2f);
+    CHECK(H.paused == 0);
+    hold(1.2f);
+    CHECK(H.paused == 1 && H.panel_up);
+    CHECK(H.steps == steps_before);  // L3 is no frame advance
+    hold(0.6f);  // held again: it ends
+    CHECK(H.paused == 0 && H.take_buttons == 0 && H.taken_keys.empty() && !H.panel_up);
+    // L3 as the game has it: the left stick pressed while Key Bindings put
+    // Dodge on it is not L3, the button they moved L3 to is.
+    hold(0.6f, BB_PAD_L3, BB_PAD_CIRCLE);
+    CHECK(H.paused == 0);
+    hold(0.6f, BB_PAD_CIRCLE, BB_PAD_L3);
     CHECK(H.paused == 1);
-    // ... Cross was held to start: no frame advance until it has been let go.
-    CHECK(H.steps == steps_before);
+    hold(0.6f, BB_PAD_CIRCLE, BB_PAD_L3);
+    CHECK(H.paused == 0);
+    // Not in a menu: the player is told why.
+    H.world.flags = BB_WORLD_IN | BB_WORLD_MENU;
+    hold(0.6f);
+    CHECK(H.paused == 0 && H.messages.back().find("close the menu") != std::string::npos);
+    H.world.flags = BB_WORLD_IN;
+    hold(0.6f);
+    CHECK(H.paused == 1);
 
     // Another player on the way: it ends at once, and does not start again.
     H.world.arriving = 1;
