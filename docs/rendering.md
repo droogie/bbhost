@@ -445,6 +445,16 @@ path at all:
 - Depth snapshots, the on-screen overlay and FSR 1 upscaling are bbhost's
   own. The depth snapshot's compute pass goes into the recorder's stream
   (`BBHOST_STREAM_DEPTH_COPY=0` records it in place, draining the recorder).
+  The scene's own depth copy is one: after the G-buffer the game copies its
+  depth into DepthRenderTarget (and its first G-buffer target, the normals,
+  into GBuffer0), which SSAO, the sun's screen-space shadows, motion blur's
+  and screen space reflections' smaller depths, the decals, the forward
+  passes and depth of field read. The world's view makes them with
+  CopyResource; the renderer's two other modes make them with three calls of
+  their own (`0x26a10c0`, `0x26a2829`, `0x26a283f`), which the built-in
+  Performance patch turned into NOPs until v0.2.35 - calls the world's view
+  never makes, so leaving them out changed nothing there; only a view drawn in
+  those modes read targets nothing had written that frame.
 
 ## Native or emulated
 
