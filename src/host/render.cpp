@@ -30722,6 +30722,11 @@ void describe_draw_record(std::uint64_t index) {
              static_cast<unsigned long long>(r.tex[0]), static_cast<unsigned long long>(r.tex[1]),
              static_cast<unsigned long long>(r.tex[2]), static_cast<unsigned long long>(r.tex[3]), r.indexed ? " idx" : "");
 }
+// The pipeline name of recorded draw `index`, or null once the ring has moved past it (BBHOST_MARKER_TRACE).
+const char* draw_record_name(std::uint64_t index) {
+    if (index >= g_draw_rec_next || (g_draw_rec_next - index) > kDrawRecs) return nullptr;
+    return g_draw_recs[index % kDrawRecs].name;
+}
 }  // namespace gpu
 
 void host_gpu_hang_report() {

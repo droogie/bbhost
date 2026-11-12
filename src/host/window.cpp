@@ -1256,6 +1256,7 @@ bool vk_present() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_vk.cmd, &bi);
     host_gpu_busy_present_begin(g_vk.cmd);  // the busy meter's first timestamp (host/gpu_busy.cpp)
+    host_gpu_present_markers(g_vk.cmd, false);  // the device-loss markers, while they are on (host/gpu_markers.h)
     // The picture's rectangle (fit_picture); what it does not cover is black.
     VkRect2D area{{0, 0}, g_vk.extent};
     if (display_w && display_h) {
@@ -1426,6 +1427,7 @@ bool vk_present() {
                              as_colour ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_present);
     }
+    host_gpu_present_markers(g_vk.cmd, true);
     host_gpu_busy_present_end(g_vk.cmd);  // counted as on its way from here: it is always submitted below
     vkEndCommandBuffer(g_vk.cmd);
     const auto t_recorded = std::chrono::steady_clock::now();

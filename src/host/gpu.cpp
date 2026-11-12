@@ -14,6 +14,7 @@
 #include "host/draw_capture.h"
 #include "host/gpu_catch_up.h"
 #include "host/gpu_internal.h"
+#include "host/gpu_markers.h"
 #include "host/gxvk.h"
 #include "host/gxvk_table.h"
 #include "host/import_mode.h"
@@ -3728,6 +3729,9 @@ void start_memory_reserve();  // below, beside the image heap
 void vram_reserve_init();     // the same
 
 bool g_use_buffer_marker = false;  // VK_AMD_buffer_marker checkpoints (gpu_checkpoint)
+bool g_dry_buffer_marker = false;  // BBHOST_GPU_CHECKPOINTS=amd-dry on a device without them: recorded, not written
+// The dry run's marker write: nothing.
+VKAPI_ATTR void VKAPI_CALL dry_buffer_marker(VkCommandBuffer, VkPipelineStageFlagBits, VkBuffer, VkDeviceSize, std::uint32_t) {}
 
 // Every device that can run the host, scored: a discrete GPU before an
 // integrated one (a laptop lists its on-board GPU first, and the first
@@ -4183,6 +4187,13 @@ bool init_locked() {
         // the recorder thread, so the command processor recorded every one.
         // BBHOST_GPU_CHECKPOINTS=amd turns them on.
         bool want_amd = c.buffer_marker && e && std::strcmp(e, "amd") == 0;
+        // BBHOST_GPU_CHECKPOINTS=amd-dry (a check of the markers' recording on a
+        // device without the extension - lavapipe; with BBHOST_MARKER_TRACE):
+        // every marker recorded as it would be, the GPU's writes left out.
+        if (e && std::strcmp(e, "amd-dry") == 0) {
+            want_amd = true;
+            g_dry_buffer_marker = !c.buffer_marker;
+        }
         // Unset, and the last run lost the device (its note beside the
         // pipeline cache): these starts run with whichever this driver has -
         // buffer markers first where there are any (NVIDIA's drivers have
@@ -4466,7 +4477,7 @@ bool init_locked() {
     if (g.has_memory_budget) dext.push_back("VK_EXT_memory_budget");
     if (g.pipeline_stats) dext.push_back("VK_KHR_pipeline_executable_properties");
     if (g.has_checkpoints && !g_use_buffer_marker) dext.push_back("VK_NV_device_diagnostic_checkpoints");
-    if (g_use_buffer_marker) dext.push_back("VK_AMD_buffer_marker");
+    if (g_use_buffer_marker && !g_dry_buffer_marker) dext.push_back("VK_AMD_buffer_marker");
     if (g.has_gpl) {
         dext.push_back("VK_KHR_pipeline_library");
         dext.push_back("VK_EXT_graphics_pipeline_library");
@@ -4905,13 +4916,18 @@ bool init_locked() {
         shadow_budget_locked();
     }
     if (g.device && g_use_buffer_marker) {
-        g.cmd_buffer_marker = reinterpret_cast<PFN_vkCmdWriteBufferMarkerAMD>(vkGetDeviceProcAddr(g.device, "vkCmdWriteBufferMarkerAMD"));
+        g.cmd_buffer_marker = g_dry_buffer_marker ? &dry_buffer_marker
+                                                  : reinterpret_cast<PFN_vkCmdWriteBufferMarkerAMD>(
+                                                        vkGetDeviceProcAddr(g.device, "vkCmdWriteBufferMarkerAMD"));
         if (!g.cmd_buffer_marker || !create_dev_buffer(g.marker_buf, 256, true)) {
             g.cmd_buffer_marker = nullptr;
             g.has_checkpoints = false;
         } else {
             std::memset(g.marker_buf.map, 0, 256);
-            host_log("gpu: AMD buffer markers on each draw and dispatch (BBHOST_GPU_CHECKPOINTS=amd; a device loss names the work)");
+            host_log("gpu: AMD buffer markers on each draw and dispatch, and the front end's word before the ops between them where "
+                     "it stops or the pass changes (BBHOST_GPU_CHECKPOINTS=amd; a device loss names the work; BBHOST_GPU_MARKER_OPS=all: "
+                     "before every op)%s",
+                     g_dry_buffer_marker ? " - recorded only, the device has no buffer markers (BBHOST_GPU_CHECKPOINTS=amd-dry)" : "");
         }
     }
     if (g.device && g.has_checkpoints && !g_use_buffer_marker) {
@@ -6915,9 +6931,23 @@ std::uint32_t gpu_marker_value(unsigned kind, std::uint64_t index) {
 }
 
 void gpu_write_markers(VkCommandBuffer cmd, std::uint32_t value) {
-    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.marker_buf.buffer, 0, value);
-    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.marker_buf.buffer, 4, value);
+    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.marker_buf.buffer, gpu_markers::kStarted, value);
+    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.marker_buf.buffer, gpu_markers::kFinishedBefore, value);
 }
+
+void gpu_write_op_marker(VkCommandBuffer cmd, std::uint32_t seq) {
+    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.marker_buf.buffer, gpu_markers::kOpReached, seq);
+}
+
+}  // namespace gpu
+// The presenter's command buffer (window.cpp): an op's marker at its start and at its end, noted as another thread's
+// (host/gpu_markers.h). The presenter records it under the renderer's lock.
+void host_gpu_present_markers(void* cmd, bool end) {
+    using namespace gpu;
+    if (!g.cmd_buffer_marker || !cmd) return;
+    gpu_write_op_marker(static_cast<VkCommandBuffer>(cmd), recorder_note_op(static_cast<std::uint16_t>(stream::Op::kForeignSubmit), end ? 1 : 0));
+}
+namespace gpu {
 
 void gpu_checkpoint(unsigned kind, std::uint64_t index) {
     if (g.cmd_buffer_marker) {
@@ -6952,6 +6982,59 @@ std::string submission_mark(std::uint64_t which) {
 const char* g_dispatch_names[256] = {};
 void note_dispatch_name(std::uint64_t index, const char* name) { g_dispatch_names[index % 256] = name; }
 
+// A marker value as words: "draw N", "dispatch N", a submission's mark.
+std::string marker_text(std::uint32_t v) {
+    const unsigned kind = v >> 30;
+    const std::uint64_t which = v & 0x3fffffff;
+    if (kind == kGpuMarkSubmission) return submission_mark(which);
+    return std::string(kind == 1 ? "draw " : kind == 2 ? "dispatch " : "(none) ") + std::to_string(which);
+}
+
+// The word the recorder writes before each op between the draws (host/gpu_markers.h): the last op the GPU's front end
+// had reached, and what it says of the draw or dispatch the GPU had started - the ops after it up to that one, and
+// whether a barrier among them, which the front end does not pass before the work before it has finished, says the
+// draw had finished. That rests on barriers holding the front end: NVIDIA's and AMD's GPUs do; the specification
+// does not promise it.
+void report_between_draws(std::uint32_t started) {
+    std::uint32_t reached = 0;
+    std::memcpy(&reached, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kOpReached, 4);
+    if (!reached) return;
+    const std::string s = recorder_op_note_text(reached);
+    host_log("gpu: AMD marker: of the ops between draws, the GPU's front end had reached op %u%s%s", reached, s.empty() ? "" : ": ",
+             s.c_str());
+    const unsigned kind = started >> 30;
+    if (kind != 1 && kind != 2) return;
+    std::vector<std::string> lines;
+    const gpu_markers::Reach r = recorder_reach_after(started, reached, lines, 24);
+    const std::string what = marker_text(started);
+    if (r.other) {
+        host_log("gpu: AMD marker: that is the presenter's command buffer, whose place among the stream's ops its number does not "
+                 "give: nothing said of %s from it",
+                 what.c_str());
+        return;
+    }
+    if (!r.ops) {
+        host_log("gpu: AMD marker: no op after %s: the front end had not got past it - the GPU stopped in it, or before the next "
+                 "marker",
+                 what.c_str());
+        return;
+    }
+    host_log("gpu: AMD marker: the ops after %s the front end had reached (%u%s):", what.c_str(), r.ops,
+             r.known ? "" : "; the ring has moved past the first of them");
+    for (const std::string& l : lines) host_log("gpu: AMD marker:   %s", l.c_str());
+    if (r.ops > lines.size()) host_log("gpu: AMD marker:   (and %zu more)", static_cast<std::size_t>(r.ops - lines.size()));
+    if (r.holds) {
+        host_log("gpu: AMD marker: past op %u, a barrier that holds the front end until the work before it has finished: %s had "
+                 "finished, and the GPU stopped in the ops after that barrier up to op %u, or before the next marker (barriers hold "
+                 "the front end on NVIDIA's and AMD's GPUs; the specification does not promise it)",
+                 r.holds, what.c_str(), reached);
+    } else {
+        host_log("gpu: AMD marker: no barrier that holds the front end before op %u: %s may not have finished - the GPU stopped in "
+                 "it or in the ops above",
+                 reached, what.c_str());
+    }
+}
+
 // Where the GPU actually got to, when VK_NV_device_diagnostic_checkpoints is
 // there: the recorded draw list is recording order, this is execution order.
 void report_checkpoints() {
@@ -6977,6 +7060,7 @@ void report_checkpoints() {
         };
         say("finished everything before", finished);
         say("started", started);
+        report_between_draws(started);
         return;
     }
     auto get_data = reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(vkGetDeviceProcAddr(g.device, "vkGetQueueCheckpointDataNV"));
@@ -12474,6 +12558,21 @@ void host_gpu_resources_report() {
         if (nl == std::string::npos) break;
         at = nl + 1;
     }
+    // BBHOST_MARKER_TRACE with the markers written (a check of the loss report without a loss): the words as they
+    // stand while the GPU runs on, read as a device loss now would read them (host/gpu_markers.h).
+    static const bool snapshot = [] {
+        const char* e = std::getenv("BBHOST_MARKER_TRACE");
+        return e && *e;
+    }();
+    if (snapshot && g.cmd_buffer_marker && g.marker_buf.map && !g_dry_buffer_marker) {
+        std::uint32_t started = 0, finished = 0;
+        std::memcpy(&started, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kStarted, 4);
+        std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kFinishedBefore, 4);
+        host_log("gpu: marker snapshot (as a device loss now would read the words; the GPU runs on): last started %s, everything "
+                 "finished before %s",
+                 gpu::marker_text(started).c_str(), gpu::marker_text(finished).c_str());
+        gpu::report_between_draws(started);
+    }
 }
 
 std::string host_gpu_image_heap_report() {
@@ -14157,12 +14256,22 @@ void host_gpu_report() {
                  static_cast<unsigned long long>(g_counter_fills.load()));
     }
     if (g.cmd_buffer_marker && g.marker_buf.map) {
-        std::uint32_t started = 0, finished = 0;
+        // The words once the GPU has run all it was given (a lost device answers at once): with nothing in flight
+        // they agree - the last started is the last finished before (the last submission's end, as a rule) - and the
+        // last op the front end reached is the last noted with a word, but for ops recorded and never submitted before
+        // the exit (the command processor runs ahead of the GPU uncapped) - so a start's exit line checks the markers
+        // themselves.
+        {
+            QueueGuard queue;
+            vkQueueWaitIdle(g.queue);
+        }
+        std::uint32_t started = 0, finished = 0, reached = 0;
         std::memcpy(&started, g.marker_buf.map, 4);
-        std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + 4, 4);
-        host_log("gpu: AMD markers at exit: last started %s %u, everything finished before %s %u",
-                 (started >> 30) == 1 ? "draw" : (started >> 30) == 2 ? "dispatch" : "-", started & 0x3fffffff,
-                 (finished >> 30) == 1 ? "draw" : (finished >> 30) == 2 ? "dispatch" : "-", finished & 0x3fffffff);
+        std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kFinishedBefore, 4);
+        std::memcpy(&reached, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kOpReached, 4);
+        host_log("gpu: AMD markers at exit: last started %s, everything finished before %s; ops between draws: the last the front end "
+                 "reached %u (the last noted with a word %u)",
+                 marker_text(started).c_str(), marker_text(finished).c_str(), reached, recorder_last_op_note());
     }
     host_log("gpu: dispatches=%llu draws=%llu draw-failures=%llu flushes=%llu failures=%llu pipelines=%llu/%llu dummy-images=%llu gpu-time=%llu ms",
              static_cast<unsigned long long>(g.dispatches.load()), static_cast<unsigned long long>(g.draws.load()),

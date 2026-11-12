@@ -1023,6 +1023,10 @@ if(UNIX)
   add_executable(list_cb_memo_test tests/list_cb_memo_test.cpp)
   target_include_directories(list_cb_memo_test PRIVATE src include)
   add_test(NAME list_cb_memo_test COMMAND list_cb_memo_test)
+  # The markers between the draws a device-loss report reads (host/gpu_markers.h).
+  add_executable(gpu_markers_test tests/gpu_markers_test.cpp)
+  target_include_directories(gpu_markers_test PRIVATE src include)
+  add_test(NAME gpu_markers_test COMMAND gpu_markers_test)
   # The draw pool's threads by default, counted from the process's affinity (host/gxvk_lists.h pool_threads_for).
   add_executable(pool_threads_test tests/pool_threads_test.cpp src/core/portable.cpp)
   target_include_directories(pool_threads_test PRIVATE src include)

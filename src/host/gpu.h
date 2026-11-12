@@ -964,6 +964,10 @@ GpuBusy host_gpu_busy();
 void host_gpu_busy_present_begin(void* cmd);
 void host_gpu_busy_present_end(void* cmd);
 void host_gpu_busy_present_done();
+// The same command buffer's front-end word, at its start (`end` false) and at
+// its end, while the device-loss markers are on (host/gpu_markers.h): the
+// stream submits it in its order, so a loss can name it among the ops.
+void host_gpu_present_markers(void* cmd, bool end);
 // The 300-flip report's line: busy over the window since the last call.
 std::string host_gpu_busy_report();
 // The presenter's, before its blit: submits the renderer's recording only when

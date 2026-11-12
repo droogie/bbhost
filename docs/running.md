@@ -252,8 +252,8 @@ without it: its title screen would otherwise be a flat green picture.
 **The graphics card stops responding.** When the GPU hangs and the system
 resets it, nothing can be drawn again in that session; bbhost stops the sound,
 says so in a box and exits. The next three starts run with the GPU's progress
-markers enabled, so the log of a second hang names the draw that hung - send
-that log. Overlays that hook Vulkan are a common cause: OBS's game capture is
+markers enabled, so the log of a second hang names the draw that hung and how
+far past it the GPU had got - send that log. Overlays that hook Vulkan are a common cause: OBS's game capture is
 kept out automatically on AMD cards (`[video] obs_capture` changes that), and
 OBS's Window Capture records bbhost without any hook.
 

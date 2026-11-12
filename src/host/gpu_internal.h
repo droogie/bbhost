@@ -68,6 +68,10 @@ bool bb_memory_test_limited(std::uint64_t* limit, std::uint64_t* used);
 
 #include "host/heap_compact.h"  // the compaction's blocks and items (global namespace)
 
+namespace gpu_markers {
+struct Reach;  // host/gpu_markers.h
+}  // namespace gpu_markers
+
 namespace gpu {
 
 // BBHOST_RUN_COMMIT (render.cpp run_commit): a run worker's counters, kept
@@ -2713,8 +2717,28 @@ void gpu_checkpoint_cmd(VkCommandBuffer cmd, unsigned kind, std::uint64_t index)
 // writes (the top of the pipe, then the bottom) into g.marker_buf.
 std::uint32_t gpu_marker_value(unsigned kind, std::uint64_t index);
 void gpu_write_markers(VkCommandBuffer cmd, std::uint32_t value);
+// The word between the draws (host/gpu_markers.h): the top-of-pipe marker
+// before an op the recorder replays between draws - one where the front end
+// stops or the pass changes, or any with BBHOST_GPU_MARKER_OPS=all - with its
+// sequence number. The recorder's replay writes it while the markers are on.
+void gpu_write_op_marker(VkCommandBuffer cmd, std::uint32_t seq);
+// The recorder's note of op `seq` (host/gpu_markers.h), as one line: its
+// kind, its words and the draw or dispatch replayed before it; "" when the
+// ring has moved past it.
+std::string recorder_op_note_text(std::uint32_t seq);
+// The last op number given to an op with the front end's word, 0 before any.
+std::uint32_t recorder_last_op_note();
+// What the GPU's front end had reached after the draw or dispatch `started`
+// (its marker value), the op word being `reached` (host/gpu_markers.h
+// reach_after), with the ops from the first after it to `reached` as lines
+// (at most `max`).
+gpu_markers::Reach recorder_reach_after(std::uint32_t started, std::uint32_t reached, std::vector<std::string>& lines, std::size_t max);
+// A note of an op another thread recorded (the presenter's command buffer), its number for the markers.
+std::uint32_t recorder_note_op(std::uint16_t kind, std::uint64_t a, std::uint64_t b = 0, std::uint64_t c = 0);
 // Logs one recorded draw by index, if it is still in the ring.
 void describe_draw_record(std::uint64_t index);
+// Its pipeline's name, or null once the ring has moved past it.
+const char* draw_record_name(std::uint64_t index);
 // A device fault's address against the tessellation LDS ring (render.cpp):
 // inside it (which region) or how far past or before it, and the recent
 // tessellated draw whose LDS holds it or ends just before it. "" before the
