@@ -633,6 +633,16 @@ void menu_key(bool patches) {
 // where the pad and keys are read (host/window.cpp).
 void panel_event(const SDL_Event& e, float ratio) {
     static bool was = false;
+    // The keys and buttons ImGui was told went down while the panel was up
+    // and not yet let go. Only their release goes to it while the panel is
+    // down - no frame of it runs then to take anything else, and the queue
+    // would fill with the game's play, losing the menu's first events.
+    static std::vector<ImGuiKey> held;
+    const auto note = [](ImGuiKey k, bool down) {
+        const auto it = std::find(held.begin(), held.end(), k);
+        if (down && it == held.end()) held.push_back(k);
+        if (!down && it != held.end()) held.erase(it);
+    };
     const bool up = plugin_panel_shown();
     if (up && !was) {
         // Where the pointer is now: it has been the camera's until this.
@@ -655,10 +665,12 @@ void panel_event(const SDL_Event& e, float ratio) {
         in.down = false;
         if (e.type == SDL_EVENT_KEY_UP && plugin_panel_key(e.key.scancode)) {
             in.key = e.key.scancode == SDL_SCANCODE_Q ? ImGuiKey_Q : e.key.scancode == SDL_SCANCODE_E ? ImGuiKey_E : key_of(e.key.key);
-            if (in.key != ImGuiKey_None) push(in);
         } else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
             in.key = pad_key_of(e.gbutton.button);
-            if (in.key != ImGuiKey_None) push(in);
+        }
+        if (in.key != ImGuiKey_None && std::find(held.begin(), held.end(), in.key) != held.end()) {
+            push(in);
+            note(in.key, false);
         }
         return;
     }
@@ -676,6 +688,7 @@ void panel_event(const SDL_Event& e, float ratio) {
             in.key = k;
             in.down = e.type == SDL_EVENT_KEY_DOWN;
             push(in);
+            note(k, in.down);
         }
         return;
     case SDL_EVENT_MOUSE_MOTION: {
@@ -717,6 +730,7 @@ void panel_event(const SDL_Event& e, float ratio) {
         in.key = k;
         in.down = e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
         push(in);
+        note(k, in.down);
         return;
     }
     default:
