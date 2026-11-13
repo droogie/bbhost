@@ -5,11 +5,14 @@
 #include "core/portable.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
+#include "engine/player_data.h"
 #include "guest_abi.h"
 #include "log.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -38,6 +41,13 @@ std::atomic<bool> g_held{false};
 std::uint64_t g_step = 0;    // the step seen last
 bool g_ours = false;         // the bytes are ours: we set them
 bool g_told = false;         // "held" logged, until the world runs again
+// A frame advance's measure, logged when the world is held again: the updates
+// world_step let run and the game time they took - each update's own step, its
+// first float argument (what the play time adds, 0x1d419d6), in game seconds -
+// and the play time's own count across them.
+std::uint32_t g_advance_updates = 0;
+double g_advance_seconds = 0.0;
+std::int64_t g_advance_play_ms = -1;  // the play time before the first of them
 
 std::uint64_t read64(std::uint64_t at) {
     std::uint64_t v = 0;
@@ -77,7 +87,16 @@ GUEST_ABI std::int64_t in_game_update_hook(std::uint64_t, const std::uint64_t* s
         std::uint32_t left = g_steps.load(std::memory_order_relaxed);
         while (left && !g_steps.compare_exchange_weak(left, left - 1, std::memory_order_relaxed)) {
         }
-        if (left) hold = false;
+        if (left) {
+            hold = false;
+            // The update's step: xmm0, which the prologue stub keeps 136
+            // bytes below the argument registers (core/thunk.h).
+            float dt = 0.0f;
+            std::memcpy(&dt, reinterpret_cast<const std::uint8_t*>(saved) - 136, sizeof(dt));
+            if (!g_advance_updates && !player_stat_get("play_time_ms", &g_advance_play_ms)) g_advance_play_ms = -1;
+            ++g_advance_updates;
+            if (std::isfinite(dt) && dt > 0.0f) g_advance_seconds += dt;
+        }
     }
     if (hold && !read64(read64(step + kCameraRoot) + kDebugCamera)) {
         static bool told = false;
@@ -88,6 +107,22 @@ GUEST_ABI std::int64_t in_game_update_hook(std::uint64_t, const std::uint64_t* s
     if (hold) {
         if (!g_told) host_log("world pause: the world held (in-game step %llx)", static_cast<unsigned long long>(step));
         g_told = true;
+        if (g_advance_updates) {
+            static int lines = 0;  // the first 16 a run: enough to see what a press does
+            if (lines < 16) {
+                const char* more = ++lines == 16 ? "; the ones after it go unlogged" : "";
+                std::int64_t play_ms = -1;
+                if (g_advance_play_ms >= 0 && player_stat_get("play_time_ms", &play_ms))
+                    host_log("world pause: a frame advance ran %u update(s), %.1f ms of game time (the play time %+lld ms)%s",
+                             g_advance_updates, g_advance_seconds * 1000.0,
+                             static_cast<long long>(play_ms - g_advance_play_ms), more);
+                else
+                    host_log("world pause: a frame advance ran %u update(s), %.1f ms of game time%s", g_advance_updates,
+                             g_advance_seconds * 1000.0, more);
+            }
+            g_advance_updates = 0;
+            g_advance_seconds = 0.0;
+        }
         bytes[kHeld] = 1;
         bytes[kHeldEffects] = 1;
         g_ours = true;
@@ -101,6 +136,8 @@ GUEST_ABI std::int64_t in_game_update_hook(std::uint64_t, const std::uint64_t* s
     if (g_told && !g_want.load(std::memory_order_relaxed)) {
         host_log("world pause: the world runs again");
         g_told = false;
+        g_advance_updates = 0;  // an advance the hold's end cut short is not one
+        g_advance_seconds = 0.0;
     }
     g_held.store(g_ours, std::memory_order_relaxed);
     return 0;
