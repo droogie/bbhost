@@ -440,6 +440,91 @@ void graphics_ssr_live_in() {
 
 namespace {
 
+// Text scale. The menus map their font, MenuFont_01, through Scaleform's
+// FontMap::MapFont(map, name, new name, flags, scale) (0x40c240, called at
+// 0x235cd2d with the scale loaded from 0x4d2913c, 1.0 - what Kyo's "50% Text
+// scale" patch set to 0.5). MapFont keeps the scale in the map's entry for
+// the name, and the font manager reads it from there as a movie makes its
+// font handles. So the hook scales the argument as the font is mapped and
+// keeps the map; a change later rewrites the entry's scale (font_map_write),
+// which a menu window takes when it is made again and the HUD at a loading
+// screen or the title - the font handles a movie already made keep theirs.
+// The map's hash (0x278aa10 reads it): *(map + 0x10) -> {table}; the table
+// {count, size mask, entries[mask + 1]}, an entry 40 bytes - next (-2 empty),
+// hash, key String, then the value: name String, float scale (+0x20), flags.
+// A String is a pointer (low two bits flags) to {size, refs, UTF-8 at +0xc}.
+constexpr std::uint64_t kMapFont = 0x40c240;
+// push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x48
+const std::uint8_t kMapFontPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                         0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x48};
+constexpr std::uint64_t kMenuFontScale = 0x4d2913c;  // the scale MapFont is called with (no hook: written once)
+std::atomic<float> g_text_scale{1.0f};               // the setting, 0.5 to 1.0
+std::mutex g_font_map_mu;
+std::uint64_t g_font_map = 0, g_font_map_vtable = 0;  // the map that holds MenuFont_01 (under g_font_map_mu)
+float g_font_base = 1.0f;                             // the scale the game mapped it with (a patch's, if one wrote it)
+
+std::uint64_t guest_u64(std::uint64_t a) { return *reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(a)); }
+
+// The MenuFont_01 entry's scale set to the base times `k`, in the map the
+// hook kept - if that map is still one (its vtable). False if not found.
+bool font_map_write(float k) {
+    if (!g_font_map || guest_u64(g_font_map) != g_font_map_vtable) return false;
+    const std::uint64_t hash = guest_u64(g_font_map + 0x10), table = hash ? guest_u64(hash) : 0;
+    if (!table) return false;
+    const std::uint64_t mask = guest_u64(table + 8);
+    if (mask > 0xffff) return false;
+    for (std::uint64_t i = 0; i <= mask; ++i) {
+        const std::uint64_t e = table + 0x10 + i * 40;
+        if (static_cast<std::int64_t>(guest_u64(e)) == -2) continue;
+        const std::uint64_t key = guest_u64(e + 0x10) & ~3ull;
+        if (!key || (guest_u64(key) & 0x7fffffffffffffffull) != 11 ||
+            std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(key + 0xc)), "MenuFont_01", 11) != 0)
+            continue;
+        auto* scale = reinterpret_cast<float*>(static_cast<std::uintptr_t>(e + 0x20));
+        const float want = g_font_base * k;
+        if (*scale != want) {
+            host_log("graphics: text scale %g -> %g (MenuFont_01)", static_cast<double>(*scale), static_cast<double>(want));
+            *scale = want;
+        }
+        return true;
+    }
+    return false;
+}
+
+void text_scale_set(float k) {
+    k = std::clamp(k, 0.5f, 1.0f);
+    g_text_scale.store(k);
+    std::lock_guard<std::mutex> lk(g_font_map_mu);
+    if (g_font_map && !font_map_write(k)) host_log("graphics: text scale %g: MenuFont_01's mapping is gone", static_cast<double>(k));
+}
+
+// FontMap::MapFont's entry: the map in rdi, the name (UTF-16) in rsi, the
+// scale in xmm0.
+GUEST_ABI std::int64_t map_font_hook(std::uint64_t, const std::uint64_t* saved) {
+    const auto* name = reinterpret_cast<const char16_t*>(static_cast<std::uintptr_t>(saved[4]));
+    static const char16_t kName[] = u"MenuFont_01";
+    if (!name || !saved[5]) return 0;
+    for (std::size_t i = 0; i < sizeof(kName) / sizeof(kName[0]); ++i)
+        if (name[i] != kName[i]) return 0;  // stops at the first difference, a shorter name's end included
+    auto* scale = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(saved) - 136);  // xmm0
+    std::lock_guard<std::mutex> lk(g_font_map_mu);
+    g_font_base = *scale;
+    g_font_map = saved[5];
+    g_font_map_vtable = guest_u64(saved[5]);
+    const float k = g_text_scale.load();
+    *scale = g_font_base * k;
+    // A second mapping of the name keeps the first entry (MapFont adds only
+    // a new one): that entry gets the scale too.
+    font_map_write(k);
+    host_log("graphics: MenuFont_01 mapped at %g (the game's %g, text scale %g)", static_cast<double>(*scale),
+             static_cast<double>(g_font_base), static_cast<double>(k));
+    return 0;
+}
+
+}  // namespace
+
+namespace {
+
 // The settings' listener (host_settings_listen, from live_install): told each
 // change once, on the thread that made it (the store calls its listeners one
 // at a time), it keeps the values the hooks below apply - the hooks read these
@@ -483,6 +568,7 @@ void settings_changed(const HostSettings& hs) {
         g_flags_gen.fetch_add(1, std::memory_order_release);
     }
     g_ssr_off.store(!hs.ssr, std::memory_order_relaxed);
+    text_scale_set(hs.text_scale);
     g_dyn_shadows_off.store(!hs.dynamic_shadows || hs.performance_mode, std::memory_order_relaxed);
     // Performance mode's blur off (its velocity map kept for the upscaler).
     static bool blur_was = true;
@@ -1776,28 +1862,29 @@ std::string graphics_glare_report() {
     return buf;
 }
 
-// Text scale. The menus register their font, MenuFont_01, with a scale
-// loaded from one constant (vmovss xmm0, [0x4d2913c] at 0x235cd15, the only
-// reader, which runs once as the menus start): 1.0 the game's own. Kyo's
-// "50% Text scale" patch wrote 0.5 there; the setting writes 0.5 to 1.0. A
-// patch that already wrote it keeps its value.
-constexpr std::uint64_t kMenuFontScale = 0x4d2913c;
-
+// Text scale: the hook on FontMap::MapFont (map_font_hook, above).
 void text_scale_install(ElfImage* image) {
-    const float want = std::clamp(host_settings().text_scale, 0.5f, 1.0f);
+    const std::uint64_t at = image->mem.slide + (kMapFont - kPreferredGuestSlide);
+    if (install_prologue_hook(image, at, kMapFontPrologue, sizeof(kMapFontPrologue), reinterpret_cast<void*>(&map_font_hook))) {
+        host_log("graphics: text scale %g, live (MenuFont_01's mapping hooked)", static_cast<double>(g_text_scale.load()));
+        return;
+    }
+    // No hook: the constant MapFont is called with, read once - the setting
+    // applies at the next start.
+    const float want = g_text_scale.load();
+    host_log("graphics: refused, 0x%llx is not Scaleform's FontMap::MapFont prologue; text scale %g at the next start",
+             static_cast<unsigned long long>(kMapFont), static_cast<double>(want));
     if (want == 1.0f) return;
-    const std::uint64_t at = image->mem.slide + (kMenuFontScale - kPreferredGuestSlide);
-    auto* p = static_cast<float*>(guest_ptr(image->mem, at));
+    const std::uint64_t c = image->mem.slide + (kMenuFontScale - kPreferredGuestSlide);
+    auto* p = static_cast<float*>(guest_ptr(image->mem, c));
     if (*p != 1.0f) {
         host_log("graphics: text scale %g left as %g (a patch wrote it, or another eboot)", static_cast<double>(want),
                  static_cast<double>(*p));
         return;
     }
-    const std::uint64_t lo = at & ~0xfffull;
-    guest_protect_rwx(&image->mem, lo, 0x1000);
+    guest_protect_rwx(&image->mem, c & ~0xfffull, 0x1000);
     *p = want;
-    guest_protect_rx(&image->mem, lo, 0x1000);
-    host_log("graphics: text scale %g (MenuFont_01)", static_cast<double>(want));
+    guest_protect_rx(&image->mem, c & ~0xfffull, 0x1000);
 }
 
 void graphics_patch_install(ElfImage* image) {

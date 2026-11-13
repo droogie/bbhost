@@ -681,13 +681,15 @@ Setting g_set[kSettingCount] = {
      "is their own blue and violet.",
      false},
     {"menu_vibrance", "Menu vibrance", signed_steps(-100, 100, "%"), 100, "How much colour bbhost's own menus have: -100% is black and white, 0% their own, +100% the most.", false},
-    // The game's own text: the scale MenuFont_01 is registered with, a float
-    // the eboot reads once as the menus start (engine/graphics_patch.cpp,
-    // text_scale_install) - what Kyo's "50% Text scale" patch set to 0.5.
+    // The game's own text: the scale MenuFont_01 is mapped with, kept in the
+    // font map and rewritten there when it changes (engine/graphics_patch.cpp,
+    // map_font_hook) - what Kyo's "50% Text scale" patch set to 0.5. A movie
+    // reads it as it makes its font handles: a menu window when it is made
+    // again, the HUD at a loading screen or the title (tried 2026-11-13).
     {"text_scale", "Text scale", signed_steps(50, 100, "%", false), 50,
-     "Requires a restart. The size of the game's own text. 100% is the game's own; smaller looks better at high "
-     "resolutions.",
-     true},
+     "The size of the game's own text. 100% is the game's own; smaller looks better at high resolutions. A menu "
+     "takes the new size when it is opened again; the HUD after the next loading screen or a return to the title.",
+     false},
 };
 
 // The in-game menu's pages, one a header, in the setup window's order: Game
@@ -1412,7 +1414,7 @@ void apply(int id) {
         case kMenuVibrance:
             break;  // the menus read them every frame (host_opt_menu_text_scale, host_opt_menu_colour)
         case kTextScale:
-            break;  // read by the loader (engine/graphics_patch.cpp)
+            break;  // the settings object carries it (engine/graphics_patch.cpp)
         default: break;
     }
 }
