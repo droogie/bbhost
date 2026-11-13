@@ -992,7 +992,19 @@ waiting 8-15%), where it used to work on for good, it tries a rest - the
 switch's 1.5 s, then 1-1.5 s counted - and keeps it where the cap holds the
 frame without it, else it works again and the next trial waits the cap's
 backoff), while the frame is the GPU's (busy 90% of two windows, until it is
-under 80% over six), and wherever resting costs the frame nothing. That last is
+under 80% over six), and wherever resting costs the frame nothing. With no cap
+holding the frame, a rest the GPU began is judged by the frame when it ends:
+resting 8% slower than the GPU-bound windows that began it, the pool's work was
+what kept the frame the GPU's, and that is an experiment's clear answer - the
+pool works, and no GPU-bound rest and no probe come for 40 s, then 160, then 240
+(a loading screen starts the place over; at a cap nothing changes). On the RTX
+4070 below, uncapped, the Hunter's Dream ran 204-208 fps working with the GPU
+91-95% busy and ~170 resting (the command processor the wall, the game held
+back 70%), and Cainhurst's courtyard 166-170 and 106-113: the GPU's rest began
+after two windows, ended after six and began again two later, ten times in
+every 20 s, and the places ran 180-184 and 121-124 fps against 216 and 167 with
+the pool never resting. A rest that runs as fast - an APU's frame, the GPU's
+either way - is the GPU's as before. That last is
 measured at each place, both ways: 10 s after the pool began to work there, an
 experiment rests it for 5.5 s and lets it work for 5.5 s more, and compares the
 frame rate resting with the windows on either side of it; under 0.5% slower
