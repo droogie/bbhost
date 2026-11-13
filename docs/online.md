@@ -71,8 +71,23 @@ bbhost.exe does not spoil the result.
   - **You'll use the relay: your router changes ports per destination** - a
     different port (or address) at each, as symmetric and many carrier-grade
     NATs do: a direct connection fails, and the relay carries the session.
-  - **UDP is blocked on this network** - no answer at all: online play will
-    not work from this network (a firewall, a VPN, a school or work network).
+  - **No answer reached bbhost** - nothing came back. On its own the PC
+    cannot tell whether its requests got out or the answers were stopped on
+    the way back; signed in, the server tells which:
+    - **Nothing from bbhost reached the server** - its test ports saw none of
+      them. If the website's test passes, the network is fine and a firewall,
+      antivirus or VPN on this PC is blocking bbhost.exe: allow it and test
+      again, as online play needs it. If the website's test fails too, the
+      network blocks UDP (school and work networks can).
+    - **The server hears bbhost, but its answers don't reach it** - the server
+      saw the requests, and its answers were stopped on the way back, most
+      likely by a firewall or antivirus on this PC: allow bbhost.exe there and
+      test again.
+  - **This PC did not let bbhost send** - the system refused every request
+    (the card gives its error): allow bbhost.exe in the firewall or antivirus.
+  - The website's test is the browser's own packets, and the server counts
+    what reaches it, so it can pass while something on the PC stops
+    bbhost.exe's - the packets the game itself sends.
 - **Incoming**, the port check: one more request asks the server to answer
   from a third port, which the game never sent anything to. When that answer
   arrives, the router and this PC's firewall let in a packet nobody asked for

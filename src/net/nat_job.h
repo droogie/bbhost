@@ -61,6 +61,9 @@ struct Remembered {
     Inbound inbound = Inbound::NotTested;
     double at = 0;       // Unix seconds
     bool saved = false;  // kept for the account
+    // The card's headline and meaning for a test run here ("" for the
+    // account's last test: headline() and meaning() of its verdict).
+    std::string head = {}, meaning = {};
 };
 void remember(const Remembered& r);
 Remembered remembered();

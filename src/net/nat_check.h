@@ -11,12 +11,22 @@
 //   relay    a different port (or address) at each: the router maps every
 //            destination anew (a symmetric or carrier-grade NAT), so a direct
 //            connection fails and the server's relay carries the session;
-//   blocked  no answer from either: UDP to the server does not get through.
+//   blocked  no answer from either: nothing came back to bbhost.
 // Signed in, POST /auth/nat_test {Token, Inbound, Port} then has the server
 // classify what it saw from this address, keep the result for the account
 // and, in its "marked" relay mode, relay this address when it says relay -
 // exactly as the website's test does. The request goes over IPv4, as the
 // test's datagrams do: the server matches the two by address.
+//
+// No answer is not the same as blocked. This PC alone cannot tell whether its
+// requests got out and the answers were stopped on the way back, or nothing
+// got out; the server can (reading_of). The website's test is the browser's
+// datagrams, and only what reaches the server counts there, so it can pass
+// while a firewall or antivirus on this PC stops bbhost.exe's - which is what
+// the game sends from, so the card says so. An inbound block at the layer
+// Windows' firewall rules use stops only datagrams nobody asked for (the port
+// check's second answer) - answers to what bbhost sent still get in - and an
+// outbound one drops bbhost's datagrams while its sends report success.
 //
 // The port check: a third request, to the first test port, carries RFC
 // 5780's CHANGE-REQUEST (change port). The server answers it as usual with
@@ -260,8 +270,9 @@ inline const char* meaning(Verdict v) {
         return "Other hunters cannot reach this PC directly, so co-op and PvP need the server's relay: it works, with a "
                "little more delay.";
     case Verdict::Blocked:
-        return "Nothing reached the server's test ports, so online play will not work from this network. A firewall, "
-               "a VPN or a school or work network can block UDP.";
+        return "Nothing reached the server's test ports. If the website's test passes while bbhost's does not, a firewall, "
+               "antivirus or VPN on this PC is blocking bbhost.exe: allow it and test again. If both fail, this network "
+               "blocks UDP (school and work networks can), and online play will not work from it.";
     case Verdict::Inconclusive:
         return "One test port answered and the other did not - a lost packet, most likely. Run the test again.";
     case Verdict::None: break;
@@ -352,6 +363,169 @@ inline std::string unsaved_reason(const Outcome& o) {
     case SaveReply::State::Saved: break;
     }
     return {};
+}
+
+// --- What a finished test says (the setup window's Connection card) ---------
+
+// The card's reading of a finished test: the verdict it shows, with what came
+// back to bbhost and what the server saw.
+enum class Reading {
+    NotResolved,     // the test server's name did not resolve: nothing sent
+    PortInUse,       // another program has the P2P port: nothing sent
+    NoSocket,        // no socket on the P2P port (error_text)
+    Cancelled,       // stopped before it ended
+    SendRefused,     // this PC refused every datagram bbhost tried to send
+    Direct,          // the server's verdict once kept, else this PC's - answers came back
+    Relay,
+    Inconclusive,    // one test port answered (not kept)
+    NoAnswer,        // not kept, and no answer came back: out or back, this PC cannot tell
+    ServerBlocked,   // kept: nothing from bbhost reached the server, and nothing came back
+    AnswersStopped,  // kept direct or relay - the server heard this address - yet no answer reached bbhost
+    AddressDiffers,  // kept blocked, yet the test ports answered bbhost: the request came from another address
+};
+
+inline Reading reading_of(const Outcome& o) {
+    if (!o.resolved) return Reading::NotResolved;
+    switch (o.probe.error) {
+    case ProbeResult::Error::PortInUse: return Reading::PortInUse;
+    case ProbeResult::Error::Socket:
+    case ProbeResult::Error::Bind: return Reading::NoSocket;
+    case ProbeResult::Error::Cancelled: return Reading::Cancelled;
+    case ProbeResult::Error::None: break;
+    }
+    if (nothing_sent(o.probe)) return Reading::SendRefused;
+    const bool answers = o.local == Verdict::Direct || o.local == Verdict::Relay || o.local == Verdict::Inconclusive;
+    if (o.saved()) {
+        if (o.save.verdict == Verdict::Blocked) return answers ? Reading::AddressDiffers : Reading::ServerBlocked;
+        if (!answers) return Reading::AnswersStopped;
+        return o.save.verdict == Verdict::Relay ? Reading::Relay : Reading::Direct;
+    }
+    if (!answers) return Reading::NoAnswer;
+    return o.local == Verdict::Direct ? Reading::Direct : o.local == Verdict::Relay ? Reading::Relay : Reading::Inconclusive;
+}
+
+// How the card marks a reading: good (a check), the relay (information), a
+// warning, or bad.
+enum class Tone { Good, Relay, Warn, Bad };
+inline Tone tone_of(Verdict v) {
+    return v == Verdict::Direct ? Tone::Good : v == Verdict::Relay ? Tone::Relay : v == Verdict::Blocked ? Tone::Bad : Tone::Warn;
+}
+
+struct Card {
+    Reading reading = Reading::NoAnswer;
+    Tone tone = Tone::Warn;
+    std::string head;      // the headline
+    std::string meaning;   // what it means, and what to do about it
+    std::string incoming;  // the port check's line ("" none)
+    std::string detail;    // where it ran from, when, and whether it was kept ("" none)
+    std::string note;      // a remark in the warning colour ("" none)
+};
+
+// The card for a finished test (`now` in Unix seconds: "just now").
+inline Card card_of(const Outcome& o, double now) {
+    Card c;
+    c.reading = reading_of(o);
+    const std::string port = std::to_string(o.probe.local_port);
+    switch (c.reading) {
+    case Reading::NotResolved:
+        c.head = "The test server could not be found";
+        c.meaning = "Its name did not resolve: check the server chosen above and this PC's network.";
+        return c;
+    case Reading::PortInUse:
+        c.head = "UDP port " + port + " is in use: close the game to test";
+        c.meaning = "Another program has the game's P2P port - most likely bbhost itself, running the game. The test sends "
+                    "from that port, so it runs while the game is closed.";
+        return c;
+    case Reading::NoSocket:
+    case Reading::Cancelled:
+        c.head = "The test could not use UDP port " + port;
+        c.meaning = o.probe.error_text.empty() ? std::string("The test was stopped.") : o.probe.error_text + ".";
+        return c;
+    case Reading::SendRefused:
+        c.tone = Tone::Bad;
+        c.head = "This PC did not let bbhost send";
+        c.meaning = "This PC refused every test packet bbhost tried to send from UDP port " + port + " (" + o.probe.send_error +
+                    "). " +
+                    (o.probe.send_denied
+                         ? std::string("A firewall or antivirus on this PC is blocking bbhost.exe: allow bbhost.exe in it and test "
+                                       "again - online play needs it.")
+                         : std::string("Check this PC's network connection; if it works, a firewall or antivirus may be blocking "
+                                       "bbhost.exe: allow bbhost.exe in it and test again."));
+        break;
+    case Reading::Direct:
+    case Reading::Relay:
+    case Reading::Inconclusive: {
+        const Verdict v = c.reading == Reading::Direct ? Verdict::Direct
+                          : c.reading == Reading::Relay ? Verdict::Relay
+                                                        : Verdict::Inconclusive;
+        c.tone = tone_of(v);
+        c.head = headline(v);
+        c.meaning = meaning(v);
+        break;
+    }
+    case Reading::NoAnswer:
+        c.tone = Tone::Bad;
+        c.head = "No answer reached bbhost";
+        c.meaning = "bbhost sent its test packets from UDP port " + port +
+                    ", but no answer came back: either they did not get out, or the answers were stopped on the way back - by "
+                    "a firewall or antivirus on this PC, or by this network. " +
+                    (o.signed_in ? std::string("The server could not tell which this time: test again.")
+                                 : std::string("Sign in (above) and test again: the server then tells which."));
+        break;
+    case Reading::ServerBlocked:
+        c.tone = Tone::Bad;
+        c.head = "Nothing from bbhost reached the server";
+        c.meaning = "The server's test ports saw none of bbhost's packets. If the website's connection test passes, your "
+                    "network is fine and a firewall, antivirus or VPN on this PC is blocking bbhost.exe: allow it and test "
+                    "again - online play needs it. If the website's test fails too, this network blocks UDP (school and "
+                    "work networks can).";
+        break;
+    case Reading::AnswersStopped:
+        c.tone = Tone::Warn;
+        c.head = "The server hears bbhost, but its answers don't reach it";
+        c.meaning = std::string("The server heard from this network and reads it as ") + verdict_word(o.save.verdict) +
+                    ", but none of its answers came back to bbhost. A firewall or antivirus on this PC is most likely "
+                    "stopping what comes back to bbhost.exe: allow bbhost.exe in it and test again - online play needs "
+                    "those packets.";
+        break;
+    case Reading::AddressDiffers:
+        c.tone = Tone::Warn;
+        c.head = "The server did not see this test from your address";
+        c.meaning = "The test ports answered bbhost, so UDP gets through, but the server saw none of its packets come from "
+                    "the address your request came from, and kept \"blocked\" for your account. A VPN or proxy for web "
+                    "traffic sends the two different ways: turn it off and test again.";
+        break;
+    }
+    const bool answers = o.local == Verdict::Direct || o.local == Verdict::Relay || o.local == Verdict::Inconclusive;
+    if (answers) c.incoming = inbound_line(o.inbound, o.probe.local_port, o.shown());
+    const std::string ports = public_ports(o.probe);
+    std::string when = ago(o.at, now);
+    if (!when.empty() && when[0] >= 'a' && when[0] <= 'z') when[0] = static_cast<char>(when[0] - 'a' + 'A');
+    c.detail = "Tested from UDP port " + port + " (the game's P2P port)" + (ports.empty() ? "" : ": the server saw " + ports) +
+               ". " + when + "; ";
+    if (o.saved()) c.detail += "saved to your account for this network (test again on another one).";
+    else if (!o.signed_in) c.detail += "this PC's own reading, not saved to your account.";
+    else c.detail += "not saved to your account: " + unsaved_reason(o) + ".";
+    if (o.saved() && answers && o.save.verdict != Verdict::Blocked) {
+        if (o.local == Verdict::Inconclusive)
+            c.note = "One of the server's answers did not come back to bbhost - a lost packet, most likely; the server saw "
+                     "both requests.";
+        else if (o.local != o.save.verdict)
+            c.note = std::string("This PC's own reading was \"") + verdict_word(o.local) +
+                     "\": the server compares what reached it from the address this request came from, and a VPN or proxy "
+                     "for web traffic can make the two differ.";
+    } else if (!o.signed_in && answers) {
+        c.note = o.local == Verdict::Relay
+                     ? "Sign in (above) and test again: the server then knows to relay you, and other hunters can reach you."
+                     : "Sign in (above) and test again to keep it for your account; the server goes by the kept result.";
+    }
+    if (o.probe.refused > 0 && o.probe.sent > 0) {
+        const std::string some = "This PC refused " + std::to_string(o.probe.refused) + " of the " +
+                                 std::to_string(o.probe.refused + o.probe.sent) + " packets bbhost tried to send (" +
+                                 o.probe.send_error + "): if a firewall or antivirus asked about bbhost.exe, allow it and test again.";
+        c.note = c.note.empty() ? some : c.note + " " + some;
+    }
+    return c;
 }
 
 // The test's one log line: the verdict, the port check, the port, what was

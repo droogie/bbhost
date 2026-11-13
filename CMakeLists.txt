@@ -911,8 +911,8 @@ if(UNIX)
   # The setup window's connection test (net/nat_check.h): the exchange from a
   # port against a test server of its own on loopback - a router that keeps
   # one port, one that changes it, none answering, the first seconds held,
-  # every send refused, the port check open, closed and absent - and the
-  # server's answers read (~25 s of waits).
+  # every send refused, the port check open, closed and absent - the server's
+  # answers read, and the card's words for each reading (~25 s of waits).
   add_executable(nat_check_test tests/nat_check_test.cpp src/net/nat_probe.cpp src/net/stun.cpp src/replay/json.cpp)
   target_include_directories(nat_check_test PRIVATE src)
   target_link_libraries(nat_check_test PRIVATE Threads::Threads)

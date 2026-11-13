@@ -2414,11 +2414,11 @@ void account_page() {
         if (const net::nat::Remembered c = net::nat::remembered(); c.known) {
             const double now = static_cast<double>(std::time(nullptr));
             ImGui::TextUnformatted(("Connection test (" + net::nat::ago(c.at, now) + (c.saved ? "" : ", not saved") +
-                                    "): " + net::nat::headline(c.verdict))
+                                    "): " + (c.head.empty() ? std::string(net::nat::headline(c.verdict)) : c.head))
                                        .c_str());
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
                 ui::tooltip("Connection test",
-                            std::string(net::nat::meaning(c.verdict)) +
+                            (c.meaning.empty() ? std::string(net::nat::meaning(c.verdict)) : c.meaning) +
                                 (c.inbound != net::nat::Inbound::NotTested
                                      ? " " + net::nat::inbound_line(c.inbound, config().p2p_port > 0 ? config().p2p_port : 9307, c.verdict)
                                      : std::string()),

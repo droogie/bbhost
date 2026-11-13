@@ -138,7 +138,8 @@ void Job::run(JobParams p) {
     o.at = unix_now();
     host_log("%s", log_line(o).c_str());
     if (o.probe.error == ProbeResult::Error::None && o.resolved && o.shown() != Verdict::None) {
-        remember(Remembered{true, o.shown(), o.inbound, o.at, o.saved()});
+        const Card c = card_of(o, o.at);
+        remember(Remembered{true, o.shown(), o.inbound, o.at, o.saved(), c.head, c.meaning});
     }
     std::lock_guard<std::mutex> lk(mu_);
     view_.outcome = std::move(o);
