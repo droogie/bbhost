@@ -52,9 +52,34 @@ struct AccountCheck {
     std::string why;   // Refused: the server's words; Unchecked: what came back instead
     long status = 0;   // the answer's HTTP status, 0 when none came
     NatTestRecord nat_test;  // Valid: the account's last connection test (whoami's NatTest)
+    RelaySwitch relay;       // Valid: the account's relay switch (whoami's RelayDirect)
 };
 void account_check_start(int timeout_ms = 5000);
 AccountCheck account_check();
+
+// The account's relay switch, as the website's account page has it: off
+// (`direct`), co-op and PvP connect directly to other hunters; on, through the
+// server's relay, which works on every network. POST /auth/profile {Token,
+// RelayDirect} to auth_server_base(), on a thread of its own; once the server
+// has taken it, the sign-in check runs again, and its answer (whoami's
+// RelayDirect) is what the setup window shows. The setting is the account's,
+// applied by the server to the addresses its games play from: the request may
+// go over IPv4 or IPv6. One at a time; a sign-in or sign-out meanwhile drops
+// its answer.
+enum class RelayChangeState {
+    None,
+    Saving,  // asked, no answer yet
+    Saved,   // the server took it (the check that follows has the switch)
+    Failed,  // `why` says what came back instead
+};
+struct RelayChange {
+    RelayChangeState state = RelayChangeState::None;
+    bool direct = false;  // what was asked: off (true) or on
+    std::string why;      // Failed: the server's words, or the transport's
+    long status = 0;      // Failed: the answer's HTTP status, 0 when none came
+};
+void account_relay_change_start(bool direct, int timeout_ms = 8000);
+RelayChange account_relay_change();
 
 // All of these talk to the server (blocking, host thread) and fill `error`
 // with the server's message when they fail.

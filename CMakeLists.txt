@@ -915,7 +915,8 @@ if(UNIX)
   add_executable(np_score_test tests/np_score_test.cpp)
   target_include_directories(np_score_test PRIVATE src)
   add_test(NAME np_score_test COMMAND np_score_test)
-  # The setup window's sign-in check: the server's answers read (net/sign_in_check.h).
+  # The setup window's sign-in check and relay switch: the server's answers
+  # read (net/sign_in_check.h).
   add_executable(sign_in_check_test tests/sign_in_check_test.cpp src/replay/json.cpp)
   target_include_directories(sign_in_check_test PRIVATE src)
   add_test(NAME sign_in_check_test COMMAND sign_in_check_test)
