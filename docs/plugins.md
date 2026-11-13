@@ -190,6 +190,12 @@ gives the Binary Ninja address.
   camera this way; where the game's own follow camera runs instead of the
   recompiled one, a plugin still needs its own camera hooks. One plugin owns
   it: 1 outside image setup, for NULL, or once taken; 0 otherwise.
+- `cutscene()` (v29): 1 while one of the game's cutscenes is asked for or
+  playing. The cutscene places the hunter and the camera itself, so a plugin
+  that moves either, hides the body, holds its gravity or takes the controls
+  gives them back for its length and takes them up again from wherever the
+  cutscene leaves the hunter (Quake, Hunter Cam and Isometric do). `on_view` is
+  not called during one; `on_camera` still is.
 
 **Settings, UI and files**
 

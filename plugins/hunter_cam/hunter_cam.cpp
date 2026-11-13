@@ -119,7 +119,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "hunter_cam",
     "Hunter Cam",
-    "1.3.1",
+    "1.3.2",
     "Kyo",
     "The hunter from closer in: an over-the-shoulder camera (right or left, swapped with a key, zoomed with the wheel) "
     "or first person with only the arms and weapons drawn; the hunter can always face where the camera looks, the right "
@@ -498,7 +498,14 @@ std::atomic<bool> g_force_roll{false};         // the env hook makes the dodge a
 std::atomic<bool> g_monocular{false};          // SpEffect 2000 on: the monocular in use
 bool g_first = false;                          // in first person now (the key or the option)
 
-bool aim_wanted() { return s.on && (s.face_camera || g_first); }
+// Plugin API 29: one of the game's cutscenes asked for or playing. It places
+// the camera and the hunter itself: the camera, the facing (the aim bit) and
+// the body go back to the game for its length, as at a load.
+bool in_cutscene() {
+    return api && api->version >= 29 && api->size >= offsetof(BbHostApi, cutscene) + sizeof(void*) && api->cutscene &&
+           api->cutscene() != 0;
+}
+bool aim_wanted() { return s.on && (s.face_camera || g_first) && !in_cutscene(); }
 bool rolling() { return now_ns() < g_roll_until.load(); }
 
 // Once a frame, on the main thread: the bit set while it should be, cleared
@@ -1042,12 +1049,13 @@ void on_camera(BbCamera* c, void*) {
     const bool loading = api->loading_screen && api->loading_screen();
     std::uint8_t* const follow = const_cast<std::uint8_t*>(f);
     std::uint8_t* const aim_cam = get<std::uint8_t*>(reinterpret_cast<std::uint8_t*>(c) - 0x10, kAimCam);
-    if (!s.on || loading) {
+    const bool cutscene = in_cutscene();
+    if (!s.on || loading || cutscene) {
         turning_off(follow, aim_cam);
         view.started = false;
         view.reach = -1.0f;
         view.have_focus = false;
-        if (!loading) {
+        if (!loading && !cutscene) {
             read_zoom(false);
             game_camera_zoom(c, f, dt);
         }
@@ -1247,7 +1255,7 @@ void on_frame(void*) {
     std::uint8_t* chr = player();
     const bool loading = api->loading_screen && api->loading_screen();
 
-    if (s.on && g_first && chr && !loading) parts_hide(chr);
+    if (s.on && g_first && chr && !loading && !in_cutscene()) parts_hide(chr);
     else parts_show();
 }
 

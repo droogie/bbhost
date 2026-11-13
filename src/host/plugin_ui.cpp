@@ -313,6 +313,12 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
 #endif
             ImGui::PopTextWrapPos();
         }
+        // A plugin it does not work with, both on (host/plugins.h plugins_clash).
+        if (const std::string clash = plugins_clash(ui.plugins, p.name); !clash.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "%s", clash.c_str());
+            ImGui::PopTextWrapPos();
+        }
         ImGui::Spacing();
         ImGui::BeginDisabled(p.bad_signature);
         bool on = p.enabled;

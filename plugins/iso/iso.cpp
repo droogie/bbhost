@@ -72,7 +72,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN,
     "iso",
     "Isometric",
-    "0.6.0",
+    "0.6.1",
     "Kyo",
     "A Diablo-like camera: high above the hunter at a fixed angle, turned by the right stick or the mouse, zoomed by the "
     "wheel, never pulled in by walls; the aim stays level. With the omni-roll built in.",
@@ -348,12 +348,25 @@ float field(const std::uint8_t* base, std::size_t at) {
 // The host's Camera Zoom keys (plugin API 26).
 bool zoom_keys() { return api->version >= 26 && api->size >= offsetof(BbHostApi, camera_zoom) + sizeof(void*); }
 
+// Plugin API 29: one of the game's cutscenes asked for or playing. The host
+// leaves its camera alone (on_view is not called); stand_down, below, takes
+// back what the view left set - the cutaway and the listener.
+bool in_cutscene() {
+    return api->version >= 29 && api->size >= offsetof(BbHostApi, cutscene) + sizeof(void*) && api->cutscene &&
+           api->cutscene() != 0;
+}
+void stand_down();
+
 // The game's camera, read only: the view's yaw (CamRotY), and how far the
 // manager's camera is from the follow camera's (another camera taking over).
 void on_camera(BbCamera* c, void*) {
     view.ready = false;
     if (api->loading_screen && api->loading_screen()) {
         view.have_focus = false;
+        return;
+    }
+    if (in_cutscene()) {
+        stand_down();
         return;
     }
     const std::uint8_t* f = follow_cam(c);
@@ -472,6 +485,18 @@ constexpr float kCutHeight = 0.6f;   // metres over the point looked at before a
 constexpr float kCutMargin = 0.5f;   // metres in front of it
 constexpr float kCutFeather = 1.5f;  // metres it fades in over
 constexpr float kObjectTipHeight = 1.4f;  // metres over the hunter's feet of the objects' cone's tip
+void cutaway(float dist);
+
+// A cutscene's camera is the game's own: nothing cut out of it, the sounds
+// heard where it is, and no glide back from where the view was - after it the
+// view starts again from the hunter, as after a load.
+void stand_down() {
+    cutaway(0);
+    g_ear_on.store(false, std::memory_order_release);
+    view.have_focus = false;
+    view.away = view.away_want = 0.0f;
+}
+
 void cutaway(float dist) {
     static BbCutaway sent{};
     static bool sent_any = false;

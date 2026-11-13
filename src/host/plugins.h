@@ -72,6 +72,12 @@ std::string plugins_ruleset();
 // The plugin of that name is loaded and on for this run (not a visitor):
 // what host features a plugin turns on ask (engine/debug_menu.h).
 bool plugins_active(const std::string& name);
+// Plugins that do not work together (Quake and Isometric: both own the
+// camera): the warning `name`'s page shows while it and a plugin it clashes
+// with are both turned on with their main switch on, among `list` (the
+// launcher's scan or the in-game catalog); "" otherwise. In game the same
+// warning is a banner, once, when the two first meet (plugins_frame).
+std::string plugins_clash(const std::vector<PluginEntry>& list, const std::string& name);
 // Plugin API 27's anti-aliasing claim (bbhost_plugin.h aa_claim): the
 // strongest claim of the plugins that are on - kAaTake before kAaLeave - in
 // one relaxed load (host/upscaler.cpp reads it at every draw).

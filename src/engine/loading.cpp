@@ -48,6 +48,8 @@ void loading_bind(std::uint64_t slide) {
 bool loading_screen_up() { return g_loading.load(std::memory_order_relaxed); }
 bool loading_in_world() { return g_in_world.load(std::memory_order_relaxed); }
 bool loading_fast_now() { return g_fast.load(std::memory_order_relaxed); }
+std::atomic<bool> g_cutscene{false};
+bool loading_cutscene() { return g_cutscene.load(std::memory_order_relaxed); }
 
 void loading_tick(std::uint64_t flip) {
     if (!g_slide) return;
@@ -68,6 +70,8 @@ void loading_tick(std::uint64_t flip) {
             cutscene = (at<std::uint32_t>(man + 0x168) & 1) != 0 || at<std::uint64_t>(man + 0xf8) != 0;
         }
     }
+    if (g_cutscene.exchange(cutscene, std::memory_order_relaxed) != cutscene)
+        host_log("cutscene: %s, flip %llu", cutscene ? "begins" : "ends", static_cast<unsigned long long>(flip));
     const bool fast = g_fast_enabled && loading && !cutscene && frame_rate_converted();  // every converted rate
     if (g_fast.exchange(fast, std::memory_order_relaxed) != fast) hle_video_set_loading_uncapped(fast);
     if (loading && !was) {
