@@ -1895,7 +1895,22 @@ void plugins_load() {
     // that does not verify was changed after signing and is not loaded;
     // plugins.signed_only = true loads official plugins alone.
     const bool signed_only = config_value("plugins.signed_only") == "true";
+    // Photo mode is Nox-'s bbphoto rebuilt on the plugin API: while it is on,
+    // bbphoto is not loaded - nor started, for a renamed copy found by its
+    // name - so the two never both answer L3 and P. [plugins] photo_mode =
+    // false loads bbphoto again.
+    const auto stem = [](const std::string& n) { return n.substr(0, n.rfind('.')); };
+    bool photo_mode_on = false;
+    if (config_switch("photo_mode") != 0) {
+        for (const auto& [name, path] : files) photo_mode_on = photo_mode_on || stem(name) == "photo_mode";
+    }
+    const auto replaced = [&](const std::string& plugin) {
+        if (!photo_mode_on || plugin != "bbphoto") return false;
+        host_log("plugin: bbphoto: not loaded - photo mode replaces it ([plugins] photo_mode = false loads bbphoto instead)");
+        return true;
+    };
     for (const auto& [name, path] : files) {
+        if (replaced(stem(name))) continue;
         bool official = false;
         if (const std::string sig = read_file(path + ".sig"); !sig.empty()) {
             if (!updater::signature_ok(read_file(path), sig, updater::release_key())) {
@@ -1927,6 +1942,10 @@ void plugins_load() {
             continue;
         }
         if (p.info && p.info->name && p.info->name[0]) p.name = p.info->name;
+        if (replaced(p.name)) {
+            close_lib(h);
+            continue;
+        }
         const std::uint32_t flags = p.info ? p.info->flags : 0;
         const int sw = config_switch(p.name);
         const bool off = sw == 0 || (sw < 0 && (flags & BB_PLUGIN_OPT_IN));
