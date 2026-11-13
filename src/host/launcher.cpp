@@ -1183,6 +1183,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     if (ui::combo("##effects", &shown, labels, et.index == 3 ? 4 : 3, tips) && shown < 3) effect_timing = shown;
                 }
                 ui::tooltip_for_item("Effect timing", kHostEffectTimingNote);
+                // Resolution: the Graphics page's own setting (host/options.h),
+                // changed and saved at once there and here alike.
+                ui::row_label("Resolution", row_lw);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                {
+                    int n = 0;
+                    const char* const* labels = host_opt_resolution_labels(&n);
+                    int res = host_opt_resolution_index();
+                    if (ui::combo("##resolution", &res, labels, n)) host_opt_set_resolution_index(res);
+                }
+                if (const char* note = host_opt_resolution_note()) ui::tooltip_for_item("Resolution", note);
                 // Frame generation: the same setting as the Graphics page's,
                 // changed and saved at once. AMD's frame generation, Windows' alone:
                 // no row elsewhere (host/options.cpp keeps it off there).

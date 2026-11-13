@@ -2891,6 +2891,14 @@ void output_for(int* w, int* h) {
 
 int host_opt_resolution_index() { return g_set[kResolution].index; }
 
+const char* const* host_opt_resolution_labels(int* n) {
+    const std::vector<const char*>& labels = resolution_labels(g_set[kResolution]);
+    *n = static_cast<int>(labels.size());
+    return labels.data();
+}
+
+const char* host_opt_resolution_note() { return g_set[kResolution].note; }
+
 void host_opt_set_resolution_index(int i) {
     if (i < 0 || static_cast<std::size_t>(i) >= g_set[kResolution].values.size()) {
         return;
