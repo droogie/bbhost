@@ -68,6 +68,11 @@ constexpr int kSpeedStart = 3;
 constexpr float kTurnRate = 2.2f;        // radians a second at a full stick, at a 60 degree field of view
 constexpr float kMouseTurn = 0.0035f;    // radians a count, as Dark Souls III's mouse (at 60 degrees)
 constexpr float kPitchLimit = 1.53f;     // short of straight up and down
+// The Field of view row's degrees go on the game's view, and the whole row
+// acts: its -40 from the narrowest view the game's camera has (43 degrees, its
+// own rows being 43 and 48) and its +60 from the widest (96: 48 with the PC
+// Field of view at +100%) stay inside these.
+constexpr float kFovLeast = 1.0f * kPi / 180.0f, kFovMost = 160.0f * kPi / 180.0f;
 constexpr std::uint32_t kStepUpdates = 2;
 constexpr float kHoldToggle = 0.5f;  // seconds L3 is held to start or end photo mode
 // The world up this long before photo mode starts: the loading screen's page
@@ -163,6 +168,12 @@ void basis(const Camera& c, float* right, float* up, float* fwd) {
     }
 }
 
+// The camera's field of view: the game's view's and the Field of view row's
+// degrees.
+float fov_of(float game, int offset_degrees) {
+    return std::clamp(game + static_cast<float>(offset_degrees) * kPi / 180.0f, kFovLeast, kFovMost);
+}
+
 // The camera's start: the game's view as it is drawn this frame.
 void seed_from(const BbCamera* view) {
     Camera& c = st.cam;
@@ -174,7 +185,7 @@ void seed_from(const BbCamera* view) {
     c.roll = 0;
     for (int i = 0; i < 3; ++i) c.pos[i] = st.start_pos[i] = view->position[i];
     st.game_fov = view->fov_y > 0.05f && view->fov_y < 3.0f ? view->fov_y : st.game_fov;
-    c.fov = std::clamp(st.game_fov + set.fov_offset * kPi / 180.0f, 10.0f * kPi / 180.0f, 120.0f * kPi / 180.0f);
+    c.fov = fov_of(st.game_fov, set.fov_offset);
     // Which way the game's right and up point against ours.
     c.right_sign = c.up_sign = 1.0f;
     float r[3], u[3], fw[3];
@@ -571,7 +582,7 @@ void on_option(const char* key, const char* value, void*) {
     } else if (std::strcmp(key, "hud") == 0) {
         if (st.on) api->hud_hide(kName, set.hud ? 0 : 1);
     } else if (std::strcmp(key, "fov") == 0) {
-        st.cam.fov = std::clamp(st.game_fov + set.fov_offset * kPi / 180.0f, 10.0f * kPi / 180.0f, 120.0f * kPi / 180.0f);
+        st.cam.fov = fov_of(st.game_fov, set.fov_offset);
     } else if (std::strcmp(key, "roll") == 0) {
         st.cam.roll = set.roll * kPi / 180.0f;
     } else if (st.on) {

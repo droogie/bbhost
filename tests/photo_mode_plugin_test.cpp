@@ -6,8 +6,9 @@
 // second (the game's L3, as the player's bindings make it), Frozen, with the
 // world held, the controls taken as its own and the HUD out of the picture; a
 // shorter press does nothing and one hold does one thing; the camera starts at
-// the game's view and flies the way it looks; Cross and N advance a held world
-// by two updates; its takes and reads of the keyboard and mouse are its own
+// the game's view and flies the way it looks, and the Field of view row's
+// whole range acts on it; Cross and N advance a held world by two updates;
+// its takes and reads of the keyboard and mouse are its own
 // (input_take_as, input_as); Static gives the controls back but Options, the touchpad and
 // R3, Live flies over a running world, warns that enemies can still attack,
 // and holds the world again at the hunter's first hit; it ends on Escape, P
@@ -388,6 +389,10 @@ int main(int argc, char** argv) {
             }
         }
         CHECK(pages == 6);
+        // The Field of view row goes from -40 to +60.
+        for (const BbOption* o = p.options; o->type; ++o) {
+            if (o->key && std::strcmp(o->key, "fov") == 0) CHECK(o->min == -40 && o->max == 60);
+        }
     }
 
     // An API 28 host: refused before asking for anything.
@@ -428,6 +433,26 @@ int main(int argc, char** argv) {
     CHECK(std::fabs(view.position[0] - 1) < 1e-4f && std::fabs(view.position[2] - 3) < 1e-4f);
     CHECK(std::fabs(view.forward[2] - 1) < 1e-4f && std::fabs(view.right[0] - 1) < 1e-4f && std::fabs(view.up[1] - 1) < 1e-4f);
     CHECK(std::fabs(view.fov_y - 0.75f) < 1e-4f);
+    // The Field of view row's whole range acts on the game's 43 degrees: -40
+    // is 3 degrees, narrower than -34 (once both 10), and +60 is 103.
+    {
+        constexpr float kDeg = 3.14159265f / 180.0f;
+        float fov[3] = {};
+        const char* rows[3] = {"-40", "-34", "60"};
+        for (int i = 0; i < 3; ++i) {
+            H.option_fn("fov", rows[i], H.option_user);
+            BbCamera v = game_view();
+            H.view_fn(&v, H.view_user);
+            fov[i] = v.fov_y;
+        }
+        CHECK(std::fabs(fov[0] - (0.75f - 40.0f * kDeg)) < 1e-4f);
+        CHECK(fov[0] < fov[1] - 5.0f * kDeg);
+        CHECK(std::fabs(fov[2] - (0.75f + 60.0f * kDeg)) < 1e-4f);
+        H.option_fn("fov", "0", H.option_user);
+        view = game_view();
+        H.view_fn(&view, H.view_user);
+        CHECK(std::fabs(view.fov_y - 0.75f) < 1e-4f);
+    }
     H.pad.ly = -1.0f;  // the stick up: forward
     for (int i = 0; i < 10; ++i) frame();
     H.pad.ly = 0.0f;
@@ -559,6 +584,17 @@ int main(int argc, char** argv) {
     H.world.flags = BB_WORLD_IN;
     hold(0.6f);
     CHECK(H.paused == 1);
+    // The game's widest view (its 48 degrees with the PC Field of view at
+    // +100%: 96) and the row's +60: 156 degrees, the camera seeded with both.
+    {
+        constexpr float kDeg = 3.14159265f / 180.0f;
+        H.option_fn("fov", "60", H.option_user);
+        BbCamera wide = game_view();
+        wide.fov_y = 96.0f * kDeg;
+        H.view_fn(&wide, H.view_user);
+        CHECK(std::fabs(wide.fov_y - 156.0f * kDeg) < 1e-3f);
+        H.option_fn("fov", "0", H.option_user);
+    }
 
     // Another player on the way: it ends at once, and does not start again.
     H.world.arriving = 1;
