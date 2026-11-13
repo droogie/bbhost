@@ -59,10 +59,11 @@ _Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, input_as) + sizeof(void*
 _Static_assert(BB_OPT_PANEL == 0x400u && BB_PANEL_DEFAULTS == 1u, "the panel's flags");
 _Static_assert(offsetof(BbPanel, page) == 8 && sizeof(BbPanel) == 8 + 3 * sizeof(void*), "BbPanel");
 _Static_assert(sizeof(BbPanelState) == 44 && offsetof(BbPanelState, page) == 12, "BbPanelState");
-_Static_assert(sizeof(BbLook) == 112, "BbLook");
+_Static_assert(sizeof(BbLook) == 128 && BB_LOOK_DOF_RANGE == 64u, "BbLook");
 _Static_assert(offsetof(BbLook, vignette) == 28 && offsetof(BbLook, dof) == 32 && offsetof(BbLook, aberration) == 52, "BbLook's groups");
 _Static_assert(offsetof(BbLook, motion_blur) == 72 && offsetof(BbLook, blur_samples) == 88 && offsetof(BbLook, fog_distance) == 92 &&
-                   offsetof(BbLook, fog_height_offset) == 108,
+                   offsetof(BbLook, fog_height_offset) == 108 && offsetof(BbLook, dof_near_end) == 112 &&
+                   offsetof(BbLook, dof_far_fade) == 124,
                "BbLook's last groups");
 _Static_assert(sizeof(BbPad) == 44 && offsetof(BbPad, play) == 40, "BbPad");
 _Static_assert(offsetof(BbPad, pressed) == 8 && offsetof(BbPad, connected) == 12, "BbPad's presses");

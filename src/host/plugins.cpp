@@ -1583,7 +1583,8 @@ float look_value(float v, float lo, float hi, float otherwise) { return std::isf
 
 int api_post_look(const char* name, const BbLook* look, std::uint32_t* available) {
     static_assert(BB_LOOK_TONE == kLookTone && BB_LOOK_VIGNETTE == kLookVignette && BB_LOOK_DOF == kLookDof &&
-                      BB_LOOK_ABERRATION == kLookAberration && BB_LOOK_MOTION_BLUR == kLookMotionBlur && BB_LOOK_FOG == kLookFog,
+                      BB_LOOK_ABERRATION == kLookAberration && BB_LOOK_MOTION_BLUR == kLookMotionBlur && BB_LOOK_FOG == kLookFog &&
+                      BB_LOOK_DOF_RANGE == kLookDofRange,
                   "post_look's groups");
     if (!plugin_named(name) || (look && look->size < 8)) return 1;
     GraphicsLook l;
@@ -1598,7 +1599,8 @@ int api_post_look(const char* name, const BbLook* look, std::uint32_t* available
         if (size < offsetof(BbLook, aberration)) set &= ~kLookDof;
         if (size < offsetof(BbLook, motion_blur)) set &= ~kLookAberration;
         if (size < offsetof(BbLook, fog_distance)) set &= ~kLookMotionBlur;
-        if (size < sizeof(BbLook)) set &= ~kLookFog;
+        if (size < offsetof(BbLook, dof_near_end)) set &= ~kLookFog;
+        if (size < sizeof(BbLook)) set &= ~kLookDofRange;
         l.set = set;
         // Inside what the post effect's setters take (some assert outside it).
         l.exposure = look_value(b.exposure, 0.0f, 16.0f, 1.0f);
@@ -1631,6 +1633,10 @@ int api_post_look(const char* name, const BbLook* look, std::uint32_t* available
         l.fog_contrast = look_value(b.fog_contrast, 0.0f, 16.0f, 1.0f);
         l.fog_distance_offset = look_value(b.fog_distance_offset, -10000.0f, 10000.0f, 0.0f);
         l.fog_height_offset = look_value(b.fog_height_offset, -10000.0f, 10000.0f, 0.0f);
+        l.dof_near_end = look_value(b.dof_near_end, 0.0f, 10000.0f, 0.0f);
+        l.dof_far_start = look_value(b.dof_far_start, 0.0f, 10000.0f, 10000.0f);
+        l.dof_near_fade = look_value(b.dof_near_fade, 0.0f, 10000.0f, 0.0f);
+        l.dof_far_fade = look_value(b.dof_far_fade, 0.0f, 10000.0f, 0.0f);
     }
     std::uint32_t was = 0;
     {

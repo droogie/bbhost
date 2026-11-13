@@ -424,6 +424,8 @@ typedef struct BbPad {
 #define BB_LOOK_ABERRATION 8u    /* chromatic aberration: off, or on with its four dispersions */
 #define BB_LOOK_MOTION_BLUR 16u  /* motion blur: off, or on with its two times, the camera blur's scale and samples */
 #define BB_LOOK_FOG 32u          /* the fog: its distance, density and contrast times the area's, its offsets added */
+#define BB_LOOK_DOF_RANGE 64u    /* with BB_LOOK_DOF on: the blur placed by distance - sharp between two distances,
+                                    blurred nearer and further - instead of the lens's */
 
 typedef struct BbLook {
     uint32_t size;          /* sizeof(BbLook) as the plugin knows it */
@@ -445,6 +447,12 @@ typedef struct BbLook {
     int32_t blur_samples;   /* 2-8 (3 or 4 there), 7 at most where the area interleaves its samples */
     float fog_distance, fog_density, fog_contrast;   /* BB_LOOK_FOG: times the area's */
     float fog_distance_offset, fog_height_offset;    /* metres added */
+    /* BB_LOOK_DOF_RANGE: the game's own blur by distance (the areas' "CustomDof", its debug menu's DofNear and DofFar
+     * depths): sharp from dof_near_end to dof_far_start metres; nearer, the front blur, full from dof_near_fade metres
+     * nearer than dof_near_end; further, the back blur, full from dof_far_fade metres past dof_far_start; each as strong
+     * as dof_near_levels and dof_far_levels say (0 none, 7 the most). The focus and the aperture are not used. */
+    float dof_near_end, dof_far_start;
+    float dof_near_fade, dof_far_fade;
 } BbLook;
 
 /* Version 29: a plugin's panel (panel_show, panel_state). */

@@ -280,8 +280,12 @@ over the game.
   fixed exposure otherwise), the vignette's power, depth of field (off, or on
   with a focus distance, an aperture and the blur's levels in front of and
   behind the focus - the lens's blur, in place of the area's own distance
-  ramps while it is on), chromatic aberration (off, or on with its lateral and
-  uniform dispersions), motion blur (off, or on with its times, scale and
+  ramps while it is on; with `BB_LOOK_DOF_RANGE` as well, the blur placed by
+  distance instead, as the areas' own is: sharp from `dof_near_end` to
+  `dof_far_start` metres, the blur in front full `dof_near_fade` metres
+  nearer and the blur behind full `dof_far_fade` metres further, each as
+  strong as its levels say), chromatic aberration (off, or on with its
+  lateral and uniform dispersions), motion blur (off, or on with its times, scale and
   samples - 2 to 8, the most the game's motion blur has shaders for, and 7
   where the area interleaves its samples, which makes 8 a 9) and the fog (its
   distance, density and contrast times the area's, its distance and height

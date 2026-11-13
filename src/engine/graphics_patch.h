@@ -62,7 +62,7 @@ void graphics_ssr_live_in();
 // while the look sets them on, whatever their settings say, and are left out
 // while it sets them off.
 constexpr std::uint32_t kLookTone = 1, kLookVignette = 2, kLookDof = 4, kLookAberration = 8, kLookMotionBlur = 16,
-                        kLookFog = 32, kLookAll = 63;
+                        kLookFog = 32, kLookDofRange = 64, kLookAll = 127;
 struct GraphicsLook {
     std::uint32_t set = 0;
     float exposure = 1, gamma = 1, saturation = 1, brightness = 1, contrast = 1;  // times the area's
@@ -77,6 +77,9 @@ struct GraphicsLook {
     std::int32_t blur_samples = 0;
     float fog_distance = 1, fog_density = 1, fog_contrast = 1;  // times the area's
     float fog_distance_offset = 0, fog_height_offset = 0;       // metres added
+    // kLookDofRange: sharp from dof_near_end to dof_far_start (metres), the
+    // blur full dof_near_fade nearer and dof_far_fade further.
+    float dof_near_end = 0, dof_far_start = 0, dof_near_fade = 0, dof_far_fade = 0;
 };
 void graphics_look_set(const GraphicsLook& look);
 // The groups a look can show now: Performance mode jumps past every depth of

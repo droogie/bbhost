@@ -284,6 +284,21 @@ std::atomic<bool> g_vignette{true}, g_dof{true};
 // multi-level path (6e2d87e3), whose near levels blur what is in front.
 constexpr std::size_t kDofCustomNear = 0x2d4, kDofCustomFar = 0x2d8, kDofNearScale = 0x2e8, kDofFarScale = 0x2f8,
                       kDofCut = 0x2fc;
+// The ramps themselves (the debug menu's DofNearDepthStart, DofNearDepthEnd,
+// DofNear CocSize; DofFarDepthStart, DofFarDepthEnd, DofFar CocSize), and the
+// table's own switch, "CustomDof-Enable" (+0x2d0: the apply hands it to
+// sub_fb3600, and with it 0 YEBIS works the lens's circle out itself).
+constexpr std::size_t kDofCustom = 0x2d0, kDofNearStart = 0x2dc, kDofNearEnd = 0x2e0, kDofNearSize = 0x2e4, kDofFarStart = 0x2ec,
+                      kDofFarEnd = 0x2f0, kDofFarSize = 0x2f4;
+// BBHOST_DOF_COC_SCALE=k: a range's circles of confusion times k, to see
+// what a strength looks like at another size.
+const float g_dof_coc_scale = [] {
+    const char* e = std::getenv("BBHOST_DOF_COC_SCALE");
+    const float k = e && *e ? std::strtof(e, nullptr) : 1.0f;
+    return k > 0.0f && k < 1000.0f ? k : 1.0f;
+}();
+// A range's lens (apply_look says why): focused at 1 m, f/0.01.
+constexpr float kDofRangeFocus = 1.0f, kDofRangeAperture = 0.01f;
 constexpr std::size_t kDofTable = 0xd0;  // on the YEBIS object: 2048 floats
 constexpr std::size_t kAutoExposure = 0x50, kMiddleGrey = 0x54, kExposure = 0x98, kGamma = 0x9c, kValue = 0xcc,
                       kContrast = 0x248;
@@ -776,15 +791,16 @@ void apply_look(std::uint8_t* b) {
     if (!g_look_logged.exchange(true)) {
         host_log("graphics: a look over the area's exposure %g (auto %d, middle grey %g), gamma %g, saturation %g, value %g, "
                  "contrast %g, vignette %g; aberration %g (%g %g, %g %g); depth of field %d (auto focus %d, focus %g, aperture "
-                 "%g, levels %d %d; its table's custom near %d far %d, scales %g %g, cut past %g m; the post effect's part %d, "
-                 "on %d); motion blur %d (%g %g, %d samples%s, scale %g)",
+                 "%g, levels %d %d; its table %d, custom near %d (%g..%g m, size %g) far %d (%g..%g m, size %g), scales %g %g, "
+                 "cut past %g m; the post effect's part %d, on %d); motion blur %d (%g %g, %d samples%s, scale %g)",
                  getf(kExposure), geti(kAutoExposure), getf(kMiddleGrey), getf(kGamma), getf(kSaturation), getf(kValue),
                  getf(kContrast), getf(kVignettePower), getf(kAberration), getf(kAberrationDispersion),
                  getf(kAberrationDispersion + 4), getf(kAberrationDispersion + 8), getf(kAberrationDispersion + 12),
                  geti(kDofOn), geti(kDofAuto), getf(kDofFocus), getf(kDofAperture), geti(kDofNear), geti(kDofFar),
-                 geti(kDofCustomNear), geti(kDofCustomFar), getf(kDofNearScale), getf(kDofFarScale), getf(kDofCut),
-                 yebis_dof_ready(), yebis_dof_on(), geti(kBlurOn), getf(kBlurTime), getf(kBlurLength), geti(kBlurSamples),
-                 b[kBlurInterleaved] ? ", interleaved" : "", getf(kBlurScale));
+                 geti(kDofCustom), geti(kDofCustomNear), getf(kDofNearStart), getf(kDofNearEnd), getf(kDofNearSize),
+                 geti(kDofCustomFar), getf(kDofFarStart), getf(kDofFarEnd), getf(kDofFarSize), getf(kDofNearScale),
+                 getf(kDofFarScale), getf(kDofCut), yebis_dof_ready(), yebis_dof_on(), geti(kBlurOn), getf(kBlurTime),
+                 getf(kBlurLength), geti(kBlurSamples), b[kBlurInterleaved] ? ", interleaved" : "", getf(kBlurScale));
     }
     if (l.set & kLookTone) {
         // The exposure: the adapted one's target with auto exposure on (the
@@ -830,6 +846,40 @@ void apply_look(std::uint8_t* b) {
             setf(kDofNearScale, l.dof_near_levels > 0 ? 1.0f : 0.0f);
             setf(kDofFarScale, l.dof_far_levels > 0 ? 1.0f : 0.0f);
             setf(kDofCut, 1.0e9f);
+            if (l.set & kLookDofRange) {
+                // By distance instead: the game's own ramps, placed where the
+                // look says, the near one always on so that the lens never
+                // reaches the table - sharp between them, each side's blur as
+                // strong as its levels (engine/look_math.h).
+                const look_math::DofRange r = look_math::dof_range(l.dof_near_end, l.dof_far_start, l.dof_near_fade,
+                                                                   l.dof_far_fade, l.dof_near_levels, l.dof_far_levels,
+                                                                   g_dof_coc_scale);
+                seti(kDofCustom, 1);
+                seti(kDofCustomNear, r.near_on);
+                setf(kDofNearStart, r.near_start);
+                setf(kDofNearEnd, r.near_end);
+                setf(kDofNearSize, r.near_size);
+                setf(kDofNearScale, r.near_scale);
+                seti(kDofCustomFar, r.far_on);
+                setf(kDofFarStart, r.far_start);
+                setf(kDofFarEnd, r.far_end);
+                setf(kDofFarSize, r.far_size);
+                setf(kDofFarScale, r.far_scale);
+                setf(kDofCut, r.cut);
+                seti(kDofNear, r.near_levels);
+                seti(kDofFar, r.far_levels);
+                // The lens only counts the levels here: YEBIS draws a side
+                // with as many levels as the lens's circle at that side's end
+                // of the view reaches (0x1068b60; behind, the circle at the
+                // far clip from the focus and the aperture), while the table
+                // sets each pixel's blur. Focused at the far end of the sharp
+                // range at f/5.6, that circle reached no level and nothing
+                // behind was blurred; focused near and wide open it reaches
+                // every level on both sides, so the counts above are the
+                // levels drawn.
+                setf(kDofFocus, kDofRangeFocus);
+                setf(kDofAperture, kDofRangeAperture);
+            }
         }
     }
     if (l.set & kLookMotionBlur) {
@@ -920,7 +970,59 @@ const bool g_dof_1080_look = [] {
     return !(e && e[0] == '0');
 }();
 
+// BBHOST_DOF_TRACE=1 (a test): the levels YEBIS drew each side with at its
+// last call (in front, behind) and what it counted them from - the lens's
+// circle at infinity (+0x1b0, as a share of the picture), its focus, the
+// view's clip distances and each level's threshold, the circle at which it
+// starts (-b/k of its pair, unscaled) - said each time they change.
+constexpr std::size_t kDofObjNearClip = 0x15c, kDofObjFarClip = 0x160, kDofObjFocus = 0x17c, kDofObjCoc = 0x1b0,
+                      kDofObjCaps = 0x1c4, kDofObjCounted = 0x1d8, kDofObjDrawn = 0x1e0, kDofLevelFarK = 0xd0,
+                      kDofLevelNearK = 0xd8;
+const bool g_dof_trace = [] {
+    const char* e = std::getenv("BBHOST_DOF_TRACE");
+    return e && e[0] == '1';
+}();
+
+void trace_dof_levels(std::uint64_t dof) {
+    const auto* o = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(dof));
+    float near_clip = 0, far_clip = 0, focus = 0, coc = 0;
+    std::int32_t caps[4] = {}, counted[2] = {}, drawn[2] = {}, n = 0;
+    std::uint64_t levels = 0;
+    std::memcpy(&near_clip, o + kDofObjNearClip, 4);
+    std::memcpy(&far_clip, o + kDofObjFarClip, 4);
+    std::memcpy(&focus, o + kDofObjFocus, 4);
+    std::memcpy(&coc, o + kDofObjCoc, 4);
+    std::memcpy(caps, o + kDofObjCaps, 16);
+    std::memcpy(counted, o + kDofObjCounted, 8);
+    std::memcpy(drawn, o + kDofObjDrawn, 8);
+    std::memcpy(&n, o + kDofLevelCount, 4);
+    std::memcpy(&levels, o + kDofLevelArray, 8);
+    char far_at[128] = "", near_at[128] = "";
+    int fl = 0, nl = 0;
+    for (std::int32_t i = 0; levels && i < n && i < 8 && coc != 0.0f; ++i) {
+        const auto* l = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(levels + static_cast<std::uint64_t>(i) * kDofLevelSize));
+        float kb[4] = {};
+        std::memcpy(kb, l + kDofLevelFarK, 8);
+        std::memcpy(kb + 2, l + kDofLevelNearK, 8);
+        if (fl < 120) fl += std::snprintf(far_at + fl, sizeof(far_at) - fl, " %.3g", kb[0] != 0.0f ? -kb[1] * coc / kb[0] : 0.0f);
+        if (nl < 120) nl += std::snprintf(near_at + nl, sizeof(near_at) - nl, " %.3g", kb[2] != 0.0f ? -kb[3] * coc / kb[2] : 0.0f);
+    }
+    std::uint64_t key = 1469598103934665603ull;
+    for (const std::uint8_t* p : {o + kDofObjNearClip, o + kDofObjFarClip, o + kDofObjFocus, o + kDofObjCoc})
+        for (int i = 0; i < 4; ++i) key = (key ^ p[i]) * 1099511628211ull;
+    for (std::int32_t v : {caps[0], caps[1], caps[2], caps[3], counted[0], counted[1], drawn[0], drawn[1], n})
+        key = (key ^ static_cast<std::uint32_t>(v)) * 1099511628211ull;
+    static std::atomic<std::uint64_t> last{0};
+    static std::atomic<int> lines{0};
+    if (last.exchange(key, std::memory_order_relaxed) == key || lines.fetch_add(1, std::memory_order_relaxed) >= 400) return;
+    host_log("graphics: depth of field's levels: %d in front, %d behind (counted %d, %d; caps %d %d %d %d) - the lens's circle "
+             "at infinity %g, focus %g m, clip %g..%g m; the levels start behind at%s, in front at%s",
+             drawn[0], drawn[1], counted[0], counted[1], caps[0], caps[1], caps[2], caps[3], coc, focus, near_clip, far_clip,
+             far_at, near_at);
+}
+
 GUEST_ABI std::int64_t dof_levels_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (g_dof_trace && saved[5]) trace_dof_levels(saved[5]);
     if (!g_dof_1080_look) return 0;
     // A cutscene's blur as YEBIS draws it: said once each time one starts.
     static std::atomic<bool> in_cutscene{false};
@@ -2168,7 +2270,7 @@ std::string graphics_glare_report() {
 std::uint32_t graphics_look_available() {
     const HostSettings& hs = host_settings_ref();
     std::uint32_t a = kLookAll;
-    if (hs.performance_mode || yebis_dof_ready() == 0) a &= ~kLookDof;
+    if (hs.performance_mode || yebis_dof_ready() == 0) a &= ~(kLookDof | kLookDofRange);
     if (hs.performance_mode) a &= ~kLookMotionBlur;
     if (host_opt_motion_rebuilt_bits()) a &= ~kLookMotionBlur;  // what the blur cannot read
     return a;
