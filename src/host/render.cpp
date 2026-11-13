@@ -23705,6 +23705,41 @@ bool look_samplers(const DrawState& s, const GfxPipeline& pl, StageImages& si) {
     }
     return true;
 }
+
+// Render scale with no upscaler (Upscaling Off, or one this machine cannot
+// run, at a Resolution below the window's: engine/render_scale.cpp): YEBIS's
+// copy - the post chain's first pass, at the output size - stretches the 3D
+// itself, and its own sampler is nearest (at the game's one size it never
+// mattered), which made the 3D blocky. The render-sized targets it samples
+// are filtered linearly instead. A plugin's look keeps its nearest
+// (look_samplers). False in a run part's draw that stopped for a sampler to
+// be made in order.
+bool stretch_samplers(const DrawState& s, const GfxPipeline& pl, StageImages& si) {
+    if (pl.name != "0b0acf50+ccbf44a6" || upscaler_method() || scene_look_scale() || !s.color[0]) return true;
+    RenderScale rs;
+    if (!render_scale_on(&rs) || s.color[0]->width != rs.output_w || s.color[0]->height != rs.output_h) return true;
+    const std::vector<std::uint32_t>& pairs = pl.ps_sampler_images;
+    for (std::size_t k = 0; k < si.samplers.size(); ++k) {
+        if (!si.samplers[k]) continue;  // unresolved: the dummy is bound
+        const std::uint32_t images = k < pairs.size() ? pairs[k] : 0;
+        bool small = false;
+        for (std::uint32_t b = images; b; b &= b - 1) {
+            const std::size_t i = static_cast<std::size_t>(__builtin_ctz(b));
+            if (i >= si.images.size() || !si.images[i].resolved) continue;
+            const RtImage* rt = find_render_target(image_base(si.images[i]));
+            if (rt && !rt->depth && rt->width == rs.render_w && rt->height == rs.render_h) small = true;
+        }
+        if (!small) continue;
+        const VkSampler l = sampler_linear(si.samplers[k]);
+        if (!l) return false;  // a run part's draw: made in order
+        si.samplers[k] = l;
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            host_log("render: YEBIS's copy brings the 3D up linearly, %ux%u to %ux%u (no upscaler running)", rs.render_w, rs.render_h,
+                     rs.output_w, rs.output_h);
+    }
+    return true;
+}
 // BBHOST_UPSCALE_JITTER=0: the upscaler with no jitter (a test of the rest);
 // =neg: the draws moved the other way from what the upscaler is told (a test:
 // the picture should go soft and shimmer).
@@ -24858,6 +24893,8 @@ static bool draw_impl(const GpuDraw& d) {
     // A plugin's look's samplers (look_samplers): the 3D's textures nearest,
     // the colour grading's tables as its rule says, the 3D brought up nearest.
     if (!look_samplers(s, pl, stage_images[1])) return false;  // a run part's draw: made in order
+    // With no upscaler, the 3D drawn smaller brought up linearly (stretch_samplers).
+    if (!stretch_samplers(s, pl, stage_images[1])) return false;  // a run part's draw: made in order
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.
     const GfxPipeline* const capture_lean = lean_of(pl);
@@ -27079,15 +27116,40 @@ static bool draw_impl(const GpuDraw& d) {
         const std::uint64_t dst = s.color[0]->base;
         if (hle_video_is_display_buffer(dst)) {
             if (s.rect) {
+                RtImage* shown = nullptr;
                 for (const StageImages::Image& im : stage_images[1].images) {
                     if (!im.resolved) continue;
-                    const RtImage* t = find_render_target(image_base(im));
+                    RtImage* t = find_render_target(image_base(im));
                     if (t && t->width == s.color[0]->width && t->height == s.color[0]->height) {
-                        if (hud_target != t->base) host_log("framegen: the HUD's target is 0x%llx", static_cast<unsigned long long>(t->base));
-                        hud_target = t->base;
-                        shown_write = t->last_write;
+                        shown = t;
                         break;
                     }
+                }
+                // A frame whose HUD drew nothing - the HUD hidden: no triangle
+                // list came into the target, so no copy was taken below, and
+                // with no HUD-less picture frame generation switched off until
+                // the HUD was back (Kyo's log, 2026-11-12: off at flip 894 and
+                // every frame after it "shown before"). The target as this pass
+                // reads it, written since the last display buffer's pass, is
+                // that frame's HUD-less picture: copied here, before the bind.
+                if (shown && upscale_pass_hudless_due_locked() && !upscale_pass_hudless_copied_locked() && !hud_begun &&
+                    (target_written || shown->last_write != shown_write)) {
+                    if (part) {
+                        run_part_stop(kRunStopOrder);
+                        return false;
+                    }
+                    upscale_pass_hudless_locked(*shown);
+                    static bool told = false;
+                    if (!told)
+                        host_log("framegen: a frame with no HUD drawn (flip %llu): the HUD's target 0x%llx as the display buffer's pass reads it "
+                                 "is its HUD-less picture",
+                                 static_cast<unsigned long long>(hle_video_flip_count()), static_cast<unsigned long long>(shown->base));
+                    told = true;
+                }
+                if (shown) {
+                    if (hud_target != shown->base) host_log("framegen: the HUD's target is 0x%llx", static_cast<unsigned long long>(shown->base));
+                    hud_target = shown->base;
+                    shown_write = shown->last_write;
                 }
                 if (upscale_pass_hudless_due_locked()) upscale_pass_hudless_bind_locked(dst, s.color[0]->width, s.color[0]->height);
             }

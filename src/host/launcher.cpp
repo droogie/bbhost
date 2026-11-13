@@ -1131,9 +1131,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 #else
             const bool stay_borderless_row = false;
 #endif
-            // A warning line or two under Frame rate and Frame generation (frame generation's limit).
+            // The display's rows: Window, Frame rate, Native frame clock, Effect
+            // timing, Resolution, Frame generation (Windows), Skip company logos
+            // and Performance mode, with a warning line or two under Frame rate
+            // and Frame generation (frame generation's limit).
+#if defined(_WIN32)
+            const float display_rows = 8.0f;
+#else
+            const float display_rows = 7.0f;
+#endif
             const float cards_h =
-                card_h(std::max(7.0f + (stay_borderless_row ? 1.0f : 0.0f) +
+                card_h(std::max(display_rows + (stay_borderless_row ? 1.0f : 0.0f) +
                                     1.5f * static_cast<float>(host_frame_rate_warning_count(cap_choice, cap_custom, cap_custom_fps)),
                                 online_rows));
             ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), cards_h), "DISPLAY");
@@ -1183,6 +1191,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     if (ui::combo("##effects", &shown, labels, et.index == 3 ? 4 : 3, tips) && shown < 3) effect_timing = shown;
                 }
                 ui::tooltip_for_item("Effect timing", kHostEffectTimingNote);
+                // Resolution: the Graphics page's own setting (host/options.h),
+                // changed and saved at once there and here alike.
+                ui::row_label("Resolution", row_lw);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                {
+                    int n = 0;
+                    const char* const* labels = host_opt_resolution_labels(&n);
+                    int res = host_opt_resolution_index();
+                    if (ui::combo("##resolution", &res, labels, n)) host_opt_set_resolution_index(res);
+                }
+                if (const char* note = host_opt_resolution_note()) ui::tooltip_for_item("Resolution", note);
                 // Frame generation: the same setting as the Graphics page's,
                 // changed and saved at once. AMD's frame generation, Windows' alone:
                 // no row elsewhere (host/options.cpp keeps it off there).

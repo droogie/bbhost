@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 28.
+/* bbhost plugin API, version 29.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 28
+#define BB_PLUGIN_API_VERSION 29
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -883,6 +883,16 @@ typedef struct BbHostApi {
      * Native-camera builds still require the plugin's native camera hooks.
      * 0 on success; 1 outside image setup, for NULL, or if already owned. */
     int (*on_camera_target)(void* (*fn)(void* character, void* user), void* user);
+
+    /* Version 29: cutscenes. 1 while one of the game's cutscenes (a Remo
+     * scene: the story's, a boss's entrance, a lamp's first lighting) is asked
+     * for or playing, 0 otherwise. The cutscene places the hunter and the
+     * camera itself: a plugin that moves either, hides the body, holds its
+     * gravity or takes the controls gives them back to the game for its
+     * length and takes them up again from wherever it leaves the hunter.
+     * on_view is not called while it is 1 (on_camera still is, so a plugin
+     * can see it begin and end). Any thread. */
+    int (*cutscene)(void);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

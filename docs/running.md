@@ -731,7 +731,10 @@ GPU for minutes.
 
 Graphics > Upscaling (F10, the setup window's Graphics page, or System > PC
 Upscaling in the game) runs one of these in place of the game's own
-anti-aliasing:
+anti-aliasing. Whatever the choice, Off included, a Resolution below the
+window's draws only the 3D at it: the game, its post effects, the HUD and the
+menus stay at the window's size (with Off the game's own copy of the 3D into
+its post chain stretches it up).
 
 | Choice | Where it runs |
 |---|---|

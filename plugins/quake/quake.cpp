@@ -72,6 +72,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -85,7 +86,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.22",
+    "0.3.23",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -440,10 +441,24 @@ constexpr std::uint8_t kDashOwn[5] = {0xc5, 0xfa, 0x11, 0x45, 0x84};
 constexpr std::uint8_t kDashHook[5] = {0xe9, 0xce, 0xe1, 0x07, 0x03};
 bool g_dash_lifted = false;
 
+// Plugin API 29: one of the game's cutscenes asked for or playing.
+bool in_cutscene() {
+    return g.api->version >= 29 && g.api->size >= offsetof(BbHostApi, cutscene) + sizeof(void*) && g.api->cutscene &&
+           g.api->cutscene() != 0;
+}
+
 void lift_dash(bool lift) {
     if (lift == g_dash_lifted) return;
     if (lift) {
-        if (g.api->patch(kDashSite, kDashHook, kDashOwn, sizeof kDashOwn) != 0) return;  // no dash patch
+        // Only where the dash patch's jump is there to set aside. The host's
+        // patch answers 0 for bytes that are already the new ones, so without
+        // the patch (it is off by default) this used to count as lifted, and
+        // the hook's return then wrote the jump into the error strings the
+        // patch's code would have replaced: the next movement step ran text
+        // (a crash at 0x4d3b8e4 at every release - a load, a cutscene, a death).
+        std::uint8_t now[sizeof kDashHook] = {};
+        if (g.api->read(kDashSite, now, sizeof now) != 0 || std::memcmp(now, kDashHook, sizeof now) != 0) return;
+        if (g.api->patch(kDashSite, kDashHook, kDashOwn, sizeof kDashOwn) != 0) return;
         g.log("quake: the debug dash's hook set aside while Quake has the player (it clears the no-gravity bit)");
     } else if (g.api->patch(kDashSite, kDashOwn, kDashHook, sizeof kDashHook) != 0) {
         g.log("quake: the debug dash's hook could not be put back");
@@ -3241,7 +3256,17 @@ void camera(BbCamera& cam) {
             g.log("quake: QUAKE_SOUNDS: %d", g.api->hook2(0x2bd3a80, prologue, sizeof prologue, &probe_sound, nullptr));
         }
     }
-    if (!s.enabled || !chr || !phys || !world || g.loading_screen() || max_hp <= 0) {
+    // A cutscene places the hunter and the camera itself (plugin API 29): the
+    // hunter goes back to the game for its length - gravity, the body, the
+    // controls and the left hand - and Quake takes them up again from
+    // wherever it leaves them, as after a load.
+    const bool cutscene = in_cutscene();
+    static bool cutscene_was = false;
+    if (cutscene != cutscene_was) {
+        g.log("quake: %s", cutscene ? "a cutscene: the hunter is the game's until it ends" : "the cutscene is over");
+        cutscene_was = cutscene;
+    }
+    if (!s.enabled || !chr || !phys || !world || g.loading_screen() || cutscene || max_hp <= 0) {
         if (g_active || g_held) release();
         // A Quake gun left in the hunter's hand by a session that ended early.
         static bool checked = false;
