@@ -1,5 +1,6 @@
 #include "guest_abi.h"
 #include "engine/graphics_patch.h"
+#include "engine/look_math.h"
 
 #include "core/elf.h"
 #include "core/legacy_cpu.h"
@@ -248,8 +249,23 @@ std::atomic<bool> g_vignette{true}, g_dof{true};
 //          distance, +0x1b4 the aperture (an f-number), +0x1d0 and +0x1d4 the
 //          blur's levels in front of and behind the focus
 //   +0x1dc motion blur on (SetMotionBlurEnable), +0x1e4 and +0x1e8 its two
-//          times, +0x1ec its sample count (an int), +0x350 what the apply
-//          multiplies +0x1e8 by into the camera blur's amount
+//          times, +0x1ec its sample count (an int, "NumBaseSamples"), +0x204
+//          its samples interleaved (a byte, "SampleInterleaved"), +0x350 what
+//          the apply multiplies +0x1e8 by into the camera blur's amount
+//
+// The sample count has a ceiling the post effect does not check. YEBIS builds
+// each motion blur technique for 1 to 8 samples only (sub_10183a0 loads
+// tech_MotionBlur*_S1..S8, eight 0x58-byte rows of a table, and the
+// techniques' tables lie back to back) and asserts fewer than 9 where the
+// count is set (SetRecursiveBlurBaseSamples, 0x1020770); its passes index the
+// tables by the count (0x1033e6e, 0x1034916) - past 8, rows of the next
+// technique's table, or past the last one - so a larger count draws with
+// shaders that are not the blur's: the picture stopped from 10 samples on, and
+// a float written there as a test once kept the game from fading in. 1 and
+// below are taken as YEBIS's own 4 or 5. Interleaved sampling makes the count
+// odd and its absence even (0x1034916, GetEffectiveRecursiveBlurBaseSamples at
+// 0x1031370), so 8 interleaved is 9: a look's count is kept to 2..8, and to 7
+// where the area interleaves.
 //
 // The areas' depth of field is not the lens above but the game's own table:
 // each view the apply (the loop at 0x25d9760) fills 2048 floats at the YEBIS
@@ -276,7 +292,8 @@ constexpr std::size_t kAberration = 0xac, kAberrationDispersion = 0xb4;
 // setting's Off has cleared it, so the look's depth of field wins either way.
 constexpr std::size_t kDofAuto = 0x188, kDofOn = kDofEnable, kDofFocus = 0x1b0, kDofAperture = 0x1b4, kDofNear = 0x1d0,
                       kDofFar = 0x1d4;
-constexpr std::size_t kBlurOn = 0x1dc, kBlurTime = 0x1e4, kBlurLength = 0x1e8, kBlurSamples = 0x1ec, kBlurScale = 0x350;
+constexpr std::size_t kBlurOn = 0x1dc, kBlurTime = 0x1e4, kBlurLength = 0x1e8, kBlurSamples = 0x1ec, kBlurInterleaved = 0x204,
+                      kBlurScale = 0x350;
 std::mutex g_look_mu;
 GraphicsLook g_look;                       // under g_look_mu
 std::atomic<std::uint32_t> g_look_set{0};  // its groups: one load a view while there is none
@@ -760,14 +777,14 @@ void apply_look(std::uint8_t* b) {
         host_log("graphics: a look over the area's exposure %g (auto %d, middle grey %g), gamma %g, saturation %g, value %g, "
                  "contrast %g, vignette %g; aberration %g (%g %g, %g %g); depth of field %d (auto focus %d, focus %g, aperture "
                  "%g, levels %d %d; its table's custom near %d far %d, scales %g %g, cut past %g m; the post effect's part %d, "
-                 "on %d); motion blur %d (%g %g, %d samples, scale %g)",
+                 "on %d); motion blur %d (%g %g, %d samples%s, scale %g)",
                  getf(kExposure), geti(kAutoExposure), getf(kMiddleGrey), getf(kGamma), getf(kSaturation), getf(kValue),
                  getf(kContrast), getf(kVignettePower), getf(kAberration), getf(kAberrationDispersion),
                  getf(kAberrationDispersion + 4), getf(kAberrationDispersion + 8), getf(kAberrationDispersion + 12),
                  geti(kDofOn), geti(kDofAuto), getf(kDofFocus), getf(kDofAperture), geti(kDofNear), geti(kDofFar),
                  geti(kDofCustomNear), geti(kDofCustomFar), getf(kDofNearScale), getf(kDofFarScale), getf(kDofCut),
                  yebis_dof_ready(), yebis_dof_on(), geti(kBlurOn), getf(kBlurTime), getf(kBlurLength), geti(kBlurSamples),
-                 getf(kBlurScale));
+                 b[kBlurInterleaved] ? ", interleaved" : "", getf(kBlurScale));
     }
     if (l.set & kLookTone) {
         // The exposure: the adapted one's target with auto exposure on (the
@@ -820,7 +837,7 @@ void apply_look(std::uint8_t* b) {
         if (l.motion_blur) {
             setf(kBlurTime, l.blur_time);
             setf(kBlurLength, l.blur_length);
-            seti(kBlurSamples, l.blur_samples);
+            seti(kBlurSamples, look_math::blur_samples(l.blur_samples, b[kBlurInterleaved] != 0));
             setf(kBlurScale, l.blur_scale);
         }
     }

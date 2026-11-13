@@ -1178,6 +1178,11 @@ if(UNIX)
   target_link_libraries(camera_settings_test PRIVATE Threads::Threads)
   add_test(NAME camera_settings_test COMMAND camera_settings_test)
   set_tests_properties(settings_store_test camera_settings_test PROPERTIES TIMEOUT 30)
+  # A plugin's look's arithmetic (engine/look_math.h): what apply_look writes
+  # into YEBIS's block for the motion blur's samples and the depth of field.
+  add_executable(look_math_test tests/look_math_test.cpp)
+  target_include_directories(look_math_test PRIVATE src)
+  add_test(NAME look_math_test COMMAND look_math_test)
   # Mouse sensitivity's scale and the old scale's settings read on it
   # (engine/mouse_camera_step.h).
   add_executable(mouse_sensitivity_test tests/mouse_sensitivity_test.cpp)

@@ -282,8 +282,10 @@ over the game.
   behind the focus - the lens's blur, in place of the area's own distance
   ramps while it is on), chromatic aberration (off, or on with its lateral and
   uniform dispersions), motion blur (off, or on with its times, scale and
-  samples) and the fog (its distance, density and contrast times the area's,
-  its distance and height offsets added) - and the rest stay the area's. It is
+  samples - 2 to 8, the most the game's motion blur has shaders for, and 7
+  where the area interleaves its samples, which makes 8 a 9) and the fog (its
+  distance, density and contrast times the area's, its distance and height
+  offsets added) - and the rest stay the area's. It is
   written every view into the numbers the area gives the post-processing and
   the fog, so nothing of the game's is kept or put back: `NULL` or `set` 0 is
   the area's own from the next frame. One look for all plugins - the last

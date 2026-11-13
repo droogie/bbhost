@@ -17,7 +17,8 @@
 // with another player in the world or on the way, or in another's world; the
 // HUD option shows the HUD; its panel opens with it, R3 hides and shows it,
 // and the panel's rows go over the area's look while it runs and nowhere
-// else. Its options table is whole, every row with its help.
+// else, motion blur's samples within what the game's blur is made for. Its
+// options table is whole, every row with its help.
 //
 //   photo_mode_plugin_test <photo_mode.so>
 #include "bbhost_plugin.h"
@@ -389,9 +390,12 @@ int main(int argc, char** argv) {
             }
         }
         CHECK(pages == 6);
-        // The Field of view row goes from -40 to +60.
+        // The Field of view row goes from -40 to +60, the motion blur's samples
+        // stop at 8.
         for (const BbOption* o = p.options; o->type; ++o) {
-            if (o->key && std::strcmp(o->key, "fov") == 0) CHECK(o->min == -40 && o->max == 60);
+            if (!o->key) continue;
+            if (std::strcmp(o->key, "blur_samples") == 0) CHECK(o->min == 2 && o->max == 8);
+            if (std::strcmp(o->key, "fov") == 0) CHECK(o->min == -40 && o->max == 60);
         }
     }
 
@@ -477,6 +481,15 @@ int main(int argc, char** argv) {
     CHECK(H.look_on && (H.look.set & BB_LOOK_TONE) && std::fabs(H.look.saturation - 0.5f) < 1e-6f && H.look.exposure == 1.0f);
     H.option_fn("dof", "On", H.option_user);
     CHECK((H.look.set & BB_LOOK_DOF) && H.look.dof == 1 && std::fabs(H.look.dof_focus - 9.0f) < 1e-4f && H.look.dof_far_levels == 1);
+    // Motion blur's samples within 2..8, whatever the config holds.
+    H.option_fn("blur", "On", H.option_user);
+    H.option_fn("blur_samples", "16", H.option_user);
+    CHECK((H.look.set & BB_LOOK_MOTION_BLUR) && H.look.blur_samples == 8);
+    H.option_fn("blur_samples", "1", H.option_user);
+    CHECK(H.look.blur_samples == 2);
+    H.option_fn("blur_samples", "6", H.option_user);
+    CHECK(H.look.blur_samples == 6);
+    H.option_fn("blur", "Area's own", H.option_user);
     H.option_fn("fog_height", "-50", H.option_user);
     CHECK((H.look.set & BB_LOOK_FOG) && H.look.fog_height_offset == -50.0f && H.look.fog_distance == 1.0f);
     H.option_fn("vignette", "Strong", H.option_user);

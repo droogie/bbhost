@@ -1621,7 +1621,11 @@ int api_post_look(const char* name, const BbLook* look, std::uint32_t* available
         l.blur_time = look_value(b.blur_time, 0.0f, 100.0f, 0.0f);
         l.blur_length = look_value(b.blur_length, 0.0f, 100.0f, 0.0f);
         l.blur_scale = look_value(b.blur_scale, 0.0f, 100.0f, 0.0f);
-        l.blur_samples = std::clamp(b.blur_samples, 1, 16);
+        // YEBIS's motion blur is built for 1 to 8 samples and draws with
+        // shaders that are not the blur's past that (engine/graphics_patch.cpp);
+        // 1 is its own 4 or 5. The look's apply keeps it to 7 where the area
+        // interleaves its samples.
+        l.blur_samples = std::clamp(b.blur_samples, 2, 8);
         l.fog_distance = look_value(b.fog_distance, 0.01f, 100.0f, 1.0f);
         l.fog_density = look_value(b.fog_density, 0.0f, 16.0f, 1.0f);
         l.fog_contrast = look_value(b.fog_contrast, 0.0f, 16.0f, 1.0f);

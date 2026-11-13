@@ -442,7 +442,7 @@ typedef struct BbLook {
     int32_t motion_blur;    /* BB_LOOK_MOTION_BLUR: 0 off, 1 on with the four below */
     float blur_time, blur_length;  /* the blur's two times (0.06-0.095 and 0.1-0.2 in Central Yharnam's views) */
     float blur_scale;       /* times blur_length, the camera blur's amount (0-4 there) */
-    int32_t blur_samples;   /* 1-16 (3 or 4 there) */
+    int32_t blur_samples;   /* 2-8 (3 or 4 there), 7 at most where the area interleaves its samples */
     float fog_distance, fog_density, fog_contrast;   /* BB_LOOK_FOG: times the area's */
     float fog_distance_offset, fog_height_offset;    /* metres added */
 } BbLook;

@@ -570,7 +570,7 @@ bool take_option(const char* key, const char* value) {
     else if (k == "blur_time") num(0, 100, &set.blur_time);
     else if (k == "blur_length") num(0, 100, &set.blur_length);
     else if (k == "blur_scale") num(0, 100, &set.blur_scale);
-    else if (k == "blur_samples") num(1, 16, &set.blur_samples);
+    else if (k == "blur_samples") num(2, 8, &set.blur_samples);
     else return false;
     return true;
 }
@@ -668,7 +668,10 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     LIVE_INT_WHEN("blur_time", "Time", "How long a moment the blur covers, in hundredths (an area's is about 9).", "9", 0, 100, "blur=On"),
     LIVE_INT_WHEN("blur_length", "Length", "The longest a streak gets, in hundredths (an area's is about 19).", "19", 0, 100, "blur=On"),
     LIVE_INT_WHEN("blur_scale", "Camera blur", "How much the camera's own turning blurs, in tenths (an area's is up to 40).", "40", 0, 100, "blur=On"),
-    LIVE_INT_WHEN("blur_samples", "Samples", "Steps along each streak: more is smoother and slower.", "4", 1, 16, "blur=On"),
+    LIVE_INT_WHEN("blur_samples", "Samples",
+                  "Steps along each streak: more is smoother and slower. The areas use 3 or 4; 8 is the most the game's motion "
+                  "blur is made for.",
+                  "4", 2, 8, "blur=On"),
     {0, nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr}};
 #undef PANEL
 #undef LIVE_INT
