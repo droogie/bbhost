@@ -372,7 +372,7 @@ void start() {
     st.look_x = st.look_y = 0;
     apply_mode();
     api->option_set(kName, "mode", "Frozen");  // the panel's row says so too
-    api->hud_hide(kName, set.hud ? 0 : 1);
+    api->hud_hide(kName, set.hud ? -1 : 1);
     post_look();
     show_panel(true);
     api->log("photo mode: on (%s)", mode_name(st.mode));
@@ -613,7 +613,7 @@ void on_option(const char* key, const char* value, void*) {
     if (std::strcmp(key, "mode") == 0) {
         set_mode(set.mode);
     } else if (std::strcmp(key, "hud") == 0) {
-        if (st.on) api->hud_hide(kName, set.hud ? 0 : 1);
+        if (st.on) api->hud_hide(kName, set.hud ? -1 : 1);
     } else if (std::strcmp(key, "fov") == 0) {
         st.cam.fov = fov_of(st.game_fov, set.fov_offset);
     } else if (std::strcmp(key, "roll") == 0) {
@@ -650,7 +650,9 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "Frozen", 0, 0, "Frozen|Static|Live"},
     LIVE_INT("fov", "Field of view", "Degrees more or less than the game's own view: 0 keeps it, less zooms in.", "0", -40, 60),
     LIVE_INT("roll", "Roll", "Tilts the camera, in degrees: 0 keeps it level.", "0", -90, 90),
-    {BB_OPT_BOOL | BB_OPT_LIVE, "hud", "HUD", "Shows the game's HUD, menus and prompts in photo mode. Off leaves them out of the picture.",
+    {BB_OPT_BOOL | BB_OPT_LIVE, "hud", "HUD",
+     "On shows the game's HUD in photo mode, even with the game's own HUD option off. Off leaves the HUD, menus and prompts "
+     "out of the picture.",
      "false", 0, 0, nullptr},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "vignette", "Vignette",
      "Darkens the picture's corners. Area's own keeps the area's (most have none).", "Area's own", 0, 0,

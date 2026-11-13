@@ -273,6 +273,10 @@ over the game.
   changes, and its HUD option keeps its value. bbhost's overlay and menus are
   drawn as always. The HUD is left out while any plugin asks; turning the
   plugin off lets go. It costs two copies of the picture a frame while on.
+  `hidden` -1 asks for the HUD shown instead, even where the player's own HUD
+  option hides it: the option is held on while any plugin asks so (and none
+  asks for the HUD left out) and is the player's again once none does. A
+  plugin's ask replaces its last.
 - `post_look(name, &look, &available)`: the picture's look over the area's
   own, as `BbLook` (set `look.size` first): the groups in `set` apply - tone
   (exposure, gamma, saturation, brightness and contrast, each times the

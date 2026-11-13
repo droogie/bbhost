@@ -1711,9 +1711,16 @@ int api_option_set(const char* name, const char* key, const char* value) {
 
 int api_hud_hide(const char* name, int hidden) {
     if (!plugin_named(name)) return 1;
-    const bool was = scene_look_hud_hidden();
-    scene_look_set_hud_hidden(name, hidden != 0);
-    if (was != scene_look_hud_hidden()) host_log("plugin: the game's HUD %s (%s)", scene_look_hud_hidden() ? "left out of the picture" : "shown", name);
+    const bool was = scene_look_hud_hidden(), was_shown = scene_look_hud_shown();
+    if (hidden < 0) scene_look_set_hud_shown(name, true);  // shown, whatever the game's HUD option says
+    else scene_look_set_hud_hidden(name, hidden != 0);     // left out, or let go (of either ask)
+    if (hidden == 0) scene_look_set_hud_shown(name, false);
+    if (was != scene_look_hud_hidden() || was_shown != scene_look_hud_shown())
+        host_log("plugin: the game's HUD %s (%s)",
+                 scene_look_hud_hidden() ? "left out of the picture"
+                 : scene_look_hud_shown() ? "shown, its own option held on"
+                                          : "as the game has it",
+                 name);
     return 0;
 }
 
@@ -2078,6 +2085,10 @@ void plugins_image(ElfImage* image) {
 void plugins_frame() {
     speffect_test_tick();  // BBHOST_SPEFFECT_TEST
     chr_watch_tick();      // BBHOST_CHR_WATCH
+    // A plugin's HUD shown (hud_hide with -1): the game's own HUD option held
+    // on, and the player's put back once none asks (before the early return,
+    // so a plugin turned off lets it go).
+    player_hud_option_hold(scene_look_hud_shown());
     std::vector<FrameCallback> now;
     std::vector<WorldLoadCallback> loads;
     std::vector<MenuRequest> requests;

@@ -61,7 +61,13 @@ std::uint32_t scene_look_dither();
 // game's own state - its HUD option - is untouched.
 void scene_look_set_hud_hidden(const char* owner, bool hidden);
 bool scene_look_hud_hidden();
-// Every hold of `owner` let go (the plugin turned off).
+// The HUD shown even where the game's own HUD option hides it (hud_hide with
+// -1), held by each plugin that asks: plugins_frame holds the option on
+// (engine/player_data.h player_hud_option_hold) while any asks and none asks
+// for it left out. An owner's ask replaces its last, of either kind.
+void scene_look_set_hud_shown(const char* owner, bool shown);
+bool scene_look_hud_shown();
+// Every ask of `owner` let go (the plugin turned off).
 void scene_look_drop_hud(const char* owner);
 
 // The scene's colour targets RGBA8.

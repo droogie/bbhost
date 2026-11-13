@@ -714,14 +714,23 @@ int main(int argc, char** argv) {
         CHECK(H.paused == 0 && H.hud_hidden == 0 && H.take_buttons == 0);
     }
 
-    // The HUD option shows the HUD in photo mode, live.
+    // The HUD option shows the HUD in photo mode, live - asked shown (-1),
+    // so the game's own HUD option off does not hide it - and Off leaves it
+    // out again; ending photo mode lets go of either.
     H.world.flags = BB_WORLD_IN;
     tap_key(kP);
     CHECK(H.hud_hidden == 1);
     H.option_fn("hud", "true", H.option_user);
-    CHECK(H.hud_hidden == 0);
+    CHECK(H.hud_hidden == -1);
+    H.option_fn("hud", "false", H.option_user);
+    CHECK(H.hud_hidden == 1);
+    H.option_fn("hud", "true", H.option_user);
     tap_key(kP);
-    CHECK(H.paused == 0);
+    CHECK(H.paused == 0 && H.hud_hidden == 0);
+    tap_key(kP);  // started again with the row On: shown from the start
+    CHECK(H.paused == 1 && H.hud_hidden == -1);
+    tap_key(kP);
+    CHECK(H.hud_hidden == 0);
     H.config["photo_mode.hud"] = "true";
 
     CHECK(H.unnamed_takes == 0);  // every take its own (input_take_as), never another plugin's

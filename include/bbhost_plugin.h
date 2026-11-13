@@ -1064,7 +1064,11 @@ typedef struct BbHostApi {
      * always. `hidden` 1 asks for it for the plugin named `name`, 0 lets it
      * go; it is left out while any plugin asks, and the plugin being turned
      * off lets go. From the next frame; while on, two copies of the picture a
-     * frame. Any thread. 0 on success; 1 for an unknown plugin. */
+     * frame. `hidden` -1 asks for the HUD shown instead, even where the
+     * player's own HUD option hides it: that option is held on while any
+     * plugin asks so (and none asks for it left out) and is the player's
+     * again when none does. A plugin's ask replaces its last. Any thread. 0 on
+     * success; 1 for an unknown plugin. */
     int (*hud_hide)(const char* name, int hidden);
     /* The picture's look over the area's own (BbLook): written every view
      * into the numbers the area gives the post-processing and the fog, so
