@@ -69,7 +69,8 @@ the one thing to do when there is something:
 
 | Headline | What it means | What to do |
 |---|---|---|
-| **Online play works directly** | the same public port at both test ports: other players can connect to this PC without the relay | nothing; with incoming closed, the steps to forward the port (below) |
+| **Your network allows direct connections** | the same public port at both test ports, with the relay on (the default): co-op and PvP go through the relay all the same | to connect directly, turn the relay off (the switch under the result) - with incoming closed, after the steps to forward the port; signed out, sign in to play online |
+| **Online play works directly** | the same, with the relay off (or on a server without the switch): other players connect to this PC without the relay | nothing; with incoming closed, the steps to forward the port (below) |
 | **Online play works through the relay** | a different port (or address) at each, as symmetric and many carrier-grade NATs do: sessions go through the relay, with a little more delay | nothing (not signed in: sign in and test again, so the server knows to relay you) |
 | **Something is blocking bbhost** | nothing came back: something on this PC (a firewall or antivirus) or the network stops bbhost's packets or the answers | sign in and test again to find out which - the server tells |
 | **Online play is blocked** | signed in, the server saw none of bbhost's packets | allow bbhost.exe in the firewall or antivirus; if the website's test fails too, the network blocks online play (school and work networks can) |

@@ -392,6 +392,7 @@ struct CardContext {
     double now = 0;                              // Unix seconds ("just now")
     int p2p_port = 9307;                         // the P2P port setting: the port the steps forward
     RelaySetting relay = RelaySetting::Unknown;  // the account's relay switch
+    bool signed_in = true;                       // this PC is signed in (a sign-in the server still takes)
     bool windows = kWindows;                     // the firewall step's words
 };
 
@@ -482,9 +483,34 @@ inline constexpr char kAllowBbhost[] = "Allow bbhost.exe in your firewall or ant
 // last one - and what the relay switch does to them. `lan` and `router` are
 // the steps' (forward_steps); `signed_in`: the test asked the server (not
 // signed in, a relay result asks for a sign-in, which the relay goes by).
+// A direct result says what happens: with the relay on (the account's switch,
+// the live server's default) co-op and PvP go through it whatever the network
+// allows; signed out, nothing goes online yet. Only with the relay off, or a
+// server without the switch, does online play work directly.
 inline void result_words(Card& c, Verdict v, Inbound in, const CardContext& x, const std::string& lan, bool router, bool signed_in) {
     const bool off = x.relay == RelaySetting::Off;
     c.tone = Tone::Good;
+    if (v == Verdict::Direct && !x.signed_in) {
+        c.head = "Your network allows direct connections";
+        c.sentence = "Your router keeps one port for the game.";
+        c.incoming = incoming_line(in);
+        c.action = "Sign in (above) to play online.";
+        return;
+    }
+    if (v == Verdict::Direct && x.relay == RelaySetting::On) {
+        c.head = "Your network allows direct connections";
+        c.sentence = "The relay is on, so co-op and PvP go through it.";
+        c.incoming = incoming_line(in);
+        if (in == Inbound::Open) {
+            c.action = "To connect directly instead, turn the relay off below.";
+        } else if (in == Inbound::Closed) {
+            // First the steps that let other hunters in; then the relay can go.
+            c.action = "To connect directly instead:";
+            c.steps = forward_steps(x.p2p_port, lan, router, x.windows);
+            c.steps.back() = "Then press Test again; then you can turn the relay off below.";
+        }
+        return;
+    }
     if (v == Verdict::Direct) {
         c.head = "Online play works directly";
         c.sentence = "Co-op and PvP can connect straight to other hunters, without the server's relay.";

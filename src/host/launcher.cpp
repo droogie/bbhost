@@ -917,6 +917,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         net::nat::CardContext nat_cx;
         nat_cx.now = static_cast<double>(std::time(nullptr));
         nat_cx.p2p_port = p2p_port;
+        nat_cx.signed_in = net::account_logged_in() && !net::account_refused();
         if (nat_check.state == net::AccountCheckState::Valid && nat_check.relay.known)
             nat_cx.relay = nat_check.relay.direct ? net::nat::RelaySetting::Off : net::nat::RelaySetting::On;
         if (nat_fake_relay) nat_cx.relay = nat_fake_relay > 0 ? net::nat::RelaySetting::Off : net::nat::RelaySetting::On;

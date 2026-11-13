@@ -626,19 +626,29 @@ net::nat::Outcome finished(ProbeResult p, bool signed_in, const char* reply = nu
 }
 
 // The card's context: just after the test, the P2P port 9307, the relay
-// switch as given, Windows' words.
-net::nat::CardContext cx(net::nat::RelaySetting relay = net::nat::RelaySetting::Unknown, int port = 9307, bool windows = true) {
+// switch as given, Windows' words, signed in unless said.
+net::nat::CardContext cx(net::nat::RelaySetting relay = net::nat::RelaySetting::Unknown, int port = 9307, bool windows = true,
+                         bool signed_in = true) {
     net::nat::CardContext x;
     x.now = 1030;
     x.p2p_port = port;
     x.relay = relay;
     x.windows = windows;
+    x.signed_in = signed_in;
     return x;
 }
 
 net::nat::Outcome example(const char* name) {
     net::nat::Outcome o;
     CHECK(net::nat::example_outcome(name, 9307, 1000, &o));
+    return o;
+}
+
+// A relay result from a test that did not ask the server (signed out).
+net::nat::Outcome unsigned_relay_out() {
+    net::nat::Outcome o = example("relay");
+    o.signed_in = false;
+    o.save = SaveReply{};
     return o;
 }
 
@@ -802,8 +812,45 @@ void card_cases() {
     CHECK(c.tone == Tone::Good && c.head == "Online play works directly" && c.action.empty() &&
           any_has(c.details, "The relay is off for your account."));
     CHECK(net::nat::card_of(example("direct-unchecked"), cx(RelaySetting::Off)).tone == Tone::Good);  // not known: no warning
+    CHECK(!any_has(net::nat::card_of(example("direct-closed"), cx(RelaySetting::On)).details, "The relay is off"));
+
+    // A direct result says what happens. The relay on (the live default): co-op and PvP go through it whatever the
+    // network allows - never "works directly ... without the server's relay"; turning it off is the way to direct.
+    for (const char* n : {"direct-open", "direct-closed", "direct-unchecked"}) {
+        c = net::nat::card_of(example(n), cx(RelaySetting::On));
+        CHECK(c.tone == Tone::Good && c.head == "Your network allows direct connections");
+        CHECK(c.sentence == "The relay is on, so co-op and PvP go through it.");
+        CHECK(!has(c.head, "works directly") && !has(c.sentence, "without the server's relay"));
+    }
+    c = net::nat::card_of(example("direct-open"), cx(RelaySetting::On));
+    CHECK(c.incoming == net::nat::incoming_line(Inbound::Open) && c.steps.empty());
+    CHECK(c.action == "To connect directly instead, turn the relay off below.");
     c = net::nat::card_of(example("direct-closed"), cx(RelaySetting::On));
-    CHECK(c.tone == Tone::Good && c.action == "To let them connect directly:" && !any_has(c.details, "The relay is off"));
+    CHECK(c.incoming == net::nat::incoming_line(Inbound::Closed) && c.action == "To connect directly instead:");
+    CHECK(c.steps == (std::vector<std::string>{"In your router's settings, forward UDP port 9307 to this PC (10.0.0.23).",
+                                               "Allow bbhost.exe in Windows Firewall (Private and Public).",
+                                               "Then press Test again; then you can turn the relay off below."}));
+    c = net::nat::card_of(example("direct-unchecked"), cx(RelaySetting::On));  // whether others get in not known: no advice
+    CHECK(c.action.empty() && c.steps.empty() && c.incoming.empty());
+    // the relay off: online play works directly, as it says
+    c = net::nat::card_of(example("direct-open"), cx(RelaySetting::Off));
+    CHECK(c.head == "Online play works directly" && c.sentence == "Co-op and PvP can connect straight to other hunters, without the server's relay.");
+    // signed out: what the network allows, and the sign-in online play needs first - no steps yet
+    for (const char* n : {"direct-open", "direct-closed"}) {
+        c = net::nat::card_of(example(n), cx(RelaySetting::Unknown, 9307, true, false));
+        CHECK(c.tone == Tone::Good && c.head == "Your network allows direct connections");
+        CHECK(c.sentence == "Your router keeps one port for the game." && c.action == "Sign in (above) to play online." && c.steps.empty());
+    }
+    CHECK(net::nat::card_of(example("direct-closed"), cx(RelaySetting::Unknown, 9307, true, false)).incoming ==
+          net::nat::incoming_line(Inbound::Closed));
+    // a server without the switch, signed in: as before
+    c = net::nat::card_of(example("direct-closed"), cx(RelaySetting::Unknown));
+    CHECK(c.head == "Online play works directly" && c.action == "To let them connect directly:" && c.steps.size() == 3);
+    // relay results are the same whatever the switch says when on, and signed out
+    c = net::nat::card_of(example("relay"), cx(RelaySetting::On));
+    CHECK(c.head == "Online play works through the relay" && c.action.empty() && c.tone == Tone::Good);
+    CHECK(net::nat::card_of(unsigned_relay_out(), cx(RelaySetting::Unknown, 9307, true, false)).action ==
+          "Sign in (above), then press Test again, so the server knows to relay you.");
     // a relay result not signed in: the server needs it kept to relay you
     net::nat::Outcome unsigned_relay = finished(made({{true, 0x0100000a, 9307}, {true, 0x0100000a, 40002}}), false);
     unsigned_relay.probe.sent = 3;
@@ -876,6 +923,13 @@ void record_cases() {
     CHECK(c.steps.size() == 3 && c.steps[0] == "In your router's settings, forward UDP port 9307 to this PC.");
     CHECK(c.details[0] == "Your account's last test, 3 hours ago, from UDP port 9307, this PC's P2P port.");
     CHECK(any_has(c.details, "Incoming: closed"));
+    // the relay on: the network allows it, the relay carries co-op and PvP; the steps end at the switch
+    c = net::nat::card_of_record(Record{Verdict::Direct, Inbound::Closed, 9307, three_hours_ago}, cx(RelaySetting::On));
+    CHECK(c.head == "Your network allows direct connections" && c.action == "To connect directly instead:" && c.steps.size() == 3);
+    CHECK(c.steps[0] == "In your router's settings, forward UDP port 9307 to this PC." &&
+          c.steps[2] == "Then press Test again; then you can turn the relay off below.");
+    c = net::nat::card_of_record(Record{Verdict::Direct, Inbound::NotTested, 0, three_hours_ago}, cx(RelaySetting::On));
+    CHECK(c.head == "Your network allows direct connections" && c.action == "Press Test again to check this PC.");
     // turned off, from here: the warning
     c = net::nat::card_of_record(Record{Verdict::Direct, Inbound::Closed, 9307, three_hours_ago}, cx(RelaySetting::Off));
     CHECK(c.tone == Tone::Warn && c.head == "Other hunters may not reach you with the relay off" && c.steps.size() == 3);
