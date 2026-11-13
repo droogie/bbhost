@@ -919,6 +919,11 @@ if(UNIX)
   add_executable(sign_in_check_test tests/sign_in_check_test.cpp src/replay/json.cpp)
   target_include_directories(sign_in_check_test PRIVATE src)
   add_test(NAME sign_in_check_test COMMAND sign_in_check_test)
+  # The setup window's links out (host/links.h): the addresses, and no browser
+  # from a test's window.
+  add_executable(launcher_links_test tests/launcher_links_test.cpp)
+  target_include_directories(launcher_links_test PRIVATE src)
+  add_test(NAME launcher_links_test COMMAND launcher_links_test)
   # The setup window's connection test (net/nat_check.h): the exchange from a
   # port against a test server of its own on loopback - a router that keeps
   # one port, one that changes it, none answering, the first seconds held,

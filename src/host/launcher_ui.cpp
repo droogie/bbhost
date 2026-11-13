@@ -772,6 +772,13 @@ void draw_icon(ImDrawList* dl, Icon icon, ImVec2 at, float size, ImU32 col) {
         dl->AddLine(P(-0.42f, 0.32f), P(0.42f, 0.32f), col, th);  // the space bar
         break;
     }
+    case Icon::Chat: {
+        dl->AddRect(P(-0.9f, -0.74f), P(0.9f, 0.44f), col, 0.34f * h, th);
+        const ImVec2 tail[] = {P(-0.46f, 0.44f), P(-0.62f, 0.9f), P(-0.08f, 0.44f)};
+        dl->AddPolyline(tail, 3, col, th);
+        for (int k = -1; k <= 1; ++k) dl->AddCircleFilled(P(0.4f * static_cast<float>(k), -0.15f), 0.11f * h, col);
+        break;
+    }
     }
 }
 
@@ -1062,6 +1069,27 @@ bool ghost_button(const char* label, ImVec2 size) {
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, alpha(kViolet, 120));
     const bool pressed = ImGui::Button(label, size);
     ImGui::PopStyleColor(3);
+    return pressed;
+}
+
+bool ghost_button(const char* label, Icon icon, ImVec2 size) {
+    const ImGuiStyle& st = ImGui::GetStyle();
+    const float s = g_scale, fh = ImGui::GetFrameHeight(), is = std::round(fh * 0.52f), gap = std::round(7 * s);
+    const char* end = ImGui::FindRenderedTextEnd(label);
+    const float tw = ImGui::CalcTextSize(label, end).x;
+    if (size.x <= 0) size.x = std::round(st.FramePadding.x * 2 + is + gap + tw);
+    if (size.y <= 0) size.y = fh;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const bool pressed = ImGui::InvisibleButton(label, size);
+    const bool hovered = ImGui::IsItemHovered(), held = ImGui::IsItemActive();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, p + size, c(held ? alpha(kViolet, 120) : IM_COL32(255, 255, 255, hovered ? 32 : 14)), st.FrameRounding);
+    // The icon and the label centred together, the label cut to what is left.
+    const std::string text = fit_text(std::string(label, end), size.x - st.FramePadding.x * 2 - is - gap);
+    const float w = is + gap + ImGui::CalcTextSize(text.c_str()).x;
+    const float x = p.x + std::max(st.FramePadding.x, (size.x - w) * 0.5f);
+    draw_icon(dl, icon, ImVec2(x + is * 0.5f, p.y + size.y * 0.5f), is, c(hovered ? kText : kIce));
+    dl->AddText(ImVec2(x + is + gap, p.y + (size.y - ImGui::GetFontSize()) * 0.5f), c(kText), text.c_str());
     return pressed;
 }
 

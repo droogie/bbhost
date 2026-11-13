@@ -9,6 +9,7 @@
 #include "engine/patch_manifest.h"
 #include "host/controls_page.h"
 #include "host/launcher_ui.h"
+#include "host/links.h"
 #include "host/options.h"
 #include "net/account.h"
 #include "net/http.h"
@@ -479,6 +480,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     const std::string test_nat = nat_hook_test ? test + 8 : test && !std::strncmp(test, "natcard:", 8) ? test + 8 : "";
     int nat_hook_stage = 0;  // 0 waiting to start, 1 testing, 2 the result shown, 3 saved
     double nat_hook_at = 0.0;
+    // links:DIR puts the pointer on each of the sidebar's links in turn, saves
+    // the window with its bubble as DIR/link-discord.png and
+    // DIR/link-website.png, and presses it - which in a test's window logs the
+    // address it would open and opens no browser - then closes.
+    const std::string test_links = test && !std::strncmp(test, "links:", 6) ? test + 6 : "";
+    int links_step = 0;
+    double links_at = 0.0;
+    ImVec2 link_mid[2] = {ImVec2(-FLT_MAX, -FLT_MAX), ImVec2(-FLT_MAX, -FLT_MAX)};
+    // A test hook's picture, saved once the frame is drawn ("" none).
+    std::string hook_shot;
+    double hook_shot_at = 0.0;
     int shot = 0;  // the picture being waited for: a page, then the bubble
     double shot_at = 1.2;
     ImVec2 patch_row_at(-FLT_MAX, -FLT_MAX);  // a row's middle, for the bubble
@@ -623,6 +635,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         return true;
     };
 
+    // A link's button (host/links.h): its address in the browser - in a
+    // test's window, only the log says which it would open.
+    auto open_link = [&](const links::Link& l) {
+        if (!links::known(l.url)) return;
+        if (!links::opens_browser(test)) {
+            host_log("setup: link: %s would open %s (a test's window opens no browser)", l.title, l.url);
+            return;
+        }
+        host_log("setup: link: %s: %s", l.title, l.url);
+        if (!SDL_OpenURL(l.url)) host_log("setup: link: %s did not open: %s", l.url, SDL_GetError());
+    };
+
     // The window's pace: 30 frames a second at most. V-Sync alone left the loop
     // drawing as fast as it could wherever the driver ignores it - a driver
     // setting that turns it off, a backend without it, a window the compositor
@@ -710,6 +734,19 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         // A test's pictures: the pointer where the test puts it, not where the
         // desk's is.
         if (!test_shot.empty()) io.AddMousePosEvent(shot == kPageCount ? patch_row_at.x : -FLT_MAX, shot == kPageCount ? patch_row_at.y : -FLT_MAX);
+        // links: the pointer on the link the hook is at, pressed and let go.
+        if (!test_links.empty()) {
+            const int k = links_step >= 1 && links_step <= 3 ? 0 : links_step >= 5 && links_step <= 7 ? 1 : -1;
+            io.AddMousePosEvent(k >= 0 ? link_mid[k].x : -FLT_MAX, k >= 0 ? link_mid[k].y : -FLT_MAX);
+            if (links_step == 2 || links_step == 6) {
+                io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+                ++links_step;
+            } else if (links_step == 3 || links_step == 7) {
+                io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+                links_at = ImGui::GetTime() + 0.6;
+                ++links_step;
+            }
+        }
         ImGui::NewFrame();
         const ImGuiViewport* vp = ImGui::GetMainViewport();
         const ImGuiStyle& st = ImGui::GetStyle();
@@ -805,7 +842,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             const float hint_h = std::round(std::round(ImGui::GetFontSize() * 0.78f) + 8 * scale);
             const float hints = 2 * (hint_h + 6 * scale) + 6 * scale + st.ItemSpacing.y;  // the two keys, the gap and the spacing under it
             const float side_h = vp->WorkSize.y - 38 * scale;
-            float foot = play_h + 4 * scale + ImGui::GetFrameHeight() + note_h + 3 * st.ItemSpacing.y;
+            // The links' row over them (host/links.h) counts in the foot.
+            float foot = play_h + 4 * scale + 2 * ImGui::GetFrameHeight() + note_h + 4 * st.ItemSpacing.y;
             // The keys where the name and the pages (last frame's height) leave room.
             static float nav_h = 0.0f;
             const bool keys = side_h - foot - hints - 8 * scale >= nav_h;
@@ -844,6 +882,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ImGui::EndChild();
             ImGui::SetCursorScreenPos(o + ImVec2(16 * scale, 20 * scale + side_h - foot));
             ImGui::BeginChild("##foot", ImVec2(w, foot), 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            // The community's Discord and its website, a press away on every
+            // page: each opens in the browser.
+            {
+                const float half = (w - st.ItemSpacing.x) * 0.5f;
+                for (int i = 0; i < 2; ++i) {
+                    const links::Link& l = *links::kAll[i];
+                    if (i) ImGui::SameLine();
+                    if (ui::ghost_button(l.label, i == 0 ? ui::Icon::Chat : ui::Icon::Online, ImVec2(half, 0))) open_link(l);
+                    link_mid[i] = (ImGui::GetItemRectMin() + ImGui::GetItemRectMax()) * 0.5f;
+                    ui::tooltip_for_item(l.title, l.tip, l.url);
+                }
+            }
             if (keys) {
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(st.ItemSpacing.x, 6 * scale));
                 ui::key_hint("F9", "In-game patches");
@@ -919,6 +969,23 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 nat_hook_at = ImGui::GetTime() + 1.0;
             }
             if (nat_hook_stage == 2) nat_scroll = true;
+        }
+        if (!test_links.empty() && ++frames > 30) {
+            // The links' walk: the pointer on each, its bubble saved, pressed.
+            const double now = ImGui::GetTime();
+            if (links_step == 0) {
+                links_step = 1;
+                links_at = now + 1.2;
+            } else if ((links_step == 1 || links_step == 5) && now >= links_at) {
+                hook_shot = test_links + (links_step == 1 ? "/link-discord.png" : "/link-website.png");
+                hook_shot_at = now;
+                ++links_step;
+            } else if (links_step == 4 && now >= links_at) {
+                links_step = 5;
+                links_at = now + 1.2;
+            } else if (links_step == 8 && now >= links_at) {
+                done = true;
+            }
         }
         if (test_link && ++frames > 30) {
             if (!test_created) {
@@ -1952,6 +2019,14 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             host_log("setup: shot %s", file.c_str());
             nat_hook_stage = 3;
             done = true;
+        }
+        if (!hook_shot.empty() && ImGui::GetTime() >= hook_shot_at) {
+            if (SDL_Surface* s = SDL_RenderReadPixels(ren, nullptr)) {
+                if (!SDL_SavePNG(s, hook_shot.c_str())) host_log("setup: shot: %s: %s", hook_shot.c_str(), SDL_GetError());
+                SDL_DestroySurface(s);
+            }
+            host_log("setup: shot %s", hook_shot.c_str());
+            hook_shot.clear();
         }
         if (!test_shot.empty() && ImGui::GetTime() >= shot_at) {
             const std::string name = shot < kPageCount ? kPages[shot].slug : "patches-bubble";

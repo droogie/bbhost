@@ -45,6 +45,8 @@ Started without a configuration, bbhost opens its setup window: pick the game
 folder and the eboot (both are checked as you go), choose the online server
 and account if you want to play online, and press Play. The window writes the
 per-user `bbhost.toml` and starts the game. `bbhost --setup` opens it again.
+Over Play, on every page, **Discord** opens the community's Discord invite and
+**Website** opens thehuntersdream.com, each in your browser.
 
 The game turns its shaders into HLSL and compiles them on your PC in the
 background, so you can play straight away; the first session uses the
