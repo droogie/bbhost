@@ -1042,6 +1042,11 @@ if(UNIX)
   add_executable(run_lookups_test tests/run_lookups_test.cpp)
   target_include_directories(run_lookups_test PRIVATE src)
   add_test(NAME run_lookups_test COMMAND run_lookups_test)
+  # The GX layer's catch-up: the flush's outcome with the GPU's time waited for outside the renderer's lock, with its
+  # mistakes (host/gpu_catch_up.h).
+  add_executable(gpu_catch_up_test tests/gpu_catch_up_test.cpp)
+  target_include_directories(gpu_catch_up_test PRIVATE src)
+  add_test(NAME gpu_catch_up_test COMMAND gpu_catch_up_test)
   # The render targets' sizes learned by their geometry, and the rule by the address alone failing (host/rt_extent.h).
   add_executable(rt_extent_test tests/rt_extent_test.cpp)
   target_include_directories(rt_extent_test PRIVATE src)

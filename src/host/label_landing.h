@@ -69,6 +69,12 @@ struct Hooks {
 };
 
 bool on();                       // BBHOST_LABEL_LANDING (default 1, 0 on Windows)
+// BBHOST_LABEL_WAIT: a wait for the GPU's timeline made inside the driver
+// (block, the default but on Windows) or by reading the value and sleeping
+// between reads (poll) - the landing thread's, and a GX catch-up's
+// (host_gpu_catch_up). NVIDIA's Windows driver holds its own lock through the
+// first kind when the value waited for is still to be submitted.
+bool waits_block();
 void start(const Hooks& hooks);  // the landing thread (bb-labels), once
 // At submit (under the renderer's lock): the writes submission `serial`
 // carries, in the order they were made.

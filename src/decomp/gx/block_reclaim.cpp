@@ -23,6 +23,12 @@
 // The catch-up goes a submission at a time first (decomp_gx_gpu_step): the
 // GPU keeps the rest of what it was handed to run while the walk finds what
 // came free (BBHOST_GX_RECLAIM_STEP=0: everything recorded at once, as before).
+// Everything recorded is waited for outside the renderer's lock
+// (host_gpu_catch_up): a flush held the lock through the GPU's time, and the
+// command processor waited for the lock meanwhile - at Old Yharnam on an RTX
+// 4070 with a 4 GB card's memory acted out, 1.96 ms a flip, 1.66 ms of it
+// these flushes' waits for the GPU (BBHOST_GX_CATCH_UP=0: the flush, as
+// before).
 // From anywhere else (the flip's own reclaim) it is the game's walk alone.
 // The wait is bounded: a few milliseconds where there was a draw with its
 // textures and constants missing.
@@ -81,6 +87,9 @@ const bool g_steps = [] {
 // The step-at-a-time catch-up's bounds: steps, and time before the flush.
 constexpr int kMaxSteps = 64;
 constexpr auto kStepBudget = std::chrono::milliseconds(200);
+// How long a catch-up of everything recorded waits outside the renderer's
+// lock before it waits under it, as the flush did (host_gpu_catch_up).
+constexpr std::uint64_t kCatchUpNs = 200'000'000ull;
 
 void* g_game = nullptr;
 std::atomic<std::uint64_t> g_calls{0}, g_stuck{0}, g_freed_by_step{0}, g_steps_taken{0}, g_freed_by_gpu{0}, g_freed_by_cp{0}, g_still{0};
@@ -147,7 +156,7 @@ GUEST_ABI void reclaim(std::uint64_t pool, std::uint64_t cb, std::uint64_t, std:
     if (!freed) {
         // 1. What is recorded: submitted and run, its labels written.
         stage = 1;
-        host_gpu_flush();
+        host_gpu_catch_up(kCatchUpNs);
         hle_call_guest<std::int64_t>(g_game, pool, cb);
         freed = in_use(pool) < before;
     }
@@ -158,7 +167,7 @@ GUEST_ABI void reclaim(std::uint64_t pool, std::uint64_t cb, std::uint64_t, std:
         while (hle_gnm_retired_total() < target && std::chrono::steady_clock::now() - t0 < kCpBudget) {
             host_sleep_us(200);
         }
-        host_gpu_flush();
+        host_gpu_catch_up(kCatchUpNs);
         hle_call_guest<std::int64_t>(g_game, pool, cb);
         freed = in_use(pool) < before;
     }

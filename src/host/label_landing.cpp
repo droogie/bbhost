@@ -314,6 +314,7 @@ void thread_main() {
 }  // namespace
 
 bool on() { return g_on; }
+bool waits_block() { return g_block; }
 void set_before_land(void (*f)(std::uint64_t completed)) { g_before_land.store(f, std::memory_order_release); }
 
 void start(const Hooks& hooks) {

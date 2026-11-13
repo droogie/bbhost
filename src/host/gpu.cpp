@@ -12,6 +12,7 @@
 #include "host/tex_update.h"
 #include "host/foreign_hooks.h"
 #include "host/draw_capture.h"
+#include "host/gpu_catch_up.h"
 #include "host/gpu_internal.h"
 #include "host/gxvk.h"
 #include "host/gxvk_table.h"
@@ -13737,6 +13738,173 @@ bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns) {
     return done;
 }
 
+namespace {
+
+// BBHOST_GX_CATCH_UP=0: the GX layer's catch-ups are flushes, as before (the measurement's baseline).
+bool catch_up_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_GX_CATCH_UP");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+// The catch-ups by the way they went (gpu_catch_up::Way), their time in all (the call's: the lock taken, the wait,
+// the slots retired) and the longest.
+std::atomic<std::uint64_t> g_cu_n[4] = {}, g_cu_us[4] = {}, g_cu_longest_us{0};
+constexpr slow_calls::Site kCatchUpValueSite{slow_calls::kSemaphoreValue, "a GX catch-up"};
+
+// BBHOST_TEST_GPU_STALL_CATCH_UP=<flip>:<ms> (tests): the first submission a GX catch-up forces from that flip on
+// carries BBHOST_TEST_GPU_STALL's GPU job (shaders/gpu_stall.comp, BBHOST_TEST_GPU_STALL_PIECES pieces of at most
+// BBHOST_TEST_GPU_STALL_TURNS turns), let go <ms> later - 0: never, it ends once its pieces are done - and no submit
+// waits for it: the catch-up's own wait outside the renderer's lock meets the busy GPU and runs out, and the same
+// submission is waited for under the lock as a flush waits for it (fence_wait_locked's steps, and past its limit the
+// stop). BBHOST_TEST_GPU_STALL's job cannot meet that wait - the submit that carries it waits for it itself, under
+// the lock - and its code stays as it is: it is inlined into submit_locked, whose Windows profile a change there costs.
+void catch_up_stall_record_locked() {
+    struct Cfg {
+        std::uint64_t flip = 0, ms = 0, pieces = 2000, turns = 4096;
+        bool on = false;
+    };
+    static const Cfg cfg = [] {
+        Cfg c;
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL_CATCH_UP"); e && *e) {
+            char* end = nullptr;
+            c.flip = std::strtoull(e, &end, 10);
+            c.ms = end && *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 0;
+            c.on = true;
+        }
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL_PIECES"); e && *e) c.pieces = std::max<std::uint64_t>(1, std::strtoull(e, nullptr, 10));
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL_TURNS"); e && *e) c.turns = std::strtoull(e, nullptr, 10);
+        return c;
+    }();
+    static bool done = false;
+    if (!cfg.on || done || !g.recording || hle_video_flip_count() < cfg.flip) return;
+    done = true;
+    // Kept for the run: the GPU runs the job until it ends.
+    static VkPipelineLayout layout = VK_NULL_HANDLE;
+    static VkPipeline pipeline = VK_NULL_HANDLE;
+    static DevBuffer flag;
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = sizeof(k_gpu_stall_spv);
+    smi.pCode = k_gpu_stall_spv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &range;
+    bool ok = vkCreateShaderModule(g.device, &smi, nullptr, &module) == VK_SUCCESS &&
+              vkCreatePipelineLayout(g.device, &pli, nullptr, &layout) == VK_SUCCESS;
+    if (ok) {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = module;
+        ci.stage.pName = "main";
+        ci.layout = layout;
+        ok = vkCreateComputePipelines(g.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) == VK_SUCCESS;
+    }
+    if (module) vkDestroyShaderModule(g.device, module, nullptr);
+    if (!ok || !create_dev_buffer(flag, 64, true) || !flag.map) {
+        host_log("gpu: test: the GPU job of BBHOST_TEST_GPU_STALL_CATCH_UP could not be made");
+        return;
+    }
+    volatile std::uint32_t* w = static_cast<volatile std::uint32_t*>(flag.map);
+    for (int i = 0; i < 4; ++i) w[i] = 0;
+    struct Push {
+        std::uint64_t flag;
+        std::uint32_t max_turns, pad;
+    } push{flag.address, static_cast<std::uint32_t>(std::min<std::uint64_t>(cfg.turns, 0xffffffffu)), 0};
+    // Outside a pass and a transfer run, as a dispatch is recorded.
+    transfer_flush_locked();
+    render_end_pass_locked();
+    rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    rec().push_constants(layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    for (std::uint64_t k = 0; k < cfg.pieces; ++k) {
+        rec().dispatch(1, 1, 1);
+        if (k + 1 < cfg.pieces) rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    char when[48];
+    if (cfg.ms) std::snprintf(when, sizeof(when), "%llu ms later", static_cast<unsigned long long>(cfg.ms));
+    else std::snprintf(when, sizeof(when), "never");
+    host_log("gpu: test: submission %llu (flip %llu), a GX catch-up's, carries a GPU job of %llu pieces of up to %llu turns that runs "
+             "until the host lets it go: %s; the catch-up waits for it itself (BBHOST_TEST_GPU_STALL_CATCH_UP)",
+             static_cast<unsigned long long>(g.flushes), static_cast<unsigned long long>(hle_video_flip_count()),
+             static_cast<unsigned long long>(cfg.pieces), static_cast<unsigned long long>(cfg.turns), when);
+    if (cfg.ms) {
+        std::thread([ms = cfg.ms, w] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            const std::uint32_t pieces = w[2], turns = w[1];
+            w[0] = 1;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            host_log("gpu: test: the catch-up's GPU job is let go %llu ms after it was recorded, %u pieces and %u turns in",
+                     static_cast<unsigned long long>(ms), pieces, turns);
+        }).detach();
+    }
+}
+
+// The renderer as gpu_catch_up::run uses it.
+struct CatchUpOps {
+    void lock() { g.mu.lock(); }
+    void unlock() { g.mu.unlock(); }
+    bool ok() const { return g.ok; }
+    bool timeline() const { return g_timeline_on.load(std::memory_order_acquire); }
+    void flush_locked() { gpu::flush_locked(); }
+    void submit_locked() {
+        catch_up_stall_record_locked();  // BBHOST_TEST_GPU_STALL_CATCH_UP
+        gpu::submit_locked();
+    }
+    std::uint64_t submissions_locked() const { return g.flushes; }
+    // Without the lock. Inside the driver where that wait is sound (host_gpu_wait_completed, which lands the labels
+    // after it). Where the driver holds its own lock through such a wait - NVIDIA's on Windows, for a value still
+    // to be submitted, as this one may be (bb-submit submits it) - every other thread's call would queue behind it,
+    // the submission's own too: there the value is read, the thread asleep between reads (label_landing::waits_block).
+    bool wait(std::uint64_t need, std::uint64_t timeout_ns) {
+        if (label_landing::waits_block() || g_device_lost.load(std::memory_order_relaxed)) return host_gpu_wait_completed(need, timeout_ns);
+        const bool done = gpu_catch_up::poll_until(
+            need, timeout_ns,
+            [] {
+                if (g_device_lost.load(std::memory_order_relaxed)) return ~0ull;  // nothing more will run
+                std::uint64_t v = 0;
+                slow_calls::Scope timed(kCatchUpValueSite);
+                return vkGetSemaphoreCounterValue(g.device, g.timeline, &v) == VK_SUCCESS ? v : ~0ull;
+            },
+            [] { return host_clock_monotonic_ns(); },
+            [](int k) {
+                if (k < 32) std::this_thread::yield();
+                else host_sleep_us(50);
+            });
+        if (done && landing_on()) label_landing::land_through(g_device_lost.load(std::memory_order_relaxed) ? ~0ull : need);
+        return done;
+    }
+    void retire_through_locked(std::uint64_t serial) { gpu::retire_through_locked(serial); }
+};
+
+}  // namespace
+
+void host_gpu_catch_up(std::uint64_t timeout_ns) {
+    const std::uint64_t t0 = host_clock_monotonic_ns();
+    CatchUpOps ops;
+    const gpu_catch_up::Result r = gpu_catch_up::run(ops, catch_up_on(), timeout_ns);
+    const std::uint64_t us = (host_clock_monotonic_ns() - t0) / 1000;
+    const int way = static_cast<int>(r.way);
+    g_cu_n[way].fetch_add(1, std::memory_order_relaxed);
+    g_cu_us[way].fetch_add(us, std::memory_order_relaxed);
+    for (std::uint64_t m = g_cu_longest_us.load(std::memory_order_relaxed); us > m && !g_cu_longest_us.compare_exchange_weak(m, us, std::memory_order_relaxed);) {
+    }
+    if (r.way == gpu_catch_up::Way::kWaitedLocked) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 8) {
+            host_log("gpu: a GX catch-up's submission %llu had not run %llu ms after it was handed over: waited for under the renderer's "
+                     "lock, as a flush waits (%llu ms in all)",
+                     static_cast<unsigned long long>(r.need - 1), static_cast<unsigned long long>(timeout_ns / 1000000),
+                     static_cast<unsigned long long>(us / 1000));
+        }
+    }
+}
+
 void host_gpu_report() {
     dispatch_cost_report();
 
@@ -13942,6 +14110,19 @@ void host_gpu_report() {
                  static_cast<unsigned long long>(g_arena_retires_ordered.load()));
         host_log("gpu: %s", landing.c_str());
         if (!landing_reused.empty()) host_log("gpu: %s", landing_reused.c_str());
+        if (const std::uint64_t n = g_cu_n[0].load() + g_cu_n[1].load() + g_cu_n[2].load() + g_cu_n[3].load()) {
+            using gpu_catch_up::Way;
+            const auto at = [](Way w) { return static_cast<int>(w); };
+            host_log("gpu: GX catch-ups (the block reclaim's and the discard rename's waits for the GPU): %llu - %llu waited for outside "
+                     "the renderer's lock (%llu ms in all), %llu ran out after their timeout and waited under the lock as a flush does "
+                     "(%llu ms), %llu flushes (%s); the longest %llu ms",
+                     static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_cu_n[at(Way::kCaughtUp)].load()),
+                     static_cast<unsigned long long>(g_cu_us[at(Way::kCaughtUp)].load() / 1000),
+                     static_cast<unsigned long long>(g_cu_n[at(Way::kWaitedLocked)].load()),
+                     static_cast<unsigned long long>(g_cu_us[at(Way::kWaitedLocked)].load() / 1000),
+                     static_cast<unsigned long long>(g_cu_n[at(Way::kFlushed)].load()),
+                     catch_up_on() ? "no timeline" : "BBHOST_GX_CATCH_UP=0", static_cast<unsigned long long>(g_cu_longest_us.load() / 1000));
+        }
         if (!landing_on()) {
             host_log("gpu: command-processor writes recorded as fills into memory the game had written again since their submission (a "
                      "command buffer begun again): %llu, %llu of them within what its new round had written; filled by the GPU over "
