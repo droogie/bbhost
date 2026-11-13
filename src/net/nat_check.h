@@ -80,6 +80,8 @@ struct ProbeResult {
     int send_error_code = 0;       // the first refusal's error (errno, WSAGetLastError)
     std::string send_error;        // ... in the system's words
     bool send_denied = false;      // ... a permission error: a firewall's or a security program's refusal
+    std::uint32_t local_addr = 0;  // this PC's own address toward the server, network byte order (0 unknown):
+                                   // the one a router forwards to; shown on the card, never logged
 };
 
 struct ProbeParams {
@@ -91,7 +93,9 @@ struct ProbeParams {
 };
 
 // The exchange, from a socket bound to `local_port` alone (never shared: a
-// game that has the port makes it PortInUse). Requests to every test port,
+// game that has the port makes it PortInUse). First this PC's own address
+// toward the server: another socket, connected there - which sends nothing -
+// tells which one the system takes. Requests to every test port,
 // each sent again while unanswered (at 0, 0.3, 0.8, 1.6, 2.8 and 4.2 s), and
 // the port check's, again while its second answer has not come (at 0, 0.5
 // and 1.2 s, and at 2.8 and 4.2 s while not even its usual answer has), until
@@ -100,6 +104,11 @@ struct ProbeParams {
 // answer". When the system refuses every send and none is left to try, it
 // ends there. net/nat_probe.cpp.
 ProbeResult probe(const ProbeParams& p);
+
+// Whether a socket could have UDP `port` now, bound alone as the test and the
+// game bind it: "" when it could, else the system's words (another program has
+// it). The P2P port setting asks before it takes a new port. net/nat_probe.cpp.
+std::string port_taken(std::uint16_t port);
 
 // What the answers say, without the server's word.
 inline Verdict verdict_of(const ProbeResult& r) {

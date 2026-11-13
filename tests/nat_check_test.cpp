@@ -226,6 +226,7 @@ void exchange_cases() {
         CHECK(r.at.size() == 2 && r.at[0].got && r.at[1].got);
         CHECK(r.at[0].port == local && r.at[1].port == local);
         CHECK(r.at[0].addr == htonl(INADDR_LOOPBACK));
+        CHECK(r.local_addr == htonl(INADDR_LOOPBACK));  // this PC's own address toward the server: loopback's here
         CHECK(net::nat::verdict_of(r) == Verdict::Direct);
         CHECK(r.change_answered && r.change_offered && r.offered_port == s.port[2]);
         CHECK(r.reached && r.reached_from == s.port[2]);
@@ -234,6 +235,16 @@ void exchange_cases() {
         CHECK(s.change_requests == 1 && s.second_answers == 1);
         CHECK(r.sent == 3 && r.refused == 0 && r.send_error.empty());
         CHECK(net::nat::public_ports(r) == "public port " + std::to_string(local) + " at both test ports, the game's own");
+    }
+    {   // this PC's own address toward the server is the system's choice for that destination, not the server's
+        // (127.0.0.2 is reached from 127.0.0.1); nothing answers there
+        net::nat::ProbeParams p;
+        p.server = htonl(0x7F000002u);
+        p.ports = {3479, 3480};
+        p.local_port = free_port();
+        p.deadline_ms = 100;
+        const ProbeResult r = net::nat::probe(p);
+        CHECK(r.local_addr == htonl(INADDR_LOOPBACK));
     }
     {   // a new port per destination; the router drops the second answer
         Server s;
@@ -367,7 +378,10 @@ void exchange_cases() {
         CHECK(r.error == ProbeResult::Error::PortInUse);
         CHECK(net::nat::verdict_of(r) == Verdict::None);
         CHECK(s.requests == 0);
+        // the P2P port setting asks the same before it takes a port
+        CHECK(!net::nat::port_taken(taken).empty());
         ::close(holder);
+        CHECK(net::nat::port_taken(taken).empty());
         // a holder that would share it (SO_REUSEADDR): never shared from here
         const int sharer = ::socket(AF_INET, SOCK_DGRAM, 0);
         const int one = 1;
@@ -379,6 +393,7 @@ void exchange_cases() {
         p.local_port = port_of(sharer);
         CHECK(net::nat::probe(p).error == ProbeResult::Error::PortInUse);
         CHECK(s.requests == 0);
+        CHECK(!net::nat::port_taken(p.local_port).empty());
         ::close(sharer);
     }
     {   // cancelled: over at once

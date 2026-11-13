@@ -143,6 +143,22 @@ ProbeResult probe(const ProbeParams& p) {
         r.error_text = error_text(e);
         return r;
     }
+    // This PC's own address toward the server, the one a router forwards to:
+    // the address the system gives a socket connected there (connecting a UDP
+    // socket sends nothing). The test's own socket stays unconnected - the
+    // port check's answer comes from a port it never sent to.
+    if (const Sock q = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP); q != kNoSock) {
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_addr.s_addr = p.server;
+        to.sin_port = htons(p.ports[0]);
+        sockaddr_in me{};
+        AddrLen me_len = sizeof(me);
+        if (::connect(q, reinterpret_cast<const sockaddr*>(&to), sizeof(to)) == 0 &&
+            ::getsockname(q, reinterpret_cast<sockaddr*>(&me), &me_len) == 0 && me.sin_family == AF_INET)
+            r.local_addr = me.sin_addr.s_addr;
+        close_sock(q);
+    }
 
     std::vector<Request> plain(p.ports.size());
     for (std::size_t i = 0; i < plain.size(); ++i) {
@@ -248,6 +264,36 @@ ProbeResult probe(const ProbeParams& p) {
     }
     close_sock(s);
     return r;
+}
+
+std::string port_taken(std::uint16_t port) {
+#if defined(_WIN32)
+    WSADATA wsa{};
+    const bool wsa_ok = ::WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+    struct Cleanup {
+        bool on;
+        ~Cleanup() {
+            if (on) ::WSACleanup();
+        }
+    } cleanup{wsa_ok};
+#endif
+    const Sock s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == kNoSock) return {};  // nothing to tell by: the test says it
+#if defined(_WIN32)
+    BOOL one = TRUE;
+    ::setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&one), sizeof(one));
+#endif
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(port);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    std::string why;
+    if (::bind(s, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) != 0) {
+        const int e = last_error();
+        if (in_use(e)) why = error_text(e);
+    }
+    close_sock(s);
+    return why;
 }
 
 }  // namespace net::nat
