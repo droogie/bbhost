@@ -3,10 +3,11 @@
 // bbhost's plugin API: nothing in it writes the game's code or reads an
 // address of its own.
 //
-// Hold L3 for half a second, or press P, to start it; the same again (or
-// Escape) ends it. L3 is the button that presses the game's L3 - the left
-// stick's, unless Key Bindings moved it (BbPad.play) - which the game itself
-// does nothing with, so holding it never moves the hunter. Three modes:
+// Press L3, or P, to start it; the same again (or Escape) ends it - or hold
+// L3 half a second, as the Start with option has it. L3 is the button that
+// presses the game's L3 - the left stick's, unless Key Bindings moved it
+// (BbPad.play) - which the game itself does nothing with, so pressing it never
+// moves the hunter. Three modes:
 //   Frozen  the world held still (world_pause) while the camera flies; Cross
 //           (N on the keyboard) lets it run one more frame - a frame advance.
 //   Static  the camera stays where it is and the hunter plays on: the
@@ -53,6 +54,8 @@ constexpr float kPi = 3.14159265358979f;
 const BbHostApi* api = nullptr;
 
 enum Mode : int { kFrozen = 0, kStatic = 1, kLive = 2 };
+// What starts and ends it on the controller (the Start with row).
+enum Start : int { kStartPress = 0, kStartHold = 1 };
 
 // SDL scancodes (the USB HID usages BbInput's keys are indexed by).
 constexpr std::uint16_t kKeyA = 4, kKeyD = 7, kKeyE = 8, kKeyN = 17, kKeyP = 19, kKeyQ = 20, kKeyS = 22, kKeyW = 26;
@@ -84,6 +87,7 @@ constexpr float kWorldSettle = 3.0f;
 
 // The options (bb_plugin_options): what the panel's rows hold.
 struct Settings {
+    int start = kStartPress;  // Start with, as Start
     int mode = 0;            // Mode, as Mode
     int fov_offset = 0;      // degrees more or less than the game's view
     int roll = 0;            // degrees
@@ -457,16 +461,23 @@ void on_frame(void*) {
     if (have_keys) std::memcpy(prev_keys, in.key, sizeof(prev_keys));
     const auto now = std::chrono::steady_clock::now();
 
-    // Start and end: L3 held half a second - the button the player's bindings
-    // make the game's L3, which does nothing in play - or P; Escape ends it
-    // too. One hold does one: it is let go before the next.
+    // Start and end: L3 - the button the player's bindings make the game's
+    // L3, which does nothing in play - pressed, or held half a second (the
+    // Start with row); or P. Escape ends it too. A hold does one thing: it is
+    // let go before the next.
     const bool l3 = (pad.play & BB_PAD_L3) != 0;
-    if (l3 && !st.l3_down) st.l3_since = now;
+    const bool l3_went_down = l3 && !st.l3_down;
+    if (l3_went_down) st.l3_since = now;
     if (!l3) st.l3_used = false;
     st.l3_down = l3;
-    const bool held = l3 && !st.l3_used && std::chrono::duration<float>(now - st.l3_since).count() >= kHoldToggle;
-    if (held) st.l3_used = true;
-    const bool toggle = held || p_down;
+    bool l3_toggle = false;
+    if (set.start == kStartHold) {
+        l3_toggle = l3 && !st.l3_used && std::chrono::duration<float>(now - st.l3_since).count() >= kHoldToggle;
+        if (l3_toggle) st.l3_used = true;
+    } else {
+        l3_toggle = l3_went_down;
+    }
+    const bool toggle = l3_toggle || p_down;
     if (!st.on) {
         if (toggle) {
             if (const char* why = refused(w)) {
@@ -539,11 +550,13 @@ bool take_option(const char* key, const char* value) {
             if (v == names[i]) *out = i;
         }
     };
+    static const char* const kStarts[] = {"L3 press", "L3 held half a second"};
     static const char* const kModes[] = {"Frozen", "Static", "Live"};
     static const char* const kVignettes[] = {"Area's own", "None", "Light", "Medium", "Strong", "Heavy"};
     static const char* const kSwitch[] = {"Area's own", "On", "Off"};
     const std::string k = key;
-    if (k == "mode") choice(kModes, 3, &set.mode);
+    if (k == "start") choice(kStarts, 2, &set.start);
+    else if (k == "mode") choice(kModes, 3, &set.mode);
     else if (k == "fov") num(-40, 60, &set.fov_offset);
     else if (k == "roll") num(-90, 90, &set.roll);
     else if (k == "hud") set.hud = v == "true";
@@ -602,10 +615,14 @@ void on_option(const char* key, const char* value, void*) {
 #define LIVE_INT_WHEN(key, label, help, def, lo, hi, when) {BB_OPT_INT | BB_OPT_LIVE | BB_OPT_WHEN, key, label, help, def, lo, hi, when}
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_HEADING, "about", "Photo mode",
-     "Hold L3 for half a second, or press P, to start photo mode and to end it (Escape ends it too). Its panel opens with it: "
-     "L1 and R1 (Q and E) turn its pages, the d-pad (the arrows) chooses and changes a row, Circle (Escape) hides it and R3 "
-     "(Tab) shows it again. Only with nobody else in your world.",
+     "Press L3, or P, to start photo mode and to end it (Escape ends it too). Its panel opens with it: L1 and R1 (Q and E) "
+     "turn its pages, the d-pad (the arrows) chooses and changes a row, Circle (Escape) hides it and R3 (Tab) shows it again. "
+     "Only with nobody else in your world.",
      "", 0, 0, nullptr},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "start", "Start with",
+     "What on the controller starts and ends photo mode: a press of L3, or L3 held for half a second (a press then does "
+     "nothing). P on the keyboard does either way.",
+     "L3 press", 0, 0, "L3 press|L3 held half a second"},
 
     PANEL("camera", "Camera", "How photo mode's camera sees, and what the world does meanwhile."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "mode", "Mode",
@@ -700,7 +717,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     "1.0.0",
     "Nox-",
     "A free camera for pictures: the world held still or running, the camera flown by the controller or the keyboard "
-    "and mouse, the HUD out of the way. Hold L3 for half a second, or press P. Only with nobody else in your world.",
+    "and mouse, the HUD out of the way. Press L3, or P. Only with nobody else in your world.",
 };
 
 extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
@@ -720,6 +737,6 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
         return 1;
     }
     if (api->key_bound(kKeyP)) api->log("photo mode: P is also one of the game's keys; it starts photo mode as well");
-    api->log("photo mode: ready - hold L3 for half a second, or press P");
+    api->log("photo mode: ready - %s, or press P", set.start == kStartHold ? "hold L3 for half a second" : "press L3");
     return 0;
 }

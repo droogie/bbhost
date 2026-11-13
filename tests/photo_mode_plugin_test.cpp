@@ -2,13 +2,14 @@
 // loaded as the host loads plugins and driven frame by frame - the world's
 // state, the controller and the keyboard as the test sets them - while every
 // plugin API 29 call it makes is recorded. Checked: on a host older than API 29
-// it refuses before asking anything; it starts on P and on L3 held half a
-// second (the game's L3, as the player's bindings make it), Frozen, with the
-// world held, the controls taken as its own and the HUD out of the picture; a
-// shorter press does nothing and one hold does one thing; the camera starts at
-// the game's view and flies the way it looks, and the Field of view row's
-// whole range acts on it; Cross and N advance a held world by one update;
-// its takes and reads of the keyboard and mouse are its own
+// it refuses before asking anything; it starts on P and on a press of L3 (the
+// game's L3, as the player's bindings make it) - or, as Start with can have
+// it, on L3 held half a second, when a shorter press does nothing and one hold
+// does one thing - Frozen, with the world held, the controls taken as its own
+// and the HUD out of the picture; the camera starts at the game's view and
+// flies the way it looks, and the Field of view row's whole range acts on it;
+// Cross and N advance a held world by one update; its takes and reads of the
+// keyboard and mouse are its own
 // (input_take_as, input_as); Static gives the controls back but Options, the touchpad and
 // R3, Live flies over a running world, warns that enemies can still attack,
 // and holds the world again at the hunter's first hit; it ends on Escape, P
@@ -377,16 +378,19 @@ int main(int argc, char** argv) {
             if ((o->type & 0xff) == BB_OPT_CHOICE) CHECK(std::strstr(o->choices, o->def) != nullptr);
             CHECK(o->type & BB_OPT_LIVE);  // the panel changes them as photo mode runs
         }
-        // Six pages, every row on one; the menus get only the first heading.
-        int pages = 0;
+        // Six pages, every row but Start with on one; the menus get the first
+        // heading and Start with under it.
+        int pages = 0, headings = 0;
         bool on_page = false;
         for (const BbOption* o = p.options; o->type; ++o) {
             if ((o->type & 0xff) == BB_OPT_HEADING) {
                 on_page = (o->type & BB_OPT_PANEL) != 0;
                 pages += on_page;
+                ++headings;
                 CHECK(o->key && o->label && o->help && o->help[0]);
-            } else {
-                CHECK(on_page);
+            } else if (!on_page) {
+                CHECK(headings == 1 && std::strcmp(o->key, "start") == 0);
+                CHECK(std::strcmp(o->def, "L3 press") == 0);
             }
         }
         CHECK(pages == 6);
@@ -573,13 +577,22 @@ int main(int argc, char** argv) {
     H.view_fn(&view, H.view_user);
     CHECK(std::fabs(view.position[2] - 3) < 1e-5f);  // the game's view again
 
-    // L3 held half a second starts it, Frozen whatever the mode was; a shorter
-    // press does nothing, and one hold does one thing however long it lasts.
+    // A press of L3 starts it, Frozen whatever the mode was, and the next ends
+    // it: the default Start with. A long press is one press.
+    tap_pad(BB_PAD_L3);
+    CHECK(H.paused == 1 && H.panel_up);
+    CHECK(H.steps == steps_before);  // L3 is no frame advance
+    hold(1.2f);
+    CHECK(H.paused == 0 && H.take_buttons == 0 && H.taken_keys.empty() && !H.panel_up);
+    // Start with "L3 held half a second": a press does nothing, a hold of
+    // half a second starts it, and one hold does one thing however long it lasts.
+    H.option_fn("start", "L3 held half a second", H.option_user);
+    tap_pad(BB_PAD_L3);
+    CHECK(H.paused == 0);
     hold(0.2f);
     CHECK(H.paused == 0);
     hold(1.2f);
     CHECK(H.paused == 1 && H.panel_up);
-    CHECK(H.steps == steps_before);  // L3 is no frame advance
     hold(0.6f);  // held again: it ends
     CHECK(H.paused == 0 && H.take_buttons == 0 && H.taken_keys.empty() && !H.panel_up);
     // L3 as the game has it: the left stick pressed while Key Bindings put
@@ -590,12 +603,30 @@ int main(int argc, char** argv) {
     CHECK(H.paused == 1);
     hold(0.6f, BB_PAD_CIRCLE, BB_PAD_L3);
     CHECK(H.paused == 0);
+    H.option_fn("start", "L3 press", H.option_user);
+    tap_pad(BB_PAD_CIRCLE);  // Circle as itself in play: nothing
+    CHECK(H.paused == 0);
+    {
+        // Circle where Key Bindings put L3, pressed: starts and ends it.
+        H.pad.buttons |= BB_PAD_CIRCLE;
+        H.pad.play |= BB_PAD_L3;
+        frame();
+        H.pad.buttons &= ~BB_PAD_CIRCLE;
+        H.pad.play &= ~BB_PAD_L3;
+        frame();
+        CHECK(H.paused == 1);
+        H.pad.play |= BB_PAD_L3;
+        frame();
+        H.pad.play &= ~BB_PAD_L3;
+        frame();
+        CHECK(H.paused == 0);
+    }
     // Not in a menu: the player is told why.
     H.world.flags = BB_WORLD_IN | BB_WORLD_MENU;
-    hold(0.6f);
+    tap_pad(BB_PAD_L3);
     CHECK(H.paused == 0 && H.messages.back().find("close the menu") != std::string::npos);
     H.world.flags = BB_WORLD_IN;
-    hold(0.6f);
+    tap_pad(BB_PAD_L3);
     CHECK(H.paused == 1);
     // The game's widest view (its 48 degrees with the PC Field of view at
     // +100%: 96) and the row's +60: 156 degrees, the camera seeded with both.
