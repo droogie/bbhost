@@ -8,7 +8,7 @@
 // stick's, unless Key Bindings moved it (BbPad.play) - which the game itself
 // does nothing with, so holding it never moves the hunter. Three modes:
 //   Frozen  the world held still (world_pause) while the camera flies; Cross
-//           (N on the keyboard) lets it run two more updates - a frame advance.
+//           (N on the keyboard) lets it run one more frame - a frame advance.
 //   Static  the camera stays where it is and the hunter plays on: the
 //           controller and the keys are the game's again, but for photo mode's
 //           own.
@@ -73,7 +73,9 @@ constexpr float kPitchLimit = 1.53f;     // short of straight up and down
 // own rows being 43 and 48) and its +60 from the widest (96: 48 with the PC
 // Field of view at +100%) stay inside these.
 constexpr float kFovLeast = 1.0f * kPi / 180.0f, kFovMost = 160.0f * kPi / 180.0f;
-constexpr std::uint32_t kStepUpdates = 2;
+// A frame advance: one update, the smallest step the world takes (a frame's
+// time - 1/60 s at 60 fps).
+constexpr std::uint32_t kStepUpdates = 1;
 constexpr float kHoldToggle = 0.5f;  // seconds L3 is held to start or end photo mode
 // The world up this long before photo mode starts: the loading screen's page
 // stays and fades out over the world's first frames - some 75 of them, two
@@ -607,10 +609,9 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
 
     PANEL("camera", "Camera", "How photo mode's camera sees, and what the world does meanwhile."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "mode", "Mode",
-     "Frozen holds the world still while the camera flies (Cross or N lets it run two more updates). Static keeps the "
-     "camera where it is while you play on. Live flies the camera while the world keeps running: enemies can still attack "
-     "your hunter, who stands still meanwhile, and the first hit holds the world again (Frozen). Photo mode always starts "
-     "Frozen.",
+     "Frozen holds the world still (Cross or N lets it run one frame). Static keeps the camera where it is while you play "
+     "on. Live flies it while the world runs: enemies can still attack your hunter, and the first hit holds the world "
+     "again. Photo mode always starts Frozen.",
      "Frozen", 0, 0, "Frozen|Static|Live"},
     LIVE_INT("fov", "Field of view", "Degrees more or less than the game's own view: 0 keeps it, less zooms in.", "0", -40, 60),
     LIVE_INT("roll", "Roll", "Tilts the camera, in degrees: 0 keeps it level.", "0", -90, 90),

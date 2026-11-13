@@ -7,7 +7,7 @@
 // world held, the controls taken as its own and the HUD out of the picture; a
 // shorter press does nothing and one hold does one thing; the camera starts at
 // the game's view and flies the way it looks, and the Field of view row's
-// whole range acts on it; Cross and N advance a held world by two updates;
+// whole range acts on it; Cross and N advance a held world by one update;
 // its takes and reads of the keyboard and mouse are its own
 // (input_take_as, input_as); Static gives the controls back but Options, the touchpad and
 // R3, Live flies over a running world, warns that enemies can still attack,
@@ -505,11 +505,11 @@ int main(int argc, char** argv) {
     tap_key(kTab);
     CHECK(H.panel_up);
 
-    // The frame advance: Cross (it was not held to start) and N, two updates each.
+    // The frame advance: Cross (it was not held to start) and N, one update each.
     tap_pad(BB_PAD_CROSS);
-    CHECK(H.steps == 2);
+    CHECK(H.steps == 1);
     tap_key(kN);
-    CHECK(H.steps == 4);
+    CHECK(H.steps == 2);
 
     // Static: the world runs, the controller is the game's but Options and the touchpad; Live flies over it.
     H.option_fn("mode", "Static", H.option_user);
