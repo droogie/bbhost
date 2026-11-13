@@ -70,7 +70,8 @@ void loading_tick(std::uint64_t flip) {
             cutscene = (at<std::uint32_t>(man + 0x168) & 1) != 0 || at<std::uint64_t>(man + 0xf8) != 0;
         }
     }
-    g_cutscene.store(cutscene, std::memory_order_relaxed);
+    if (g_cutscene.exchange(cutscene, std::memory_order_relaxed) != cutscene)
+        host_log("cutscene: %s, flip %llu", cutscene ? "begins" : "ends", static_cast<unsigned long long>(flip));
     const bool fast = g_fast_enabled && loading && !cutscene && frame_rate_converted();  // every converted rate
     if (g_fast.exchange(fast, std::memory_order_relaxed) != fast) hle_video_set_loading_uncapped(fast);
     if (loading && !was) {

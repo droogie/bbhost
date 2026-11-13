@@ -1180,6 +1180,16 @@ typedef struct BbHostApi {
      * from its list's on_action); Circle there comes back. Main thread. 0 on
      * success; 1 for an unknown plugin or page, or no menu of its up. */
     int (*panel_open)(const char* name, const char* page);
+
+    /* Version 29: cutscenes. 1 while one of the game's cutscenes (a Remo
+     * scene: the story's, a boss's entrance, a lamp's first lighting) is asked
+     * for or playing, 0 otherwise. The cutscene places the hunter and the
+     * camera itself: a plugin that moves either, hides the body, holds its
+     * gravity or takes the controls gives them back to the game for its
+     * length and takes them up again from wherever it leaves the hunter.
+     * on_view is not called while it is 1 (on_camera still is, so a plugin
+     * can see it begin and end). Any thread. */
+    int (*cutscene)(void);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

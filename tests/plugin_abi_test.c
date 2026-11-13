@@ -3,7 +3,8 @@
  * move: their sizes, the places of the fields read most, and the API table's
  * version 27 calls right after version 26's camera_zoom - the frame's three,
  * then the shaders' five, followed by version 28's camera target hook and
- * version 29's world pause, controller and world state.
+ * version 29's world pause, controller, world state and menus, ending with
+ * its cutscene().
  * Built as C99, so the header stays C. */
 #include "bbhost_plugin.h"
 
@@ -58,7 +59,8 @@ _Static_assert(offsetof(BbHostApi, input_as) == offsetof(BbHostApi, input_take_a
 _Static_assert(offsetof(BbHostApi, panel_rows) == offsetof(BbHostApi, input_as) + sizeof(void*), "panel_rows after input_as");
 _Static_assert(offsetof(BbHostApi, panel_value) == offsetof(BbHostApi, panel_rows) + sizeof(void*), "panel_value after panel_rows");
 _Static_assert(offsetof(BbHostApi, panel_open) == offsetof(BbHostApi, panel_value) + sizeof(void*), "panel_open after panel_value");
-_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, panel_open) + sizeof(void*), "panel_open ends the API table");
+_Static_assert(offsetof(BbHostApi, cutscene) == offsetof(BbHostApi, panel_open) + sizeof(void*), "cutscene after panel_open");
+_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, cutscene) + sizeof(void*), "cutscene ends the API table");
 _Static_assert(BB_OPT_PANEL == 0x400u && BB_PANEL_DEFAULTS == 1u && BB_PANEL_CORNER == 2u, "the panel's flags");
 _Static_assert(BB_OPT_MENU == 0x800u && BB_OPT_SUBPAGE == 0x1000u && BB_OPT_OPEN == 0x2000u && BB_OPT_CONFIRM == 0x4000u &&
                    BB_OPT_INFO == 8,

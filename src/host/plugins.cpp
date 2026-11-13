@@ -1192,6 +1192,8 @@ std::vector<CameraCallback> g_view_callbacks;  // under g_frame_mu
 bool g_view_hooked = false;
 
 GUEST_ABI std::int64_t view_hook(std::uint64_t, const std::uint64_t*) {
+    // A cutscene's own camera, left as it places it (plugin API 29).
+    if (loading_cutscene()) return 0;
     const std::uint64_t slot = runtime_of(0x594f880, 8);
     std::uint64_t holder = 0, scene = 0;
     if (!slot || !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(slot)), &holder, 8) || !holder ||
@@ -1223,6 +1225,9 @@ int api_on_view(void (*fn)(BbCamera*, void*), void* user) {
     }
     return 0;
 }
+
+// Version 29: a cutscene asked for or playing (engine/loading.h).
+int api_cutscene() { return loading_cutscene() ? 1 : 0; }
 
 int api_key_bound(std::uint16_t scancode) {
     if (scancode == 0) return 0;
@@ -1831,6 +1836,7 @@ const BbHostApi g_api = {
     &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state, &api_hud_hide, &api_post_look,
     &api_panel_show, &api_panel_state, &api_option_set, &api_input_take_as, &api_input_as,
     &api_panel_rows, &api_panel_value, &api_panel_open,
+    &api_cutscene,
 };
 
 std::string read_file(const std::string& path) {
@@ -2144,6 +2150,7 @@ void plugins_image(ElfImage* image) {
     aa_update();
 }
 
+void clash_check();
 void plugins_frame() {
     speffect_test_tick();  // BBHOST_SPEFFECT_TEST
     chr_watch_tick();      // BBHOST_CHR_WATCH
@@ -2172,6 +2179,13 @@ void plugins_frame() {
         std::int64_t hp = -1;
         if (!player_stat_get("hp", &hp)) hp = -1;
         plugin_panel_world(world_flags(), hp);
+    }
+    // Plugins that clash (plugins_clash): told once in game, at the first
+    // frame and after a switch or setting changes.
+    static bool clash_first = true;
+    if (clash_first) {
+        clash_first = false;
+        clash_check();
     }
     std::vector<FrameCallback> now;
     std::vector<WorldLoadCallback> loads;
@@ -2224,6 +2238,7 @@ void plugins_frame() {
             if (c.name == r.name) c.fn(r.key.c_str(), r.value.c_str(), c.user);
         }
     }
+    if (!requests.empty()) clash_check();
     if (!loads.empty()) {
         // A world load is a new main player (every load builds one) or the
         // player in another block (a warp that keeps it).
@@ -2442,6 +2457,56 @@ std::vector<std::string> rules_without(const std::string& rules, const std::vect
     return out;
 }
 }  // namespace
+
+namespace {
+// The pairs, each by its plugins' names and their main switch (a BB_OPT_BOOL
+// key; "" for the plugin's on/off alone).
+struct Clash {
+    const char *a, *a_switch, *b, *b_switch, *text;
+};
+constexpr Clash kClashes[] = {
+    {"quake", "enabled", "iso", "enabled",
+     "Quake and Isometric don't work together: both take over the camera. Turn one of them off."},
+};
+
+bool truthy(const std::string& v) { return v == "true" || v == "1" || v == "on" || v == "yes"; }
+
+// A plugin turned on, with its switch on, as `list` and the config say.
+bool entry_on(const std::vector<PluginEntry>& list, const char* name, const char* key) {
+    for (const PluginEntry& p : list) {
+        if (p.name != name || !p.enabled) continue;
+        if (!*key) return true;
+        for (const PluginOptionDesc& o : p.options)
+            if (o.key == key) return truthy(plugins_option_value(p, o));
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
+std::string plugins_clash(const std::vector<PluginEntry>& list, const std::string& name) {
+    for (const Clash& c : kClashes) {
+        if (name != c.a && name != c.b) continue;
+        if (entry_on(list, c.a, c.a_switch) && entry_on(list, c.b, c.b_switch)) return c.text;
+    }
+    return {};
+}
+
+// In game: a banner the first time a pair is on together, and again only
+// after they have been apart.
+void clash_check() {
+    static std::vector<bool> was(sizeof(kClashes) / sizeof(kClashes[0]), false);
+    const std::vector<PluginEntry> list = plugins_catalog();
+    for (std::size_t i = 0; i < was.size(); ++i) {
+        const Clash& c = kClashes[i];
+        const bool now = entry_on(list, c.a, c.a_switch) && entry_on(list, c.b, c.b_switch);
+        if (now && !was[i]) {
+            host_log("plugin: %s and %s are both on: %s", c.a, c.b, c.text);
+            host_message_show(c.text, 8.0f);
+        }
+        was[i] = now;
+    }
+}
 
 bool plugins_active(const std::string& name) {
     for (const Plugin& p : g_plugins) {
