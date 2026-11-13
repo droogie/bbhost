@@ -2213,6 +2213,30 @@ bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
     return changed;
 }
 
+// The Resolution list as the setup window and F10 show it: each size after
+// its aspect ratio, "(16:9) 1280x720" - the list is grouped by ratio already,
+// smallest to largest in each. The values stay plain WxH (saved by name and
+// read with %ux%u); kResolutionAspects runs parallel to them, and a list of
+// another length shows the bare sizes. The game's own list says the same
+// (tools/pc_option_messages.tsv, 117010-117077).
+const char* const kResolutionAspects[] = {
+    "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:10",
+    "16:10", "16:10", "16:10", "16:10", "16:10", "16:10", "16:10", "16:10", "4:3", "4:3", "4:3", "4:3", "4:3", "4:3",
+    "5:4", "1:1", "1:1", "1:1", "21:9", "21:9", "21:9", "21:9", "21:9", "16:5", "32:9", "32:9", "32:9", "18:5",
+    "4:1", "4:1", "24:5", "24:5", "5:1", "16:3", "16:3", "16:3", "16:3", "16:3", "64:9", "43:6",
+};
+const std::vector<const char*>& resolution_labels(const Setting& s) {
+    static std::vector<std::string> text;
+    static std::vector<const char*> labels;
+    if (labels.empty()) {
+        constexpr std::size_t kAspects = sizeof(kResolutionAspects) / sizeof(kResolutionAspects[0]);
+        for (std::size_t v = 0; v < s.values.size(); ++v)
+            text.push_back(s.values.size() == kAspects ? std::string("(") + kResolutionAspects[v] + ") " + s.values[v] : s.values[v]);
+        for (const std::string& t : text) labels.push_back(t.c_str());
+    }
+    return labels;
+}
+
 void setting_row(int id, const char* label = nullptr, const char* note = nullptr, const char* const* names = nullptr) {
     const Setting& s = g_set[id];
     if (!label) label = s.label;
@@ -2290,7 +2314,7 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
         return;
     } else if (id == kResolution || id == kMenuTextSize) {
         ImGui::SetNextItemWidth(cw);
-        ui::combo("##v", &want, s.values.data(), n);
+        ui::combo("##v", &want, id == kResolution ? resolution_labels(s).data() : s.values.data(), n);
     } else if (n <= 4 || id == kShadowResolution || id == kUpscaler || id == kAnisotropicFiltering) {
         // Shadow resolution's six sizes and Upscaling's five (Off, TAA, FSR 3,
         // FSR 4, DLSS - a slider once TAA made five) as buttons too, as wide as
