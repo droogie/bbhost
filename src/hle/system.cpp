@@ -20,6 +20,7 @@
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/window.h"
+#include "host/plugin_panel.h"
 #include "net/account.h"
 #include "net/session.h"
 #include "core/config.h"
@@ -1749,7 +1750,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         // who wants the pad to own the camera.
         const HostSettings& hs = host_settings_ref();  // the snapshot as published: no copy, no lock
         const bool want = hs.mouse_camera && !host_options_open() && !ingame_menu_open() &&
-                          !menu_pointer_in_menu() && !host_text_entry_open();
+                          !menu_pointer_in_menu() && !host_text_entry_open() && !plugin_panel_shown();
         // What the follow camera turns by, and whether its own turns as the
         // character moves are held: the keyboard and mouse used last, the
         // mouse turning the camera, and Mouse auto-rotation off. A controller
@@ -2006,6 +2007,9 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         return v > 0 ? v : 500;
     }();
 
+    // What the taps and the autopress below add stands for the controller
+    // (plugin API 29: a plugin reads it, and what it takes the game does not).
+    const PadState before_taps = p;
     // Taps the port itself asks for (hle_pad_tap): a press the game reads as
     // the player's, for a few polls - on a pad that is there. With no window
     // and no controller (a headless test run) the record is a disconnected
@@ -2089,6 +2093,22 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             p.buttons |= seq[(ms / 1500) % 4];
         }
         p.timestamp = static_cast<std::uint64_t>(ms) * 1000;
+    }
+    {
+        const std::uint32_t tapped = p.buttons & ~before_taps.buttons;
+        const auto moved = [](std::uint8_t now, std::uint8_t was) { return now != was ? now : kStickRest; };
+        host_plugin_pad_test(tapped, moved(p.lx, before_taps.lx), moved(p.ly, before_taps.ly), moved(p.rx, before_taps.rx),
+                             moved(p.ry, before_taps.ry));
+        const std::uint32_t take_axes = host_plugin_pad_taken_axes();
+        p.buttons &= ~(tapped & host_plugin_pad_taken_buttons());
+        if (take_axes & kPadTakeLeftStick) {
+            p.lx = before_taps.lx;
+            p.ly = before_taps.ly;
+        }
+        if (take_axes & kPadTakeRightStick) {
+            p.rx = before_taps.rx;
+            p.ry = before_taps.ry;
+        }
     }
     // BBHOST_TRACE_PAD=1: every read that sees a button change, with the
     // flip count and the reads-per-flip rate (double-press investigations).

@@ -59,7 +59,9 @@ The setup window's Game page has a Connection card. **Test connection**
 checks whether other players can reach this PC directly, or whether its
 co-op and PvP go through the server's relay. It runs from the game's own P2P
 port, so it needs the game closed (Play waits for it), and it takes a few
-seconds.
+seconds - up to about six when nothing comes back, sending again meanwhile
+so that a security program holding the first packets while it asks about
+bbhost.exe does not spoil the result.
 
 - It sends STUN requests from the P2P port to the server's two test ports
   (3479 and 3480 at the STUN server's host; `online.nat_test_ports` for a
@@ -69,8 +71,23 @@ seconds.
   - **You'll use the relay: your router changes ports per destination** - a
     different port (or address) at each, as symmetric and many carrier-grade
     NATs do: a direct connection fails, and the relay carries the session.
-  - **UDP is blocked on this network** - no answer at all: online play will
-    not work from this network (a firewall, a VPN, a school or work network).
+  - **No answer reached bbhost** - nothing came back. On its own the PC
+    cannot tell whether its requests got out or the answers were stopped on
+    the way back; signed in, the server tells which:
+    - **Nothing from bbhost reached the server** - its test ports saw none of
+      them. If the website's test passes, the network is fine and a firewall,
+      antivirus or VPN on this PC is blocking bbhost.exe: allow it and test
+      again, as online play needs it. If the website's test fails too, the
+      network blocks UDP (school and work networks can).
+    - **The server hears bbhost, but its answers don't reach it** - the server
+      saw the requests, and its answers were stopped on the way back, most
+      likely by a firewall or antivirus on this PC: allow bbhost.exe there and
+      test again.
+  - **This PC did not let bbhost send** - the system refused every request
+    (the card gives its error): allow bbhost.exe in the firewall or antivirus.
+  - The website's test is the browser's own packets, and the server counts
+    what reaches it, so it can pass while something on the PC stops
+    bbhost.exe's - the packets the game itself sends.
 - **Incoming**, the port check: one more request asks the server to answer
   from a third port, which the game never sent anything to. When that answer
   arrives, the router and this PC's firewall let in a packet nobody asked for
@@ -86,7 +103,9 @@ seconds.
 - The card says what the result means, the port the test ran from, and when
   your account's last test ran (also one taken on the website). F10's Game
   page repeats the verdict when the setup window opened before the game. The
-  log has one line per test (`connection test: ...`), with no addresses.
+  log has one line per test (`connection test: ...`): the result, how many
+  requests went out and how many the system refused (with its first error),
+  and no addresses.
 
 ## Beyond the console
 

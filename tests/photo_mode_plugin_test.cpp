@@ -1,0 +1,638 @@
+// plugins/photo_mode on a host of our own: no game, no GPU. The plugin is
+// loaded as the host loads plugins and driven frame by frame - the world's
+// state, the controller and the keyboard as the test sets them - while every
+// plugin API 29 call it makes is recorded. Checked: on a host older than API 29
+// it refuses before asking anything; it starts on P and on L3 held half a
+// second (the game's L3, as the player's bindings make it), Frozen, with the
+// world held, the controls taken as its own and the HUD out of the picture; a
+// shorter press does nothing and one hold does one thing; the camera starts at
+// the game's view and flies the way it looks; Cross and N advance a held world
+// by two updates; its takes and reads of the keyboard and mouse are its own
+// (input_take_as, input_as); Static gives the controls back but Options, the touchpad and
+// R3, Live flies over a running world, warns that enemies can still attack,
+// and holds the world again at the hunter's first hit; it ends on Escape, P
+// and L3 held, and at a loading screen, a cutscene or a menu, giving
+// everything back, and does not start in a menu; it does not start, and it ends,
+// with another player in the world or on the way, or in another's world; the
+// HUD option shows the HUD; its panel opens with it, R3 hides and shows it,
+// and the panel's rows go over the area's look while it runs and nowhere
+// else. Its options table is whole, every row with its help.
+//
+//   photo_mode_plugin_test <photo_mode.so>
+#include "bbhost_plugin.h"
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+#include <chrono>
+#include <cmath>
+#include <cstdarg>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <string>
+#include <thread>
+#include <vector>
+
+static int g_failures = 0;
+#define CHECK(cond)                                                                        \
+    do {                                                                                   \
+        if (!(cond)) {                                                                     \
+            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond);  \
+            ++g_failures;                                                                  \
+        }                                                                                  \
+    } while (0)
+
+namespace {
+
+constexpr std::uint16_t kP = 19, kN = 17, kW = 26, kEscape = 41, kTab = 43;
+
+struct Host {
+    std::map<std::string, std::string> config;
+    std::vector<std::string> log, messages;
+    void (*frame_fn)(void*) = nullptr;
+    void* frame_user = nullptr;
+    void (*view_fn)(BbCamera*, void*) = nullptr;
+    void* view_user = nullptr;
+    void (*option_fn)(const char*, const char*, void*) = nullptr;
+    void* option_user = nullptr;
+    // What the plugin asked for last.
+    int paused = 0, hud_hidden = 0, steps = 0;
+    std::uint32_t take_buttons = 0, take_axes = 0;
+    std::vector<std::uint16_t> taken_keys;
+    int unnamed_takes = 0;  // input_take calls: photo mode names its takes (input_take_as)
+    int unnamed_reads = 0;  // input calls: photo mode reads as itself (input_as)
+    std::int64_t hp = 100;  // the hunter's, as player_stat_get("hp") reads it
+    std::uint32_t taken_mouse = 0;
+    int taken_motion = 0;
+    // What the host reports.
+    BbWorldState world{};
+    BbPad pad{};
+    BbInput input{};
+    int calls = 0;  // every call that asks for something (pause, take, hide, step)
+    // The look and the panel.
+    int looks = 0;               // post_look calls
+    bool look_on = false;        // the last one set a look (not NULL)
+    BbLook look{};
+    bool panel_up = false;
+    std::uint32_t panel_flags = 0;
+    std::vector<std::pair<std::string, std::string>> sets;  // option_set calls
+} H;
+
+void fake_log(const char* fmt, ...) {
+    char b[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    H.log.push_back(b);
+}
+const char* fake_config(const char* key) {
+    static std::string v;
+    const auto it = H.config.find(key);
+    v = it == H.config.end() ? "" : it->second;
+    return v.c_str();
+}
+int fake_eboot_is_109() { return 1; }
+int fake_on_frame(void (*fn)(void*), void* user) {
+    H.frame_fn = fn;
+    H.frame_user = user;
+    return 0;
+}
+int fake_on_view(void (*fn)(BbCamera*, void*), void* user) {
+    H.view_fn = fn;
+    H.view_user = user;
+    return 0;
+}
+int fake_on_option(const char* name, void (*fn)(const char*, const char*, void*), void* user) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    H.option_fn = fn;
+    H.option_user = user;
+    return 0;
+}
+int fake_key_bound(std::uint16_t) { return 0; }
+int fake_show_message(const char* text, float) {
+    H.messages.push_back(text);
+    return 0;
+}
+int fake_world_pause(const char* name, int paused) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    H.paused = paused;
+    ++H.calls;
+    return 0;
+}
+int fake_world_step(const char* name, std::uint32_t updates) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    H.steps += static_cast<int>(updates);
+    ++H.calls;
+    return H.paused ? 0 : 1;
+}
+int fake_pad(BbPad* out) {
+    CHECK(out->size == sizeof(BbPad));
+    *out = H.pad;
+    out->size = sizeof(BbPad);
+    H.pad.pressed = 0;  // the frame's presses, read once a frame
+    return 0;
+}
+int fake_pad_take(const char* name, std::uint32_t buttons, std::uint32_t axes) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    H.take_buttons = buttons;
+    H.take_axes = axes;
+    ++H.calls;
+    return 0;
+}
+int fake_input(BbInput*) {
+    ++H.unnamed_reads;
+    return 1;
+}
+int fake_input_as(const char* name, BbInput* out) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    *out = H.input;
+    H.input.pressed = 0;
+    H.input.dx = H.input.dy = 0;
+    return 0;
+}
+int fake_input_take(const std::uint16_t*, std::size_t, std::uint32_t, int, int) {
+    ++H.unnamed_takes;
+    return 0;
+}
+int fake_input_take_as(const char* name, const std::uint16_t* sc, std::size_t n, std::uint32_t buttons, int, int motion) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    H.taken_keys.assign(sc, sc + n);
+    H.taken_mouse = buttons;
+    H.taken_motion = motion;
+    ++H.calls;
+    return 0;
+}
+int fake_world_state(BbWorldState* out) {
+    CHECK(out->size == sizeof(BbWorldState));
+    *out = H.world;
+    out->size = sizeof(BbWorldState);
+    return 0;
+}
+int fake_post_look(const char* name, const BbLook* look, std::uint32_t* available) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    ++H.looks;
+    H.look_on = look != nullptr;
+    if (look) {
+        CHECK(look->size == sizeof(BbLook));
+        H.look = *look;
+    }
+    if (available) *available = 63;
+    return 0;
+}
+int fake_panel_show(const char* name, const BbPanel* panel) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    H.panel_up = panel != nullptr;
+    if (panel) {
+        CHECK(panel->size == sizeof(BbPanel));
+        H.panel_flags = panel->flags;
+        CHECK(panel->guide && panel->guide_keys);
+    }
+    return 0;
+}
+int fake_panel_state(const char* name, BbPanelState* out) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    CHECK(out->size == sizeof(BbPanelState));
+    out->shown = H.panel_up ? 1 : 0;
+    out->closed = 0;
+    std::snprintf(out->page, sizeof out->page, "camera");
+    return 0;
+}
+int fake_option_set(const char* name, const char* key, const char* value) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    H.sets.emplace_back(key, value);
+    return 0;
+}
+int fake_hud_hide(const char* name, int hidden) {
+    CHECK(std::strcmp(name, "photo_mode") == 0);
+    H.hud_hidden = hidden;
+    ++H.calls;
+    return 0;
+}
+int fake_player_stat_get(const char* name, std::int64_t* value) {
+    if (std::strcmp(name, "hp") != 0) return 1;
+    *value = H.hp;
+    return 0;
+}
+int fake_player_position(float xyz[3], float* yaw) {
+    if (xyz) xyz[0] = xyz[1] = xyz[2] = 0;
+    if (yaw) *yaw = 0;
+    return 0;
+}
+
+struct Plugin {
+#if defined(_WIN32)
+    HMODULE handle = nullptr;
+    void* sym(const char* name) { return reinterpret_cast<void*>(GetProcAddress(handle, name)); }
+#else
+    void* handle = nullptr;
+    void* sym(const char* name) { return dlsym(handle, name); }
+#endif
+    int (*image)(const BbHostApi*) = nullptr;
+    const BbOption* options = nullptr;
+    const BbPluginInfo* info = nullptr;
+};
+
+Plugin load(const char* path) {
+    Plugin p;
+#if defined(_WIN32)
+    p.handle = LoadLibraryA(path);
+#else
+    p.handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+#endif
+    if (!p.handle) return p;
+    p.image = reinterpret_cast<int (*)(const BbHostApi*)>(p.sym("bb_plugin_image"));
+    p.options = static_cast<const BbOption*>(p.sym("bb_plugin_options"));
+    p.info = static_cast<const BbPluginInfo*>(p.sym("bb_plugin_info"));
+    return p;
+}
+
+BbHostApi make_api(std::uint32_t version) {
+    BbHostApi api;
+    std::memset(&api, 0, sizeof api);
+    api.version = version;
+    api.size = sizeof(BbHostApi);
+    api.log = &fake_log;
+    api.config = &fake_config;
+    api.eboot_is_109 = &fake_eboot_is_109;
+    api.on_frame = &fake_on_frame;
+    api.on_view = &fake_on_view;
+    api.on_option = &fake_on_option;
+    api.key_bound = &fake_key_bound;
+    api.show_message = &fake_show_message;
+    api.input = &fake_input;
+    api.input_take = &fake_input_take;
+    api.player_position = &fake_player_position;
+    api.player_stat_get = &fake_player_stat_get;
+    if (version >= 29) {
+        api.world_pause = &fake_world_pause;
+        api.world_step = &fake_world_step;
+        api.pad = &fake_pad;
+        api.pad_take = &fake_pad_take;
+        api.world_state = &fake_world_state;
+        api.hud_hide = &fake_hud_hide;
+        api.post_look = &fake_post_look;
+        api.panel_show = &fake_panel_show;
+        api.panel_state = &fake_panel_state;
+        api.option_set = &fake_option_set;
+        api.input_take_as = &fake_input_take_as;
+        api.input_as = &fake_input_as;
+    } else {
+        api.size = static_cast<std::uint32_t>(offsetof(BbHostApi, on_camera_target) + sizeof(void*));
+    }
+    return api;
+}
+
+void frame() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    H.frame_fn(H.frame_user);
+}
+// A key held for one frame, then let go for the next.
+void tap_key(std::uint16_t k) {
+    H.input.key[k] = 1;
+    frame();
+    H.input.key[k] = 0;
+    frame();
+}
+void tap_pad(std::uint32_t b) {
+    H.pad.buttons |= b;
+    H.pad.play |= b;
+    H.pad.pressed |= b;
+    frame();
+    H.pad.buttons &= ~b;
+    H.pad.play &= ~b;
+    frame();
+}
+// A button held for `seconds`, frame by frame, then let go: `button` the
+// controller's own, `play` what the player's bindings make it in the game.
+void hold(float seconds, std::uint32_t button = BB_PAD_L3, std::uint32_t play = BB_PAD_L3) {
+    H.pad.buttons |= button;
+    H.pad.play |= play;
+    H.pad.pressed |= button;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<int>(seconds * 1000.0f));
+    while (std::chrono::steady_clock::now() < until) frame();
+    H.pad.buttons &= ~button;
+    H.pad.play &= ~play;
+    frame();
+}
+// The world in for longer than the plugin's settle (the loading screen's page
+// fades out over its first frames).
+void settle() {
+    frame();
+    std::this_thread::sleep_for(std::chrono::milliseconds(3100));
+    frame();
+}
+// The game's view, as on_view hands it: looking along +z from (1, 2, 3).
+BbCamera game_view() {
+    BbCamera c{};
+    c.right[0] = 1;   // the game's right for a camera looking along +z, up +y
+    c.up[1] = 1;
+    c.forward[2] = 1;
+    c.position[0] = 1;
+    c.position[1] = 2;
+    c.position[2] = 3;
+    c.position[3] = 1;
+    c.fov_y = 0.75f;
+    c.aspect = 16.0f / 9.0f;
+    c.near_z = 0.1f;
+    c.far_z = 1000.0f;
+    return c;
+}
+bool logged(const char* text) {
+    for (const std::string& l : H.log) {
+        if (l.find(text) != std::string::npos) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: photo_mode_plugin_test <photo_mode.so>\n");
+        return 2;
+    }
+    Plugin p = load(argv[1]);
+    CHECK(p.handle && p.image && p.info && p.options);
+    if (!p.handle || !p.image) return 1;
+
+    // Its info and options: not a gameplay plugin (no session rules), not opt-in.
+    CHECK(std::strcmp(p.info->name, "photo_mode") == 0);
+    CHECK((p.info->flags & BB_PLUGIN_GAMEPLAY) == 0);
+    CHECK((p.info->flags & BB_PLUGIN_OPT_IN) == 0);
+    {
+        std::map<std::string, int> keys;
+        for (const BbOption* o = p.options; o->type; ++o) {
+            if ((o->type & 0xff) == BB_OPT_HEADING || (o->type & 0xff) == BB_OPT_ACTION) continue;
+            CHECK(o->key && o->label && o->help && o->help[0]);  // every row says what it does
+            CHECK(keys[o->key]++ == 0);
+            if ((o->type & 0xff) == BB_OPT_CHOICE) CHECK(std::strstr(o->choices, o->def) != nullptr);
+            CHECK(o->type & BB_OPT_LIVE);  // the panel changes them as photo mode runs
+        }
+        // Six pages, every row on one; the menus get only the first heading.
+        int pages = 0;
+        bool on_page = false;
+        for (const BbOption* o = p.options; o->type; ++o) {
+            if ((o->type & 0xff) == BB_OPT_HEADING) {
+                on_page = (o->type & BB_OPT_PANEL) != 0;
+                pages += on_page;
+                CHECK(o->key && o->label && o->help && o->help[0]);
+            } else {
+                CHECK(on_page);
+            }
+        }
+        CHECK(pages == 6);
+    }
+
+    // An API 28 host: refused before asking for anything.
+    {
+        const BbHostApi old = make_api(28);
+        CHECK(p.image(&old) != 0);
+        CHECK(H.frame_fn == nullptr && H.calls == 0);
+    }
+
+    const BbHostApi api = make_api(29);
+    CHECK(p.image(&api) == 0);
+    CHECK(H.frame_fn && H.view_fn && H.option_fn);
+    H.world.flags = BB_WORLD_IN;
+    H.pad.connected = 1;
+    H.input.playing = 1;
+    for (int i = 0; i < 5; ++i) frame();
+    CHECK(H.calls == 0);  // asks for nothing until started
+    // Not in the world's first three seconds.
+    tap_key(kP);
+    CHECK(H.paused == 0 && logged("the world is still coming in"));
+    settle();
+
+    // P starts it: Frozen, the world held, the controller and the camera's keys taken, the HUD out.
+    tap_key(kP);
+    CHECK(H.paused == 1);
+    CHECK(H.hud_hidden == 1);
+    CHECK((H.take_buttons & (BB_PAD_CROSS | BB_PAD_L1 | BB_PAD_R1 | BB_PAD_OPTIONS)) == (BB_PAD_CROSS | BB_PAD_L1 | BB_PAD_R1 | BB_PAD_OPTIONS));
+    CHECK(H.take_axes == (BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS));
+    CHECK(H.taken_motion == 1);
+    {
+        bool w = false;
+        for (std::uint16_t k : H.taken_keys) w = w || k == kW;
+        CHECK(w);
+    }
+    // The camera starts at the game's view and flies the way it looks.
+    BbCamera view = game_view();
+    H.view_fn(&view, H.view_user);
+    CHECK(std::fabs(view.position[0] - 1) < 1e-4f && std::fabs(view.position[2] - 3) < 1e-4f);
+    CHECK(std::fabs(view.forward[2] - 1) < 1e-4f && std::fabs(view.right[0] - 1) < 1e-4f && std::fabs(view.up[1] - 1) < 1e-4f);
+    CHECK(std::fabs(view.fov_y - 0.75f) < 1e-4f);
+    H.pad.ly = -1.0f;  // the stick up: forward
+    for (int i = 0; i < 10; ++i) frame();
+    H.pad.ly = 0.0f;
+    view = game_view();
+    H.view_fn(&view, H.view_user);
+    CHECK(view.position[2] > 3.01f);
+    CHECK(std::fabs(view.position[0] - 1) < 1e-3f && std::fabs(view.position[1] - 2) < 1e-3f);
+    H.pad.lx = 1.0f;  // right: along the game's right
+    for (int i = 0; i < 10; ++i) frame();
+    H.pad.lx = 0.0f;
+    view = game_view();
+    H.view_fn(&view, H.view_user);
+    CHECK(view.position[0] > 1.01f);
+
+    // Its panel opened with it, the Mode row back to Frozen, and no look over
+    // the area's until a row says otherwise.
+    CHECK(H.panel_up && (H.panel_flags & BB_PANEL_DEFAULTS));
+    CHECK(!H.sets.empty() && H.sets.back().first == "mode" && H.sets.back().second == "Frozen");
+    CHECK(H.looks >= 1 && !H.look_on);
+    // The rows' look, as they change.
+    H.option_fn("saturation", "50", H.option_user);
+    CHECK(H.look_on && (H.look.set & BB_LOOK_TONE) && std::fabs(H.look.saturation - 0.5f) < 1e-6f && H.look.exposure == 1.0f);
+    H.option_fn("dof", "On", H.option_user);
+    CHECK((H.look.set & BB_LOOK_DOF) && H.look.dof == 1 && std::fabs(H.look.dof_focus - 9.0f) < 1e-4f && H.look.dof_far_levels == 1);
+    H.option_fn("fog_height", "-50", H.option_user);
+    CHECK((H.look.set & BB_LOOK_FOG) && H.look.fog_height_offset == -50.0f && H.look.fog_distance == 1.0f);
+    H.option_fn("vignette", "Strong", H.option_user);
+    CHECK((H.look.set & BB_LOOK_VIGNETTE) && std::fabs(H.look.vignette - 1.0f) < 1e-6f);
+    H.option_fn("saturation", "100", H.option_user);
+    H.option_fn("dof", "Area's own", H.option_user);
+    H.option_fn("fog_height", "0", H.option_user);
+    H.option_fn("vignette", "Area's own", H.option_user);
+    CHECK(!H.look_on);  // every row the area's again: no look
+    // R3 and Tab hide and show the panel.
+    tap_pad(BB_PAD_R3);
+    CHECK(!H.panel_up);
+    tap_key(kTab);
+    CHECK(H.panel_up);
+
+    // The frame advance: Cross (it was not held to start) and N, two updates each.
+    tap_pad(BB_PAD_CROSS);
+    CHECK(H.steps == 2);
+    tap_key(kN);
+    CHECK(H.steps == 4);
+
+    // Static: the world runs, the controller is the game's but Options and the touchpad; Live flies over it.
+    H.option_fn("mode", "Static", H.option_user);
+    CHECK(H.paused == 0);
+    CHECK(H.take_buttons == (BB_PAD_OPTIONS | BB_PAD_TOUCHPAD | BB_PAD_R3) && H.take_axes == 0);
+    CHECK(H.taken_motion == 0);
+    view = game_view();
+    H.view_fn(&view, H.view_user);
+    const float static_z = view.position[2];
+    H.pad.ly = -1.0f;
+    for (int i = 0; i < 6; ++i) frame();
+    H.pad.ly = 0.0f;
+    view = game_view();
+    H.view_fn(&view, H.view_user);
+    CHECK(std::fabs(view.position[2] - static_z) < 1e-5f);  // the camera stays
+    H.option_fn("mode", "Live", H.option_user);
+    CHECK(H.paused == 0 && H.take_axes == (BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS));
+    CHECK(!H.messages.empty() && H.messages.back().find("enemies can still attack") != std::string::npos);
+    const int steps_before = H.steps;
+    tap_key(kN);
+    CHECK(H.steps == steps_before);  // no frame advance over a running world
+    // The hunter hit in Live: the world held again (Frozen) at once, the
+    // panel's row says so, and the player is told.
+    H.hp = 80;
+    frame();
+    CHECK(H.paused == 1);
+    CHECK(!H.sets.empty() && H.sets.back().first == "mode" && H.sets.back().second == "Frozen");
+    CHECK(H.messages.back().find("was hit") != std::string::npos);
+    CHECK(logged("hit in Live (100 -> 80 HP)"));
+    H.hp = 60;  // held now: no second notice
+    const std::size_t notices = H.messages.size();
+    frame();
+    CHECK(H.paused == 1 && H.messages.size() == notices);
+    // Healed in Live, then hit: the drop counts from where it was.
+    H.option_fn("mode", "Live", H.option_user);
+    CHECK(H.paused == 0);
+    frame();
+    H.hp = 90;
+    frame();
+    frame();
+    CHECK(H.paused == 0);
+    H.hp = 89;
+    frame();
+    CHECK(H.paused == 1);
+    H.hp = 100;
+    H.option_fn("mode", "Live", H.option_user);
+
+    // Escape ends it: everything given back, the panel down and no look.
+    H.option_fn("exposure", "150", H.option_user);
+    CHECK(H.look_on);
+    tap_key(kEscape);
+    CHECK(H.paused == 0 && H.hud_hidden == 0 && H.take_buttons == 0 && H.take_axes == 0 && H.taken_keys.empty() && H.taken_motion == 0);
+    CHECK(!H.look_on && !H.panel_up);
+    {
+        // A row changed while it is off goes over nothing.
+        const int looks = H.looks;
+        H.option_fn("exposure", "100", H.option_user);
+        CHECK(H.looks == looks);
+    }
+    view = game_view();
+    H.view_fn(&view, H.view_user);
+    CHECK(std::fabs(view.position[2] - 3) < 1e-5f);  // the game's view again
+
+    // L3 held half a second starts it, Frozen whatever the mode was; a shorter
+    // press does nothing, and one hold does one thing however long it lasts.
+    hold(0.2f);
+    CHECK(H.paused == 0);
+    hold(1.2f);
+    CHECK(H.paused == 1 && H.panel_up);
+    CHECK(H.steps == steps_before);  // L3 is no frame advance
+    hold(0.6f);  // held again: it ends
+    CHECK(H.paused == 0 && H.take_buttons == 0 && H.taken_keys.empty() && !H.panel_up);
+    // L3 as the game has it: the left stick pressed while Key Bindings put
+    // Dodge on it is not L3, the button they moved L3 to is.
+    hold(0.6f, BB_PAD_L3, BB_PAD_CIRCLE);
+    CHECK(H.paused == 0);
+    hold(0.6f, BB_PAD_CIRCLE, BB_PAD_L3);
+    CHECK(H.paused == 1);
+    hold(0.6f, BB_PAD_CIRCLE, BB_PAD_L3);
+    CHECK(H.paused == 0);
+    // Not in a menu: the player is told why.
+    H.world.flags = BB_WORLD_IN | BB_WORLD_MENU;
+    hold(0.6f);
+    CHECK(H.paused == 0 && H.messages.back().find("close the menu") != std::string::npos);
+    H.world.flags = BB_WORLD_IN;
+    hold(0.6f);
+    CHECK(H.paused == 1);
+
+    // Another player on the way: it ends at once, and does not start again.
+    H.world.arriving = 1;
+    frame();
+    CHECK(H.paused == 0 && H.hud_hidden == 0 && H.take_buttons == 0);
+    CHECK(logged("a player is on the way"));
+    tap_key(kP);
+    CHECK(H.paused == 0);
+    H.world.arriving = 0;
+    H.world.others = 1;
+    tap_key(kP);
+    CHECK(H.paused == 0);
+    CHECK(logged("another player is in the world"));
+    CHECK(!H.messages.empty());
+    H.world.others = 0;
+    // Matched to a player: the game hosts its session before they join the room.
+    H.world.flags = BB_WORLD_IN | BB_WORLD_OPEN;
+    for (const int role : {BB_SESSION_HOSTING, BB_SESSION_HOST, BB_SESSION_LEAVING}) {
+        H.world.session = role;
+        tap_key(kP);
+        CHECK(H.paused == 0);
+    }
+    H.world.flags = BB_WORLD_IN;
+    H.world.session = BB_SESSION_NONE;
+    tap_key(kP);
+    CHECK(H.paused == 1);  // nobody coming: it starts
+    H.world.session = BB_SESSION_HOSTING;
+    H.world.flags = BB_WORLD_IN | BB_WORLD_OPEN;
+    frame();
+    CHECK(H.paused == 0 && H.hud_hidden == 0 && H.take_buttons == 0);  // a match ends it
+    H.world.session = BB_SESSION_NONE;
+    H.world.flags = BB_WORLD_IN | BB_WORLD_VISITING;
+    tap_key(kP);
+    CHECK(H.paused == 0);
+    H.world.flags = BB_WORLD_IN | BB_WORLD_MENU;
+    tap_key(kP);
+    CHECK(H.paused == 0);
+    H.world.flags = BB_WORLD_IN | BB_WORLD_CUTSCENE;
+    tap_key(kP);
+    CHECK(H.paused == 0);
+    H.world.flags = BB_WORLD_LOADING;
+    tap_key(kP);
+    CHECK(H.paused == 0);
+
+    // A loading screen, a menu or a cutscene ends it.
+    for (const std::uint32_t flags : {BB_WORLD_LOADING, BB_WORLD_IN | BB_WORLD_MENU, BB_WORLD_IN | BB_WORLD_CUTSCENE}) {
+        const bool from_load = H.world.flags & BB_WORLD_LOADING;
+        H.world.flags = BB_WORLD_IN;
+        if (from_load) settle();
+        tap_key(kP);
+        CHECK(H.paused == 1);
+        H.world.flags = flags;
+        frame();
+        CHECK(H.paused == 0 && H.hud_hidden == 0 && H.take_buttons == 0);
+    }
+
+    // The HUD option shows the HUD in photo mode, live.
+    H.world.flags = BB_WORLD_IN;
+    tap_key(kP);
+    CHECK(H.hud_hidden == 1);
+    H.option_fn("hud", "true", H.option_user);
+    CHECK(H.hud_hidden == 0);
+    tap_key(kP);
+    CHECK(H.paused == 0);
+    H.config["photo_mode.hud"] = "true";
+
+    CHECK(H.unnamed_takes == 0);  // every take its own (input_take_as), never another plugin's
+    CHECK(H.unnamed_reads == 0);  // and every read (input_as): the mouse's motion is never taken from another
+
+    if (g_failures) {
+        std::fprintf(stderr, "photo_mode_plugin_test: %d failure(s)\n", g_failures);
+        for (const std::string& l : H.log) std::fprintf(stderr, "  log: %s\n", l.c_str());
+        return 1;
+    }
+    std::printf("photo_mode_plugin_test: ok\n");
+    return 0;
+}

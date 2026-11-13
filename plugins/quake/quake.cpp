@@ -16,7 +16,8 @@
 //   plasma = "A Call Beyond"   # or Blacksky Eye: what the plasma gun fires
 //
 // Every setting is live: the launcher's Plugins page and F9's change it while
-// playing.
+// playing. While another plugin holds the world still (photo mode's Frozen,
+// plugin API 29), Quake holds with it.
 //
 // Where it sits. The game's state update runs the camera manager's blend
 // (the follow camera's update, then the blend into the manager's own camera)
@@ -70,6 +71,7 @@
 
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -321,6 +323,11 @@ const bool g_sounds = [] {
     const char* e = std::getenv("QUAKE_SOUNDS");
     return e && e[0] == '1';
 }();
+
+// The world held still by another plugin - a photo mode's (plugin API 29's
+// world_pause) - as world_state read it on the main thread this frame; the
+// camera reads it on the game's.
+std::atomic<bool> g_world_held{false};
 
 // ---- the game ------------------------------------------------------------------
 
@@ -3182,6 +3189,11 @@ void camera(BbCamera& cam) {
     g_last = now;
     g_have_last = true;
     dt = std::min(dt, kMaxFrame);
+    // A world another plugin holds still (a photo mode's) holds Quake's time
+    // too: the player stays where the world was held and the view as it was,
+    // and what the keys and the mouse do meanwhile is that plugin's camera's.
+    const bool held = g_world_held.load(std::memory_order_relaxed);
+    if (held) dt = 0.0;
     g_now += dt;
     view.ms = g_now * 1000.0;
 
@@ -3310,7 +3322,8 @@ void camera(BbCamera& cam) {
         g_off_dump = g_now + 2.0;
         return;
     }
-    const Frame in = read_input();
+    Frame in = read_input();
+    if (held) in = Frame{};
     weapons_frame(in, view.ms);
     static const bool dmg_log = std::getenv("QUAKE_DMG") != nullptr;
     if (dmg_log) damage_log();
@@ -3511,6 +3524,14 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
         g.log("quake: %s changed to %s (%s physics)", key, value ? value : "?", physics_name());
     }, nullptr);
     g.on_world_load([](std::uint32_t) { g_written_valid = false; });
+    // A world another plugin holds still (plugin API 29: a photo mode's).
+    if (api->version >= 29 && api->size >= offsetof(BbHostApi, world_state) + sizeof(void*)) {
+        g.every_frame([] {
+            BbWorldState w{};
+            w.size = sizeof(w);
+            g_world_held.store(g.api->world_state(&w) == 0 && (w.flags & BB_WORLD_PAUSED) != 0, std::memory_order_relaxed);
+        });
+    }
     // The guns' rows, once the tables are there and whenever the switch moves.
     g.every_frame([] {
         static std::uint64_t frame = 0;

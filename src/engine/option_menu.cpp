@@ -593,8 +593,9 @@ std::uint64_t g_gfx_vtable = 0;
 std::uint64_t g_gfx_base_depth = 0;  // its popup stack with nothing open on it
 
 
-// PC Effects: motion blur and depth of field (shader patches,
-// host/shader_patch.h), chromatic aberration and vignette, and two sliders -
+// PC Effects: motion blur (a shader patch, host/shader_patch.h), depth of
+// field (YEBIS's own switch, engine/graphics_patch.cpp), chromatic aberration
+// and vignette, and two sliders -
 // bloom (10 the area's own glare, 0 none) and saturation (5 the area's own,
 // 0 black and white).
 Toggle g_effects[] = {

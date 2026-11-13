@@ -157,7 +157,6 @@ enum SettingId {
     kSkipLogos,
     kPerformanceMode,
     kDebugMenu,
-    kDebugCamera,
     kChangeAppearance,
     kRebirth,
     kFivePlayers,
@@ -367,8 +366,12 @@ Setting g_set[kSettingCount] = {
      "The game's own anti-aliasing pass, over the finished picture. Off while TAA, FSR, DLSS or a plugin's own anti-aliasing "
      "takes its place: they do the anti-aliasing, and this pass after them would only soften the picture again.",
      false},
+    // Off is YEBIS's own switch, cleared each view (engine/graphics_patch.cpp):
+    // none of the blur's passes run.
     {"depth_of_field", "Depth of field", {"Off", "On"}, 1,
-     "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
+     "Blurs distant scenery, and what is out of focus in cutscenes; indoors there is rarely anything far enough to "
+     "blur. Off leaves it out everywhere, and its passes are not drawn.",
+     false},
     {"chromatic_aberration", "Chromatic aberration", {"Off", "On"}, 1,
      "The colour fringing at the edges of the frame.", false},
     // Two of the area's draw parameters (param/drawparam), scaled or cleared
@@ -640,11 +643,6 @@ Setting g_set[kSettingCount] = {
     // plugin replaced (engine/debug_menu.h): no row shows it, and an "On" an
     // older bbhost saved turns the plugin on once (main.cpp).
     {"debug_menu", "Debug menu", {"Off", "On"}, 0, "Replaced by the Debug Menu plugin.", true},
-    // Lance McDonald's "Restore Debug Camera" (patches/debug-camera.toml). Its
-    // code takes the place of a debug-only load-test step, so the debug menu's
-    // LOAD TEST and DUNGEON MOVEMAP TEST crash while it is on.
-    {"debug_camera", "Debug camera", {"Off", "On"}, 0,
-     "Requires a restart. Hold Interact (E) and press L3 (Left Ctrl) to cycle the free camera's modes.", true},
     // The PC enhancements: additions to the game itself, each read once at
     // start (main.cpp hands them to config_set_enhancements), all on unless
     // bbhost.toml's [world] says otherwise. Off, all of them, is the game as it
@@ -1389,7 +1387,6 @@ void apply(int id) {
         }
         case kSkipLogos:
         case kDebugMenu:
-        case kDebugCamera:
         case kChangeAppearance:
         case kRebirth:
         case kFivePlayers:
@@ -1565,7 +1562,6 @@ void rebuild_settings() {
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
     h.debug_menu = on_of(kDebugMenu);
-    h.debug_camera = on_of(kDebugCamera);
     h.change_appearance = on_of(kChangeAppearance);
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
@@ -1761,6 +1757,13 @@ void host_options_load() {
                 continue;
             }
             if (key == "old_hunters") continue;  // v0.2.9's PC enhancement: The Old Hunters is always on now
+            // The Debug camera: it switched a patch manifest no package carries
+            // (patches/debug-camera.toml), and photo mode (plugins/photo_mode)
+            // took its place. A saved one is set aside; the next save drops it.
+            if (key == "debug_camera") {
+                if (val == "On") host_log("options: the Debug camera is gone - photo mode is its place (P, or hold L3); the saved On is set aside");
+                continue;
+            }
             // Looked at again once the file's version is known (below).
             if (key == "frame_cap") frame_cap_val = val;
             if (key == "window_mode") window_mode_val = val;
@@ -2411,11 +2414,11 @@ void account_page() {
         if (const net::nat::Remembered c = net::nat::remembered(); c.known) {
             const double now = static_cast<double>(std::time(nullptr));
             ImGui::TextUnformatted(("Connection test (" + net::nat::ago(c.at, now) + (c.saved ? "" : ", not saved") +
-                                    "): " + net::nat::headline(c.verdict))
+                                    "): " + (c.head.empty() ? std::string(net::nat::headline(c.verdict)) : c.head))
                                        .c_str());
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
                 ui::tooltip("Connection test",
-                            std::string(net::nat::meaning(c.verdict)) +
+                            (c.meaning.empty() ? std::string(net::nat::meaning(c.verdict)) : c.meaning) +
                                 (c.inbound != net::nat::Inbound::NotTested
                                      ? " " + net::nat::inbound_line(c.inbound, config().p2p_port > 0 ? config().p2p_port : 9307, c.verdict)
                                      : std::string()),
@@ -2991,14 +2994,15 @@ void host_options_save_now() {
 
 int host_options_selftest(const std::string& dir) {
     // An options file as v0.2.31 wrote it, Character motion at Off (then
-    // called Velocity map) and one other setting away from its default.
+    // called Velocity map) and one other setting away from its default - and
+    // the Debug camera on, a setting that is gone.
     const std::string path = dir + "/bbhost-options.toml";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     {
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
         f << "# bbhost PC port options. Written by the options screen (F10).\n[options]\nversion = \"8\"\n"
-             "char_motion = \"Velocity map\"\nssr_quality = \"Half\"\n";
+             "char_motion = \"Velocity map\"\ndebug_camera = \"On\"\nssr_quality = \"Half\"\n";
         if (!f) {
             std::printf("options selftest: cannot write %s\n", path.c_str());
             return 1;
@@ -3028,6 +3032,7 @@ int host_options_selftest(const std::string& dir) {
     check(text.find("\nchar_motion = \"Off\"\n") != std::string::npos, "written back as char_motion = \"Off\"");
     check(text.find("Velocity map") == std::string::npos, "with no Velocity map left in the file");
     check(text.find("\nssr_quality = \"Half\"\n") != std::string::npos, "and ssr_quality = \"Half\" kept");
+    check(text.find("debug_camera") == std::string::npos, "and the Debug camera's line, a setting that is gone, left out");
     std::printf("options selftest: %s (%s)\n", failed ? "FAILED" : "passed", path.c_str());
     return failed ? 1 : 0;
 }

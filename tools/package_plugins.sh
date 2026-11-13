@@ -8,7 +8,7 @@
 # secret) or RELEASE_SIGNING_KEY_FILE; without either the plugins ship unsigned.
 set -eu
 from=$1; to=$2
-plugins="randomizer boss_rush mutators quake lohit ps1 iso debug_menu"
+plugins="randomizer boss_rush mutators quake lohit ps1 iso photo_mode debug_menu"
 mkdir -p "$to"
 key=""
 if [ -n "${RELEASE_SIGNING_KEY:-}" ]; then

@@ -317,7 +317,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool stay_borderless = host_opt_get("stay_borderless");  // Windows' switch under the Window row, for Borderless
     bool skip_logos = host_opt_get("skip_logos");
     bool performance_mode = host_opt_get("performance_mode");
-    bool debug_camera = host_opt_get("debug_camera");
     int frame_cap = host_opt_frame_cap();
     // The Native frame clock (experimental, off): F10's DISPLAY row, read as the
     // game starts (engine/frame_rate.cpp; BBHOST_FRAME_CLOCK=0|1 wins).
@@ -406,7 +405,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // The Patches page: every manifest the loader would read
     // (engine/patch_manifest.h), each with its switch. One that follows a
     // setting (its `option`) shows that setting - the Game page's Skip company
-    // logos, the debug camera - so a patch has one switch; the rest (The Old
+    // logos, Performance mode - so a patch has one switch; the rest (The Old
     // Hunters among them) are [patches] <name> = true or false in bbhost.toml.
     bool quick_reentry = cfg.quick_reentry, all_post_processors = cfg.all_post_processors;
     bool quick_reentry_was = quick_reentry, all_post_processors_was = all_post_processors;
@@ -434,7 +433,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         const std::string& o = r.p.option;
         if (o == "startup.skip_intro") return &skip_logos;
         if (o == "startup.performance_mode") return &performance_mode;
-        if (o == "debug.free_camera") return &debug_camera;
         if (o == "loading.quick_reentry") return &quick_reentry;
         if (o == "streaming.all_post_processors") return &all_post_processors;
         return &r.on;
@@ -611,7 +609,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("stay_borderless", stay_borderless);
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("performance_mode", performance_mode);
-        host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);  // unticks Custom limit, set again next
         host_opt_set_frame_cap_custom(cap_custom, cap_custom_fps);
         host_opt_set("frame_clock", frame_clock);
@@ -789,7 +786,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         if (nat_record)
             net::nat::remember(net::nat::Remembered{true, net::nat::verdict_from_word(nat_check.nat_test.verdict),
                                                     net::nat::inbound_from_word(nat_check.nat_test.inbound),
-                                                    nat_check.nat_test.tested_at, true});
+                                                    nat_check.nat_test.tested_at, true, {}, {}});
         const bool can_play = app0_ok && eboot.ok && !compiling && !game && !nat_view.running;
         bool play = false;
         const SignIn si = sign_in_state();
@@ -1364,57 +1361,29 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 std::string incoming, detail, note;
                 ImU32 col = ui::kText;
                 ui::Icon icon = ui::Icon::Online;
+                auto mark = [&](nat::Tone t) {
+                    col = t == nat::Tone::Good ? ui::kGood : t == nat::Tone::Relay ? ui::kIce : t == nat::Tone::Bad ? ui::kBad : ui::kWarn;
+                    icon = t == nat::Tone::Good ? ui::Icon::Check : t == nat::Tone::Relay ? ui::Icon::Info : ui::Icon::Warning;
+                };
                 auto look = [&](nat::Verdict v) {
                     head = nat::headline(v);
                     meaning = nat::meaning(v);
-                    col = v == nat::Verdict::Direct ? ui::kGood : v == nat::Verdict::Relay ? ui::kIce : ui::kWarn;
-                    icon = v == nat::Verdict::Direct ? ui::Icon::Check : v == nat::Verdict::Relay ? ui::Icon::Info : ui::Icon::Warning;
-                    if (v == nat::Verdict::Blocked) col = ui::kBad;
+                    mark(nat::tone_of(v));
                 };
                 if (nat_view.running) {
                     head = "Testing the connection...";
                     meaning = std::string(nat_view.step) + " From UDP port " + std::to_string(p2p) + "; a few seconds.";
                     icon = ui::Icon::Refresh;
                 } else if (nat_ours) {
-                    const nat::Outcome& o = nat_view.outcome;
-                    const std::string port = std::to_string(o.probe.local_port);
-                    if (!o.resolved) {
-                        head = "The test server could not be found";
-                        meaning = "Its name did not resolve: check the server chosen above and this PC's network.";
-                        col = ui::kWarn;
-                        icon = ui::Icon::Warning;
-                    } else if (o.probe.error == nat::ProbeResult::Error::PortInUse) {
-                        head = "UDP port " + port + " is in use: close the game to test";
-                        meaning = "Another program has the game's P2P port - most likely bbhost itself, running the game. The "
-                                  "test sends from that port, so it runs while the game is closed.";
-                        col = ui::kWarn;
-                        icon = ui::Icon::Warning;
-                    } else if (o.probe.error != nat::ProbeResult::Error::None) {
-                        head = "The test could not use UDP port " + port;
-                        meaning = o.probe.error_text.empty() ? std::string("The test was stopped.") : o.probe.error_text + ".";
-                        col = ui::kWarn;
-                        icon = ui::Icon::Warning;
-                    } else {
-                        look(o.shown());
-                        if (o.local != nat::Verdict::Blocked) incoming = nat::inbound_line(o.inbound, o.probe.local_port, o.shown());
-                        std::string ports = nat::public_ports(o.probe);
-                        detail = "Tested from UDP port " + port + " (the game's P2P port)" + (ports.empty() ? "" : ": the server saw " + ports) +
-                                 ". " + capitalised(nat::ago(o.at, now_unix)) + "; ";
-                        if (o.saved()) {
-                            detail += "saved to your account for this network (test again on another one).";
-                            if (o.save.verdict != o.local)
-                                note = std::string("This PC's own reading was \"") + nat::verdict_word(o.local) +
-                                       "\": the server compares what reached it from the address this request came from, and a VPN or "
-                                       "proxy for web traffic can make the two differ.";
-                        } else if (!o.signed_in) {
-                            detail += "this PC's own reading, not saved to your account.";
-                            note = o.local == nat::Verdict::Relay
-                                       ? "Sign in (above) and test again: the server then knows to relay you, and other hunters can reach you."
-                                       : "Sign in (above) and test again to keep it for your account; the server goes by the kept result.";
-                        } else {
-                            detail += "not saved to your account: " + nat::unsaved_reason(o) + ".";
-                        }
-                    }
+                    // What came back to bbhost and what the server saw, in
+                    // words (net/nat_check.h card_of).
+                    const nat::Card c = nat::card_of(nat_view.outcome, now_unix);
+                    head = c.head;
+                    meaning = c.meaning;
+                    incoming = c.incoming;
+                    detail = c.detail;
+                    note = c.note;
+                    mark(c.tone);
                 } else if (record) {
                     const nat::Verdict v = nat::verdict_from_word(ac.nat_test.verdict);
                     look(v);

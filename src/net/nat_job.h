@@ -2,8 +2,9 @@
 // it does): on a thread of its own, from the game's P2P port, while the game
 // is not running - the setup window's Connection card starts it, and only
 // there. One at a time; nothing waits for it. It never takes longer than the
-// exchange's 3 s and the server's answer's 8 s, and closing the window ends
-// it.
+// exchange's 6 s and the server's answer's 8 s, and closing the window ends
+// it. When this PC refused every datagram, the server is not asked: nothing
+// reached it.
 #pragma once
 
 #include "net/nat_check.h"
@@ -60,6 +61,9 @@ struct Remembered {
     Inbound inbound = Inbound::NotTested;
     double at = 0;       // Unix seconds
     bool saved = false;  // kept for the account
+    // The card's headline and meaning for a test run here ("" for the
+    // account's last test: headline() and meaning() of its verdict).
+    std::string head = {}, meaning = {};
 };
 void remember(const Remembered& r);
 Remembered remembered();

@@ -276,8 +276,10 @@ Plugins
       ps1 = true           # the 3D drawn as the first PlayStation drew it
       iso = true           # an isometric camera, the walls in its way cut away
       debug_menu = true    # the developers' debug menu: \` opens it
+      photo_mode = false   # Photo mode is on without this (P, or hold L3 for
+                           # half a second, for a free camera); false turns it off
   Each one's settings go in a section of its own name ([randomizer],
-  [boss_rush], [mutators], [quake], [lohit], [ps1], [iso]); docs/plugins.md in the repository lists them.
+  [boss_rush], [mutators], [quake], [lohit], [ps1], [iso], [photo_mode]); docs/plugins.md in the repository lists them.
   Use the boss rush on a save of its own. Cheating against other players
   with the debug menu gets an account banned; trying it out online with
   friends is fine.

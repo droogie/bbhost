@@ -120,6 +120,32 @@ int main() {
         CHECK(m.name == "smaller-hunter" && m.enabled);
     }
 
+    // The built-in Performance patch (engine/performance_v3_sites.inc, always
+    // on) leaves the scene's depth and G-buffer copies to the game: none of its
+    // sites writes the three calls of the copy recorder (0x268f180) in the
+    // scene's render, which the list turned into NOPs. Without them SSAO,
+    // depth of field and the passes after the G-buffer read a target nothing
+    // wrote that frame.
+    {
+        const std::vector<patch_file::Site> perf = {
+#include "engine/performance_v3_sites.inc"
+        };
+        constexpr std::uint64_t kCopyCalls[] = {0x026a10c0, 0x026a2829, 0x026a283f};  // 5-byte calls each
+        int over = 0;
+        for (const patch_file::Site& s : perf) {
+            CHECK(s.expect.size() == s.bytes.size() && !s.bytes.empty());
+            for (const std::uint64_t call : kCopyCalls) {
+                if (s.address < call + 5 && call < s.address + s.bytes.size()) {
+                    std::printf("  performance site %s (0x%llx) writes the copy call at 0x%llx\n", s.id.c_str(),
+                                static_cast<unsigned long long>(s.address), static_cast<unsigned long long>(call));
+                    ++over;
+                }
+            }
+        }
+        CHECK(over == 0);
+        CHECK(perf.size() == 172);  // the list's 177 less the camera blur's force, Model detail's and the three copies
+    }
+
     // What a player starts from turns nothing on.
     CHECK(config_write_template((dir / "template.toml").string()));
     CHECK(patches_turned_on(dir / "template.toml").empty());

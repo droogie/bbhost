@@ -5,14 +5,20 @@
 //   - the same public port at both test ports (a router that keeps one port): direct;
 //   - another port, or another public address, at the second (one that maps
 //     every destination anew): relay;
-//   - nothing (UDP blocked): blocked; one port alone: inconclusive;
+//   - nothing (UDP blocked): no answer, at the deadline; one port alone:
+//     inconclusive;
 //   - the port check: OTHER-ADDRESS and the second answer from a third port
 //     (open), OTHER-ADDRESS alone (closed: the router dropped the second
 //     answer), neither (a server without it: not available);
+//   - the first 2.5 s held, as a security program asking about bbhost.exe
+//     holds them: the later sends get through, the port check's too;
+//   - every send refused by this PC: counted with the first error, over once
+//     nothing is left to try;
 //   - a lost first answer, the port held by another socket, a cancel.
 // Then what the server's /auth/nat_test answers mean, the ports setting, and
-// the words the card and the log use (the owner's three headlines; no
-// address in the log line).
+// the words the card and the log use: the owner's three headlines, each
+// reading of a finished test (no answer kept or not, the server's blocked,
+// its answers stopped, every send refused...), no address in the log line.
 #include "net/nat_check.h"
 #include "net/stun.h"
 
@@ -23,6 +29,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -94,10 +101,12 @@ struct Server {
     Check check = Check::Open;
     int drop_first_plain_a = 0;  // the first test port's plain answers to drop
     bool xor_only = false;       // XOR-MAPPED-ADDRESS alone, as RFC 5389 servers answer
+    int hold_ms = 0;             // nothing answered until then (a security program holding the first datagrams)
     int fd[3] = {-1, -1, -1};    // A, B, R
     std::uint16_t port[3] = {};
     std::atomic<bool> stop{false};
     std::atomic<int> requests{0}, change_requests{0}, second_answers{0};
+    std::chrono::steady_clock::time_point started;
     std::thread thread;
 
     void begin() {
@@ -105,6 +114,7 @@ struct Server {
             fd[i] = udp_bound(0);
             port[i] = port_of(fd[i]);
         }
+        started = std::chrono::steady_clock::now();
         thread = std::thread([this] { serve(); });
     }
     ~Server() {
@@ -169,6 +179,7 @@ struct Server {
                 }
                 const bool change = flags & net::stun::kChangePort;
                 if (change) ++change_requests;
+                if (std::chrono::steady_clock::now() - started < std::chrono::milliseconds(hold_ms)) continue;
                 if (mapping == Mapping::Silent || (mapping == Mapping::FirstOnly && i == 1)) continue;
                 if (i == 0 && !change && plain_a++ < drop_first_plain_a) continue;
                 std::uint32_t ip = ntohl(from.sin_addr.s_addr);
@@ -188,7 +199,7 @@ struct Server {
     }
 };
 
-ProbeResult run(Server& s, std::uint16_t local, int deadline_ms = 3000, std::function<bool()> cancelled = {}) {
+ProbeResult run(Server& s, std::uint16_t local, int deadline_ms = 6000, std::function<bool()> cancelled = {}) {
     net::nat::ProbeParams p;
     p.server = htonl(INADDR_LOOPBACK);
     p.ports = {s.port[0], s.port[1]};
@@ -221,6 +232,7 @@ void exchange_cases() {
         CHECK(net::nat::inbound_of(r) == Inbound::Open);
         CHECK(took < 1000);  // everything in: no waiting out the deadline
         CHECK(s.change_requests == 1 && s.second_answers == 1);
+        CHECK(r.sent == 3 && r.refused == 0 && r.send_error.empty());
         CHECK(net::nat::public_ports(r) == "public port " + std::to_string(local) + " at both test ports, the game's own");
     }
     {   // a new port per destination; the router drops the second answer
@@ -251,7 +263,7 @@ void exchange_cases() {
         CHECK(net::nat::verdict_of(r) == Verdict::Relay);
         CHECK(net::nat::public_ports(r).find("from different public addresses") != std::string::npos);
     }
-    {   // nothing answers: blocked, at the deadline
+    {   // nothing answers: no answer, at the deadline
         Server s;
         s.mapping = Server::Mapping::Silent;
         s.begin();
@@ -261,9 +273,55 @@ void exchange_cases() {
         CHECK(r.error == ProbeResult::Error::None);
         CHECK(net::nat::verdict_of(r) == Verdict::Blocked);
         CHECK(net::nat::inbound_of(r) == Inbound::NotTested);
-        CHECK(took >= 2900 && took < 3500);
-        CHECK(s.requests == 4 + 4 + 3);  // each request four times, the port check's three
+        CHECK(took >= 5900 && took < 6600);
+        CHECK(s.requests == 6 + 6 + 5);  // each request six times, the port check's five
+        CHECK(r.sent == 17 && r.refused == 0);
         CHECK(net::nat::public_ports(r).empty());
+    }
+    {   // the first 2.5 s held (a security program asking about bbhost.exe): the sends at 2.8 s get through, the
+        // port check's with them
+        Server s;
+        s.hold_ms = 2500;
+        s.begin();
+        const std::uint16_t local = free_port();
+        const auto t0 = std::chrono::steady_clock::now();
+        const ProbeResult r = run(s, local);
+        const double took = ms_since(t0);
+        CHECK(net::nat::verdict_of(r) == Verdict::Direct);
+        CHECK(r.at[0].port == local && r.at[1].port == local);
+        CHECK(net::nat::inbound_of(r) == Inbound::Open);
+        CHECK(took > 2700 && took < 3600);  // over once the held-up answers are in
+        CHECK(s.change_requests == 4);
+    }
+    {   // held, and the router drops the second answer: closed, a second after the port check's request got through
+        Server s;
+        s.hold_ms = 2500;
+        s.check = Server::Check::Closed;
+        s.begin();
+        const auto t0 = std::chrono::steady_clock::now();
+        const ProbeResult r = run(s, free_port());
+        const double took = ms_since(t0);
+        CHECK(net::nat::verdict_of(r) == Verdict::Direct);
+        CHECK(net::nat::inbound_of(r) == Inbound::Closed);
+        CHECK(took > 3700 && took < 4600);
+        CHECK(s.change_requests == 4);  // its fifth only while not even the usual answer has come
+    }
+    {   // this PC refuses every send (here the limited broadcast address, without SO_BROADCAST): counted, the
+        // first error kept, over once nothing is left to try
+        net::nat::ProbeParams p;
+        p.server = htonl(INADDR_BROADCAST);
+        p.ports = {3479, 3480};
+        p.local_port = free_port();
+        const auto t0 = std::chrono::steady_clock::now();
+        const ProbeResult r = net::nat::probe(p);
+        const double took = ms_since(t0);
+        CHECK(r.error == ProbeResult::Error::None);
+        CHECK(r.sent == 0 && r.refused == 6 + 6 + 5);
+        CHECK(r.send_error_code != 0 && r.send_error == std::strerror(r.send_error_code));
+        CHECK(r.send_denied == (r.send_error_code == EACCES || r.send_error_code == EPERM));
+        CHECK(net::nat::nothing_sent(r));
+        CHECK(net::nat::verdict_of(r) == Verdict::Blocked);
+        CHECK(took > 4100 && took < 5000);  // the last refused at 4.2 s: no wait for the deadline
     }
     {   // one test port answers
         Server s;
@@ -284,14 +342,16 @@ void exchange_cases() {
         CHECK(ms_since(t0) < 1000);  // no wait for an answer that never comes
         CHECK(s.change_requests == 1);
     }
-    {   // the first test port's plain answers lost: its retries, and the port check's usual answer, fill it in
+    {   // every plain answer of the first test port lost: the port check's usual answer, from there, fills it in
         Server s;
-        s.drop_first_plain_a = 4;
+        s.drop_first_plain_a = 6;
         s.begin();
         const std::uint16_t local = free_port();
+        const auto t0 = std::chrono::steady_clock::now();
         const ProbeResult r = run(s, local);
         CHECK(r.at[0].got && r.at[0].port == local);
         CHECK(net::nat::verdict_of(r) == Verdict::Direct);
+        CHECK(ms_since(t0) < 1500);  // at once, not at a retry
     }
     {   // the port held by another socket: nothing sent
         Server s;
@@ -457,16 +517,18 @@ void words_cases() {
     CHECK(net::nat::ago(1000, 1000 + 3 * 3600) == "3 hours ago");
     CHECK(net::nat::ago(1000, 1000 + 2 * 86400) == "2 days ago");
 
-    // The log line: the verdict, the port check, the port, whether kept - no address.
+    // The log line: the verdict, the port check, the port, what was sent and refused, whether kept - no address.
     const std::regex dotted(R"(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)");
     net::nat::Outcome o;
     o.probe = made({{true, htonl(0xCB007107u), 9307}, {true, htonl(0xCB007107u), 9307}}, true, true, true);
+    o.probe.sent = 3;
     o.local = net::nat::verdict_of(o.probe);
     o.inbound = net::nat::inbound_of(o.probe);
     o.signed_in = true;
     o.save = net::nat::read_save_reply(200, R"({"ResKind":0,"Verdict":"direct","TestedAt":5})", "");
     std::string line = net::nat::log_line(o);
-    CHECK(line == "connection test: direct (public port 9307 at both test ports, the game's own); incoming open; UDP port 9307; saved to the account");
+    CHECK(line == "connection test: direct (public port 9307 at both test ports, the game's own); incoming open; UDP port 9307; sent 3, "
+                  "refused 0; saved to the account");
     CHECK(!std::regex_search(line, dotted));
     o.save = net::nat::read_save_reply(200, R"({"ResKind":0,"Verdict":"relay","TestedAt":5})", "");
     CHECK(net::nat::log_line(o).find("saved to the account - the server says relay") != std::string::npos);
@@ -478,14 +540,187 @@ void words_cases() {
     o.save = net::nat::read_save_reply(429, R"({"ResKind":1,"Message":"too many tests; try again later"})", "");
     CHECK(net::nat::log_line(o).find("10 tests an hour") != std::string::npos);
     o.probe = made({{}, {}});
+    o.probe.sent = 17;
     o.local = net::nat::verdict_of(o.probe);
     o.inbound = net::nat::inbound_of(o.probe);
-    CHECK(net::nat::log_line(o).rfind("connection test: blocked (no answer from the test ports); incoming not checked", 0) == 0);
+    CHECK(net::nat::log_line(o).rfind("connection test: blocked (no answer from the test ports); incoming not checked; UDP port 9307; "
+                                      "sent 17, refused 0; not saved (the server takes 10 tests",
+                                      0) == 0);
+    // every send refused: the count and the first refusal's words; the server not asked
+    o.probe.sent = 0;
+    o.probe.refused = 17;
+    o.probe.send_error_code = EPERM;
+    o.probe.send_error = "Operation not permitted";
+    o.save = SaveReply{};
+    line = net::nat::log_line(o);
+    CHECK(line == "connection test: blocked (no answer from the test ports); incoming not checked; UDP port 9307; sent 0, refused 17 "
+                  "(Operation not permitted); not saved (nothing was sent)");
+    CHECK(!std::regex_search(line, dotted));
+    o.probe.sent = 12;
+    o.probe.refused = 5;
+    CHECK(net::nat::log_line(o).find("; sent 12, refused 5 (Operation not permitted); not saved (the server did not answer") !=
+          std::string::npos);
     o.probe.error = ProbeResult::Error::PortInUse;
     o.probe.error_text = "Address already in use";
     CHECK(net::nat::log_line(o) == "connection test: UDP port 9307 is in use by another program (Address already in use); nothing sent");
     o.resolved = false;
     CHECK(net::nat::log_line(o).find("did not resolve") != std::string::npos);
+}
+
+// A finished test as the job leaves it: what came back read, signed in or
+// not, and the server's answer to /auth/nat_test (none when not asked).
+net::nat::Outcome finished(ProbeResult p, bool signed_in, const char* reply = nullptr) {
+    net::nat::Outcome o;
+    o.probe = std::move(p);
+    o.local = net::nat::verdict_of(o.probe);
+    o.inbound = net::nat::inbound_of(o.probe);
+    o.signed_in = signed_in;
+    if (reply) o.save = net::nat::read_save_reply(200, reply, "");
+    o.at = 1000;
+    return o;
+}
+
+bool has(const std::string& text, const char* part) { return text.find(part) != std::string::npos; }
+
+void reading_cases() {
+    using net::nat::Answer;
+    using net::nat::Card;
+    using net::nat::Reading;
+    using net::nat::Tone;
+    const Answer a{true, 0x0100000a, 9307}, b{true, 0x0100000a, 40002}, none{};
+    const char* kDirect = R"({"ResKind":0,"Verdict":"direct","TestedAt":5})";
+    const char* kRelay = R"({"ResKind":0,"Verdict":"relay","TestedAt":5})";
+    const char* kBlocked = R"({"ResKind":0,"Verdict":"blocked","TestedAt":5})";
+    ProbeResult back = made({a, a}, true, true, false);  // both answers, the port check closed
+    back.sent = 3;
+    ProbeResult silent = made({none, none});  // sent, nothing came back
+    silent.sent = 17;
+    ProbeResult refused = made({none, none});  // nothing went out
+    refused.refused = 17;
+    refused.send_error_code = EPERM;
+    refused.send_error = "Operation not permitted";
+    refused.send_denied = true;
+    ProbeResult one = made({a, none});
+    one.sent = 7;
+    ProbeResult changes = made({a, b});
+    changes.sent = 3;
+
+    // Not signed in, nothing back: this PC cannot tell out from back - no word of the server, nor of "this network"
+    // being blocked; signing in tells which.
+    net::nat::Outcome o = finished(silent, false);
+    CHECK(net::nat::reading_of(o) == Reading::NoAnswer);
+    Card c = net::nat::card_of(o, 1030);
+    CHECK(c.tone == Tone::Bad && c.head == "No answer reached bbhost");
+    CHECK(has(c.meaning, "either they did not get out, or the answers were stopped on the way back"));
+    CHECK(has(c.meaning, "Sign in (above) and test again: the server then tells which."));
+    CHECK(!has(c.meaning, "reached the server") && !has(c.head, "blocked") && !has(c.meaning, "blocked"));
+    CHECK(c.incoming.empty() && c.note.empty());
+    CHECK(c.detail == "Tested from UDP port 9307 (the game's P2P port). Just now; this PC's own reading, not saved to your account.");
+    // signed in, the server's answer lost: still no answer, test again
+    o = finished(silent, true);
+    o.save = net::nat::read_save_reply(0, "", "Couldn't connect to server");
+    CHECK(net::nat::reading_of(o) == Reading::NoAnswer);
+    c = net::nat::card_of(o, 1030);
+    CHECK(has(c.meaning, "The server could not tell which this time: test again.") && !has(c.meaning, "Sign in"));
+    CHECK(has(c.detail, "not saved to your account: the server did not answer (Couldn't connect to server)."));
+
+    // Kept, the server saw nothing from bbhost: if the website's test passes, something on this PC blocks bbhost.exe.
+    o = finished(silent, true, kBlocked);
+    CHECK(net::nat::reading_of(o) == Reading::ServerBlocked);
+    c = net::nat::card_of(o, 1030);
+    CHECK(c.tone == Tone::Bad && c.head == "Nothing from bbhost reached the server");
+    CHECK(has(c.meaning, "If the website's connection test passes, your network is fine and a firewall, antivirus or VPN on this "
+                         "PC is blocking bbhost.exe: allow it and test again - online play needs it."));
+    CHECK(has(c.meaning, "If the website's test fails too, this network blocks UDP"));
+    CHECK(has(c.detail, "saved to your account for this network"));
+
+    // Kept direct or relay, yet nothing came back: a warning that the answers are stopped - never "Direct connections:
+    // yes", no VPN or proxy blamed.
+    o = finished(silent, true, kDirect);
+    CHECK(net::nat::reading_of(o) == Reading::AnswersStopped);
+    c = net::nat::card_of(o, 1030);
+    CHECK(c.tone == Tone::Warn && c.head == "The server hears bbhost, but its answers don't reach it");
+    CHECK(has(c.meaning, "reads it as direct") && has(c.meaning, "stopping what comes back to bbhost.exe"));
+    CHECK(!has(c.head, "Direct connections") && !has(c.meaning, "Direct connections"));
+    CHECK(c.note.empty() && c.incoming.empty());
+    o = finished(silent, true, kRelay);
+    CHECK(net::nat::reading_of(o) == Reading::AnswersStopped && has(net::nat::card_of(o, 1030).meaning, "reads it as relay"));
+
+    // Every send refused: this PC did not let bbhost send - its words and what to allow; nothing kept.
+    o = finished(refused, true);
+    CHECK(net::nat::reading_of(o) == Reading::SendRefused);
+    c = net::nat::card_of(o, 1030);
+    CHECK(c.tone == Tone::Bad && c.head == "This PC did not let bbhost send");
+    CHECK(has(c.meaning, "refused every test packet bbhost tried to send from UDP port 9307 (Operation not permitted)"));
+    CHECK(has(c.meaning, "A firewall or antivirus on this PC is blocking bbhost.exe: allow bbhost.exe in it and test again"));
+    CHECK(has(c.detail, "not saved to your account: nothing was sent.") && c.note.empty() && c.incoming.empty());
+    o.signed_in = false;
+    CHECK(net::nat::reading_of(o) == Reading::SendRefused);
+    // refused for another reason (no route): the network first, the firewall only maybe
+    o.probe.send_denied = false;
+    o.probe.send_error_code = ENETUNREACH;
+    o.probe.send_error = "Network is unreachable";
+    c = net::nat::card_of(o, 1030);
+    CHECK(net::nat::reading_of(o) == Reading::SendRefused && has(c.meaning, "(Network is unreachable). Check this PC's network connection"));
+    CHECK(!has(c.meaning, "is blocking bbhost.exe"));
+    // some refused, the rest answered: the result stands, the refusals told
+    ProbeResult partly = back;
+    partly.refused = 2;
+    partly.send_error = "Operation not permitted";
+    o = finished(partly, false);
+    CHECK(net::nat::reading_of(o) == Reading::Direct);
+    CHECK(has(net::nat::card_of(o, 1030).note, "This PC refused 2 of the 5 packets bbhost tried to send (Operation not permitted)"));
+
+    // Kept blocked, yet the test ports answered bbhost: the request came from another address (a VPN or proxy).
+    o = finished(back, true, kBlocked);
+    CHECK(net::nat::reading_of(o) == Reading::AddressDiffers);
+    c = net::nat::card_of(o, 1030);
+    CHECK(c.tone == Tone::Warn && c.head == "The server did not see this test from your address");
+    CHECK(has(c.meaning, "so UDP gets through") && has(c.meaning, "A VPN or proxy for web traffic"));
+    CHECK(!c.incoming.empty());
+
+    // The answers back: the server's verdict once kept, else this PC's.
+    o = finished(back, true, kDirect);
+    CHECK(net::nat::reading_of(o) == Reading::Direct);
+    c = net::nat::card_of(o, 1030);
+    CHECK(c.tone == Tone::Good && c.head == net::nat::headline(Verdict::Direct) && c.note.empty());
+    CHECK(has(c.incoming, "Incoming: closed") && has(c.detail, ": the server saw public port 9307 at both test ports, the game's own"));
+    CHECK(has(c.detail, "Just now; saved to your account for this network"));
+    o = finished(back, true, kRelay);  // the server's word and the reading it differs from
+    CHECK(net::nat::reading_of(o) == Reading::Relay);
+    c = net::nat::card_of(o, 1030);
+    CHECK(c.tone == Tone::Relay && c.head == net::nat::headline(Verdict::Relay));
+    CHECK(c.note.rfind("This PC's own reading was \"direct\"", 0) == 0);
+    o = finished(one, true, kDirect);  // one answer lost on the way back
+    CHECK(net::nat::reading_of(o) == Reading::Direct && has(net::nat::card_of(o, 1030).note, "did not come back to bbhost"));
+    o = finished(one, false);
+    CHECK(net::nat::reading_of(o) == Reading::Inconclusive);
+    CHECK(net::nat::card_of(o, 1030).tone == Tone::Warn);
+    o = finished(changes, false);
+    CHECK(net::nat::reading_of(o) == Reading::Relay && has(net::nat::card_of(o, 1030).note, "the server then knows to relay you"));
+    o = finished(back, false);
+    CHECK(net::nat::reading_of(o) == Reading::Direct && has(net::nat::card_of(o, 1030).note, "to keep it for your account"));
+    CHECK(net::nat::card_of(o, 1000 + 300).detail.find("5 minutes ago;") != std::string::npos);
+
+    // Nothing sent for other reasons: the name, the port, the socket, a cancel.
+    o = finished(silent, false);
+    o.resolved = false;
+    CHECK(net::nat::reading_of(o) == Reading::NotResolved && net::nat::card_of(o, 1030).detail.empty());
+    o.resolved = true;
+    o.probe.error = ProbeResult::Error::PortInUse;
+    CHECK(net::nat::reading_of(o) == Reading::PortInUse && net::nat::card_of(o, 1030).head == "UDP port 9307 is in use: close the game to test");
+    o.probe.error = ProbeResult::Error::Bind;
+    o.probe.error_text = "Cannot assign requested address";
+    CHECK(net::nat::reading_of(o) == Reading::NoSocket && net::nat::card_of(o, 1030).meaning == "Cannot assign requested address.");
+    o.probe.error = ProbeResult::Error::Cancelled;
+    o.probe.error_text.clear();
+    CHECK(net::nat::reading_of(o) == Reading::Cancelled && net::nat::card_of(o, 1030).meaning == "The test was stopped.");
+    for (Verdict v : {Verdict::Direct, Verdict::Relay, Verdict::Blocked, Verdict::Inconclusive}) {
+        const Tone t = net::nat::tone_of(v);
+        CHECK(t == (v == Verdict::Direct ? Tone::Good : v == Verdict::Relay ? Tone::Relay : v == Verdict::Blocked ? Tone::Bad : Tone::Warn));
+    }
+    // the account's last test said blocked: the website passing while bbhost fails points at this PC
+    CHECK(has(net::nat::meaning(Verdict::Blocked), "If the website's test passes while bbhost's does not"));
 }
 
 }  // namespace
@@ -496,6 +731,7 @@ int main() {
     save_reply_cases();
     ports_cases();
     words_cases();
+    reading_cases();
     exchange_cases();
     if (g_fail) {
         std::printf("nat_check_test: %d failures\n", g_fail);

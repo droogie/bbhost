@@ -15,11 +15,11 @@
 // (e0305cef) blurs only where |vx| + |vy| >= C#[0x2f2], and the patch makes
 // that compare always false.
 //
-// Depth of field: its composite (111fce32) blends the blurred copy in by a
-// clamped factor, and the patch makes that factor 0.
+// (Depth of field is not a patch here: its setting clears YEBIS's own enable
+// each view - engine/graphics_patch.cpp - so none of its passes run.)
 //
-// Both follow their settings live: the programs are read again when the mask
-// below changes (render.cpp's program_at - both are pixel shaders), and
+// The patches follow their settings live: the programs are read again when the
+// mask below changes (render.cpp's program_at - both are pixel shaders), and
 // the patched and unpatched words are simply two programs, each with its own
 // pipelines.
 
@@ -34,3 +34,8 @@ void shader_patch_apply(const std::string& name, std::vector<std::uint32_t>& wor
 std::uint32_t shader_patch_mask();
 // Whether a program with this name is one a patch applies to.
 bool shader_patch_touches(const std::string& name);
+// A plugin's look (plugin API 29's post_look, engine/graphics_patch.h) over
+// the settings' motion blur: 1 shows the blur (its patches off), 0 leaves it
+// out (its patches on), -1 leaves it to its setting. (A look's depth of field
+// is the block's own enable, written after the setting's Off has cleared it.)
+void shader_patch_look(int motion_blur);

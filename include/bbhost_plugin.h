@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 28.
+/* bbhost plugin API, version 29.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 28
+#define BB_PLUGIN_API_VERSION 29
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -163,6 +163,10 @@ typedef struct BbPluginInfo {
                               plugin's option `key` holds that value (older hosts
                               show it as always). On a HEADING it covers the rows
                               under it, up to the next heading. */
+#define BB_OPT_PANEL 0x400u /* version 29, or-ed into a HEADING's type: it and the rows
+                              under it, up to the next heading, are a page of the
+                              plugin's panel (panel_show) - drawn over the game while
+                              the plugin shows it - and not in the menus */
 typedef struct BbOption {
     uint32_t type;        /* BB_OPT_*, maybe | BB_OPT_LIVE */
     const char* key;      /* the config key; an action's id */
@@ -356,6 +360,117 @@ typedef void (*BbRenderFn)(const BbRenderCall* call, void* user);
 #define BB_AA_TAKE 2   /* the plugin does it: while it is on, bbhost moves no draws (no jitter) and runs no TAA, FSR or
                           DLSS nor the game's own anti-aliasing pass, and draws the 3D at the Resolution, as with
                           Upscaling Off; the menus name the plugin */
+
+/* Version 29: the controller as a plugin with controls of its own reads it
+ * (pad) - its own buttons, sticks and triggers, whatever the player's bindings
+ * make of them in the game - and what it takes from the game (pad_take). */
+#define BB_PAD_L3 0x0002u
+#define BB_PAD_R3 0x0004u
+#define BB_PAD_OPTIONS 0x0008u
+#define BB_PAD_UP 0x0010u
+#define BB_PAD_RIGHT 0x0020u
+#define BB_PAD_DOWN 0x0040u
+#define BB_PAD_LEFT 0x0080u
+#define BB_PAD_L2 0x0100u        /* the trigger past a quarter of its travel */
+#define BB_PAD_R2 0x0200u
+#define BB_PAD_L1 0x0400u
+#define BB_PAD_R1 0x0800u
+#define BB_PAD_TRIANGLE 0x1000u
+#define BB_PAD_CIRCLE 0x2000u
+#define BB_PAD_CROSS 0x4000u
+#define BB_PAD_SQUARE 0x8000u
+#define BB_PAD_TOUCHPAD 0x100000u /* the touchpad's press, or a controller's Back (Select, Share) */
+#define BB_PAD_LEFT_STICK 1u     /* pad_take's axes */
+#define BB_PAD_RIGHT_STICK 2u
+#define BB_PAD_TRIGGERS 4u       /* L2's and R2's travel (their presses are BB_PAD_L2 and BB_PAD_R2) */
+
+typedef struct BbPad {
+    uint32_t size;        /* set to sizeof(BbPad) before the call: the host fills as much as both know */
+    uint32_t buttons;     /* BB_PAD_* held */
+    uint32_t pressed;     /* BB_PAD_* that went down since the last frame - latched, so a press shorter than a
+                             frame is still seen, and the same for every plugin reading in that frame */
+    int32_t connected;    /* 1 while a controller is there */
+    float lx, ly, rx, ry; /* the sticks, -1..1, right and down positive, the player's dead zones applied */
+    float l2, r2;         /* the triggers' travel, 0..1 */
+    uint32_t play;        /* BB_PAD_* the held buttons press in play under the player's bindings (Key Bindings'
+                             controller column): a plugin whose controls follow the game's own reads these */
+} BbPad;
+
+/* Version 29: what the world is doing and who else is in it (world_state). */
+#define BB_WORLD_IN 1u         /* a world is loaded and running - or held by world_pause */
+#define BB_WORLD_LOADING 2u    /* a loading screen is up */
+#define BB_WORLD_CUTSCENE 4u   /* a cutscene plays, or one is queued */
+#define BB_WORLD_MENU 8u       /* one of the game's menus or dialogs has the controls (its debug menu too) */
+#define BB_WORLD_PAUSED 16u    /* world_pause holds the world (any plugin's) */
+#define BB_WORLD_VISITING 32u  /* the player is in another player's world, or on the way there */
+#define BB_WORLD_OPEN 64u      /* the world's own session is up: players matched to it, or in it */
+
+/* BbWorldState.session: the game's own session role. */
+#define BB_SESSION_NONE 0
+#define BB_SESSION_HOSTING 1       /* the world's session being made for players matched to it - before they join */
+#define BB_SESSION_HOST_FAILED 2
+#define BB_SESSION_HOST 3          /* the world's own session, others in it or matched to come */
+#define BB_SESSION_JOINING 4       /* on the way into another player's world */
+#define BB_SESSION_JOIN_FAILED 5
+#define BB_SESSION_GUEST 6         /* in another player's world */
+#define BB_SESSION_LEAVING 7
+
+/* Version 29: the picture's look over the area's own (post_look): each group
+ * applies while its bit is in `set`, every view, on the numbers the area gives
+ * the post-processing and the fog that view; the rest stay the area's. */
+#define BB_LOOK_TONE 1u          /* exposure, gamma, saturation, brightness and contrast: times the area's */
+#define BB_LOOK_VIGNETTE 2u      /* the vignette's power (0 is none) */
+#define BB_LOOK_DOF 4u           /* depth of field: off, or on with the focus, the aperture and the blur levels */
+#define BB_LOOK_ABERRATION 8u    /* chromatic aberration: off, or on with its four dispersions */
+#define BB_LOOK_MOTION_BLUR 16u  /* motion blur: off, or on with its two times, the camera blur's scale and samples */
+#define BB_LOOK_FOG 32u          /* the fog: its distance, density and contrast times the area's, its offsets added */
+
+typedef struct BbLook {
+    uint32_t size;          /* sizeof(BbLook) as the plugin knows it */
+    uint32_t set;           /* BB_LOOK_* */
+    float exposure, gamma, saturation, brightness, contrast;  /* BB_LOOK_TONE: 1 is the area's own; the exposure is
+                                                                the eye adaptation's target while it adapts; the
+                                                                contrast is steep (1.1 crushes Central Yharnam's
+                                                                shadows to black) */
+    float vignette;         /* BB_LOOK_VIGNETTE */
+    int32_t dof;            /* BB_LOOK_DOF: 0 off, 1 on with the four below */
+    float dof_focus;        /* the distance in focus (Central Yharnam's 1) */
+    float dof_aperture;     /* an f-number: the smaller, the more blurred away from the focus (Central Yharnam's 5.6) */
+    int32_t dof_near_levels, dof_far_levels;  /* the blur's levels in front of and behind the focus, 0-7 */
+    int32_t aberration;     /* BB_LOOK_ABERRATION: 0 off, 1 on with the four below */
+    float lateral[2], uniform[2];  /* its dispersions, -1..1 (Central Yharnam's lateral[0] is 0.006) */
+    int32_t motion_blur;    /* BB_LOOK_MOTION_BLUR: 0 off, 1 on with the four below */
+    float blur_time, blur_length;  /* the blur's two times (0.06-0.095 and 0.1-0.2 in Central Yharnam's views) */
+    float blur_scale;       /* times blur_length, the camera blur's amount (0-4 there) */
+    int32_t blur_samples;   /* 1-16 (3 or 4 there) */
+    float fog_distance, fog_density, fog_contrast;   /* BB_LOOK_FOG: times the area's */
+    float fog_distance_offset, fog_height_offset;    /* metres added */
+} BbLook;
+
+/* Version 29: a plugin's panel (panel_show, panel_state). */
+#define BB_PANEL_DEFAULTS 1u  /* each page ends with a Defaults row: its rows back to their defaults */
+typedef struct BbPanel {
+    uint32_t size;           /* sizeof(BbPanel) as the plugin knows it */
+    uint32_t flags;          /* BB_PANEL_* */
+    const char* page;        /* the page to show: its heading's key; NULL or "" for the one shown last */
+    const char* guide;       /* a line under the rows while the controller is in use (may be NULL) */
+    const char* guide_keys;  /* the same while the keyboard and mouse are (may be NULL) */
+} BbPanel;
+typedef struct BbPanelState {
+    uint32_t size;      /* set to sizeof(BbPanelState) before the call: the host fills as much as both know */
+    int32_t shown;      /* 1 while the panel is up */
+    int32_t closed;     /* 1 when the player closed it (Circle, Escape) since the last call */
+    char page[32];      /* the page shown or shown last: its heading's key */
+} BbPanelState;
+
+typedef struct BbWorldState {
+    uint32_t size;      /* set to sizeof(BbWorldState) before the call: the host fills as much as both know */
+    uint32_t flags;     /* BB_WORLD_* */
+    uint32_t others;    /* other players' characters in this world now: co-operators, invaders, the host one visits */
+    uint32_t arriving;  /* players on their way in: members of the world's session or of its matchmaking room
+                           who are not in the world yet (from the server's word that one joined the room) */
+    int32_t session;    /* BB_SESSION_* */
+} BbWorldState;
 
 typedef struct BbHostApi {
     uint32_t version; /* BB_PLUGIN_API_VERSION */
@@ -589,8 +704,10 @@ typedef struct BbHostApi {
 
     /* Version 13: controls and a view of a plugin's own (a first-person mode). */
     /* What the keyboard and mouse hold now, and the presses, motion and wheel
-     * since the last read (one reader: two plugins reading would share them).
-     * Main thread. 0 on success; 1 without a window (headless). */
+     * since the last read (one reader: two plugins reading would share them -
+     * since version 29 input_as gives a plugin reads of its own, and this is
+     * the read of the plugins that do not name themselves). Main thread. 0 on
+     * success; 1 without a window (headless). */
     int (*input)(BbInput* out);
     /* Takes inputs from the game while the player is playing
      * (BbInput.playing): the keys listed (scancodes) no longer press what they
@@ -598,6 +715,11 @@ typedef struct BbHostApi {
      * `wheel` nonzero keeps the wheel's notches from the game, and `motion`
      * nonzero keeps the mouse from turning the game's camera. The menus keep
      * every key. A call replaces the last; nothing taken gives everything
+     * back - a key held then stays taken until it is let go (version 29), so
+     * the game never sees it go down, while a key a call leaves out as it
+     * goes on taking others is the game's again at once. Since version 29 this
+     * is the take of the plugins that do not name themselves: input_take_as's
+     * named takes add to it, and nothing a plugin does here gives theirs
      * back. Any thread. 0 on success. */
     int (*input_take)(const uint16_t* scancodes, size_t n, uint32_t buttons, int wheel, int motion);
     /* fn(cam, user) each frame once the game has placed the player's camera
@@ -883,6 +1005,111 @@ typedef struct BbHostApi {
      * Native-camera builds still require the plugin's native camera hooks.
      * 0 on success; 1 outside image setup, for NULL, or if already owned. */
     int (*on_camera_target)(void* (*fn)(void* character, void* user), void* user);
+
+    /* Version 29: the world held still, the controller, and who else is in
+     * the world (a photo mode's). */
+    /* The world held still - its characters, physics, AI, events, effects and
+     * cloth - while frames go on being drawn and on_view goes on being called:
+     * the game's own pause, the one it holds while it leaves a world. `paused`
+     * 1 asks for it for the plugin named `name` (its BbPluginInfo name), 0 lets
+     * it go; the world is held while any plugin asks. It takes hold at the
+     * world's next update. A load lets every hold go (a new world starts
+     * running), and so does the plugin being turned off. Any thread. 0 on
+     * success; 1 for another eboot or an unknown plugin. */
+    int (*world_pause)(const char* name, int paused);
+    /* While the plugin holds the world: `updates` more of its updates run, one
+     * a frame, and then it is held again (a frame advance). A later call adds
+     * to what is left. Any thread. 0 on success; 1 when the plugin holds no
+     * pause. */
+    int (*world_step)(const char* name, uint32_t updates);
+    /* The controller, into *out (set out->size first): its own buttons and
+     * sticks - the dead zones applied, the player's key bindings not - pressed
+     * or not, as the game would read them before pad_take takes any, and
+     * (BbPad.play) what the held buttons press in play under the player's
+     * bindings; a test's taps (BBHOST_AUTOPRESS, the "tap" request) count as
+     * the controller's. The presses are the frame's: every plugin reading in
+     * it sees the same. While bbhost's own menus or a text box have the
+     * controller it reads nothing held. Main thread (on_frame). 0 on success;
+     * 1 for a size under 8. */
+    int (*pad)(BbPad* out);
+    /* Takes the controller's buttons (BB_PAD_*, the controller's own) and axes
+     * (BB_PAD_LEFT_STICK, BB_PAD_RIGHT_STICK, BB_PAD_TRIGGERS) from the game
+     * for the plugin named `name`: the game reads them let go and at rest -
+     * whatever they are bound to in play is not pressed - while pad still
+     * reads them. Keys are input_take_as's. Each plugin's take is its own and
+     * the game loses what any plugin takes; a call replaces the plugin's last.
+     * 0, 0 gives its buttons back - one held then stays taken until it is let
+     * go, so the game never sees it go down - while a button a call leaves
+     * out as it goes on taking others is the game's again at once. The plugin
+     * being turned off gives its take back. Any thread. 0 on success; 1 for
+     * an unknown plugin. */
+    int (*pad_take)(const char* name, uint32_t buttons, uint32_t axes);
+    /* What the world is doing and who else is in it (BbWorldState), into *out
+     * (set out->size first). Main thread. 0 on success; 1 for another eboot or
+     * a size under 8. */
+    int (*world_state)(BbWorldState* out);
+    /* The game's HUD, menus and prompts left out of the picture: the game
+     * draws them as always and they are left out where the picture is put
+     * together for the screen (the point frame generation takes its picture
+     * without the HUD from), so nothing of the game's own state changes - its
+     * HUD option keeps its value. bbhost's own overlay and menus are drawn as
+     * always. `hidden` 1 asks for it for the plugin named `name`, 0 lets it
+     * go; it is left out while any plugin asks, and the plugin being turned
+     * off lets go. From the next frame; while on, two copies of the picture a
+     * frame. Any thread. 0 on success; 1 for an unknown plugin. */
+    int (*hud_hide)(const char* name, int hidden);
+    /* The picture's look over the area's own (BbLook): written every view
+     * into the numbers the area gives the post-processing and the fog, so
+     * nothing of the game's is kept or written back - `look` NULL (or `set`
+     * 0) gives the area's own from the next frame. One look for all plugins:
+     * the last call holds, and the plugin being turned off takes its look
+     * away. Depth of field and motion blur show while the look sets them on
+     * whatever the Graphics settings say, and are left out while it sets
+     * them off; Performance mode jumps past every depth of field pass and
+     * leaves the scene's motion blur off, so those two cannot show then.
+     * `available` (may be NULL) gets the BB_LOOK_* groups that can show now.
+     * Values outside what the post effect takes are clamped. Any thread. 0 on
+     * success; 1 for an unknown plugin or a size under 8. */
+    int (*post_look)(const char* name, const BbLook* look, uint32_t* available);
+    /* The plugin's panel up (BbPanel) or down (NULL): the pages of its options
+     * table it marks with BB_OPT_PANEL, drawn over the game at the bottom
+     * right with the rows' own widgets, their changes going to on_option as
+     * the menus' do (the rows want BB_OPT_LIVE). The controller drives it -
+     * the d-pad up and down to a row, left and right to change it, Cross to
+     * set a switch or press a button, L1 and R1 the pages, Circle closes it -
+     * as do the keyboard (the arrows, Enter, Page Up and Page Down or Q and E,
+     * Escape) and the pointer, which is free while it is up. While it is up
+     * the game reads none of those buttons and keys, and neither do the
+     * plugin's pad and input: the panel has them. One panel at a time - a
+     * later call replaces another plugin's - and the plugin being turned off
+     * takes it down. Main thread. 0 on success; 1 for an unknown plugin, a
+     * size under 8, a page it has not got, or none at all. */
+    int (*panel_show)(const char* name, const BbPanel* panel);
+    /* Whether the plugin's panel is up, whether the player closed it since
+     * the last call, and its page (BbPanelState; set out->size first). Main
+     * thread. 0 on success; 1 for an unknown plugin or a size under 8. */
+    int (*panel_state)(const char* name, BbPanelState* out);
+    /* One of the plugin's options set to `value` (text, as the config holds
+     * it) as the menus set it: kept in the player's config, and on_option
+     * called with it from the next frame. Any thread. 0 on success; 1 for an
+     * unknown plugin or option. */
+    int (*option_set)(const char* name, const char* key, const char* value);
+    /* input_take for the plugin named `name`: the plugins' takes add up, each
+     * call replacing only that plugin's last, so one plugin giving its keys
+     * back leaves another's taken (input_take's own is the take of every
+     * plugin that does not name itself). Nothing taken gives the plugin's
+     * back - a key held then stays taken until it is let go - while a key a
+     * call leaves out as it goes on taking others is the game's again at
+     * once. The plugin being turned off gives its take back. Any thread. 0 on
+     * success; 1 for an unknown plugin. */
+    int (*input_take_as)(const char* name, const uint16_t* scancodes, size_t n, uint32_t buttons, int wheel, int motion);
+    /* input for the plugin named `name`: the presses, motion and wheel since
+     * that plugin's own last read, so plugins reading each frame never take
+     * them from one another (input's own are the read of every plugin that
+     * does not name itself). The first read starts its count. Main thread or
+     * the game's, as input. 0 on success; 1 for an unknown plugin or without
+     * a window (headless). */
+    int (*input_as)(const char* name, BbInput* out);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

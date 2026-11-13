@@ -343,6 +343,16 @@ the Intel SFX workaround, Disable HTTP Requests, Disable Facegen, Enable TAA,
 Bookmark and Capture outputs, the low-res motion blur buffers). A player who
 wants one keeps its file in their own patches folder.
 
+The Performance patch (Kyo's Performance Patch v3, Velomap and Decals On) is
+built in and always on (`performance = false` under `[patches]` leaves it
+out, for a test). It writes the list's sites but five: its camera blur's
+force and its Model detail force (the Motion blur and Model detail settings
+decide those), and, since v0.2.35, the three that turned the scene
+renderer's own depth and G-buffer copies into NOPs (`0x26a10c0`,
+`0x26a2829`, `0x26a283f`): SSAO, the sun's shadows, the decals and depth of
+field read what those copy, in the views drawn in the renderer's modes that
+make them (the world's view fills the same targets with copies of its own).
+
 | File | Patch |
 |---|---|
 | `disable-misc-renders.toml` | **Disable Misc. Renders**: Disable Misc. Renders - Kyo's patch: four of the scene's extra targets are not made, nor their passes drawn (off by default; at the next start) |

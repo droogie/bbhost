@@ -212,8 +212,10 @@ game's code or data.
   company logos); the shadPS4 patch list's patches - Kyo's graphics, physics
   and gameplay patches and his The Old Hunters patch, johnnycoax's Auto-Refill,
   Imedved's camera auto-rotation and Lance McDonald's region unlock (shipped as
-  patch files); and Kyo's 60 FPS++ timing list and yogesh1239's high-FPS fixes
-  (built into the frame-rate code).
+  patch files); Kyo's 60 FPS++ timing list and yogesh1239's high-FPS fixes
+  (built into the frame-rate code); and Nox-'s
+  [bbphoto](https://github.com/Noxde/bbhost-photo-mode-plugin), which the photo
+  mode plugin is rebuilt from.
 - [shadPS4](https://github.com/shadps4-emu/shadPS4), a reference for the PS4's
   system behaviour and a working run to compare against.
 - SDL3, Vulkan, FFmpeg, SPIRV-Tools, the DirectX Shader Compiler (DXC),

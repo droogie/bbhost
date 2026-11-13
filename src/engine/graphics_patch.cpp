@@ -14,6 +14,7 @@
 #include "engine/sf_text_layout.h"
 #include "engine/frame_rate.h"
 #include "engine/live_resolution.h"
+#include "engine/loading.h"
 #include "engine/menu_memory.h"
 #include "engine/sf_heap_probe.h"
 #include "hle/modules.h"
@@ -21,6 +22,7 @@
 #include "host/plugins.h"
 #include "host/scene_look.h"
 #include "host/settings.h"
+#include "host/shader_patch.h"
 #include "host/upscaler.h"
 #include "host/window.h"
 #include "log.h"
@@ -83,7 +85,8 @@ namespace {
 //     a jump to a stub that does the same copy with the amount ANDed with a
 //     mask the host owns: all ones for on, 0 for off. The code is written
 //     once, at load; turning it on or off is one store to the mask.
-//   - Motion blur and depth of field are shader patches (host/shader_patch.h).
+//   - Motion blur is a shader patch (host/shader_patch.h); depth of field is
+//     YEBIS's own switch, cleared in the block each view (kDofEnable below).
 //   - Bloom and vignette are two of the area's draw parameters, changed in the
 //     block the game hands YEBIS each frame - "Draw parameters" below.
 constexpr std::uint64_t kRenderView = 0x269e990;
@@ -192,11 +195,14 @@ std::atomic<bool> g_made_any{false};
 // FilmicContrast mostly moves the overall brightness, which the game's own
 // Brightness already does.
 //
-// Nor does motion blur's strength, though "Yebis-MotionBlurScale" (+0x1ec) is
-// right there: at half and at double the area's value the game never fades in
-// from its loading screen (twice at half, three times at double; the glare
-// that eases in as the world starts stays at its first value), while 0, 1x
-// and 1.4x load normally. Motion blur keeps its on/off setting.
+// Nor does motion blur's strength - and +0x1ec, once taken here for
+// "Yebis-MotionBlurScale", is not it: it is an int, the blur's sample count
+// (4 in Central Yharnam), the first integer the apply hands the blur's
+// parameters (ppfx_sub_fb38f0). Scaled there as a float, to half and to
+// double, the game never faded in from its loading screen (twice at half,
+// three times at double; the glare that eases in as the world starts stayed
+// at its first value), while 0, 1x and 1.4x loaded normally. Motion blur
+// keeps its on/off setting.
 constexpr std::uint64_t kYebisRecord = 0x25d4860;
 // push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x28; mov r13, r9
 const std::uint8_t kYebisRecordPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
@@ -204,9 +210,77 @@ const std::uint8_t kYebisRecordPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57,
 constexpr std::uint64_t kPostBlock = 0x59406e0;
 constexpr std::size_t kSaturation = 0xc8, kVignettePower = 0xd0, kGlareLuminance = 0xdc;
 constexpr std::size_t kYebisHeld = 0x2710;  // on the YEBIS object: the block was not refreshed
+// Depth of field's switch: the block's +0x1ac, the area's "Yebis-DepthOfField:
+// Enable", which the game copies in every view (0x25d541e). The flip pass
+// (0x25d5f80) hands it to YEBIS's own enable at 0x25d7a98 (ppfx_sub_fb2960:
+// the effect's +0x940) and skips the depth of field's parameters on 0 (the
+// je at 0x25d7bbc). With the enable 0, YEBIS's effective switch (+0xc4b, set
+// in sub_fdb120 from +0x940) stays 0 and the effect chain never calls its
+// depth of field (sub_fe6c60, from 0xfec146/0xfec519 only while +0xc4b is
+// set): no circle of confusion, downsample, aperture-filter levels or
+// composite - the single-level one (d3ca03f3+111fce32) the world's faint far
+// blur uses at 1080p, the multi-level ones (+6e2d87e3, +8fcc561d, +b9167b53:
+// a smaller picture, the cutscenes, a strong blur). A 1 the next view copies
+// in turns it back on, with its parameters fed again from that view.
+constexpr std::size_t kDofEnable = 0x1ac;
 std::uint8_t* g_post_block = nullptr;
 std::atomic<float> g_bloom{1.0f}, g_saturation{1.0f};
-std::atomic<bool> g_vignette{true};
+std::atomic<bool> g_vignette{true}, g_dof{true};
+
+// A plugin's look (plugin API 29's post_look, graphics_look_set): the fields
+// it writes in the block, each a 4-byte cell, as YEBIS's apply (sub_25d5f80)
+// hands them to the post effect's setters (decomp/yebis/ppfx_setters.cpp):
+//
+//   +0x50  auto exposure on; +0x54 its middle grey (0..1: what the eye
+//          adaptation brings the scene's luminance to;
+//          SetAutoExposureMiddleGray)
+//   +0x98  the exposure while auto exposure is off (with it on, the apply
+//          writes the adapted one there itself); +0x9c gamma (both
+//          SetTonemapParameters)
+//   +0xc8  saturation, +0xcc value ("Yebis-ColorS", "-ColorV"), +0x248
+//          contrast ("-Contrust"): colour-matrix multiplies, skipped at 1
+//   +0xd0  the vignette's power (ppfx_sub_fb3670, with +0xd4)
+//   +0xac  chromatic aberration on (1.0 where an area's lens has it -
+//          Central Yharnam's has not; SetChromaticAberrationEnable),
+//          +0xb4/+0xb8 its lateral and +0xbc/+0xc0 its uniform dispersion
+//   +0x1ac depth of field on (the cmp before the je at 0x25d7bbc), +0x188
+//          its auto focus (0: the focus distance below), +0x1b0 the focus
+//          distance, +0x1b4 the aperture (an f-number), +0x1d0 and +0x1d4 the
+//          blur's levels in front of and behind the focus
+//   +0x1dc motion blur on (SetMotionBlurEnable), +0x1e4 and +0x1e8 its two
+//          times, +0x1ec its sample count (an int), +0x350 what the apply
+//          multiplies +0x1e8 by into the camera blur's amount
+//
+// The areas' depth of field is not the lens above but the game's own table:
+// each view the apply (the loop at 0x25d9760) fills 2048 floats at the YEBIS
+// object's +0xd0, entry i the blur at device depth i/2047 (the last two at
+// depth 1), which CustomDofLutCopy.cpo copies to the texture the CoC pass
+// reads depth through. An entry is the lens's circle of confusion at that
+// depth (sub_fb2dc0 0 -> 3: the focus and aperture above), negative in front
+// of the focus - unless +0x2d4 (the custom near ramp on) puts a ramp over
+// +0x2dc..+0x2e0 m there, strength +0x2e4, or +0x2d8 (the custom far ramp on)
+// one past +0x2ec..+0x2f0 m, strength +0x2f4; then a negative entry times
+// +0x2e8, a positive one times +0x2f8, and 0 past +0x2fc m. Every main area
+// has both ramps on (its GPARAM's CustomDof), so the lens's numbers never
+// reach the table there. With Central Yharnam's own levels (+0x1d0 0 in
+// front, +0x1d4 1 behind) YEBIS composites by clamp(k * CoC + b) (111fce32),
+// which never blends a negative circle; with a look's 7 and 7 it takes its
+// multi-level path (6e2d87e3), whose near levels blur what is in front.
+constexpr std::size_t kDofCustomNear = 0x2d4, kDofCustomFar = 0x2d8, kDofNearScale = 0x2e8, kDofFarScale = 0x2f8,
+                      kDofCut = 0x2fc;
+constexpr std::size_t kDofTable = 0xd0;  // on the YEBIS object: 2048 floats
+constexpr std::size_t kAutoExposure = 0x50, kMiddleGrey = 0x54, kExposure = 0x98, kGamma = 0x9c, kValue = 0xcc,
+                      kContrast = 0x248;
+constexpr std::size_t kAberration = 0xac, kAberrationDispersion = 0xb4;
+// kDofOn is the setting's switch (kDofEnable): the look writes it after the
+// setting's Off has cleared it, so the look's depth of field wins either way.
+constexpr std::size_t kDofAuto = 0x188, kDofOn = kDofEnable, kDofFocus = 0x1b0, kDofAperture = 0x1b4, kDofNear = 0x1d0,
+                      kDofFar = 0x1d4;
+constexpr std::size_t kBlurOn = 0x1dc, kBlurTime = 0x1e4, kBlurLength = 0x1e8, kBlurSamples = 0x1ec, kBlurScale = 0x350;
+std::mutex g_look_mu;
+GraphicsLook g_look;                       // under g_look_mu
+std::atomic<std::uint32_t> g_look_set{0};  // its groups: one load a view while there is none
+std::atomic<bool> g_look_logged{true};     // the area's own values logged since the look changed
 
 // Ambient occlusion strength. The SSAO bank (+0x5968) is blended the same way
 // (sub_1285500, into a 0x6c-byte block) and copied into the SSAO object the
@@ -440,6 +514,23 @@ void graphics_ssr_live_in() {
 
 namespace {
 
+// Motion blur's velocity switch (motion_blur_apply): the setting's, unless a
+// plugin's look sets motion blur on or off (graphics_look_set). Called from
+// the settings' thread and the look's, one at a time.
+std::atomic<bool> g_blur_setting{true};
+std::atomic<int> g_blur_look{-1};
+void blur_update() {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    static bool was = true;  // the constructor's own
+    const int look = g_blur_look.load(std::memory_order_relaxed);
+    const bool want = look >= 0 ? look != 0 : g_blur_setting.load(std::memory_order_relaxed);
+    if (want != was) {
+        was = want;
+        motion_blur_apply(want);
+    }
+}
+
 // The settings' listener (host_settings_listen, from live_install): told each
 // change once, on the thread that made it (the store calls its listeners one
 // at a time), it keeps the values the hooks below apply - the hooks read these
@@ -485,19 +576,16 @@ void settings_changed(const HostSettings& hs) {
     g_ssr_off.store(!hs.ssr, std::memory_order_relaxed);
     g_dyn_shadows_off.store(!hs.dynamic_shadows || hs.performance_mode, std::memory_order_relaxed);
     // Performance mode's blur off (its velocity map kept for the upscaler).
-    static bool blur_was = true;
     // Rebuilt motion vectors hold what the blur cannot read: it goes too.
-    const bool blur = hs.motion_blur && !hs.performance_mode && !host_opt_motion_rebuilt_bits();
-    if (blur != blur_was) {
-        blur_was = blur;
-        motion_blur_apply(blur);
-    }
+    g_blur_setting.store(hs.motion_blur && !hs.performance_mode && !host_opt_motion_rebuilt_bits());
+    blur_update();
     set_chromatic_aberration(hs.chromatic_aberration && !hs.performance_mode);
     g_bloom.store(hs.bloom);
     g_saturation.store(hs.saturation);
     g_fog.store(hs.fog);
     g_ao_strength.store(hs.ao_strength);
     g_vignette.store(hs.vignette);
+    g_dof.store(hs.depth_of_field);
     g_motion_blur.store(hs.motion_blur);
     if (!g_lod_bias_env) g_lod_bias.store(hs.lod_bias);
     g_shadow_scale.store(hs.shadow_scale > 1.0f ? hs.shadow_scale
@@ -644,9 +732,241 @@ void log_glare(float glare, float power, float bloom, bool vignette) {
     l.skipped = skipped;
 }
 
+int yebis_dof_ready();  // below, beside the slide they read
+int yebis_dof_on();
+
+// A plugin's look over this view's block (graphics_look_set), after the
+// settings: the area's numbers times its factors, or its own where it sets
+// them.
+void apply_look(std::uint8_t* b) {
+    GraphicsLook l;
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        l = g_look;
+    }
+    const auto getf = [b](std::size_t at) {
+        float v = 0;
+        std::memcpy(&v, b + at, 4);
+        return v;
+    };
+    const auto geti = [b](std::size_t at) {
+        std::int32_t v = 0;
+        std::memcpy(&v, b + at, 4);
+        return v;
+    };
+    const auto setf = [b](std::size_t at, float v) { std::memcpy(b + at, &v, 4); };
+    const auto seti = [b](std::size_t at, std::int32_t v) { std::memcpy(b + at, &v, 4); };
+    if (!g_look_logged.exchange(true)) {
+        host_log("graphics: a look over the area's exposure %g (auto %d, middle grey %g), gamma %g, saturation %g, value %g, "
+                 "contrast %g, vignette %g; aberration %g (%g %g, %g %g); depth of field %d (auto focus %d, focus %g, aperture "
+                 "%g, levels %d %d; its table's custom near %d far %d, scales %g %g, cut past %g m; the post effect's part %d, "
+                 "on %d); motion blur %d (%g %g, %d samples, scale %g)",
+                 getf(kExposure), geti(kAutoExposure), getf(kMiddleGrey), getf(kGamma), getf(kSaturation), getf(kValue),
+                 getf(kContrast), getf(kVignettePower), getf(kAberration), getf(kAberrationDispersion),
+                 getf(kAberrationDispersion + 4), getf(kAberrationDispersion + 8), getf(kAberrationDispersion + 12),
+                 geti(kDofOn), geti(kDofAuto), getf(kDofFocus), getf(kDofAperture), geti(kDofNear), geti(kDofFar),
+                 geti(kDofCustomNear), geti(kDofCustomFar), getf(kDofNearScale), getf(kDofFarScale), getf(kDofCut),
+                 yebis_dof_ready(), yebis_dof_on(), geti(kBlurOn), getf(kBlurTime), getf(kBlurLength), geti(kBlurSamples),
+                 getf(kBlurScale));
+    }
+    if (l.set & kLookTone) {
+        // The exposure: the adapted one's target with auto exposure on (the
+        // middle grey, which SetAutoExposureMiddleGray keeps inside 0..1),
+        // the fixed one with it off.
+        if (geti(kAutoExposure) != 0)
+            setf(kMiddleGrey, std::clamp(getf(kMiddleGrey) * l.exposure, 0.001f, 0.999f));
+        else
+            setf(kExposure, getf(kExposure) * l.exposure);
+        setf(kGamma, getf(kGamma) * l.gamma);
+        setf(kSaturation, getf(kSaturation) * l.saturation);
+        setf(kValue, getf(kValue) * l.brightness);
+        setf(kContrast, getf(kContrast) * l.contrast);
+    }
+    if (l.set & kLookVignette) setf(kVignettePower, l.vignette);
+    if (l.set & kLookAberration) {
+        setf(kAberration, l.aberration ? 1.0f : 0.0f);
+        setf(kAberrationDispersion, l.lateral[0]);
+        setf(kAberrationDispersion + 4, l.lateral[1]);
+        setf(kAberrationDispersion + 8, l.uniform[0]);
+        setf(kAberrationDispersion + 12, l.uniform[1]);
+    }
+    if (l.set & kLookDof) {
+        seti(kDofOn, l.dof ? 1 : 0);
+        if (l.dof) {
+            seti(kDofAuto, 0);
+            setf(kDofFocus, l.dof_focus);
+            setf(kDofAperture, l.dof_aperture);
+            seti(kDofNear, l.dof_near_levels);
+            seti(kDofFar, l.dof_far_levels);
+            // The table from the lens instead of the area's ramps, every
+            // entry kept (nothing cut by distance) and as the lens gives it:
+            // negative in front of the focus, which the multi-level path's
+            // near levels blur at any focus distance (0 without blur in
+            // front), positive behind it (0 without blur behind). Turned to
+            // count as what is behind, the front went to the far side's
+            // levels, which YEBIS counts by the circle at the far end
+            // (0x1068b60) - none from a focus of about 50 m on, and no front
+            // blur with them. The block is the area's again at the next view
+            // without the look.
+            seti(kDofCustomNear, 0);
+            seti(kDofCustomFar, 0);
+            setf(kDofNearScale, l.dof_near_levels > 0 ? 1.0f : 0.0f);
+            setf(kDofFarScale, l.dof_far_levels > 0 ? 1.0f : 0.0f);
+            setf(kDofCut, 1.0e9f);
+        }
+    }
+    if (l.set & kLookMotionBlur) {
+        seti(kBlurOn, l.motion_blur ? 1 : 0);
+        if (l.motion_blur) {
+            setf(kBlurTime, l.blur_time);
+            setf(kBlurLength, l.blur_length);
+            seti(kBlurSamples, l.blur_samples);
+            setf(kBlurScale, l.blur_scale);
+        }
+    }
+}
+
+// BBHOST_DOF_TABLE_LOG=1: the depth of field's table as the last view's apply
+// filled it (the YEBIS object's +0xd0), a hash and its range each time it
+// changes - the area's table before a look's depth of field and after it is
+// byte for byte the same.
+void log_dof_table(const std::uint8_t* yebis) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_DOF_TABLE_LOG");
+        return e && e[0] == '1';
+    }();
+    if (!on) return;
+    std::uint64_t h = 1469598103934665603ull;
+    float lo = 0, hi = 0;
+    int neg = 0, pos = 0;
+    for (int i = 0; i < 2048; ++i) {
+        std::uint32_t u = 0;
+        std::memcpy(&u, yebis + kDofTable + i * 4, 4);
+        h = (h ^ u) * 1099511628211ull;
+        float v = 0;
+        std::memcpy(&v, &u, 4);
+        lo = i ? std::min(lo, v) : v;
+        hi = i ? std::max(hi, v) : v;
+        neg += v < 0.0f;
+        pos += v > 0.0f;
+    }
+    static std::uint64_t last = 0;
+    if (h == last) return;
+    last = h;
+    float at[6] = {};
+    const int idx[6] = {1024, 1945, 2013, 2037, 2045, 2047};  // ~0.1, 1, 3, 10, 50 m and depth 1
+    for (int i = 0; i < 6; ++i) std::memcpy(&at[i], yebis + kDofTable + idx[i] * 4, 4);
+    host_log("graphics: the depth of field's table %016llx: %d entries < 0, %d > 0, %g..%g; at 1024 %g, 1945 %g, 2013 %g, 2037 %g, "
+             "2045 %g, 2047 %g",
+             static_cast<unsigned long long>(h), neg, pos, static_cast<double>(lo), static_cast<double>(hi), static_cast<double>(at[0]),
+             static_cast<double>(at[1]), static_cast<double>(at[2]), static_cast<double>(at[3]), static_cast<double>(at[4]),
+             static_cast<double>(at[5]));
+}
+
+// Depth of field's blend at the 1080-line look, at any Resolution. YEBIS
+// blends a level's blurred image in by t = clamp(k * CoC + b): for the first
+// level k = s / (1.25 r0 - 0.25 r0) and b = -0.25 r0 / (1.25 r0 - 0.25 r0) =
+// -0.250125 (sub_1055af0, from the level's radius r0 in pixels and s, the
+// circle of confusion's size in pixels, which grows with the height: k is
+// 0.291 at 360 lines, 0.874 at 1080, 1.747 at 2160). The circle is the same
+// share of the picture at every size, and a level's blur is a fixed number
+// of pixels in a target a fixed share of the picture's size, so on the screen
+// it is a smaller blur the larger the picture: the look stays the same only if
+// t grows with the height. k * CoC does, b does not - so the areas' faint far
+// blur faded below 1080 lines (none at 640x360, two thirds of it at 720p) and
+// came out up to 18% stronger above (1440p; t clamps at 1 by 2160p). With b
+// times height / 1080, t = (height / 1080) * its 1080-line value for every
+// circle: the 1080-line look at every size.
+// Where: CDepthOfField's aperture-filter levels (sub_1068b60, called only from
+// its ApplyDepthOfField right after sub_1055af0 writes the levels' factors
+// afresh), each level's two (k, b) pairs - behind the focus at +0xd0/+0xd4,
+// in front at +0xd8/+0xdc of the level's 0x108 bytes, the array at the
+// object's +0x470, the count at +0xc0 - which the level choice and the
+// composites' constants read after it. Once a call, from values written that
+// call: nothing compounds. Only the world's view: the source's height (its
+// +0x54) is the picture's - a menu's preview keeps its look - and no Remo
+// cutscene runs (a cutscene's blur stays as YEBIS draws it), and only on a
+// side drawn with one level (below). Nothing at 1080 lines, and with Depth of
+// field off YEBIS never calls the function. With an upscaler the height is
+// the picture's, the one YEBIS works at: the blend is the native size's, and
+// what the upscaler's picture lacks before the blur is the upscaler's.
+constexpr std::uint64_t kDofLevels = 0x1068b60;
+// push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x148
+const std::uint8_t kDofLevelsPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                           0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x48, 0x01, 0x00, 0x00};
+constexpr std::size_t kDofLevelCount = 0xc0, kDofLevelArray = 0x470, kDofLevelSize = 0x108;
+constexpr std::size_t kDofLevelFarB = 0xd4, kDofLevelNearB = 0xdc, kGpuTextureHeight = 0x54;
+
+// BBHOST_DOF_1080_LOOK=0 (a test): the blend as YEBIS has it at every size.
+const bool g_dof_1080_look = [] {
+    const char* e = std::getenv("BBHOST_DOF_1080_LOOK");
+    return !(e && e[0] == '0');
+}();
+
+GUEST_ABI std::int64_t dof_levels_hook(std::uint64_t, const std::uint64_t* saved) {
+    if (!g_dof_1080_look) return 0;
+    // A cutscene's blur as YEBIS draws it: said once each time one starts.
+    static std::atomic<bool> in_cutscene{false};
+    const bool cutscene = loading_cutscene();
+    if (in_cutscene.exchange(cutscene, std::memory_order_relaxed) != cutscene && cutscene) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 8)
+            host_log("graphics: a cutscene plays: its depth of field's blend left as YEBIS has it at this size");
+    }
+    if (cutscene) return 0;
+    const std::uint64_t dof = saved[5], src = saved[4];
+    if (!dof || !src) return 0;
+    std::uint32_t height = 0;
+    std::memcpy(&height, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src + kGpuTextureHeight)), 4);
+    unsigned picture_h = 0;
+    live_resolution_current(nullptr, &picture_h);
+    if (height != picture_h || height < 64 || height > 16384 || height == 1080) return 0;
+    std::int32_t n = 0;
+    std::uint64_t levels = 0;
+    std::memcpy(&n, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(dof + kDofLevelCount)), 4);
+    std::memcpy(&levels, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(dof + kDofLevelArray)), 8);
+    if (n <= 0 || n > 16 || !levels || !g_post_block) return 0;
+    // Only a side the view draws with one level (the block's level counts,
+    // the areas' own far blur: near 0, far 1). With more, a circle that grows
+    // with the picture moves on to the next level, twice as large, which keeps
+    // the look by itself - a look's lens (photo mode's 7 and 7) and the
+    // cutscenes' come out at 0.92-1.00x of 1080p's at 2160p as YEBIS has them,
+    // and larger offsets would hold the circle back on the smaller levels
+    // (0.64x).
+    std::int32_t near_levels = 0, far_levels = 0;
+    std::memcpy(&near_levels, g_post_block + kDofNear, 4);
+    std::memcpy(&far_levels, g_post_block + kDofFar, 4);
+    const bool far_one = far_levels == 1, near_one = near_levels == 1;
+    if (!far_one && !near_one) return 0;
+    const float f = static_cast<float>(height) / 1080.0f;
+    float b0 = 0;
+    for (std::int32_t i = 0; i < n; ++i) {
+        auto* l = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(levels + static_cast<std::uint64_t>(i) * kDofLevelSize));
+        float far_b = 0, near_b = 0;
+        std::memcpy(&far_b, l + kDofLevelFarB, 4);
+        std::memcpy(&near_b, l + kDofLevelNearB, 4);
+        if (i == 0) b0 = far_one ? far_b : near_b;
+        if (far_one) far_b *= f;
+        if (near_one) near_b *= f;
+        std::memcpy(l + kDofLevelFarB, &far_b, 4);
+        std::memcpy(l + kDofLevelNearB, &near_b, 4);
+    }
+    static std::atomic<std::uint64_t> logged{0};
+    static std::atomic<int> lines{0};
+    std::uint32_t bb = 0;
+    std::memcpy(&bb, &b0, 4);
+    const std::uint64_t key = (static_cast<std::uint64_t>(height) << 40) ^ (static_cast<std::uint64_t>(far_one * 2 + near_one) << 32) ^ bb;
+    if (logged.exchange(key, std::memory_order_relaxed) != key && lines.fetch_add(1, std::memory_order_relaxed) < 16)
+        host_log("graphics: depth of field's blend at the 1080-line look: the picture %u lines high, the %s side%s drawn with one "
+                 "level, its first offset %g given, %g used",
+                 height, far_one && near_one ? "far and near" : far_one ? "far" : "near", far_one && near_one ? "s" : "", b0, b0 * f);
+    return 0;
+}
+
 // sub_25d4860's entry: the YEBIS object in rdi.
 GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* saved) {
     const auto* yebis = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(saved[5]));
+    if (yebis) log_dof_table(yebis);
     if (!g_post_block || !yebis || yebis[kYebisHeld]) return 0;
     const float bloom = g_bloom.load(std::memory_order_relaxed);
     const bool vignette = g_vignette.load(std::memory_order_relaxed);
@@ -671,9 +991,15 @@ GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* sav
         power = 0.0f;
         std::memcpy(g_post_block + kVignettePower, &power, 4);
     }
+    // Depth of field off: YEBIS's own switch, every view (kDofEnable).
+    if (!g_dof.load(std::memory_order_relaxed)) {
+        const std::int32_t off = 0;
+        std::memcpy(g_post_block + kDofEnable, &off, 4);
+    }
     for (int i = 0; i < g_post_poke.n; ++i) {
         std::memcpy(g_post_block + g_post_poke.off[i], &g_post_poke.value[i], 4);
     }
+    if (g_look_set.load(std::memory_order_acquire)) apply_look(g_post_block);
     return 0;
 }
 
@@ -713,6 +1039,25 @@ const BankLookup kBanks[12] = {
     {0x59c0, 0x1274bd0, 0x2ad0, 0x2b38, 0x2b74, 0x1f0}, {0x59c8, 0x127dad0, 0x2ad8, 0x2b40, 0x2b78, 0x1c0},
 };
 std::uint64_t g_slide = 0;
+
+// YEBIS's post effect (s_pSinglePostEffect) and its +0x140 byte: depth of
+// field's part made at its initialisation. Without it the effect's setters
+// keep the pass off whatever they are handed (sub_fd2a90 writes its enable
+// byte, +0x940, only while it is set).
+constexpr std::uint64_t kSinglePostEffect = 0x5865ed0;
+constexpr std::size_t kEffectDofReady = 0x140, kEffectDofOn = 0x940;
+std::uint64_t yebis_effect() {
+    std::uint64_t effect = 0;
+    if (g_slide)
+        std::memcpy(&effect, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_slide + (kSinglePostEffect - kPreferredGuestSlide))), 8);
+    return effect;
+}
+int yebis_effect_byte(std::size_t at) {  // -1 before the effect is made
+    const std::uint64_t effect = yebis_effect();
+    return effect ? *reinterpret_cast<const volatile std::uint8_t*>(static_cast<std::uintptr_t>(effect + at)) : -1;
+}
+int yebis_dof_ready() { return yebis_effect_byte(kEffectDofReady) > 0 ? 1 : yebis_effect_byte(kEffectDofReady); }
+int yebis_dof_on() { return yebis_effect_byte(kEffectDofOn); }  // as the last view's apply left it
 
 // BBHOST_DRAWPARAM_POKE=<bank>:<offset>:<float>:<expect>: write that float
 // into both entries a view asks that bank for, every view - to see whether a
@@ -880,7 +1225,13 @@ void drawparam_probe(const std::uint8_t* mgr, const std::uint8_t* r) {
 // written.
 GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved) {
     const float k = g_fog.load(std::memory_order_relaxed);
-    if (k == 1.0f && g_fog_test.n == 0) return 0;
+    GraphicsLook look;
+    if (g_look_set.load(std::memory_order_acquire) & kLookFog) {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        look = g_look;
+    }
+    const bool look_fog = look.set & kLookFog;
+    if (k == 1.0f && g_fog_test.n == 0 && !look_fog) return 0;
     std::uint64_t gm = 0, fm = 0;
     std::memcpy(&gm, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(g_slide + (kGraphicsManager - kPreferredGuestSlide))), 8);
     if (gm) std::memcpy(&fm, reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(gm)) + kFogManager, 8);
@@ -896,6 +1247,21 @@ GUEST_ABI std::int64_t fog_upload_hook(std::uint64_t, const std::uint64_t* saved
     for (std::uint32_t i = 0; i < count; ++i) {
         float* b = blocks + i * (kFogBlock / 4);
         for (int o : kFogOpacity) b[o] *= k;
+        if (look_fog) {
+            // A plugin's look (post_look): the distance (1/Dist at [1] and
+            // [10]), the density (the three opacities), the contrast ([7], the
+            // colour's, and [19], the height colour's) and the offsets
+            // (DistOffset [9], HeightOffset [13]).
+            if (look.fog_distance > 0.0f) {
+                b[1] /= look.fog_distance;
+                b[10] /= look.fog_distance;
+            }
+            for (int o : kFogOpacity) b[o] *= look.fog_density;
+            b[7] *= look.fog_contrast;
+            b[19] *= look.fog_contrast;
+            b[9] += look.fog_distance_offset;
+            b[13] += look.fog_height_offset;
+        }
         for (int t = 0; t < g_fog_test.n; ++t) {
             float& v = b[g_fog_test.index[t]];
             v = g_fog_test.add[t] ? v + g_fog_test.mul[t] : v * g_fog_test.mul[t];
@@ -1501,10 +1867,16 @@ void live_install(ElfImage* image) {
     if (!install_prologue_hook(image, at(kYebisRecord), kYebisRecordPrologue, sizeof(kYebisRecordPrologue),
                                reinterpret_cast<void*>(&yebis_record_hook))) {
         host_log("graphics: refused, 0x%llx is not the YEBIS record's prologue (or no room for its hook); "
-                 "bloom and vignette stay as the area has them",
+                 "bloom, vignette and depth of field stay as the area has them",
                  static_cast<unsigned long long>(kYebisRecord));
     } else {
         g_post_block = static_cast<std::uint8_t*>(guest_ptr(image->mem, at(kPostBlock)));
+    }
+    if (!install_prologue_hook(image, at(kDofLevels), kDofLevelsPrologue, sizeof(kDofLevelsPrologue),
+                               reinterpret_cast<void*>(&dof_levels_hook))) {
+        host_log("graphics: refused, 0x%llx is not the depth of field levels' prologue (or no room for its hook); its blend "
+                 "stays as the size has it",
+                 static_cast<unsigned long long>(kDofLevels));
     }
     if (!install_prologue_hook(image, at(kSsaoDraw), kSsaoDrawPrologue, sizeof(kSsaoDrawPrologue),
                                reinterpret_cast<void*>(&ssao_draw_hook))) {
@@ -1774,6 +2146,35 @@ std::string graphics_glare_report() {
     last_views = views;
     last_skipped = skipped;
     return buf;
+}
+
+std::uint32_t graphics_look_available() {
+    const HostSettings& hs = host_settings_ref();
+    std::uint32_t a = kLookAll;
+    if (hs.performance_mode || yebis_dof_ready() == 0) a &= ~kLookDof;
+    if (hs.performance_mode) a &= ~kLookMotionBlur;
+    if (host_opt_motion_rebuilt_bits()) a &= ~kLookMotionBlur;  // what the blur cannot read
+    return a;
+}
+
+void graphics_look_set(const GraphicsLook& look) {
+    const std::uint32_t avail = graphics_look_available();
+    GraphicsLook l = look;
+    l.set &= kLookAll;
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        g_look = l;
+    }
+    g_look_logged.store(l.set == 0);
+    g_look_set.store(l.set, std::memory_order_release);
+    // Motion blur on or off whatever its setting says: its shader patches
+    // (host/shader_patch.h) and the blur's velocity switch, where it can show
+    // at all. Depth of field needs nothing here: apply_look writes the
+    // block's enable after the setting's Off has cleared it (kDofOn).
+    const int blur = (l.set & kLookMotionBlur) && (avail & kLookMotionBlur) ? (l.motion_blur ? 1 : 0) : -1;
+    shader_patch_look(blur);
+    g_blur_look.store(blur, std::memory_order_relaxed);
+    blur_update();
 }
 
 void graphics_patch_install(ElfImage* image) {

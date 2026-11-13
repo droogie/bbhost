@@ -1368,9 +1368,6 @@ int main(int argc, char** argv) {
     }
 #endif
     plugins_load();  // before the HLE table is bound: a plugin may replace an import
-    if (host_settings().debug_camera && plugins_active("debug_menu"))
-        host_log("debug camera: on with the debug menu - its LOAD TEST and DUNGEON MOVEMAP TEST crash the game "
-                 "(the camera's code takes their step's place)");
     register_hle();
 
     ElfImage image{};

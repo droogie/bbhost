@@ -440,11 +440,30 @@ path at all:
 
 - YEBIS, the post-processing library (bloom, glare, depth of field, tone
   mapping): every stage's resources and constants are built by bbhost.
+  Its depth of field blends each blurred level in by the circle of
+  confusion in pixels, which grows with the picture, against an offset that
+  does not. A blur drawn with several levels keeps its look by itself, as a
+  growing circle moves on to the next, larger level (the cutscenes, a
+  plugin's lens), but the areas' own faint far blur has one level, so it
+  faded out below 1080 lines and grew above them. On a side drawn with one
+  level the offset now scales with the picture's height over 1080, which
+  keeps the 1080-line look at every Resolution; with an upscaler the height
+  is the picture's, the one YEBIS works at.
 - Scaleform, the menu renderer: its draws are taken from its hardware
   abstraction layer.
 - Depth snapshots, the on-screen overlay and FSR 1 upscaling are bbhost's
   own. The depth snapshot's compute pass goes into the recorder's stream
   (`BBHOST_STREAM_DEPTH_COPY=0` records it in place, draining the recorder).
+  The scene's own depth copy is one: after the G-buffer the game copies its
+  depth into DepthRenderTarget (and its first G-buffer target, the normals,
+  into GBuffer0), which SSAO, the sun's screen-space shadows, motion blur's
+  and screen space reflections' smaller depths, the decals, the forward
+  passes and depth of field read. The world's view makes them with
+  CopyResource; the renderer's two other modes make them with three calls of
+  their own (`0x26a10c0`, `0x26a2829`, `0x26a283f`), which the built-in
+  Performance patch turned into NOPs until v0.2.35 - calls the world's view
+  never makes, so leaving them out changed nothing there; only a view drawn in
+  those modes read targets nothing had written that frame.
 
 ## Native or emulated
 

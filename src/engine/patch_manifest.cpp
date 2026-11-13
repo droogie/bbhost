@@ -77,7 +77,6 @@ bool option_on(const std::string& option, bool* known) {
     if (option == "startup.skip_intro") return config().skip_intro;
     if (option == "loading.quick_reentry") return config().quick_reentry;
     if (option == "streaming.all_post_processors") return config().all_post_processors;
-    if (option == "debug.free_camera") return host_settings().debug_camera;  // F10 > Game, read once
     if (option == "startup.performance_mode") return host_settings().performance_mode;  // F10 > Game, read once
     if (option == "graphics.ssr") return host_settings().ssr;  // F10 > GRAPHICS, read once
     if (option == "graphics.hd_motion_blur") return host_settings().hd_motion_blur;  // F10 > GRAPHICS, read once
@@ -284,17 +283,30 @@ Manifest performance_mode_manifest() {
 // half and quarter depth at 640x360 and 320x180 (0x125b1a3/0x125b1d6, which
 // Screen space reflections puts back at the game's sizes when it is on). A
 // 2026-10-03 review of it, entry by entry, found parts emulator-specific,
-// parts that leave SSAO, depth of field and distortion reading stale buffers
-// (the skipped depth and scene copies), and parts it judged harmful (the file
-// cache's access-time skips, a condition wait made a `ret`, a cave calling
-// with a misaligned stack, the assert and DL_PANIC suppression). It is kept
-// byte for byte as players have run it, until each part is done natively.
+// parts that skip the scene renderer's own copies, and parts it judged harmful
+// (the file cache's access-time skips, a condition wait made a `ret`, a cave
+// calling with a misaligned stack, the assert and DL_PANIC suppression). It is
+// kept byte for byte as players have run it, until each part is done
+// natively - all but those copies, since v0.2.35. They were three calls of
+// GX's texture copy (sub_268f180) in the scene renderer (sub_26a0a30) made
+// NOPs: the scene's depth into DepthRenderTarget (+0xf48, the engine's own
+// name), which SSAO, the sun's screen-space shadows, the half- and quarter-size
+// depth of motion blur and screen space reflections, the decals, the forward
+// passes and depth of field read, and the first G-buffer target (world-space
+// normals) into GBuffer0 (+0x1068), which the decals and the forward passes
+// read. They belong to two of the renderer's three modes (+0x68): s125
+// (0x26a10c0) to mode 0's depth pre-pass, s126 and s127 (0x26a2829,
+// 0x26a283f) to mode 1 after the G-buffer. The world's view draws in mode 2,
+// where CopyResource calls the list leaves alone fill the same targets after
+// the G-buffer, so the world never ran them; a view in mode 0 or 1 read
+// targets nothing had written that frame. bbhost makes the copies as it
+// makes the others (the depth as its snapshot's compute pass, host/depth_copy.cpp).
 Manifest performance_manifest() {
     Manifest m;
     m.name = "performance";
     m.title = "Performance patch";
     m.eboot = kEboot109Sha256;
-    m.description = "Kyo's Performance Patch v3 (Velomap, Decals On), without its camera blur's and model detail's forces";
+    m.description = "Kyo's Performance Patch v3 (Velomap, Decals On), without its camera blur's and model detail's forces or its skipped scene copies";
     m.order = 21;
     m.sites = {
 #include "engine/performance_v3_sites.inc"

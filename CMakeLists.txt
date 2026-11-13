@@ -145,6 +145,7 @@ add_executable(bbhost
   src/engine/live_resolution.cpp
   src/engine/render_scale.cpp
   src/engine/loading.cpp
+  src/engine/world_pause.cpp
   src/engine/camera.cpp
   src/engine/mouse_camera.cpp
   src/engine/mouse_camera_stubs.cpp
@@ -173,6 +174,7 @@ add_executable(bbhost
   src/host/overlay.cpp
   src/host/present_pass.cpp
   src/host/ingame_menu.cpp
+  src/host/plugin_panel.cpp
   src/host/controls_page.cpp
   src/host/framegen.cpp
   src/host/options.cpp
@@ -292,6 +294,7 @@ bb_plugin(quake plugins/quake/quake.cpp)
 bb_plugin(lohit plugins/lohit/lohit.cpp)
 bb_plugin(ps1 plugins/ps1/ps1.cpp)
 bb_plugin(iso plugins/iso/iso.cpp)
+bb_plugin(photo_mode plugins/photo_mode/photo_mode.cpp)
 # The Debug Menu plugin carries its glyphs (plugins/debug_menu/font14.bin,
 # tools/make_debug_font.py) as bytes: build/gen/debug_font14.inc, rewritten
 # only when the file changes.
@@ -750,6 +753,12 @@ if(UNIX)
   add_dependencies(mapval_probe_test mapval_probe)
   add_test(NAME mapval_probe_test COMMAND mapval_probe_test $<TARGET_FILE:mapval_probe>)
   set_tests_properties(mapval_probe_test PROPERTIES SKIP_RETURN_CODE 77)
+  # Plugin API 29's world_pause, world_step, pad, pad_take and world_state in a
+  # running game, for a harness (tools/api29_probe.c). Built beside the tests,
+  # never into plugins/, where bbhost would load it.
+  add_library(api29_probe MODULE tools/api29_probe.c)
+  target_include_directories(api29_probe PRIVATE include)
+  set_target_properties(api29_probe PROPERTIES PREFIX "")
   # The boss rush plugin's travel and fog warp on a pretend host whose loads
   # are slow (plugins/boss_rush): nothing moves the player inside a loading
   # screen, and only a travel that truly fails stops the run.
@@ -777,6 +786,14 @@ if(UNIX)
   target_link_libraries(ps1_plugin_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(ps1_plugin_test bb_plugin_ps1)
   add_test(NAME ps1_plugin_test COMMAND ps1_plugin_test $<TARGET_FILE:bb_plugin_ps1>)
+  # The photo mode plugin on a pretend host (plugins/photo_mode): when it starts
+  # and ends - nobody else in the world - and what it asks of the host meanwhile.
+  add_executable(photo_mode_plugin_test tests/photo_mode_plugin_test.cpp)
+  target_include_directories(photo_mode_plugin_test PRIVATE include)
+  target_compile_features(photo_mode_plugin_test PRIVATE cxx_std_17)
+  target_link_libraries(photo_mode_plugin_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(photo_mode_plugin_test bb_plugin_photo_mode)
+  add_test(NAME photo_mode_plugin_test COMMAND photo_mode_plugin_test $<TARGET_FILE:bb_plugin_photo_mode>)
   # The shader overrides' example on a pretend host (examples/plugins/shader_tint):
   # its own source asked for until met, patched, on and off by turns, its
   # strength in its shader data each frame; nothing asked of an older host.
@@ -893,13 +910,14 @@ if(UNIX)
   add_test(NAME sign_in_check_test COMMAND sign_in_check_test)
   # The setup window's connection test (net/nat_check.h): the exchange from a
   # port against a test server of its own on loopback - a router that keeps
-  # one port, one that changes it, none answering, the port check open, closed
-  # and absent - and the server's answers read.
+  # one port, one that changes it, none answering, the first seconds held,
+  # every send refused, the port check open, closed and absent - the server's
+  # answers read, and the card's words for each reading (~25 s of waits).
   add_executable(nat_check_test tests/nat_check_test.cpp src/net/nat_probe.cpp src/net/stun.cpp src/replay/json.cpp)
   target_include_directories(nat_check_test PRIVATE src)
   target_link_libraries(nat_check_test PRIVATE Threads::Threads)
   add_test(NAME nat_check_test COMMAND nat_check_test)
-  set_tests_properties(nat_check_test PROPERTIES TIMEOUT 60)
+  set_tests_properties(nat_check_test PROPERTIES TIMEOUT 120)
   add_executable(uncapped_limit_test tests/uncapped_limit_test.cpp)
   target_include_directories(uncapped_limit_test PRIVATE src)
   add_test(NAME uncapped_limit_test COMMAND uncapped_limit_test)
@@ -1506,7 +1524,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     # The official plugins too: the package carries them, and a CI build makes
     # nothing it is not asked for (v0.2.0's Windows zip shipped without them).
-    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_iso bb_plugin_debug_menu
+    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_iso bb_plugin_photo_mode bb_plugin_debug_menu
     USES_TERMINAL)
 else()
   add_custom_target(smoke

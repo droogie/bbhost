@@ -10,9 +10,11 @@
 #include "host/controls_page.h"
 #include "host/launcher_ui.h"
 #include "host/options.h"
+#include "host/plugin_panel.h"
 #include "host/plugin_ui.h"
 #include "host/settings.h"
 #include "host/slow_calls.h"
+#include "host/window.h"
 #include "log.h"
 
 #include "imgui.h"
@@ -84,6 +86,8 @@ ImGuiKey key_of(SDL_Keycode k) {
     case SDLK_RSHIFT: return ImGuiKey_RightShift;
     case SDLK_A: return ImGuiKey_A;
     case SDLK_C: return ImGuiKey_C;
+    case SDLK_E: return ImGuiKey_E;
+    case SDLK_Q: return ImGuiKey_Q;
     case SDLK_V: return ImGuiKey_V;
     case SDLK_X: return ImGuiKey_X;
     default: return ImGuiKey_None;
@@ -348,13 +352,12 @@ bool toml_bool(const char* key, bool fallback) {
     return v.empty() ? fallback : v == "true" || v == "1";
 }
 
-// The switch a patch follows: a setting for the four that follow one (the
-// setup window's same four), [patches] <name> for the rest.
+// The switch a patch follows: a setting for those that follow one (the setup
+// window's same ones), [patches] <name> for the rest.
 bool switch_of(const PatchListing& p) {
     const std::string& o = p.option;
     if (o == "startup.skip_intro") return host_opt_get("skip_logos");
     if (o == "startup.performance_mode") return host_opt_get("performance_mode");
-    if (o == "debug.free_camera") return host_opt_get("debug_camera");
     if (o == "loading.quick_reentry") return toml_bool("loading.quick_reentry", config().quick_reentry);
     if (o == "streaming.all_post_processors") return toml_bool("streaming.all_post_processors", config().all_post_processors);
     return patch_manifest_on(p.name, p.enabled);
@@ -366,7 +369,6 @@ void save_switch(const PatchRow& r) {
     host_options_post([o = r.p.option, name = r.p.name, on = r.on] {
         if (o == "startup.skip_intro") return host_opt_set("skip_logos", on);
         if (o == "startup.performance_mode") return host_opt_set("performance_mode", on);
-        if (o == "debug.free_camera") return host_opt_set("debug_camera", on);
         std::string section = "patches", key = name;
         if (o == "loading.quick_reentry") section = "loading", key = "quick_reentry";
         if (o == "streaming.all_post_processors") section = "streaming", key = "all_post_processors";
@@ -625,6 +627,117 @@ void menu_key(bool patches) {
     if (!open) host_options_set_open(true);
 }
 
+// A plugin's panel up (host/plugin_panel.h) and no menu: its keys, the
+// controller's buttons it takes and the pointer go to ImGui as well. Nothing
+// is taken from the window - the game and the plugins are kept from them
+// where the pad and keys are read (host/window.cpp).
+void panel_event(const SDL_Event& e, float ratio) {
+    static bool was = false;
+    // The keys and buttons ImGui was told went down while the panel was up
+    // and not yet let go. Only their release goes to it while the panel is
+    // down - no frame of it runs then to take anything else, and the queue
+    // would fill with the game's play, losing the menu's first events.
+    static std::vector<ImGuiKey> held;
+    const auto note = [](ImGuiKey k, bool down) {
+        const auto it = std::find(held.begin(), held.end(), k);
+        if (down && it == held.end()) held.push_back(k);
+        if (!down && it != held.end()) held.erase(it);
+    };
+    const bool up = plugin_panel_shown();
+    if (up && !was) {
+        // Where the pointer is now: it has been the camera's until this.
+        Input focus;
+        focus.kind = Input::Focus;
+        push(focus);
+        Input in;
+        SDL_GetMouseState(&in.x, &in.y);
+        in.x *= ratio;
+        in.y *= ratio;
+        push(in);
+    }
+    was = up;
+    if (!up) {
+        // A key or button of the panel's let go while it is down (the Escape
+        // or Circle that closed it): ImGui is told, or it would take the next
+        // press for one still held when the panel comes back.
+        Input in;
+        in.kind = Input::Key;
+        in.down = false;
+        if (e.type == SDL_EVENT_KEY_UP && plugin_panel_key(e.key.scancode)) {
+            in.key = e.key.scancode == SDL_SCANCODE_Q ? ImGuiKey_Q : e.key.scancode == SDL_SCANCODE_E ? ImGuiKey_E : key_of(e.key.key);
+        } else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+            in.key = pad_key_of(e.gbutton.button);
+        }
+        if (in.key != ImGuiKey_None && std::find(held.begin(), held.end(), in.key) != held.end()) {
+            push(in);
+            note(in.key, false);
+        }
+        return;
+    }
+    switch (e.type) {
+    case SDL_EVENT_KEY_DOWN:
+    case SDL_EVENT_KEY_UP:
+        if (!plugin_panel_key(e.key.scancode)) return;
+        // Q and E where they are on the keyboard, whatever its layout calls them.
+        if (const ImGuiKey k = e.key.scancode == SDL_SCANCODE_Q   ? ImGuiKey_Q
+                               : e.key.scancode == SDL_SCANCODE_E ? ImGuiKey_E
+                                                                  : key_of(e.key.key);
+            k != ImGuiKey_None) {
+            Input in;
+            in.kind = Input::Key;
+            in.key = k;
+            in.down = e.type == SDL_EVENT_KEY_DOWN;
+            push(in);
+            note(k, in.down);
+        }
+        return;
+    case SDL_EVENT_MOUSE_MOTION: {
+        Input in;
+        in.kind = Input::Move;
+        in.x = e.motion.x * ratio;
+        in.y = e.motion.y * ratio;
+        push(in);
+        return;
+    }
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: {
+        Input in;
+        in.kind = Input::Button;
+        in.x = e.button.x * ratio;
+        in.y = e.button.y * ratio;
+        in.button = e.button.button == SDL_BUTTON_LEFT ? 0 : e.button.button == SDL_BUTTON_RIGHT ? 1 : 2;
+        in.down = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+        push(in);
+        return;
+    }
+    case SDL_EVENT_MOUSE_WHEEL: {
+        Input in;
+        in.kind = Input::Wheel;
+        in.x = e.wheel.x;
+        in.y = e.wheel.y;
+        push(in);
+        return;
+    }
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP: {
+        const ImGuiKey k = pad_key_of(e.gbutton.button);
+        const bool panel_button = k == ImGuiKey_GamepadDpadUp || k == ImGuiKey_GamepadDpadDown || k == ImGuiKey_GamepadDpadLeft ||
+                                  k == ImGuiKey_GamepadDpadRight || k == ImGuiKey_GamepadFaceDown || k == ImGuiKey_GamepadFaceRight ||
+                                  k == ImGuiKey_GamepadL1 || k == ImGuiKey_GamepadR1;
+        if (!panel_button) return;
+        Input in;
+        in.kind = Input::Key;
+        in.key = k;
+        in.down = e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+        push(in);
+        note(k, in.down);
+        return;
+    }
+    default:
+        return;
+    }
+}
+
 }  // namespace
 
 bool ingame_menu_open() { return host_options_open(); }
@@ -655,6 +768,7 @@ bool ingame_menu_event(const SDL_Event& e, float ratio) {
     }
     if (!ingame_menu_open()) {
         controls_menu_closed();
+        panel_event(e, ratio);
         return false;
     }
     // A binding being chosen on the Controls page takes the next press first.
@@ -828,15 +942,59 @@ void ingame_menu_shutdown() {
 
 namespace {
 
+// The frame's end, the menu's or a plugin's panel's: rendered to draw data,
+// coloured, and ImGui's texture uploads done under the queue's lock.
+bool finish_frame() {
+    ImGui::Render();
+    // Menu hue and Menu vibrance, on everything the menus draw.
+    float hue = 0.0f, vibrance = 0.0f;
+    host_opt_menu_colour(&hue, &vibrance);
+    ui::set_colour(hue, vibrance);
+    ui::recolour(ImGui::GetDrawData());
+    // ImGui's own texture uploads - the font atlas when the menu first opens,
+    // and again whenever 1.92 adds glyphs to it - submit on the renderer's
+    // queue and then wait for that queue to go idle. Left to RenderDrawData
+    // they ran on this thread with no lock, beside the submission thread's
+    // vkQueueSubmit on the same queue, which Vulkan requires the caller to
+    // keep apart. Done here under the queue's lock (as the overlay's atlas
+    // is, host/overlay.cpp), RenderDrawData then finds nothing to upload. A
+    // frame with no texture to change - nearly all of them - takes no lock.
+    ImDrawData* dd = ImGui::GetDrawData();
+    bool uploads = false;
+    if (dd && dd->Textures) {
+        for (ImTextureData* tex : *dd->Textures) uploads = uploads || tex->Status != ImTextureStatus_OK;
+    }
+    if (uploads) {
+        // A submission and a wait for the queue to go idle, inside ImGui's backend.
+        static constexpr slow_calls::Site kMenuUploads{slow_calls::kQueueIdle, "the menus' texture uploads"};
+        host_gpu_queue_lock();
+        {
+            slow_calls::Scope timed(kMenuUploads);
+            for (ImTextureData* tex : *dd->Textures) {
+                if (tex->Status != ImTextureStatus_OK) ImGui_ImplVulkan_UpdateTexture(tex);
+            }
+        }
+        host_gpu_queue_unlock();
+    }
+    return true;
+}
+
 // ImGui's frame for the menu, built and rendered to draw data; false when
 // neither menu is open (no ImGui frame at all, so a closed menu costs the
 // presenter nothing but this check).
 bool build_frame(VkExtent2D extent) {
-    if (!g_vk_ready || !host_options_open()) {
+    const bool menu = host_options_open();
+    const bool panel = !menu && plugin_panel_shown();  // a plugin's panel (host/plugin_panel.h) while no menu is up
+    if (!g_vk_ready || (!menu && !panel)) {
         g_ui.scanned = false;     // read the files again when it next opens
         g_patches.read = false;
         g_was_up = false;
         return false;
+    }
+    if (!menu) {
+        g_ui.scanned = false;
+        g_patches.read = false;
+        g_was_up = false;
     }
     ImGui::SetCurrentContext(g_ctx);
     ImGuiIO& io = ImGui::GetIO();
@@ -875,11 +1033,15 @@ bool build_frame(VkExtent2D extent) {
         case Input::Focus: io.AddFocusEvent(true); break;
         }
     }
+    ImGui_ImplVulkan_NewFrame();
+    ImGui::NewFrame();
+    if (panel) {
+        plugin_panel_draw(ui::scale(), host_input_device() == InputDevice::Pad);
+        return finish_frame();
+    }
     const int n = static_cast<int>(menu_pages().size());
     if (const int p = g_test_page.exchange(-1); p >= 0 && p < n) g_page = p;
     if (g_jump.exchange(-1) == -2) g_page = g_patches_page;
-    ImGui_ImplVulkan_NewFrame();
-    ImGui::NewFrame();
     if (!g_was_up) {
         g_shown_at = ImGui::GetTime();
         g_page_at = g_shown_at;
@@ -897,38 +1059,7 @@ bool build_frame(VkExtent2D extent) {
     close = draw_menu() || close;
     ImGui::PopStyleVar();
     if (close) host_options_close();
-    ImGui::Render();
-    // Menu hue and Menu vibrance, on everything the menus draw.
-    float hue = 0.0f, vibrance = 0.0f;
-    host_opt_menu_colour(&hue, &vibrance);
-    ui::set_colour(hue, vibrance);
-    ui::recolour(ImGui::GetDrawData());
-    // ImGui's own texture uploads - the font atlas when the menu first opens,
-    // and again whenever 1.92 adds glyphs to it - submit on the renderer's
-    // queue and then wait for that queue to go idle. Left to RenderDrawData
-    // they ran on this thread with no lock, beside the submission thread's
-    // vkQueueSubmit on the same queue, which Vulkan requires the caller to
-    // keep apart. Done here under the queue's lock (as the overlay's atlas
-    // is, host/overlay.cpp), RenderDrawData then finds nothing to upload. A
-    // frame with no texture to change - nearly all of them - takes no lock.
-    ImDrawData* dd = ImGui::GetDrawData();
-    bool uploads = false;
-    if (dd && dd->Textures) {
-        for (ImTextureData* tex : *dd->Textures) uploads = uploads || tex->Status != ImTextureStatus_OK;
-    }
-    if (uploads) {
-        // A submission and a wait for the queue to go idle, inside ImGui's backend.
-        static constexpr slow_calls::Site kMenuUploads{slow_calls::kQueueIdle, "the menus' texture uploads"};
-        host_gpu_queue_lock();
-        {
-            slow_calls::Scope timed(kMenuUploads);
-            for (ImTextureData* tex : *dd->Textures) {
-                if (tex->Status != ImTextureStatus_OK) ImGui_ImplVulkan_UpdateTexture(tex);
-            }
-        }
-        host_gpu_queue_unlock();
-    }
-    return true;
+    return finish_frame();
 }
 
 }  // namespace

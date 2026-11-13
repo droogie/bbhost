@@ -31,3 +31,6 @@ bool loading_in_world();
 // run as fast as the machine allows - the community's fast-loading patch,
 // done natively. BBHOST_FAST_LOADING=0 turns it off.
 bool loading_fast_now();
+// The last tick's answer: a cutscene (a Remo) plays, or one is queued - the
+// SprjRemo manager's running bit or its queue (plugin API 29 world_state).
+bool loading_cutscene();

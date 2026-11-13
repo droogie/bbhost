@@ -182,7 +182,7 @@ all_post_processors = false
 # [patches]
 # The patch manifests (patches/*.toml, a mod's <mods>/patches), by name: every
 # shipped one is off until true puts it in. The setup window's Patches tab
-# writes these; a manifest tied to a setting (skip-intro, debug-camera, ...)
+# writes these; a manifest tied to a setting (skip-intro, performance-mode, ...)
 # follows that setting instead.
 # fov-uncap = true
 

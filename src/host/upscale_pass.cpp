@@ -2435,6 +2435,91 @@ void upscale_pass_hudless_locked(RtImage& display) {  // `display`: the HUD's ta
 
 bool upscale_pass_hudless_copied_locked() { return g_fg_copy != VK_NULL_HANDLE; }
 
+// Plugin API 29's hud_hide (host/scene_look.h): the picture in the game's 2D's
+// target kept before its first 2D draw, and put back before the display
+// buffer's pass reads the target - so the game's HUD, menus and prompts are
+// drawn as always and composited away. One image: the frame's copy back is in
+// its command buffer before the next frame's copy in, and each copy waits on
+// the last (the barriers cover what came before in the queue).
+namespace {
+OwnImage g_hud_copy;
+VkFormat g_hud_copy_format = VK_FORMAT_UNDEFINED;
+std::uint32_t g_hud_copy_w = 0, g_hud_copy_h = 0;
+bool g_hud_saved = false;  // this frame's picture is kept and not yet put back
+}  // namespace
+
+void hud_hide_save_locked(RtImage& target) {
+    if (g_hud_copy.image && (g_hud_copy_format != target.format || g_hud_copy_w != target.width || g_hud_copy_h != target.height))
+        drop(g_hud_copy);
+    if (!g_hud_copy.image) {
+        if (!make(g_hud_copy, target.format, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, target.width,
+                  target.height)) {
+            static bool told = false;
+            if (!told) host_log("plugin: no image to keep the picture in; the HUD stays");
+            told = true;
+            return;
+        }
+        g_hud_copy_format = target.format;
+        g_hud_copy_w = target.width;
+        g_hud_copy_h = target.height;
+    }
+    begin_recording_locked();
+    if (target.view_clear) view_clear_apply_locked(target);
+    render_end_pass_locked();
+    VkCommandBuffer cb = g_cmd();
+    barrier(cb, target.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    barrier(cb, g_hud_copy.image, VK_IMAGE_ASPECT_COLOR_BIT, g_hud_copy.initialised ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageCopy r{};
+    r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.extent = {target.width, target.height, 1};
+    vkCmdCopyImage(cb, target.image, VK_IMAGE_LAYOUT_GENERAL, g_hud_copy.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    barrier(cb, target.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+    barrier(cb, g_hud_copy.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+    g_hud_copy.initialised = true;
+    g_hud_saved = true;
+}
+
+bool hud_hide_saved_locked() { return g_hud_saved; }
+
+bool hud_hide_held_locked() { return g_hud_saved || g_hud_copy.image; }
+
+void hud_hide_release_locked() {
+    if (!g_hud_copy.image || g_hud_saved) return;
+    drop(g_hud_copy);
+    g_hud_copy_format = VK_FORMAT_UNDEFINED;
+    g_hud_copy_w = g_hud_copy_h = 0;
+    host_log("plugin: the HUD shows again; its copy's video memory given back");
+}
+
+void hud_hide_restore_locked(RtImage& target) {
+    const bool saved = g_hud_saved;
+    g_hud_saved = false;
+    if (!saved || !g_hud_copy.image || g_hud_copy_w != target.width || g_hud_copy_h != target.height ||
+        g_hud_copy_format != target.format)
+        return;
+    begin_recording_locked();
+    if (target.view_clear) view_clear_apply_locked(target);
+    render_end_pass_locked();
+    VkCommandBuffer cb = g_cmd();
+    barrier(cb, target.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageCopy r{};
+    r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.extent = {target.width, target.height, 1};
+    vkCmdCopyImage(cb, g_hud_copy.image, VK_IMAGE_LAYOUT_GENERAL, target.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    barrier(cb, target.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                VK_ACCESS_TRANSFER_READ_BIT);
+    static std::uint64_t frames = 0;
+    if (++frames == 1) host_log("plugin: the game's HUD left out of the picture (%ux%u)", target.width, target.height);
+}
+
 void upscale_pass_hudless_bind_locked(std::uint64_t display_va, std::uint32_t display_w, std::uint32_t display_h) {
     if (g_fg_pending && g_fg_copy)
         framegen_note_hudless(display_va, g_fg_pending, g_fg_copy, g_fg_copy_format, g_fg_copy_w, g_fg_copy_h, display_w, display_h);

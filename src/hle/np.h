@@ -15,6 +15,10 @@ std::string hle_np_online_status();
 // True once the game has started its Matching2 context (it read its NpId before that,
 // so an account logged in afterwards only takes effect on the next launch).
 bool hle_np_context_started();
+// The other members of the room this session is in (0 outside one): a player
+// on the way in counts from the server's member-joined event, before the game
+// has made anything of them (plugin API 29's world_state).
+std::uint32_t hle_np_room_others();
 void hle_register_np_signaling();
 
 // NpSignaling learns a peer's address: fires ESTABLISHED/ACTIVE for a
