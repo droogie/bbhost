@@ -772,6 +772,11 @@ void draw_icon(ImDrawList* dl, Icon icon, ImVec2 at, float size, ImU32 col) {
         dl->AddLine(P(-0.42f, 0.32f), P(0.42f, 0.32f), col, th);  // the space bar
         break;
     }
+    case Icon::Problem:
+        dl->AddCircleFilled(at, 0.92f * h, col);
+        dl->AddLine(P(-0.34f, -0.34f), P(0.34f, 0.34f), c(kInk), th * 1.25f);
+        dl->AddLine(P(-0.34f, 0.34f), P(0.34f, -0.34f), c(kInk), th * 1.25f);
+        break;
     case Icon::Chat: {
         dl->AddRect(P(-0.9f, -0.74f), P(0.9f, 0.44f), col, 0.34f * h, th);
         const ImVec2 tail[] = {P(-0.46f, 0.44f), P(-0.62f, 0.9f), P(-0.08f, 0.44f)};
@@ -1091,6 +1096,26 @@ bool ghost_button(const char* label, Icon icon, ImVec2 size) {
     draw_icon(dl, icon, ImVec2(x + is * 0.5f, p.y + size.y * 0.5f), is, c(hovered ? kText : kIce));
     dl->AddText(ImVec2(x + is + gap, p.y + (size.y - ImGui::GetFontSize()) * 0.5f), c(kText), text.c_str());
     return pressed;
+}
+
+bool disclosure(const char* label, bool* open) {
+    const float s = g_scale, fs = ImGui::GetFontSize();
+    const char* end = ImGui::FindRenderedTextEnd(label);
+    const float cw = std::round(fs * 0.62f), gap = std::round(6 * s);
+    const ImVec2 size(cw + gap + ImGui::CalcTextSize(label, end).x, std::round(fs * 1.3f));
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    if (ImGui::InvisibleButton(label, size)) *open = !*open;
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImU32 col = c(hovered ? kText : kTextDim);
+    // The chevron: pointing right while closed, down while open.
+    const ImVec2 m(p.x + cw * 0.5f, p.y + size.y * 0.5f);
+    const float k = cw * 0.28f, th = std::max(1.2f, 1.5f * s);
+    const ImVec2 v[] = {*open ? ImVec2(m.x - k * 1.3f, m.y - k * 0.6f) : ImVec2(m.x - k * 0.6f, m.y - k * 1.3f), m + (*open ? ImVec2(0, k * 0.7f) : ImVec2(k * 0.7f, 0)),
+                        *open ? ImVec2(m.x + k * 1.3f, m.y - k * 0.6f) : ImVec2(m.x - k * 0.6f, m.y + k * 1.3f)};
+    dl->AddPolyline(v, 3, col, 0, th);
+    dl->AddText(ImVec2(p.x + cw + gap, p.y + (size.y - fs) * 0.5f), col, label, end);
+    return *open;
 }
 
 void avatar(const std::string& name, float size) {

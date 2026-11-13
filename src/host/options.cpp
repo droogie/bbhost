@@ -2407,22 +2407,28 @@ void account_page() {
         ImGui::PopFont();
         ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextDim);
         ImGui::TextUnformatted(hle_np_online_status().c_str());
-        // The connection test's verdict as the setup window had it before
-        // the game started (its own test, or the account's last one): the
-        // test itself runs only there, from the game's port while the game
-        // is closed. Nothing when the setup window did not open.
+        // The connection test's result as the setup window's card said it
+        // before the game started (its own test, or the account's last one),
+        // in the card's words and colour: the test itself runs only there,
+        // from the game's port while the game is closed. Nothing when the
+        // setup window did not open.
         if (const net::nat::Remembered c = net::nat::remembered(); c.known) {
             const double now = static_cast<double>(std::time(nullptr));
-            ImGui::TextUnformatted(("Connection test (" + net::nat::ago(c.at, now) + (c.saved ? "" : ", not saved") +
-                                    "): " + (c.head.empty() ? std::string(net::nat::headline(c.verdict)) : c.head))
-                                       .c_str());
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-                ui::tooltip("Connection test",
-                            (c.meaning.empty() ? std::string(net::nat::meaning(c.verdict)) : c.meaning) +
-                                (c.inbound != net::nat::Inbound::NotTested
-                                     ? " " + net::nat::inbound_line(c.inbound, config().p2p_port > 0 ? config().p2p_port : 9307, c.verdict)
-                                     : std::string()),
-                            "The setup window's Game page runs it again (bbhost --setup, while the game is closed).");
+            const net::nat::Tone t = c.card.tone;
+            ImGui::PushStyleColor(ImGuiCol_Text, t == net::nat::Tone::Good ? ui::kGood
+                                                 : t == net::nat::Tone::Warn ? ui::kWarn
+                                                 : t == net::nat::Tone::Bad  ? ui::kBad
+                                                                             : ui::kTextDim);
+            ImGui::TextUnformatted(("Connection test (" + net::nat::ago(c.at, now) + (c.saved ? "" : ", not saved") + "): " + c.card.head).c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
+                std::string text = c.card.sentence;
+                for (const std::string* line : {&c.card.incoming, &c.card.action}) {
+                    if (!line->empty()) text += " " + *line;
+                }
+                for (std::size_t i = 0; i < c.card.steps.size(); ++i) text += "\n" + std::to_string(i + 1) + ". " + c.card.steps[i];
+                ui::tooltip("Connection test", text, "The setup window's Game page runs it again (bbhost --setup, while the game is closed).");
+            }
         }
         ImGui::PopStyleColor();
         ImGui::EndGroup();

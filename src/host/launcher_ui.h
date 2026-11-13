@@ -42,6 +42,7 @@ enum class Icon {
     Game, Online, Enhance, Patches, Shaders, Plugins, Settings,
     Folder, File, Check, Warning, Info, Play, Moon, Search, Copy, User, Download, Refresh, SignIn,
     Display, Image, Keyboard,
+    Problem,  // a cross in a disc: something stops it (Check's and Warning's third)
     Chat,     // a speech bubble: the community's Discord
 };
 
@@ -127,6 +128,9 @@ bool ghost_button(const char* label, ImVec2 size = ImVec2(0, 0));
 // The same with `icon` before its label (cut to the button with "..."); a
 // width of 0 fits both.
 bool ghost_button(const char* label, Icon icon, ImVec2 size = ImVec2(0, 0));
+// A line that opens and closes what is under it: a chevron and `label`, dim.
+// Flips *open when pressed, and returns it.
+bool disclosure(const char* label, bool* open);
 // The sidebar's entries: a dot of colour `dot` (0 for none) at the right, or
 // `badge`'s text in it.
 bool nav_item(const char* label, Icon icon, bool selected, ImU32 dot = 0, const char* badge = nullptr);

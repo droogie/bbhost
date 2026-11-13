@@ -53,17 +53,13 @@ private:
 };
 
 // The latest result this process knows - a test the setup window ran, or the
-// account's last one as the sign-in check read it (whoami's NatTest) - for
-// F10's line in the game.
+// account's last one as the sign-in check read it (whoami's NatTest) - as the
+// setup window's card says it, for F10's line in the game.
 struct Remembered {
     bool known = false;
-    Verdict verdict = Verdict::None;
-    Inbound inbound = Inbound::NotTested;
     double at = 0;       // Unix seconds
     bool saved = false;  // kept for the account
-    // The card's headline and meaning for a test run here ("" for the
-    // account's last test: headline() and meaning() of its verdict).
-    std::string head = {}, meaning = {};
+    Card card;           // the card's words (the setup window remembers what it shows)
 };
 void remember(const Remembered& r);
 Remembered remembered();
