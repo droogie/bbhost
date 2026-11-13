@@ -2452,7 +2452,11 @@ void hud_hide_save_locked(RtImage& target) {
     if (g_hud_copy.image && (g_hud_copy_format != target.format || g_hud_copy_w != target.width || g_hud_copy_h != target.height))
         drop(g_hud_copy);
     if (!g_hud_copy.image) {
-        if (!make(g_hud_copy, target.format, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, target.width,
+        // Sampled too, though only copies touch it: make() gives every image a
+        // view, which an image of transfers alone may not have (the validation
+        // layer's VUID-VkImageViewCreateInfo-image-04441 as photo mode started).
+        if (!make(g_hud_copy, target.format,
+                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, target.width,
                   target.height)) {
             static bool told = false;
             if (!told) host_log("plugin: no image to keep the picture in; the HUD stays");
