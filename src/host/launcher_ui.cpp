@@ -1,5 +1,6 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/launcher_ui.h"
+#include "host/game_font.h"
 #include "core/portable.h"
 
 #include "log.h"
@@ -517,6 +518,9 @@ void init_ingame(float scale) {
     g_art = Art{};
     g_scale = scale;
     load_fonts();
+    // A plugin's panel in the game's own menu letters, read from the dump
+    // (host/game_font.h); the system's serif where it has none.
+    if (ImFont* f = game_font_add_to_imgui()) g_game = f;
     apply_style(scale);
 }
 

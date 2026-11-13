@@ -175,6 +175,7 @@ add_executable(bbhost
   src/host/present_pass.cpp
   src/host/ingame_menu.cpp
   src/host/plugin_panel.cpp
+  src/host/game_font.cpp
   src/host/controls_page.cpp
   src/host/framegen.cpp
   src/host/options.cpp
@@ -1183,6 +1184,13 @@ if(UNIX)
   add_executable(look_math_test tests/look_math_test.cpp)
   target_include_directories(look_math_test PRIVATE src)
   add_test(NAME look_math_test COMMAND look_math_test)
+  # The game's menu font read from the dump and its glyphs rasterised
+  # (host/game_font.h); skipped without the dump (BBHOST_APP0).
+  add_executable(game_font_test tests/game_font_test.cpp src/host/game_font.cpp)
+  target_include_directories(game_font_test PRIVATE src)
+  target_compile_definitions(game_font_test PRIVATE BBHOST_GAME_FONT_NO_FS=1)
+  add_test(NAME game_font_test COMMAND game_font_test)
+  set_tests_properties(game_font_test PROPERTIES SKIP_RETURN_CODE 77)
   # Mouse sensitivity's scale and the old scale's settings read on it
   # (engine/mouse_camera_step.h).
   add_executable(mouse_sensitivity_test tests/mouse_sensitivity_test.cpp)
