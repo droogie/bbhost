@@ -95,9 +95,9 @@ struct Settings {
     int vignette = 0;        // Area's own, None, Light, Medium, Strong, Heavy
     int saturation = 100, brightness = 100, exposure = 100, gamma = 100, contrast = 100;  // % of the area's
     int dof = 0;             // Area's own, On, Off
-    int dof_focus = 30;      // (it / 10) squared metres
-    float dof_aperture = 5.6f;
-    int dof_near = 0, dof_far = 1;
+    float dof_from = 1.0f, dof_to = 10.0f;  // metres: sharp between them
+    int dof_near = 0, dof_far = 3;          // the blur's strength in front and behind, 0-7
+    int dof_fade = 3;                       // kFades: how gradually the blur comes in
     int ca = 0;              // Area's own, On, Off
     int ca_lateral[2] = {6, 0}, ca_uniform[2] = {0, 0};  // thousandths
     int fog_distance = 100, fog_density = 100, fog_contrast = 100;  // % of the area's
@@ -286,6 +286,13 @@ void show_panel(bool up) {
     }
 }
 
+// The Depth of field page's distances (metres) and fades (of the distance).
+#define BB_DOF_DISTANCES                                                                                                   \
+    "0.25 m|0.5 m|0.75 m|1 m|1.5 m|2 m|2.5 m|3 m|4 m|5 m|6 m|8 m|10 m|12 m|15 m|20 m|25 m|30 m|40 m|50 m|75 m|100 m|150 m|" \
+    "200 m|300 m|500 m|1000 m"
+#define BB_DOF_FADES "None|10%|25%|50%|100%"
+constexpr float kFades[] = {0.0f, 0.1f, 0.25f, 0.5f, 1.0f};
+
 // The look the rows make (post_look): only what differs from the area's own.
 constexpr float kVignettePower[] = {0.0f, 0.0f, 0.3f, 0.6f, 1.0f, 1.5f};  // by the Vignette row, Area's own first
 void post_look() {
@@ -304,13 +311,22 @@ void post_look() {
         l.vignette = kVignettePower[std::clamp(set.vignette, 0, 5)];
     }
     if (set.dof > 0) {
+        // On, by distance (BB_LOOK_DOF_RANGE): sharp from Sharp from to
+        // Sharp to, the blur nearer and further coming in over the Fade's
+        // share of each distance. The lens is the host's then: no focus or
+        // aperture here.
         l.set |= BB_LOOK_DOF;
         l.dof = set.dof == 1;
-        const float d = set.dof_focus / 10.0f;
-        l.dof_focus = d * d;
-        l.dof_aperture = set.dof_aperture;
         l.dof_near_levels = set.dof_near;
         l.dof_far_levels = set.dof_far;
+        if (l.dof) {
+            const float fade = kFades[std::clamp(set.dof_fade, 0, 4)];
+            l.set |= BB_LOOK_DOF_RANGE;
+            l.dof_near_end = set.dof_from;
+            l.dof_far_start = set.dof_to;
+            l.dof_near_fade = set.dof_from * fade;
+            l.dof_far_fade = set.dof_to * fade;
+        }
     }
     if (set.ca > 0) {
         l.set |= BB_LOOK_ABERRATION;
@@ -339,7 +355,7 @@ void post_look() {
     std::uint32_t available = 0;
     api->post_look(kName, l.set ? &l : nullptr, &available);
     static std::uint32_t told = 0;
-    const std::uint32_t missing = l.set & ~available & (BB_LOOK_DOF | BB_LOOK_MOTION_BLUR);
+    const std::uint32_t missing = l.set & ~available & (BB_LOOK_DOF | BB_LOOK_MOTION_BLUR);  // DOF_RANGE goes with DOF
     if (missing && missing != told)
         api->log("photo mode: %s cannot show now (Performance mode leaves it out)",
                  missing == BB_LOOK_DOF ? "depth of field" : missing == BB_LOOK_MOTION_BLUR ? "motion blur" : "depth of field and motion blur");
@@ -554,6 +570,7 @@ bool take_option(const char* key, const char* value) {
     static const char* const kModes[] = {"Frozen", "Static", "Live"};
     static const char* const kVignettes[] = {"Area's own", "None", "Light", "Medium", "Strong", "Heavy"};
     static const char* const kSwitch[] = {"Area's own", "On", "Off"};
+    static const char* const kFadeNames[] = {"None", "10%", "25%", "50%", "100%"};
     const std::string k = key;
     if (k == "start") choice(kStarts, 2, &set.start);
     else if (k == "mode") choice(kModes, 3, &set.mode);
@@ -567,8 +584,9 @@ bool take_option(const char* key, const char* value) {
     else if (k == "gamma") num(50, 150, &set.gamma);
     else if (k == "contrast") num(80, 120, &set.contrast);
     else if (k == "dof") choice(kSwitch, 3, &set.dof);
-    else if (k == "dof_focus") num(5, 200, &set.dof_focus);
-    else if (k == "dof_aperture") set.dof_aperture = std::clamp(static_cast<float>(std::atof(v.c_str())), 0.7f, 32.0f);
+    else if (k == "dof_from") set.dof_from = std::clamp(static_cast<float>(std::atof(v.c_str())), 0.1f, 1000.0f);
+    else if (k == "dof_to") set.dof_to = std::clamp(static_cast<float>(std::atof(v.c_str())), 0.1f, 1000.0f);
+    else if (k == "dof_fade") choice(kFadeNames, 5, &set.dof_fade);
     else if (k == "dof_near") num(0, 7, &set.dof_near);
     else if (k == "dof_far") num(0, 7, &set.dof_far);
     else if (k == "ca") choice(kSwitch, 3, &set.ca);
@@ -647,19 +665,28 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
              "% of the area's own contrast. Steep: a few percent goes a long way, and 110 crushes most shadows to black.", "100", 80, 120),
 
     PANEL("dof", "Depth of field",
-          "The blur away from the focus. Performance mode leaves it out, and with it these rows do nothing."),
+          "Sharp between two distances from the camera, blurred nearer and further. Performance mode leaves it out, and with "
+          "it these rows do nothing."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "dof", "Depth of field",
      "Area's own keeps the area's depth of field. On uses the rows below; Off leaves it out. Performance mode leaves it out "
      "whatever this says.",
      "Area's own", 0, 0, "Area's own|On|Off"},
-    LIVE_INT_WHEN("dof_focus", "Focus", "Where it is sharp: 10 is 1 m, 30 is 9 m, 100 is 100 m (the number over ten, squared).",
-                  "30", 5, 200, "dof=On"),
-    {BB_OPT_FLOAT | BB_OPT_LIVE | BB_OPT_WHEN, "dof_aperture", "Aperture",
-     "The lens's f-number: the smaller, the more blurred away from the focus. The areas use 5.6.", "5.6", 0.7, 32, "dof=On"},
-    LIVE_INT_WHEN("dof_near", "Blur in front", "Blurs what is nearer than the focus, the further the more (0: none, up to 7).",
+    // (A choice row cannot be greyed out by another's value: BB_OPT_WHEN
+    // takes its choices field.)
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "dof_from", "Sharp from",
+     "With Depth of field On, where the blur in front ends: nearer than this is blurred, as Blur in front says.", "1 m", 0, 0,
+     BB_DOF_DISTANCES},
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "dof_to", "Sharp to",
+     "With Depth of field On, where the blur behind begins: further than this is blurred, as Blur behind says.", "10 m", 0, 0,
+     BB_DOF_DISTANCES},
+    LIVE_INT_WHEN("dof_near", "Blur in front", "How strongly what is nearer than Sharp from is blurred (0: not at all, up to 7).",
                   "0", 0, 7, "dof=On"),
-    LIVE_INT_WHEN("dof_far", "Blur behind", "Blurs what is further than the focus, the further the more (0: none, up to 7).", "1",
+    LIVE_INT_WHEN("dof_far", "Blur behind", "How strongly what is further than Sharp to is blurred (0: not at all, up to 7).", "3",
                   0, 7, "dof=On"),
+    {BB_OPT_CHOICE | BB_OPT_LIVE, "dof_fade", "Fade",
+     "With Depth of field On, how gradually the blur comes in, as a share of each distance: None is a sharp edge; at 100% "
+     "the blur behind is full only at twice Sharp to, and the blur in front grows from Sharp from to the camera.",
+     "50%", 0, 0, BB_DOF_FADES},
 
     PANEL("ca", "Chromatic aberration", "Colour fringes towards the picture's edges, as a lens makes them."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "ca", "Chromatic aberration",

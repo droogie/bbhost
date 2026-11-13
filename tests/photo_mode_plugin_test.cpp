@@ -18,8 +18,9 @@
 // with another player in the world or on the way, or in another's world; the
 // HUD option shows the HUD; its panel opens with it, R3 hides and shows it,
 // and the panel's rows go over the area's look while it runs and nowhere
-// else, motion blur's samples within what the game's blur is made for. Its
-// options table is whole, every row with its help.
+// else: depth of field placed by distance, motion blur's samples within what
+// the game's blur is made for. Its options table is whole, every row with its
+// help.
 //
 //   photo_mode_plugin_test <photo_mode.so>
 #include "bbhost_plugin.h"
@@ -394,13 +395,18 @@ int main(int argc, char** argv) {
             }
         }
         CHECK(pages == 6);
-        // The Field of view row goes from -40 to +60, the motion blur's samples
-        // stop at 8.
+        // The depth of field's page places the blur by distance, the motion
+        // blur's samples stop at 8.
+        bool from = false, to = false, aperture = false;
         for (const BbOption* o = p.options; o->type; ++o) {
             if (!o->key) continue;
+            from = from || std::strcmp(o->key, "dof_from") == 0;
+            to = to || std::strcmp(o->key, "dof_to") == 0;
+            aperture = aperture || std::strcmp(o->key, "dof_aperture") == 0;
             if (std::strcmp(o->key, "blur_samples") == 0) CHECK(o->min == 2 && o->max == 8);
             if (std::strcmp(o->key, "fov") == 0) CHECK(o->min == -40 && o->max == 60);
         }
+        CHECK(from && to && !aperture);
     }
 
     // An API 28 host: refused before asking for anything.
@@ -484,7 +490,20 @@ int main(int argc, char** argv) {
     H.option_fn("saturation", "50", H.option_user);
     CHECK(H.look_on && (H.look.set & BB_LOOK_TONE) && std::fabs(H.look.saturation - 0.5f) < 1e-6f && H.look.exposure == 1.0f);
     H.option_fn("dof", "On", H.option_user);
-    CHECK((H.look.set & BB_LOOK_DOF) && H.look.dof == 1 && std::fabs(H.look.dof_focus - 9.0f) < 1e-4f && H.look.dof_far_levels == 1);
+    // On places the blur by distance: sharp from 1 m to 10 m, the blur behind
+    // at 3 coming in over half of each distance, none in front.
+    CHECK((H.look.set & BB_LOOK_DOF) && (H.look.set & BB_LOOK_DOF_RANGE) && H.look.dof == 1);
+    CHECK(H.look.dof_near_end == 1.0f && H.look.dof_far_start == 10.0f && H.look.dof_near_levels == 0 && H.look.dof_far_levels == 3);
+    CHECK(std::fabs(H.look.dof_near_fade - 0.5f) < 1e-6f && std::fabs(H.look.dof_far_fade - 5.0f) < 1e-6f);
+    H.option_fn("dof_from", "2.5 m", H.option_user);
+    H.option_fn("dof_to", "40 m", H.option_user);
+    H.option_fn("dof_near", "5", H.option_user);
+    H.option_fn("dof_fade", "None", H.option_user);
+    CHECK(H.look.dof_near_end == 2.5f && H.look.dof_far_start == 40.0f && H.look.dof_near_levels == 5);
+    CHECK(H.look.dof_near_fade == 0.0f && H.look.dof_far_fade == 0.0f);
+    H.option_fn("dof", "Off", H.option_user);
+    CHECK((H.look.set & BB_LOOK_DOF) && H.look.dof == 0 && !(H.look.set & BB_LOOK_DOF_RANGE));
+    H.option_fn("dof", "On", H.option_user);
     // Motion blur's samples within 2..8, whatever the config holds.
     H.option_fn("blur", "On", H.option_user);
     H.option_fn("blur_samples", "16", H.option_user);
