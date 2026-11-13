@@ -91,6 +91,11 @@ bool host_opt_motion_wanted();
 int host_opt_motion_rebuilt_bits();
 int host_opt_resolution_index();
 void host_opt_set_resolution_index(int i);
+// The Resolution list as its row shows it - "(16:9) 1920x1080", each size
+// after its aspect ratio - its length in *n, and the row's help text: for
+// the setup window's Display card, the same setting as the Graphics page's.
+const char* const* host_opt_resolution_labels(int* n);
+const char* host_opt_resolution_note();
 // The game's frame rate (engine/frame_rate.h): 30, 60, 90, 120, 150, 180,
 // 240, 360, 480, 960, or 0 for Uncapped (the display's refresh rate); the
 // file's key is still frame_cap. Same setting, same file.
