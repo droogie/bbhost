@@ -347,7 +347,6 @@ wants one keeps its file in their own patches folder.
 |---|---|
 | `disable-misc-renders.toml` | **Disable Misc. Renders**: Disable Misc. Renders - Kyo's patch: four of the scene's extra targets are not made, nor their passes drawn (off by default; at the next start) |
 | `fxaa2-gs-dlaa-gs.toml` | **Better AA**: FXAA2_GS + DLAA_GS - Kyo's patch: both anti-aliasing filters (off by default) |
-| `text-scale-50.toml` | **50% Text scale**: Smaller text, which looks good at higher resolutions. (off by default) |
 | `ds1-physics.toml` | **DS1-like physics**: Corpses and objects can be flung around, as in Dark Souls. (off by default; one of object physics) |
 | `lower-object-physics.toml` | **Lower object/corpse physics**: Corpses resist being moved by the player or anything else. (off by default; one of object physics) |
 | `disable-camera-auto-rotation.toml` | **Disable Camera Auto Rotation via Movement**: The camera no longer turns by itself as the character moves; turning it by hand and lock-on still work. (off by default; at the next start) |

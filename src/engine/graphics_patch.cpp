@@ -1776,8 +1776,33 @@ std::string graphics_glare_report() {
     return buf;
 }
 
+// Text scale. The menus register their font, MenuFont_01, with a scale
+// loaded from one constant (vmovss xmm0, [0x4d2913c] at 0x235cd15, the only
+// reader, which runs once as the menus start): 1.0 the game's own. Kyo's
+// "50% Text scale" patch wrote 0.5 there; the setting writes 0.5 to 1.0. A
+// patch that already wrote it keeps its value.
+constexpr std::uint64_t kMenuFontScale = 0x4d2913c;
+
+void text_scale_install(ElfImage* image) {
+    const float want = std::clamp(host_settings().text_scale, 0.5f, 1.0f);
+    if (want == 1.0f) return;
+    const std::uint64_t at = image->mem.slide + (kMenuFontScale - kPreferredGuestSlide);
+    auto* p = static_cast<float*>(guest_ptr(image->mem, at));
+    if (*p != 1.0f) {
+        host_log("graphics: text scale %g left as %g (a patch wrote it, or another eboot)", static_cast<double>(want),
+                 static_cast<double>(*p));
+        return;
+    }
+    const std::uint64_t lo = at & ~0xfffull;
+    guest_protect_rwx(&image->mem, lo, 0x1000);
+    *p = want;
+    guest_protect_rx(&image->mem, lo, 0x1000);
+    host_log("graphics: text scale %g (MenuFont_01)", static_cast<double>(want));
+}
+
 void graphics_patch_install(ElfImage* image) {
     resolution_patch(image, live_resolution_install(image));
+    text_scale_install(image);
     menu_memory_install(image);
     frame_rate_install(image);
     camera_install(image);

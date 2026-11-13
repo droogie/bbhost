@@ -167,6 +167,7 @@ enum SettingId {
     kMenuTextSize,
     kMenuHue,
     kMenuVibrance,
+    kTextScale,
     kSettingCount,
 };
 
@@ -680,6 +681,13 @@ Setting g_set[kSettingCount] = {
      "is their own blue and violet.",
      false},
     {"menu_vibrance", "Menu vibrance", signed_steps(-100, 100, "%"), 100, "How much colour bbhost's own menus have: -100% is black and white, 0% their own, +100% the most.", false},
+    // The game's own text: the scale MenuFont_01 is registered with, a float
+    // the eboot reads once as the menus start (engine/graphics_patch.cpp,
+    // text_scale_install) - what Kyo's "50% Text scale" patch set to 0.5.
+    {"text_scale", "Text scale", signed_steps(50, 100, "%", false), 50,
+     "Requires a restart. The size of the game's own text. 100% is the game's own; smaller looks better at high "
+     "resolutions.",
+     true},
 };
 
 // The in-game menu's pages, one a header, in the setup window's order: Game
@@ -738,6 +746,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kTextureQuality},
     {Row::Option, nullptr, kSfxTextureQuality},
     {Row::Option, nullptr, kModelDetail},
+    {Row::Option, nullptr, kTextScale},
     {Row::Option, nullptr, kAnisotropicFiltering},
     {Row::Option, nullptr, kHdMotionBlur},
     {Row::Option, nullptr, kHdMotionBlurRes},
@@ -1402,6 +1411,8 @@ void apply(int id) {
         case kMenuHue:
         case kMenuVibrance:
             break;  // the menus read them every frame (host_opt_menu_text_scale, host_opt_menu_colour)
+        case kTextScale:
+            break;  // read by the loader (engine/graphics_patch.cpp)
         default: break;
     }
 }
@@ -1563,6 +1574,7 @@ void rebuild_settings() {
         h.motion_vectors = std::clamp(index_of(kMotionVectors), 0, 3);
         h.char_motion = index_of(kCharMotion) != 1;  // Precise, Off (the game's velocity map alone)
     }
+    h.text_scale = static_cast<float>(50 + std::clamp(index_of(kTextScale), 0, 50)) / 100.0f;
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
     h.debug_menu = on_of(kDebugMenu);
@@ -1708,6 +1720,7 @@ void host_options_load() {
                          static_cast<int>(kSkillIssue), static_cast<int>(kFullPhantomHp), static_cast<int>(kAutoReplenish)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
+    bool text_scale_saved = false;  // the file has a text_scale (below)
     FILE* f = std::fopen(path.c_str(), "r");
     if (f) {
         char line[512];
@@ -1764,6 +1777,7 @@ void host_options_load() {
             if (key == "old_hunters") continue;  // v0.2.9's PC enhancement: The Old Hunters is always on now
             // Looked at again once the file's version is known (below).
             if (key == "frame_cap") frame_cap_val = val;
+            if (key == "text_scale") text_scale_saved = true;
             if (key == "window_mode") window_mode_val = val;
             // HD motion blur quality's were Quarter, Half and Full until 2026-11-05.
             if (key == "hd_motion_blur_res") val = val == "Quarter" ? "Low" : val == "Half" ? "Medium" : val == "Full" ? "High" : val;
@@ -1864,6 +1878,14 @@ void host_options_load() {
             save();  // as version 2, so a later Off is the player's and stays
         }
         host_log("options: read %s", path.c_str());
+    }
+    // Text scale was the patch text-scale-50 until 2026-11-13: a player who
+    // had it on keeps 50% (once: the save writes text_scale, which wins from then on).
+    if (!text_scale_saved && config_value("patches.text-scale-50") == "true") {
+        g_set[kTextScale].index = 0;
+        g_dirty = true;
+        save();
+        host_log("options: the patch text-scale-50 was on; Text scale reads as %s", "50%");
     }
     // BBHOST_ACCOUNT=name:token, for a scripted run that must not touch the file.
     if (const char* e = std::getenv("BBHOST_ACCOUNT"); e && e[0]) {
@@ -2312,7 +2334,7 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
         }
         ImGui::PopID();
         return;
-    } else if (id == kResolution || id == kMenuTextSize) {
+    } else if (id == kResolution || id == kMenuTextSize || id == kTextScale) {
         ImGui::SetNextItemWidth(cw);
         ui::combo("##v", &want, id == kResolution ? resolution_labels(s).data() : s.values.data(), n);
     } else if (n <= 4 || id == kShadowResolution || id == kUpscaler || id == kAnisotropicFiltering) {
