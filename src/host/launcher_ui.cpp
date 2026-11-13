@@ -54,6 +54,7 @@ SDL_Renderer* g_ren = nullptr;
 ImFont* g_body = nullptr;
 ImFont* g_strong = nullptr;
 ImFont* g_title = nullptr;
+ImFont* g_game = nullptr;  // the serif nearest the game's own menus' letters
 
 struct Art {
     SDL_Texture* sharp = nullptr;  // the painting in the palette
@@ -214,6 +215,7 @@ void load_fonts() {
     add_font({"malgun.ttf", "gulim.ttc"}, true);
     g_strong = add_font({"seguisb.ttf", "segoeuib.ttf"});
     g_title = add_font({"pala.ttf", "georgia.ttf", "constan.ttf"});
+    g_game = add_font({"times.ttf", "pala.ttf", "georgia.ttf"});
 #else
     g_body = add_font({"/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/noto/NotoSans-Regular.ttf",
                        "/usr/share/fonts/google-noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -242,6 +244,14 @@ void load_fonts() {
                         "/usr/share/fonts/dejavu-serif-fonts/DejaVuSerif.ttf",
                         "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
                         "/usr/share/fonts/liberation/LiberationSerif-Regular.ttf"});
+    // Liberation Serif is drawn to Times New Roman's measure, the face the
+    // game's menus' Latin letters are nearest.
+    g_game = add_font({"/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+                       "/usr/share/fonts/liberation/LiberationSerif-Regular.ttf", "/usr/share/fonts/TTF/LiberationSerif-Regular.ttf",
+                       "/usr/share/fonts/liberation-serif/LiberationSerif-Regular.ttf",
+                       "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", "/usr/share/fonts/TTF/DejaVuSerif.ttf",
+                       "/usr/share/fonts/dejavu/DejaVuSerif.ttf", "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
+                       "/usr/share/fonts/noto/NotoSerif-Regular.ttf"});
 #endif
     ImGui::GetIO().FontDefault = g_body;
 }
@@ -522,13 +532,14 @@ void shutdown() {
     if (g_art.mild) SDL_DestroyTexture(g_art.mild);
     g_art = Art{};
     g_motes.clear();
-    g_body = g_strong = g_title = nullptr;
+    g_body = g_strong = g_title = g_game = nullptr;
     g_ren = nullptr;
 }
 
 float scale() { return g_scale; }
 ImFont* font_strong() { return g_strong ? g_strong : ImGui::GetFont(); }
 ImFont* font_title() { return g_title ? g_title : font_strong(); }
+ImFont* font_game() { return g_game ? g_game : font_title(); }
 
 static bool g_animations = true;
 void set_animations(bool on) { g_animations = on; }

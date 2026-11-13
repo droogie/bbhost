@@ -943,14 +943,15 @@ void ingame_menu_shutdown() {
 namespace {
 
 // The frame's end, the menu's or a plugin's panel's: rendered to draw data,
-// coloured, and ImGui's texture uploads done under the queue's lock.
-bool finish_frame() {
+// coloured (the menu's: a panel keeps the game's own colours), and ImGui's
+// texture uploads done under the queue's lock.
+bool finish_frame(bool menu) {
     ImGui::Render();
     // Menu hue and Menu vibrance, on everything the menus draw.
     float hue = 0.0f, vibrance = 0.0f;
     host_opt_menu_colour(&hue, &vibrance);
     ui::set_colour(hue, vibrance);
-    ui::recolour(ImGui::GetDrawData());
+    if (menu) ui::recolour(ImGui::GetDrawData());
     // ImGui's own texture uploads - the font atlas when the menu first opens,
     // and again whenever 1.92 adds glyphs to it - submit on the renderer's
     // queue and then wait for that queue to go idle. Left to RenderDrawData
@@ -1037,7 +1038,7 @@ bool build_frame(VkExtent2D extent) {
     ImGui::NewFrame();
     if (panel) {
         plugin_panel_draw(ui::scale(), host_input_device() == InputDevice::Pad);
-        return finish_frame();
+        return finish_frame(false);
     }
     const int n = static_cast<int>(menu_pages().size());
     if (const int p = g_test_page.exchange(-1); p >= 0 && p < n) g_page = p;
@@ -1059,7 +1060,7 @@ bool build_frame(VkExtent2D extent) {
     close = draw_menu() || close;
     ImGui::PopStyleVar();
     if (close) host_options_close();
-    return finish_frame();
+    return finish_frame(true);
 }
 
 }  // namespace

@@ -63,6 +63,7 @@ void set_scale(float scale);
 float scale();
 ImFont* font_strong();  // semibold, for headings
 ImFont* font_title();   // the serif, for the name and the big buttons
+ImFont* font_game();    // the serif nearest the game's own menus' letters (Times New Roman's measure): a plugin's panel
 
 // Each frame, first: the painting covering the window (drifting a little),
 // its veils, darker toward the sidebar and the bottom, and the motes.

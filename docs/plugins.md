@@ -307,7 +307,13 @@ over the game.
   (`NULL`). Its pages are the plugin's own options table: a `BB_OPT_HEADING`
   with `BB_OPT_PANEL` or-ed in starts a page, the rows under it up to the next
   heading are on it, and neither shows in the menus. It is drawn over the game
-  at the bottom right with the rows' own widgets, its changes going to
+  at the bottom right in the look of the game's own menus - their serif
+  letters, a dark plate between thin rules, the page's name in gold, the row
+  with the cursor lit gold, a switch or a choice shown as its value between
+  two arrows - at one size for every page (its longest page's rows and room
+  for its longest help), so it never moves as rows or pages change; Menu hue
+  and Menu vibrance, which colour bbhost's menus, leave it as it is. Its rows'
+  changes go to
   `on_option` as the menus' do (so its rows want `BB_OPT_LIVE`), the help of
   the row in use under them, then `guide` or `guide_keys` - whichever device
   the player used last. The controller drives it (the d-pad up and down to a
