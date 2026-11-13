@@ -50,6 +50,7 @@
 #include "host/gxvk.h"
 #include "host/gxvk_homes.h"
 #include "host/rt_extent.h"
+#include "host/run_lookups.h"
 #include "log.h"
 
 #if !defined(_WIN32)
@@ -257,7 +258,14 @@ std::uint64_t g_slide = 0;
 std::mutex g_mu;
 std::unordered_map<std::uint64_t, Entry> g_by_holder;      // under g_mu
 std::map<std::uint64_t, std::uint64_t> g_by_memory;        // memory base -> holder, live entries only
-std::atomic<std::uint64_t> g_write_seq{1};
+// The registry's shape (host/run_lookups.h): its memory index, its holders,
+// and each entry's memory, size, type and liveness - what gx_buffer_end's
+// answer is made of. Moved under g_mu after each change of it, before anything
+// else in that change (run_lookups' helpers), with release order; read with
+// acquire. A line of its own: every vertex record whose extent is asked reads
+// it, and the counters beside the maps are written at every Map and lookup.
+alignas(64) std::atomic<std::uint64_t> g_shape_gen{1};
+alignas(64) std::atomic<std::uint64_t> g_write_seq{1};
 std::atomic<std::uint64_t> g_gen_next{1};  // GxResourceInfo::gen
 
 // Counters.
@@ -571,8 +579,9 @@ void register_entry(std::uint64_t key, Entry& e) {
     if (auto old = g_by_holder.find(key); old != g_by_holder.end()) {
         // The holder's address reused before its destructor was seen.
         g_replaced_holder.fetch_add(1, std::memory_order_relaxed);
-        if (auto m = g_by_memory.find(old->second.info.memory); m != g_by_memory.end() && m->second == key) g_by_memory.erase(m);
-        g_by_holder.erase(old);
+        if (auto m = g_by_memory.find(old->second.info.memory); m != g_by_memory.end() && m->second == key)
+            run_lookups::erase_moved(g_by_memory, m, g_shape_gen);
+        run_lookups::erase_moved(g_by_holder, old, g_shape_gen);
     }
     if (e.info.memory && e.info.bytes) {
         // The census: live resources the new one's memory overlaps other than
@@ -613,11 +622,11 @@ void register_entry(std::uint64_t key, Entry& e) {
                          static_cast<unsigned long long>(old != g_by_holder.end() ? old->second.created_flip : 0), static_cast<unsigned long long>(m->second));
             }
             if (const auto old = g_by_holder.find(m->second); old != g_by_holder.end() && old->second.info.type == 1) gxvk::buffer_replaced(m->second);
-            if (old_holder_alive(m->second)) g_by_holder.erase(m->second);
+            if (old_holder_alive(m->second)) run_lookups::erase_moved(g_by_holder, g_by_holder.find(m->second), g_shape_gen);
         }
-        g_by_memory[e.info.memory] = key;
+        run_lookups::set_moved(g_by_memory, e.info.memory, key, g_shape_gen);
     }
-    g_by_holder.emplace(key, e);
+    run_lookups::emplace_moved(g_by_holder, key, e, g_shape_gen);
     const std::uint64_t live = g_by_memory.size();
     if (live > g_peak_live.load(std::memory_order_relaxed)) g_peak_live.store(live, std::memory_order_relaxed);
     // A resource made: with data, its creator copied the data in before
@@ -747,8 +756,9 @@ void unregister_holder(std::uint64_t holder) {
             buffer_bytes = it->second.info.bytes;
             buffer_gen = it->second.info.gen;
         }
-        if (auto m = g_by_memory.find(it->second.info.memory); m != g_by_memory.end() && m->second == holder) g_by_memory.erase(m);
-        g_by_holder.erase(it);
+        if (auto m = g_by_memory.find(it->second.info.memory); m != g_by_memory.end() && m->second == holder)
+            run_lookups::erase_moved(g_by_memory, m, g_shape_gen);
+        run_lookups::erase_moved(g_by_holder, it, g_shape_gen);
         g_last_copy.erase(holder);
     }
     retire_memory(memory, bytes, gen);
@@ -796,9 +806,11 @@ void note_map(std::uint64_t holder, std::uint64_t type, std::uint64_t mapped_out
                 moved_from = e.info.memory;
                 moved_bytes = e.info.bytes;
             }
-            if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == holder) g_by_memory.erase(m);
+            if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == holder)
+                run_lookups::erase_moved(g_by_memory, m, g_shape_gen);
             e.info.memory = memory;
-            g_by_memory[memory] = holder;
+            run_lookups::shape_moved(g_shape_gen);
+            run_lookups::set_moved(g_by_memory, memory, holder, g_shape_gen);
         }
         if (e.info.type >= 2 && e.info.type <= 4) {
             texture_memory = e.info.memory;
@@ -1120,9 +1132,11 @@ void yebis_written(std::uint64_t object, bool after_map = false, bool tell_cache
         Entry& e = it->second;
         if (now && now != e.info.memory) {
             g_map_moved.fetch_add(1, std::memory_order_relaxed);
-            if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == key) g_by_memory.erase(m);
+            if (auto m = g_by_memory.find(e.info.memory); m != g_by_memory.end() && m->second == key)
+                run_lookups::erase_moved(g_by_memory, m, g_shape_gen);
             e.info.memory = now;
-            g_by_memory[now] = key;
+            run_lookups::shape_moved(g_shape_gen);
+            run_lookups::set_moved(g_by_memory, now, key, g_shape_gen);
             e.yebis_flip = ~0ull;  // (its object read again on the new memory)
         }
         memory = e.info.memory;
@@ -2001,8 +2015,12 @@ void gx_resources_memory_released(std::uint64_t va, std::size_t len) {
         if (g_by_memory.empty()) return;
         for (auto it = g_by_memory.lower_bound(va); it != g_by_memory.end() && it->first < va + len;) {
             auto h = g_by_holder.find(it->second);
-            if (h != g_by_holder.end()) h->second.info.alive = false;  // the holder may still be destroyed later
-            it = g_by_memory.erase(it);
+            if (h != g_by_holder.end()) {
+                h->second.info.alive = false;  // the holder may still be destroyed later
+                run_lookups::shape_moved(g_shape_gen);
+            }
+            const auto here = it++;
+            run_lookups::erase_moved(g_by_memory, here, g_shape_gen);
             ++n;
         }
     }
@@ -2036,15 +2054,81 @@ bool gx_resource_at(std::uint64_t va, std::size_t bytes, GxResourceInfo* out) {
     return true;
 }
 
+namespace {
+// gx_buffer_end's memo (BBHOST_RUN_LOOKUPS, host/run_lookups.h): this thread's
+// last answer, the addresses that answer the same, and the shape's generation
+// it was worked out at - under g_mu, the generation read there, where no move
+// can come between the lookup and the read (every move is made under g_mu).
+//
+// A hit answers without the lock. It cannot answer older than a change of the
+// registry the calling thread has synchronised with: each change is followed
+// at once by a release move of g_shape_gen, before anything in its change that
+// could release a lock or free memory (run_lookups' helpers: an erased node
+// is freed after the move). Whatever the thread synchronised with the change
+// through - g_mu, another lock, an atomic, the submission that brought it the
+// draw - was released after the change in the changing thread, so after the
+// move: the move happens before the thread's acquire load of the generation,
+// which then reads that move's value or a later one (coherence), never the
+// generation of a memo made before the change (a memo's generation is read
+// under g_mu, and every change after it moves the generation on). Such a
+// lookup misses and takes the lock. A change the thread has not synchronised
+// with is one its lookup may come before, which is what a hit answers. Each
+// thread's memo is its own; BBHOST_RUN_LOOKUPS=compare looks every hit up
+// under the lock as well and counts the differences.
+thread_local run_lookups::ExtentMemo t_extent_memo;
+// Lookups and memo answers on this thread, added to the totals every 256
+// lookups (a shared counter at every lookup would be a line the command
+// processor and the run commit's workers pass between them); compare mode's
+// checks, differences, and checks a change of the shape came between (the
+// memo's shape gone: not comparable), counted as made.
+struct ExtentCounts {
+    std::uint64_t asked = 0, hits = 0;
+};
+thread_local ExtentCounts t_extent_counts;
+std::atomic<std::uint64_t> g_extent_asked{0}, g_extent_hits{0}, g_extent_checked{0}, g_extent_differed{0}, g_extent_raced{0};
+std::atomic<int> g_extent_logs{0};
+const GxResourceInfo* resource_of_key(std::uint64_t key) {
+    const auto h = g_by_holder.find(key);
+    return h == g_by_holder.end() ? nullptr : &h->second.info;
+}
+}  // namespace
+
 std::uint64_t gx_buffer_end(std::uint64_t va) {
+    const int mode = run_lookups::g_mode;
+    ExtentCounts& c = t_extent_counts;
+    if ((++c.asked & 255) == 0) {
+        g_extent_asked.fetch_add(256, std::memory_order_relaxed);
+        g_extent_hits.fetch_add(c.hits, std::memory_order_relaxed);
+        c.hits = 0;
+    }
+    run_lookups::ExtentMemo& memo = t_extent_memo;
+    const bool hit = mode && run_lookups::extent_hit(memo, g_shape_gen.load(std::memory_order_acquire), va);
+    if (hit) {
+        ++c.hits;
+        if (mode == 1) return memo.end;
+    }
     std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_by_memory.upper_bound(va);
-    if (it == g_by_memory.begin()) return 0;
-    --it;
-    const auto h = g_by_holder.find(it->second);
-    if (h == g_by_holder.end() || !h->second.info.alive || h->second.info.type != 1) return 0;
-    const GxResourceInfo& r = h->second.info;
-    return va < r.memory + r.bytes ? r.memory + r.bytes : 0;
+    run_lookups::ExtentMemo m;
+    const std::uint64_t end = run_lookups::extent_lookup(g_by_memory, resource_of_key, va, &m);
+    m.gen = g_shape_gen.load(std::memory_order_relaxed);
+    if (hit) {  // compare: the memo's answer against the lookup's, the shape the same
+        g_extent_checked.fetch_add(1, std::memory_order_relaxed);
+        if (m.gen != memo.gen) {
+            g_extent_raced.fetch_add(1, std::memory_order_relaxed);
+        } else if (end != memo.end) {
+            g_extent_differed.fetch_add(1, std::memory_order_relaxed);
+            if (g_extent_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                host_log("run-lookups: compare: the GX buffer extent at 0x%llx: the memo answered 0x%llx ([0x%llx, 0x%llx) at shape %llu), "
+                         "the lookup 0x%llx ([0x%llx, 0x%llx)) at flip %llu",
+                         static_cast<unsigned long long>(va), static_cast<unsigned long long>(memo.end), static_cast<unsigned long long>(memo.lo),
+                         static_cast<unsigned long long>(memo.hi), static_cast<unsigned long long>(memo.gen), static_cast<unsigned long long>(end),
+                         static_cast<unsigned long long>(m.lo), static_cast<unsigned long long>(m.hi),
+                         static_cast<unsigned long long>(hle_video_flip_count()));
+            }
+        }
+    }
+    if (mode) memo = m;
+    return end;
 }
 
 bool gx_buffers_cover(std::uint64_t va, std::uint64_t bytes) {
@@ -2185,6 +2269,18 @@ bool gx_resource_newer_overlapping(std::uint64_t va, std::size_t bytes, std::uin
 }
 
 void gx_resources_report() {
+    {
+        const unsigned long long asked = g_extent_asked.load(), hits = g_extent_hits.load();
+        if (asked || run_lookups::compare()) {
+            std::string compared;
+            if (run_lookups::compare())
+                compared = "; compare: memo answers checked " + std::to_string(g_extent_checked.load()) + ", differed " +
+                           std::to_string(g_extent_differed.load()) + ", a change of the registry between " + std::to_string(g_extent_raced.load());
+            host_log("run-lookups: GX buffer extents (%s): %llu asked (whole 256s a thread), %llu answered by the memo (%.1f%%)%s",
+                     run_lookups::compare() ? "compare" : run_lookups::on() ? "on" : "off", asked, hits,
+                     asked ? 100.0 * static_cast<double>(hits) / static_cast<double>(asked) : 0.0, compared.c_str());
+        }
+    }
     if (!g_gx_res_after_thunk) return;
     std::size_t live = 0;
     {

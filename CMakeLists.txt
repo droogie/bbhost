@@ -1038,6 +1038,10 @@ if(UNIX)
   add_executable(vertex_clamp_test tests/vertex_clamp_test.cpp)
   target_include_directories(vertex_clamp_test PRIVATE src)
   add_test(NAME vertex_clamp_test COMMAND vertex_clamp_test)
+  # The run's lookups answered from the last one while what it was made of is unchanged, with their mistakes (host/run_lookups.h).
+  add_executable(run_lookups_test tests/run_lookups_test.cpp)
+  target_include_directories(run_lookups_test PRIVATE src)
+  add_test(NAME run_lookups_test COMMAND run_lookups_test)
   # The render targets' sizes learned by their geometry, and the rule by the address alone failing (host/rt_extent.h).
   add_executable(rt_extent_test tests/rt_extent_test.cpp)
   target_include_directories(rt_extent_test PRIVATE src)

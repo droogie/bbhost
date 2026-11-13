@@ -449,6 +449,45 @@ hand-offs - every time another thread takes it while the command processor
 works costs one wake either way - and the vblank's flip waiter, which takes
 it some 2,000 times a second, would wait a run each time.
 
+## The run's lookups (`BBHOST_RUN_LOOKUPS`)
+
+Two lookups the command processor repeats for the in-order draws of a run give
+the same answer through the run (`src/host/run_lookups.h`):
+
+- **The run's publication.** With the pool's segments on, every batched
+  in-order draw asks `publish_run_targets_locked` to publish its run's targets
+  for the pool's draws: `names_of` builds a zeroed `GpuDrawInputs` from the
+  run's lookups, the names are hashed and the set's ways searched - and the way
+  already holds them. The run's answers (`RunTargets`) carry a version that
+  `run_targets` moves whenever it refills or drops them. While it stays, the
+  way the last call took keeps its sequence (only the command processor writes
+  a way, each write moving it, and one way of a set holds a run's names at
+  most), the erase generation is the one it was published or found at, and the
+  publication is no older than `kRtPubAge / 2` flips, the call returns at once:
+  the condition the full call checks, on the same values.
+- **The GX buffer's extent.** Each vertex record whose extent decides something
+  (the buffer shadow, staging, the race census) asks `gx_buffer_end` for the
+  end of the GX buffer it starts in: the registry's lock, which every GX Map
+  takes, and its map walk. The answer is a function of the registry's shape -
+  its memory index, its holders, and each entry's memory, size, type and
+  liveness - and is the same over an interval of addresses. Each thread keeps
+  its last answer with that interval and the shape's generation, which the
+  registry moves under its lock right after each change of the shape, before
+  anything in the change that could release a lock or free memory (an erased
+  node is freed after the move). A thread that has synchronised with a change
+  reads the moved generation and looks up under the lock.
+
+`BBHOST_RUN_LOOKUPS=0` looks both up every time; `=compare` looks every memo
+answer up as before, returns that, and counts and logs the differences (the
+exit report's `run-lookups:` lines). On an RTX 4070 (the 16 places uncapped,
+and Old Yharnam, the Nightmare of Mensis, Central Yharnam and Cainhurst's
+courtyard held to a 4 GB card's 2,950 MiB) the memo answered 50% of 40.9
+million publications and 94% of 60.6 million extents. Compared there, on an
+RTX 3070 Ti Laptop GPU under Windows (the homes on; then the run commit on,
+its workers resolving 73% of the draws) and under lavapipe at the 12 places
+(the homes off and on), none of 123 million memo answers differed. A Steam
+Deck asks neither lookup (no pool, no buffer shadow, no staging).
+
 ## The draw's own context (`BBHOST_DRAW_CONTEXT`)
 
 The first step of committing per run: what a draw allocates, taken through an
@@ -733,6 +772,9 @@ on the live save), 182.4 and 177.4 off against 182.0 and 184.5, and 200.9 on.
   tracking (`list_resolve::run_serial`, which the per-run commit will start
   from). On by default (since 2026-11-11; before, only with the run commit -
   Windows' default - and the constant buffers' homes); `=0` off.
+- `BBHOST_RUN_LOOKUPS=0|compare`: the run's lookups above - the publication and
+  the GX buffer's extent answered from the lookup before. On by default; `=0`
+  looks both up every time.
 - `BBHOST_DRAW_CONTEXT=chunks|compare`: the draw's own context above, with its
   census and checks. Off by default.
 - `BBHOST_RUN_COMMIT=fork|on|compare` (`BBHOST_RUN_COMMIT_THREADS`,

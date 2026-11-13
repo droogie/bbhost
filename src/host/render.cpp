@@ -32,6 +32,7 @@
 #include "host/lvp_split.h"
 #include "host/masked_blend.h"
 #include "host/rt_extent.h"
+#include "host/run_lookups.h"
 #include "host/shader_bundles.h"
 #include "host/vertex_clamp.h"
 #include "host/shader_overrides.h"
@@ -92,6 +93,8 @@ namespace {
 // tessellated draws below).
 bool hs_constant_factors(const gcn::Program& p, float out[6]);
 }  // namespace
+
+void publish_memo_report();  // BBHOST_RUN_LOOKUPS: the run's publications (below, beside publish_run_targets_locked)
 
 namespace gpu {
 // What a draw resolved, as its digest (RunDigest) keeps it: the run commit's
@@ -14591,6 +14594,7 @@ std::atomic<std::uint64_t> g_onepass_faced{0}, g_onepass_unfaced{0};
 
 void render_report() {
     cross_vendor_report();
+    ::publish_memo_report();
     if (const std::uint64_t n = g_onepass_faced.load() + g_onepass_unfaced.load())
         host_log("render: OnePass cube shadows: %llu caster draws given their six faces, %llu without a light block found (of %llu)",
                  static_cast<unsigned long long>(g_onepass_faced.load()), static_cast<unsigned long long>(g_onepass_unfaced.load()),
@@ -23074,6 +23078,9 @@ void take_target_inputs(const GpuDrawInputs& in, TargetInputs& k) {
 // The draw before's answers on this command-processor thread.
 struct RunTargets {
     bool valid = false;
+    // Moved by run_targets whenever it refills or drops the answers (not when a
+    // draw takes them): publish_run_targets_locked's memo holds while it stays.
+    std::uint64_t version = 0;
     std::uint64_t serial = 0, acquires = 0, rt_gen = 0, htile_gen = 0;
     std::uint64_t pending_gen = 0;  // g_pending_gen at its lookups (BBHOST_RUN_COMMIT's fork checks it)
     TargetInputs in{};
@@ -23518,8 +23525,10 @@ void run_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, std::u
     }
     if (why == kBatchMissKind) {
         m.valid = false;
+        ++m.version;
         return;
     }
+    ++m.version;
     m.valid = true;
     m.serial = serial;
     m.acquires = mu_taken;
@@ -28783,11 +28792,46 @@ void pass_restart_locked(VkRenderingFlags flags);
 
 }  // namespace
 
+namespace {
+// publish_run_targets_locked's memo (BBHOST_RUN_LOOKUPS, host/run_lookups.h):
+// the call before on this thread - its run's version, the way that holds the
+// run's names, and that way's sequence, erase generation and flip after it.
+thread_local run_lookups::PubMemo t_pub_memo;
+// Calls and memo answers; compare mode's checks, differences, and checks whose
+// two looks at the flip count fell on either side of a flip (the publication's
+// age, judged at two moments: not comparable). The command processor's, under
+// g.mu.
+struct PubMemoCounts {
+    std::atomic<std::uint64_t> calls{0}, hits{0}, checked{0}, differed{0}, flipped{0};
+};
+PubMemoCounts g_pub_memo;
+void pub_memo_bump(std::atomic<std::uint64_t>& a) { a.store(a.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+}  // namespace
+
 // The command processor, under g.mu: a run's first draw just looked its
 // targets up (t_run_targets): published for the pool's draws with the same
-// names, unless the slot already holds them.
+// names, unless the slot already holds them. The run's later draws ask again
+// for the same: while the run's answers (their version), the way's sequence,
+// the erase generation and the publication's age say the slot still holds
+// them, the memo returns before the names are worked out (run_lookups::pub_hit
+// says why that is the call's own answer).
 void publish_run_targets_locked(const RunTargets& m) {
     if (!m.valid) return;
+    const int mode = run_lookups::g_mode;
+    run_lookups::PubMemo& memo = t_pub_memo;
+    const std::uint64_t erase_gen = g_rt_erase_gen.load(std::memory_order_acquire);
+    bool hit = false;
+    std::uint64_t memo_flip = 0;
+    if (mode) {
+        pub_memo_bump(g_pub_memo.calls);
+        memo_flip = hle_video_flip_count();
+        const std::uint64_t seq_now = memo.slot ? static_cast<const PubTargets*>(memo.slot)->seq.load(std::memory_order_relaxed) : 0;
+        hit = run_lookups::pub_hit(memo, &m, m.version, seq_now, erase_gen, memo_flip, kRtPubAge);
+        if (hit) {
+            pub_memo_bump(g_pub_memo.hits);
+            if (mode == 1) return;
+        }
+    }
     std::uint32_t n[kTargetNames];
     names_of(m, n);
     // The way that holds these names, else the one published longer ago (an empty one first). (The command
@@ -28806,20 +28850,61 @@ void publish_run_targets_locked(const RunTargets& m) {
         }
     }
     PubTargets& p = *way;
-    const std::uint64_t erase_gen = g_rt_erase_gen.load(std::memory_order_acquire);
-    if (p.seq.load(std::memory_order_relaxed) && p.erase_gen == erase_gen && p.flip + kRtPubAge / 2 >= hle_video_flip_count() &&
-        std::memcmp(p.names, n, sizeof(n)) == 0 &&
-        std::memcmp(p.m.out.looked, m.out.looked, sizeof(m.out.looked)) == 0 && p.m.out.reached == m.out.reached)
-        return;
-    const std::uint64_t s = p.seq.load(std::memory_order_relaxed);
-    p.seq.store(s + 1, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
-    std::memcpy(p.names, n, sizeof(n));
-    p.m = m;
-    p.erase_gen = erase_gen;
-    p.flip = hle_video_flip_count();
-    p.seq.store(s + 2, std::memory_order_release);
-    g_pub_writes.fetch_add(1, std::memory_order_relaxed);
+    // The way holds these names and lookups, published at this erase generation at most kRtPubAge / 2 flips ago.
+    const auto holds = [&](std::uint64_t flip_now) {
+        return p.seq.load(std::memory_order_relaxed) && p.erase_gen == erase_gen && p.flip + kRtPubAge / 2 >= flip_now &&
+               std::memcmp(p.names, n, sizeof(n)) == 0 && std::memcmp(p.m.out.looked, m.out.looked, sizeof(m.out.looked)) == 0 &&
+               p.m.out.reached == m.out.reached;
+    };
+    const bool kept = holds(hle_video_flip_count());
+    if (hit) {  // compare: the memo returned; the call must have
+        pub_memo_bump(g_pub_memo.checked);
+        if (!kept && holds(memo_flip)) {
+            pub_memo_bump(g_pub_memo.flipped);
+        } else if (!kept) {
+            pub_memo_bump(g_pub_memo.differed);
+            static int logs = 0;  // under g.mu
+            if (logs++ < 8) {
+                host_log("run-lookups: compare: the run's publication at flip %llu: the memo returned, the call publishes - the way %s the "
+                         "memo's (sequence %llu, memo %llu), names %s, lookups %s, erase generation %llu (the way's %llu, memo %llu), the "
+                         "way's flip %llu (memo %llu), the run's version %llu (memo %llu)",
+                         static_cast<unsigned long long>(memo_flip), &p == memo.slot ? "is" : "is not",
+                         static_cast<unsigned long long>(p.seq.load(std::memory_order_relaxed)), static_cast<unsigned long long>(memo.seq),
+                         std::memcmp(p.names, n, sizeof(n)) == 0 ? "the same" : "differ",
+                         std::memcmp(p.m.out.looked, m.out.looked, sizeof(m.out.looked)) == 0 && p.m.out.reached == m.out.reached ? "the same"
+                                                                                                                                 : "differ",
+                         static_cast<unsigned long long>(erase_gen), static_cast<unsigned long long>(p.erase_gen),
+                         static_cast<unsigned long long>(memo.erase_gen), static_cast<unsigned long long>(p.flip),
+                         static_cast<unsigned long long>(memo.flip), static_cast<unsigned long long>(m.version),
+                         static_cast<unsigned long long>(memo.version));
+            }
+        }
+    }
+    if (!kept) {
+        const std::uint64_t s = p.seq.load(std::memory_order_relaxed);
+        p.seq.store(s + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        std::memcpy(p.names, n, sizeof(n));
+        p.m = m;
+        p.erase_gen = erase_gen;
+        p.flip = hle_video_flip_count();
+        p.seq.store(s + 2, std::memory_order_release);
+        g_pub_writes.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (mode) memo = run_lookups::PubMemo{&m, m.version, &p, p.seq.load(std::memory_order_relaxed), p.erase_gen, p.flip};
+}
+
+// The exit report's line (render_report).
+void publish_memo_report() {
+    const unsigned long long calls = g_pub_memo.calls.load(), hits = g_pub_memo.hits.load();
+    if (!calls && !run_lookups::compare()) return;
+    std::string compared;
+    if (run_lookups::compare())
+        compared = "; compare: memo answers checked " + std::to_string(g_pub_memo.checked.load()) + ", differed " +
+                   std::to_string(g_pub_memo.differed.load()) + ", a flip between the two looks " + std::to_string(g_pub_memo.flipped.load());
+    host_log("run-lookups: run target publications (%s): %llu calls, %llu answered by the memo (%.1f%%)%s",
+             run_lookups::compare() ? "compare" : "on", calls, hits, calls ? 100.0 * static_cast<double>(hits) / static_cast<double>(calls) : 0.0,
+             compared.c_str());
 }
 
 namespace {
