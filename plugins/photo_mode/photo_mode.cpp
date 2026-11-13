@@ -287,11 +287,23 @@ void show_panel(bool up) {
 }
 
 // The Depth of field page's distances (metres) and fades (of the distance).
-#define BB_DOF_DISTANCES                                                                                                   \
-    "0.25 m|0.5 m|0.75 m|1 m|1.5 m|2 m|2.5 m|3 m|4 m|5 m|6 m|8 m|10 m|12 m|15 m|20 m|25 m|30 m|40 m|50 m|75 m|100 m|150 m|" \
-    "200 m|300 m|500 m|1000 m"
+// The blur is read through the game's table of 2048 steps over the depth
+// buffer, step i at n * 2047 / (2047 - i) metres for the camera's near plane
+// n (5 cm): a few centimetres apart up close, but 9 m apart by 30 m, 17 m by
+// 40 m and 51 m past 50 m, then the sky. The choices stop where each still
+// moves the blur, at 40 m, and the last is everything past about 50 m (a
+// distance between the steps at 51 m and 102 m) - no two alike.
+#define BB_DOF_DISTANCES \
+    "0.25 m|0.5 m|0.75 m|1 m|1.5 m|2 m|2.5 m|3 m|4 m|5 m|6 m|8 m|10 m|12 m|15 m|20 m|25 m|30 m|40 m|Beyond 50 m"
+constexpr char kDofBeyond[] = "Beyond 50 m";
+constexpr float kDofBeyondMetres = 60.0f;
 #define BB_DOF_FADES "None|10%|25%|50%|100%"
 constexpr float kFades[] = {0.0f, 0.1f, 0.25f, 0.5f, 1.0f};
+
+float dof_distance(const std::string& v) {
+    if (v == kDofBeyond) return kDofBeyondMetres;
+    return std::clamp(static_cast<float>(std::atof(v.c_str())), 0.1f, kDofBeyondMetres);
+}
 
 // The look the rows make (post_look): only what differs from the area's own.
 constexpr float kVignettePower[] = {0.0f, 0.0f, 0.3f, 0.6f, 1.0f, 1.5f};  // by the Vignette row, Area's own first
@@ -584,8 +596,8 @@ bool take_option(const char* key, const char* value) {
     else if (k == "gamma") num(50, 150, &set.gamma);
     else if (k == "contrast") num(80, 120, &set.contrast);
     else if (k == "dof") choice(kSwitch, 3, &set.dof);
-    else if (k == "dof_from") set.dof_from = std::clamp(static_cast<float>(std::atof(v.c_str())), 0.1f, 1000.0f);
-    else if (k == "dof_to") set.dof_to = std::clamp(static_cast<float>(std::atof(v.c_str())), 0.1f, 1000.0f);
+    else if (k == "dof_from") set.dof_from = dof_distance(v);
+    else if (k == "dof_to") set.dof_to = dof_distance(v);
     else if (k == "dof_fade") choice(kFadeNames, 5, &set.dof_fade);
     else if (k == "dof_near") num(0, 7, &set.dof_near);
     else if (k == "dof_far") num(0, 7, &set.dof_far);
@@ -679,8 +691,9 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      "With Depth of field On, where the blur in front ends: nearer than this is blurred, as Blur in front says.", "1 m", 0, 0,
      BB_DOF_DISTANCES},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "dof_to", "Sharp to",
-     "With Depth of field On, where the blur behind begins: further than this is blurred, as Blur behind says.", "10 m", 0, 0,
-     BB_DOF_DISTANCES},
+     "With Depth of field On, where the blur behind begins: further than this is blurred, as Blur behind says. Far off the "
+     "game's blur moves in large steps, so the last is Beyond 50 m.",
+     "10 m", 0, 0, BB_DOF_DISTANCES},
     LIVE_INT_WHEN("dof_near", "Blur in front", "How strongly what is nearer than Sharp from is blurred (0: not at all, up to 7).",
                   "0", 0, 7, "dof=On"),
     LIVE_INT_WHEN("dof_far", "Blur behind", "How strongly what is further than Sharp to is blurred (0: not at all, up to 7).", "3",

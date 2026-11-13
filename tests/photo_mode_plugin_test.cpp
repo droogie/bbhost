@@ -403,6 +403,13 @@ int main(int argc, char** argv) {
             from = from || std::strcmp(o->key, "dof_from") == 0;
             to = to || std::strcmp(o->key, "dof_to") == 0;
             aperture = aperture || std::strcmp(o->key, "dof_aperture") == 0;
+            if (std::strcmp(o->key, "dof_from") == 0 || std::strcmp(o->key, "dof_to") == 0) {
+                // The distances stop where the game's table still tells them
+                // apart: 40 m, then everything past about 50 m.
+                const std::string c = o->choices;
+                CHECK(c.size() > 16 && c.compare(c.size() - 16, 16, "40 m|Beyond 50 m") == 0);
+                CHECK(c.find("1000 m") == std::string::npos && c.find("|50 m") == std::string::npos);
+            }
             if (std::strcmp(o->key, "blur_samples") == 0) CHECK(o->min == 2 && o->max == 8);
             if (std::strcmp(o->key, "fov") == 0) CHECK(o->min == -40 && o->max == 60);
         }
@@ -501,6 +508,48 @@ int main(int argc, char** argv) {
     H.option_fn("dof_fade", "None", H.option_user);
     CHECK(H.look.dof_near_end == 2.5f && H.look.dof_far_start == 40.0f && H.look.dof_near_levels == 5);
     CHECK(H.look.dof_near_fade == 0.0f && H.look.dof_far_fade == 0.0f);
+    // No two distances alike: the game reads the blur through a table of
+    // 2048 steps over the depth buffer, step i at 0.05 * 2047 / (2047 - i)
+    // metres (the camera's near plane 5 cm), so with a sharp edge each choice
+    // must blur from a step of its own - behind, the first step past Sharp
+    // to; in front, the last step before Sharp from.
+    {
+        const auto step_past = [](float d) { return static_cast<int>(std::floor(2047.0 - 0.05 * 2047.0 / d)) + 1; };
+        const auto step_before = [](float d) { return static_cast<int>(std::ceil(2047.0 - 0.05 * 2047.0 / d)) - 1; };
+        const BbOption* to_row = nullptr;
+        for (const BbOption* o = p.options; o->type; ++o) {
+            if (o->key && std::strcmp(o->key, "dof_to") == 0) to_row = o;
+        }
+        CHECK(to_row != nullptr);
+        if (to_row) {
+            std::string all = to_row->choices, name;
+            int last_past = -1, last_before = -1, n = 0;
+            for (std::size_t at = 0; at <= all.size(); ++at) {
+                if (at < all.size() && all[at] != '|') {
+                    name += all[at];
+                    continue;
+                }
+                H.option_fn("dof_to", name.c_str(), H.option_user);
+                H.option_fn("dof_from", name.c_str(), H.option_user);
+                const int past = step_past(H.look.dof_far_start), before = step_before(H.look.dof_near_end);
+                CHECK(past > last_past && before > last_before);  // further: a later step each time
+                CHECK(past <= 2046);                               // and never the sky alone
+                last_past = past;
+                last_before = before;
+                name.clear();
+                ++n;
+            }
+            CHECK(n == 20);
+            // The last, everything past about 50 m: between the steps at 51 m
+            // and 102 m.
+            H.option_fn("dof_to", "Beyond 50 m", H.option_user);
+            CHECK(H.look.dof_far_start > 0.05f * 2047.0f / 2.0f && H.look.dof_far_start < 0.05f * 2047.0f);
+            H.option_fn("dof_to", "1000 m", H.option_user);  // a config from before: kept within the choices
+            CHECK(H.look.dof_far_start < 0.05f * 2047.0f);
+        }
+        H.option_fn("dof_from", "2.5 m", H.option_user);
+        H.option_fn("dof_to", "40 m", H.option_user);
+    }
     H.option_fn("dof", "Off", H.option_user);
     CHECK((H.look.set & BB_LOOK_DOF) && H.look.dof == 0 && !(H.look.set & BB_LOOK_DOF_RANGE));
     H.option_fn("dof", "On", H.option_user);
