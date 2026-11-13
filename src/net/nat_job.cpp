@@ -115,10 +115,10 @@ void Job::run(JobParams p) {
         o.local = verdict_of(o.probe);
         o.inbound = inbound_of(o.probe);
     }
-    // Signed in, and the answers say something: the server's own verdict,
-    // kept for the account (and the relay's marks) as the website's is.
+    // Signed in, and something went out: the server's own verdict, kept for
+    // the account (and the relay's marks) as the website's is.
     o.signed_in = !p.token.empty() && !p.save_url.empty();
-    if (o.resolved && o.probe.error == ProbeResult::Error::None && o.signed_in && !cancel_.load()) {
+    if (o.resolved && o.probe.error == ProbeResult::Error::None && o.probe.sent > 0 && o.signed_in && !cancel_.load()) {
         {
             std::lock_guard<std::mutex> lk(mu_);
             view_.step = "Asking the server what it saw...";

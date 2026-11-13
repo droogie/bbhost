@@ -34,8 +34,19 @@ constexpr Sock kNoSock = INVALID_SOCKET;
 #endif
 int last_error() { return WSAGetLastError(); }
 bool in_use(int e) { return e == WSAEADDRINUSE || e == WSAEACCES; }
+bool denied(int e) { return e == WSAEACCES; }
 void close_sock(Sock s) { closesocket(s); }
-std::string error_text(int e) { return "Windows sockets error " + std::to_string(e); }
+// The few errors a player may meet here, in words, with the number.
+std::string error_text(int e) {
+    const char* words = e == WSAEACCES          ? "access denied"
+                        : e == WSAEADDRINUSE    ? "address in use"
+                        : e == WSAENETDOWN      ? "the network is down"
+                        : e == WSAENETUNREACH   ? "the network is unreachable"
+                        : e == WSAEHOSTUNREACH  ? "the host is unreachable"
+                        : e == WSAENOBUFS       ? "no buffer space"
+                                                : nullptr;
+    return (words ? std::string(words) + ", " : std::string()) + "Windows sockets error " + std::to_string(e);
+}
 // Up to `ms` for a datagram.
 bool readable(Sock s, int ms) {
     fd_set set;
@@ -50,6 +61,8 @@ using AddrLen = socklen_t;
 constexpr Sock kNoSock = -1;
 int last_error() { return errno; }
 bool in_use(int e) { return e == EADDRINUSE || e == EACCES; }
+// nftables or iptables dropping the datagram: EPERM; a refused destination: EACCES.
+bool denied(int e) { return e == EPERM || e == EACCES; }
 void close_sock(Sock s) { ::close(s); }
 std::string error_text(int e) { return std::strerror(e); }
 bool readable(Sock s, int ms) {
@@ -60,11 +73,17 @@ bool readable(Sock s, int ms) {
 }
 #endif
 
-// When each request goes out (ms from the start), while it is unanswered.
-constexpr int kPlainAt[] = {0, 300, 800, 1600};
+// When each request goes out (ms from the start), while it is unanswered:
+// quickly at first, then on to 4.2 s, so a security program that holds the
+// first datagrams while it asks about bbhost.exe does not make the test read
+// "no answer".
+constexpr int kPlainAt[] = {0, 300, 800, 1600, 2800, 4200};
 // The port check's: again while its second answer has not come, which gets a
-// second after the last.
-constexpr int kChangeAt[] = {0, 500, 1200};
+// second after the last - the first three in any case, the last two only
+// while not even its usual answer has come (held as the others), so a router
+// that drops the second answer still ends the check at 2.2 s.
+constexpr int kChangeAt[] = {0, 500, 1200, 2800, 4200};
+constexpr int kChangeFirst = 3;
 constexpr int kSecondAnswerWait = 1000;
 
 struct Request {
@@ -73,6 +92,7 @@ struct Request {
     std::size_t len = 0;
     std::uint16_t to = 0;  // the test port, host order
     int sends = 0;
+    int last_at = 0;  // when it last went out (ms from the start)
     bool answered = false;
 };
 
@@ -133,15 +153,26 @@ ProbeResult probe(const ProbeParams& p) {
     change.len = stun::build_change_request(change.data, change.txid, stun::kChangePort);
     change.to = p.ports[0];
 
-    auto send = [&](Request& q) {
+    // A refused send is counted, its first error kept, and the request goes
+    // again at its next time like an unanswered one.
+    auto send = [&](Request& q, int now) {
         sockaddr_in to{};
         to.sin_family = AF_INET;
         to.sin_addr.s_addr = p.server;
         to.sin_port = htons(q.to);
         if (::sendto(s, reinterpret_cast<const char*>(q.data), static_cast<int>(q.len), 0, reinterpret_cast<const sockaddr*>(&to),
-                     sizeof(to)) >= 0)
+                     sizeof(to)) >= 0) {
             ++r.sent;
+        } else {
+            const int e = last_error();
+            if (r.refused++ == 0) {
+                r.send_error_code = e;
+                r.send_error = error_text(e);
+                r.send_denied = denied(e);
+            }
+        }
         ++q.sends;
+        q.last_at = now;
     };
     // An address this socket has sent to: an answer from there is one the
     // router expects.
@@ -159,18 +190,24 @@ ProbeResult probe(const ProbeParams& p) {
             break;
         }
         const int now = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count());
-        bool plain_done = true;
+        constexpr int kPlainN = static_cast<int>(std::size(kPlainAt)), kChangeN = static_cast<int>(std::size(kChangeAt));
+        bool plain_done = true, plain_more = false;
         for (Request& q : plain) {
-            if (!q.answered && q.sends < static_cast<int>(std::size(kPlainAt)) && now >= kPlainAt[q.sends]) send(q);
+            if (!q.answered && q.sends < kPlainN && now >= kPlainAt[q.sends]) send(q, now);
             plain_done = plain_done && q.answered;
+            plain_more = plain_more || (!q.answered && q.sends < kPlainN);
         }
         // The port check is over once its second answer came, once a server
         // without it has answered, or a second after its last request.
-        const bool change_done = r.reached || (r.change_answered && !r.change_offered) ||
-                                 (change.sends == static_cast<int>(std::size(kChangeAt)) &&
-                                  now >= kChangeAt[std::size(kChangeAt) - 1] + kSecondAnswerWait);
-        if (!change_done && change.sends < static_cast<int>(std::size(kChangeAt)) && now >= kChangeAt[change.sends]) send(change);
+        const bool change_over = r.reached || (r.change_answered && !r.change_offered);
+        auto change_more = [&] {
+            return !change_over && change.sends < kChangeN && (change.sends < kChangeFirst || !r.change_answered);
+        };
+        if (change_more() && now >= kChangeAt[change.sends]) send(change, now);
+        const bool change_done = change_over || (!change_more() && now >= change.last_at + kSecondAnswerWait);
         if ((plain_done && change_done) || now >= p.deadline_ms) break;
+        // Every send refused and none left to try: nothing can come back.
+        if (r.sent == 0 && !plain_more && !change_more()) break;
         if (!readable(s, 40)) continue;
         std::uint8_t buf[1500];
         sockaddr_in from{};

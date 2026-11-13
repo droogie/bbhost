@@ -65,22 +65,30 @@ struct ProbeResult {
     std::uint16_t offered_port = 0;  // the port its second answer leaves from
     bool reached = false;          // the second answer reached the P2P port
     std::uint16_t reached_from = 0;  // the port it came from
-    int sent = 0;                  // datagrams sent, retries included
+    int sent = 0;                  // datagrams the system took to send, retries included
+    int refused = 0;               // datagrams it refused (the send failed)
+    int send_error_code = 0;       // the first refusal's error (errno, WSAGetLastError)
+    std::string send_error;        // ... in the system's words
+    bool send_denied = false;      // ... a permission error: a firewall's or a security program's refusal
 };
 
 struct ProbeParams {
     std::uint32_t server = 0;            // the test server's IPv4 address, network byte order
     std::vector<std::uint16_t> ports;    // its test ports, host order: two or more
     std::uint16_t local_port = 0;        // the P2P port to send from
-    int deadline_ms = 3000;              // the whole exchange
+    int deadline_ms = 6000;              // the whole exchange
     std::function<bool()> cancelled;     // asked every few tens of milliseconds
 };
 
 // The exchange, from a socket bound to `local_port` alone (never shared: a
-// game that has the port makes it PortInUse). Requests to every test port
-// and the port check's, each sent again while unanswered (at 0, 0.3, 0.8 and
-// 1.6 s; the port check's at 0, 0.4, 1.0 and 1.7 s until its second answer
-// comes), until everything is in or the deadline. net/nat_probe.cpp.
+// game that has the port makes it PortInUse). Requests to every test port,
+// each sent again while unanswered (at 0, 0.3, 0.8, 1.6, 2.8 and 4.2 s), and
+// the port check's, again while its second answer has not come (at 0, 0.5
+// and 1.2 s, and at 2.8 and 4.2 s while not even its usual answer has), until
+// everything is in or the deadline: a security program that holds the first
+// datagrams while it asks about bbhost.exe does not make the test read "no
+// answer". When the system refuses every send and none is left to try, it
+// ends there. net/nat_probe.cpp.
 ProbeResult probe(const ProbeParams& p);
 
 // What the answers say, without the server's word.
@@ -326,10 +334,15 @@ inline std::string public_ports(const ProbeResult& r) {
     return s + (same_addr ? "" : ", from different public addresses");
 }
 
+// Every datagram the test tried to send was refused by this PC: nothing went
+// out, so the server is not asked.
+inline bool nothing_sent(const ProbeResult& r) { return r.sent == 0 && r.refused > 0; }
+
 // Why a test's result was not kept for the account ("" when it was).
 inline std::string unsaved_reason(const Outcome& o) {
     if (o.saved()) return {};
     if (!o.signed_in) return "not signed in";
+    if (nothing_sent(o.probe)) return "nothing was sent";
     switch (o.save.state) {
     case SaveReply::State::Limited: return "the server takes 10 tests an hour; try again later";
     case SaveReply::State::Refused: return "the sign-in has expired";
@@ -341,8 +354,9 @@ inline std::string unsaved_reason(const Outcome& o) {
     return {};
 }
 
-// The test's one log line: the verdict, the port check, the port, whether it
-// was kept - and no addresses.
+// The test's one log line: the verdict, the port check, the port, what was
+// sent and refused (the first refusal's words), whether it was kept - and no
+// addresses.
 inline std::string log_line(const Outcome& o) {
     const int port = o.probe.local_port;
     if (!o.resolved) return "connection test: the test server's name did not resolve; nothing sent";
@@ -367,7 +381,10 @@ inline std::string log_line(const Outcome& o) {
     case Inbound::Unavailable: s += "not checked (no port check on this server)"; break;
     case Inbound::NotTested: s += "not checked"; break;
     }
-    s += "; UDP port " + std::to_string(port) + "; ";
+    s += "; UDP port " + std::to_string(port) + "; sent " + std::to_string(o.probe.sent) + ", refused " +
+         std::to_string(o.probe.refused);
+    if (o.probe.refused > 0) s += " (" + o.probe.send_error + ")";
+    s += "; ";
     if (o.saved()) {
         s += "saved to the account";
         if (o.save.verdict != o.local) s += std::string(" - the server says ") + verdict_word(o.save.verdict);

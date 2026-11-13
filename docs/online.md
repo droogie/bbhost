@@ -59,7 +59,9 @@ The setup window's Game page has a Connection card. **Test connection**
 checks whether other players can reach this PC directly, or whether its
 co-op and PvP go through the server's relay. It runs from the game's own P2P
 port, so it needs the game closed (Play waits for it), and it takes a few
-seconds.
+seconds - up to about six when nothing comes back, sending again meanwhile
+so that a security program holding the first packets while it asks about
+bbhost.exe does not spoil the result.
 
 - It sends STUN requests from the P2P port to the server's two test ports
   (3479 and 3480 at the STUN server's host; `online.nat_test_ports` for a
@@ -86,7 +88,9 @@ seconds.
 - The card says what the result means, the port the test ran from, and when
   your account's last test ran (also one taken on the website). F10's Game
   page repeats the verdict when the setup window opened before the game. The
-  log has one line per test (`connection test: ...`), with no addresses.
+  log has one line per test (`connection test: ...`): the result, how many
+  requests went out and how many the system refused (with its first error),
+  and no addresses.
 
 ## Beyond the console
 
