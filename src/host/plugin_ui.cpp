@@ -346,7 +346,11 @@ bool plugin_ui_wants_attention() {
     if (config_value("plugins.show_settings") == "true") return true;
     const std::vector<std::string> seen = seen_list();
     for (const PluginEntry& p : plugins_scan()) {
-        if (!p.enabled || p.options.empty()) continue;
+        // Only a plugin the player turned on: one on by default (photo mode)
+        // never opens the window - its settings wait on the Plugins tab and in
+        // game for whoever looks.
+        const std::string sw = config_value(("plugins." + p.name).c_str());
+        if (!p.enabled || p.options.empty() || (sw != "true" && sw != "1")) continue;
         if (std::find(seen.begin(), seen.end(), seen_key(p)) == seen.end()) return true;
     }
     return false;
