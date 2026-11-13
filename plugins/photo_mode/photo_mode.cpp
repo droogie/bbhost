@@ -1,6 +1,7 @@
-// Photo mode: a free camera over the world, for pictures. Based on Nox's
-// bbphoto, rebuilt on bbhost's plugin API: nothing in it writes the game's code
-// or reads an address of its own.
+// Photo mode: a free camera over the world, for pictures. Based on Nox-'s
+// bbphoto (https://github.com/Noxde/bbhost-photo-mode-plugin), rebuilt on
+// bbhost's plugin API: nothing in it writes the game's code or reads an
+// address of its own.
 //
 // Hold L3 for half a second, or press P, to start it; the same again (or
 // Escape) ends it. L3 is the button that presses the game's L3 - the left
