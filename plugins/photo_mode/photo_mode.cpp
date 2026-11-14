@@ -275,7 +275,7 @@ void show_panel(bool up) {
     if (up) {
         BbPanel p{};
         p.size = sizeof(p);
-        p.flags = BB_PANEL_DEFAULTS;
+        p.flags = BB_PANEL_DEFAULTS | BB_PANEL_CORNER;  // at the bottom right, the picture in view
         p.page = nullptr;  // the page it showed last
         p.guide = kGuide;
         p.guide_keys = kGuideKeys;

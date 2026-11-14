@@ -56,7 +56,7 @@ _Static_assert(offsetof(BbHostApi, option_set) == offsetof(BbHostApi, panel_stat
 _Static_assert(offsetof(BbHostApi, input_take_as) == offsetof(BbHostApi, option_set) + sizeof(void*), "input_take_as after option_set");
 _Static_assert(offsetof(BbHostApi, input_as) == offsetof(BbHostApi, input_take_as) + sizeof(void*), "input_as after input_take_as");
 _Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, input_as) + sizeof(void*), "input_as ends the API table");
-_Static_assert(BB_OPT_PANEL == 0x400u && BB_PANEL_DEFAULTS == 1u, "the panel's flags");
+_Static_assert(BB_OPT_PANEL == 0x400u && BB_PANEL_DEFAULTS == 1u && BB_PANEL_CORNER == 2u, "the panel's flags");
 _Static_assert(offsetof(BbPanel, page) == 8 && sizeof(BbPanel) == 8 + 3 * sizeof(void*), "BbPanel");
 _Static_assert(sizeof(BbPanelState) == 44 && offsetof(BbPanelState, page) == 12, "BbPanelState");
 _Static_assert(sizeof(BbLook) == 128 && BB_LOOK_DOF_RANGE == 64u, "BbLook");

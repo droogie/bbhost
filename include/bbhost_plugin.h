@@ -457,6 +457,7 @@ typedef struct BbLook {
 
 /* Version 29: a plugin's panel (panel_show, panel_state). */
 #define BB_PANEL_DEFAULTS 1u  /* each page ends with a Defaults row: its rows back to their defaults */
+#define BB_PANEL_CORNER 2u    /* at the bottom right, the world in view (photo mode's): where every panel is drawn for now */
 typedef struct BbPanel {
     uint32_t size;           /* sizeof(BbPanel) as the plugin knows it */
     uint32_t flags;          /* BB_PANEL_* */

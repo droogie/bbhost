@@ -490,7 +490,7 @@ int main(int argc, char** argv) {
 
     // Its panel opened with it, the Mode row back to Frozen, and no look over
     // the area's until a row says otherwise.
-    CHECK(H.panel_up && (H.panel_flags & BB_PANEL_DEFAULTS));
+    CHECK(H.panel_up && (H.panel_flags & BB_PANEL_DEFAULTS) && (H.panel_flags & BB_PANEL_CORNER));  // in the corner: the picture in view
     CHECK(!H.sets.empty() && H.sets.back().first == "mode" && H.sets.back().second == "Frozen");
     CHECK(H.looks >= 1 && !H.look_on);
     // The rows' look, as they change.
