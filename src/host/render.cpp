@@ -27677,8 +27677,10 @@ static bool draw_impl(const GpuDraw& d) {
     }
     draw_stamp.to(kRenderCostGeometry);
     if (g.cmd_buffer_marker) {
-        cmds.marker(gpu_marker_value(1, part ? run->record : g_draw_rec_next));
-    } else if (!(run && run->list)) {  // (stage 4b.1b: refused with checkpoints - lists_commit)
+        // A list-mode draw has no marker of its own - no number in the recent-draw ring, committed beside the command
+        // processor: its splice is an op the recorder notes, and the report names the draws marked around it.
+        if (!(run && run->list)) cmds.marker(gpu_marker_value(1, part ? run->record : g_draw_rec_next));
+    } else if (!(run && run->list)) {  // (stage 4b.1b: refused with NVIDIA's checkpoints - lists_commit)
         gpu_checkpoint(1, g_draw_rec_next);  // (a run is not forked with checkpoints recorded in place)
     }
     if (bind_pl->profile_name.empty()) {
@@ -29034,7 +29036,7 @@ const std::uint32_t* run_names_of(const RunTargets& m) {
 // Whether the list-mode commit takes draws in this configuration at all (as
 // host_gpu_run_commit's refusals): read under g.mu.
 bool list_config_ok_locked() {
-    if (!g.ok || !recorder_threaded() || g.profile || g.profile_passes || g.has_checkpoints || g.cmd_buffer_marker || !set_cache_on() || !cb_push_on() ||
+    if (!g.ok || !recorder_threaded() || g.profile || g.profile_passes || (g.has_checkpoints && !g.cmd_buffer_marker) || !set_cache_on() || !cb_push_on() ||
         capture_wanted() || g_trace || glitch_on() || g_render_cost_enabled || run_diagnostics_on())
         return false;
     if (g.bindless || (gxvk::buffers_on() && !gxvk_buffers_bind_mode()) || gxvk::arena_wanted() || shadow_in_place_on()) return false;
