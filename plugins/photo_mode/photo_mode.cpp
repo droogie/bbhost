@@ -268,8 +268,8 @@ void set_mode(int m) {
 }
 
 // The panel (panel_show): its guide for the controller and for the keyboard.
-constexpr const char* kGuide = "L1 R1: page    d-pad: choose and change    Circle: hide    R3: show";
-constexpr const char* kGuideKeys = "Q E: page    arrows: choose and change    Esc: hide    Tab: show";
+constexpr const char* kGuide = "L1 R1: page    R3: show";
+constexpr const char* kGuideKeys = "PgUp PgDn: page    Tab: show";
 
 void show_panel(bool up) {
     if (up) {
@@ -645,9 +645,9 @@ void on_option(const char* key, const char* value, void*) {
 #define LIVE_INT_WHEN(key, label, help, def, lo, hi, when) {BB_OPT_INT | BB_OPT_LIVE | BB_OPT_WHEN, key, label, help, def, lo, hi, when}
 extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_HEADING, "about", "Photo mode",
-     "Press L3, or P, to start photo mode and to end it (Escape ends it too). Its panel opens with it: L1 and R1 (Q and E) "
-     "turn its pages, the d-pad (the arrows) chooses and changes a row, Circle (Escape) hides it and R3 (Tab) shows it again. "
-     "Only with nobody else in your world.",
+     "Press L3, or P, to start photo mode and to end it (Escape ends it too). Its panel opens with it: L1 and R1 (Page Up "
+     "and Page Down) turn its pages, the d-pad (the arrows) chooses and changes a row, Circle (Escape) hides it and R3 (Tab) "
+     "shows it again. Only with nobody else in your world.",
      "", 0, 0, nullptr},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "start", "Start with",
      "What on the controller starts and ends photo mode: a press of L3, or L3 held for half a second (a press then does "
@@ -656,81 +656,84 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
 
     PANEL("camera", "Camera", "How photo mode's camera sees, and what the world does meanwhile."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "mode", "Mode",
-     "Frozen holds the world still (Cross or N lets it run one frame). Static keeps the camera where it is while you play "
-     "on. Live flies it while the world runs: enemies can still attack your hunter, and the first hit holds the world "
-     "again. Photo mode always starts Frozen.",
+     "What the world does meanwhile. Frozen holds it still (Cross or N lets it run one frame). Static keeps the camera "
+     "where it is while you play on. Live flies it while the world runs: enemies can still attack your hunter, and the "
+     "first hit holds the world again. Photo mode always starts Frozen.",
      "Frozen", 0, 0, "Frozen|Static|Live"},
-    LIVE_INT("fov", "Field of view", "Degrees more or less than the game's own view: 0 keeps it, less zooms in.", "0", -40, 60),
-    LIVE_INT("roll", "Roll", "Tilts the camera, in degrees: 0 keeps it level.", "0", -90, 90),
+    LIVE_INT("fov", "Field of view", "The view's width, in degrees. 0 keeps the game's own; less zooms in, more widens it.", "0", -40, 60),
+    LIVE_INT("roll", "Roll", "Tilts the camera, in degrees. 0 keeps it level.", "0", -90, 90),
     {BB_OPT_BOOL | BB_OPT_LIVE, "hud", "HUD",
-     "On shows the game's HUD in photo mode, even with the game's own HUD option off. Off leaves the HUD, menus and prompts "
-     "out of the picture.",
+     "Shows the game's HUD in the picture. On shows it in photo mode, even with the game's own HUD option off; Off leaves "
+     "the HUD, menus and prompts out of the picture.",
      "false", 0, 0, nullptr},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "vignette", "Vignette",
      "Darkens the picture's corners. Area's own keeps the area's (most have none).", "Area's own", 0, 0,
      "Area's own|None|Light|Medium|Strong|Heavy"},
 
     PANEL("picture", "Picture", "The picture's tone, in % of the area's own: 100 keeps the area's."),
-    LIVE_INT("saturation", "Saturation", "% of the area's own colour: 0 is black and white, 200 twice as vivid.", "100", 0, 200),
-    LIVE_INT("brightness", "Brightness", "% of the area's own brightness, after the tone map.", "100", 20, 250),
-    LIVE_INT("exposure", "Exposure", "% of the area's own exposure, before the tone map: the light the picture is made from.", "100", 10, 250),
-    LIVE_INT("gamma", "Gamma", "% of the area's own gamma: more lifts the shadows and pales the colours.", "100", 50, 150),
+    LIVE_INT("saturation", "Saturation", "Colour, in % of the area's. 0 is black and white, 200 twice as vivid.", "100", 0, 200),
+    LIVE_INT("brightness", "Brightness", "Brightness, in % of the area's. It is applied after the tone map.", "100", 20, 250),
+    LIVE_INT("exposure", "Exposure", "Exposure, in % of the area's. The light the picture is made from, before the tone map.", "100", 10, 250),
+    LIVE_INT("gamma", "Gamma", "Gamma, in % of the area's. More lifts the shadows and pales the colours.", "100", 50, 150),
     LIVE_INT("contrast", "Contrast",
-             "% of the area's own contrast. Steep: a few percent goes a long way, and 110 crushes most shadows to black.", "100", 80, 120),
+             "Contrast, in % of the area's. Steep: a few percent goes a long way, and 110 crushes most shadows to black.", "100", 80, 120),
 
     PANEL("dof", "Depth of field",
           "Sharp between two distances from the camera, blurred nearer and further. Performance mode leaves it out, and with "
           "it these rows do nothing."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "dof", "Depth of field",
-     "Area's own keeps the area's depth of field. On uses the rows below; Off leaves it out. Performance mode leaves it out "
+     "On uses the rows below; Off, none. Area's own keeps the area's depth of field. Performance mode leaves it out "
      "whatever this says.",
      "Area's own", 0, 0, "Area's own|On|Off"},
     // (A choice row cannot be greyed out by another's value: BB_OPT_WHEN
     // takes its choices field.)
     {BB_OPT_CHOICE | BB_OPT_LIVE, "dof_from", "Sharp from",
-     "With Depth of field On, where the blur in front ends: nearer than this is blurred, as Blur in front says.", "1 m", 0, 0,
+     "Where the blur in front ends. With Depth of field On, nearer than this is blurred, as Blur in front says.", "1 m", 0, 0,
      BB_DOF_DISTANCES},
     {BB_OPT_CHOICE | BB_OPT_LIVE, "dof_to", "Sharp to",
-     "With Depth of field On, where the blur behind begins: further than this is blurred, as Blur behind says. Far off the "
-     "game's blur moves in large steps, so the last is Beyond 50 m.",
+     "Where the blur behind begins. With Depth of field On, further than this is blurred, as Blur behind says. Far off "
+     "the game's blur moves in large steps, so the last is Beyond 50 m.",
      "10 m", 0, 0, BB_DOF_DISTANCES},
-    LIVE_INT_WHEN("dof_near", "Blur in front", "How strongly what is nearer than Sharp from is blurred (0: not at all, up to 7).",
+    LIVE_INT_WHEN("dof_near", "Blur in front", "How strongly the front is blurred. What is nearer than Sharp from: 0 not at all, up to 7.",
                   "0", 0, 7, "dof=On"),
-    LIVE_INT_WHEN("dof_far", "Blur behind", "How strongly what is further than Sharp to is blurred (0: not at all, up to 7).", "3",
+    LIVE_INT_WHEN("dof_far", "Blur behind", "How strongly the back is blurred. What is further than Sharp to: 0 not at all, up to 7.", "3",
                   0, 7, "dof=On"),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "dof_fade", "Fade",
-     "With Depth of field On, how gradually the blur comes in, as a share of each distance: None is a sharp edge; at 100% "
+     "How gradually the blur comes in. With Depth of field On, as a share of each distance: None is a sharp edge; at 100% "
      "the blur behind is full only at twice Sharp to, and the blur in front grows from Sharp from to the camera.",
      "50%", 0, 0, BB_DOF_FADES},
 
     PANEL("ca", "Chromatic aberration", "Colour fringes towards the picture's edges, as a lens makes them."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "ca", "Chromatic aberration",
-     "Area's own keeps the area's (most have none). On uses the rows below; Off leaves it out.", "Area's own", 0, 0,
+     "On uses the rows below; Off, none. Area's own keeps the area's (most have none).", "Area's own", 0, 0,
      "Area's own|On|Off"},
-    LIVE_INT_WHEN("ca_lateral_x", "Lateral, across", "Fringes growing towards the edges, across the picture, in thousandths (an area's is 6).",
+    LIVE_INT_WHEN("ca_lateral_x", "Lateral, across", "Edge fringes, across. They grow towards the picture's edges, in thousandths (an area's is 6).",
                   "6", -100, 100, "ca=On"),
-    LIVE_INT_WHEN("ca_lateral_y", "Lateral, up and down", "The same up and down, in thousandths.", "0", -100, 100, "ca=On"),
-    LIVE_INT_WHEN("ca_uniform_x", "Uniform, across", "Fringes the same all over, across the picture, in thousandths.", "0", -100, 100, "ca=On"),
-    LIVE_INT_WHEN("ca_uniform_y", "Uniform, up and down", "The same up and down, in thousandths.", "0", -100, 100, "ca=On"),
+    LIVE_INT_WHEN("ca_lateral_y", "Lateral, up and down", "Edge fringes, up and down. The same up and down, in thousandths.", "0", -100, 100,
+                  "ca=On"),
+    LIVE_INT_WHEN("ca_uniform_x", "Uniform, across", "Even fringes, across. The same all over the picture, in thousandths.", "0", -100, 100,
+                  "ca=On"),
+    LIVE_INT_WHEN("ca_uniform_y", "Uniform, up and down", "Even fringes, up and down. The same up and down, in thousandths.", "0", -100, 100,
+                  "ca=On"),
 
     PANEL("fog", "Fog", "The area's fog and haze: 100% and 0 m keep the area's."),
-    LIVE_INT("fog_distance", "Distance", "% of the area's distance to the fog: less brings it closer.", "100", 10, 200),
-    LIVE_INT("fog_density", "Density", "% of the area's fog: 0 clears it, 200 doubles it.", "100", 0, 200),
-    LIVE_INT("fog_contrast", "Contrast", "% of the area's fog contrast: more darkens what the fog covers.", "100", 0, 200),
-    LIVE_INT("fog_start", "Start", "Metres added to where the fog begins: more pushes it away.", "0", -100, 100),
-    LIVE_INT("fog_height", "Height fog", "Metres added to the height fog's height: less raises the fog over the ground.", "0", -200, 200),
+    LIVE_INT("fog_distance", "Distance", "Fog distance, in % of the area's. Less brings the fog closer.", "100", 10, 200),
+    LIVE_INT("fog_density", "Density", "Fog density, in % of the area's. 0 clears it, 200 doubles it.", "100", 0, 200),
+    LIVE_INT("fog_contrast", "Contrast", "Fog contrast, in % of the area's. More darkens what the fog covers.", "100", 0, 200),
+    LIVE_INT("fog_start", "Start", "Metres added to where fog begins. More pushes it away.", "0", -100, 100),
+    LIVE_INT("fog_height", "Height fog", "Metres added to the height fog. Less raises the fog over the ground.", "0", -200, 200),
 
     PANEL("blur", "Motion blur",
           "The blur of what moves, as the camera sees it. Performance mode leaves it out, and with it these rows do nothing."),
     {BB_OPT_CHOICE | BB_OPT_LIVE, "blur", "Motion blur",
-     "Area's own keeps the area's. On uses the rows below; Off leaves it out. Performance mode leaves it out whatever this says.",
+     "On uses the rows below; Off, none. Area's own keeps the area's. Performance mode leaves it out whatever this says.",
      "Area's own", 0, 0, "Area's own|On|Off"},
-    LIVE_INT_WHEN("blur_time", "Time", "How long a moment the blur covers, in hundredths (an area's is about 9).", "9", 0, 100, "blur=On"),
-    LIVE_INT_WHEN("blur_length", "Length", "The longest a streak gets, in hundredths (an area's is about 19).", "19", 0, 100, "blur=On"),
-    LIVE_INT_WHEN("blur_scale", "Camera blur", "How much the camera's own turning blurs, in tenths (an area's is up to 40).", "40", 0, 100, "blur=On"),
+    LIVE_INT_WHEN("blur_time", "Time", "How long a moment the blur covers. In hundredths (an area's is about 9).", "9", 0, 100, "blur=On"),
+    LIVE_INT_WHEN("blur_length", "Length", "The longest a streak gets. In hundredths (an area's is about 19).", "19", 0, 100, "blur=On"),
+    LIVE_INT_WHEN("blur_scale", "Camera blur", "How much turning the camera blurs. In tenths (an area's is up to 40).", "40", 0, 100, "blur=On"),
     LIVE_INT_WHEN("blur_samples", "Samples",
-                  "Steps along each streak: more is smoother and slower. The areas use 3 or 4; 8 is the most the game's motion "
-                  "blur is made for.",
+                  "Steps along each streak. More is smoother and slower; the areas use 3 or 4, and 8 is the most the game's "
+                  "motion blur is made for.",
                   "4", 2, 8, "blur=On"),
     {0, nullptr, nullptr, nullptr, nullptr, 0, 0, nullptr}};
 #undef PANEL
