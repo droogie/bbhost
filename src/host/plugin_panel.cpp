@@ -1013,6 +1013,16 @@ void plugin_panel_draw(float scale, bool pad) {
         return greyed(*p.entry, r.desc);
     };
     if (ImGui::Begin("##plugin_panel", nullptr, flags)) {
+        // A centred menu is the game's modal dialog: a click outside it does
+        // not take the cursor away - from the next frame it is back where it
+        // was.
+        if (!p.corner && !g_confirm.on && !refocus && !ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+            std::lock_guard<std::mutex> lk(g_mu);
+            if (g_panel.owner == p.owner) {
+                g_panel.cursor_to = g_panel.focused_row;
+                g_appeared.store(true);
+            }
+        }
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 o = ImGui::GetWindowPos();
         // The column rule down the middle where the game draws its; without
