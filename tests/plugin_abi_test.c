@@ -79,6 +79,7 @@ _Static_assert(sizeof(BbPad) == 44 && offsetof(BbPad, play) == 40, "BbPad");
 _Static_assert(offsetof(BbPad, pressed) == 8 && offsetof(BbPad, connected) == 12, "BbPad's presses");
 _Static_assert(offsetof(BbPad, lx) == 16 && offsetof(BbPad, r2) == 36, "BbPad's axes");
 _Static_assert(sizeof(BbWorldState) == 20, "BbWorldState");
+_Static_assert(BB_WORLD_PAUSED == 16u && BB_WORLD_OPEN == 64u && BB_WORLD_VIEW == 128u, "the world's flags");
 _Static_assert(offsetof(BbWorldState, others) == 8 && offsetof(BbWorldState, session) == 16, "BbWorldState's fields");
 _Static_assert(BB_PAD_CROSS == 0x4000u && BB_PAD_CIRCLE == 0x2000u && BB_PAD_L1 == 0x400u && BB_PAD_R1 == 0x800u &&
                    BB_PAD_L3 == 0x2u && BB_PAD_R3 == 0x4u && BB_PAD_OPTIONS == 0x8u && BB_PAD_TOUCHPAD == 0x100000u,

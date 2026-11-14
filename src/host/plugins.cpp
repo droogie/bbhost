@@ -1190,6 +1190,9 @@ int api_on_camera(void (*fn)(BbCamera*, void*), void* user) {
 // argument registers, so the camera is found again through the slot rather than r15.
 std::vector<CameraCallback> g_view_callbacks;  // under g_frame_mu
 bool g_view_hooked = false;
+// world_state's BB_WORLD_VIEW: one more than the flip at which a plugin's
+// on_view last changed the view (0: never) - another camera's picture.
+std::atomic<std::uint64_t> g_view_moved{0};
 
 GUEST_ABI std::int64_t view_hook(std::uint64_t, const std::uint64_t*) {
     // A cutscene's own camera, left as it places it (plugin API 29).
@@ -1205,7 +1208,10 @@ GUEST_ABI std::int64_t view_hook(std::uint64_t, const std::uint64_t*) {
         now = g_view_callbacks;
     }
     auto* cam = reinterpret_cast<BbCamera*>(static_cast<std::uintptr_t>(scene + 0x10));
+    BbCamera before;
+    std::memcpy(&before, cam, sizeof before);
     for (const CameraCallback& c : now) c.fn(cam, c.user);
+    if (std::memcmp(&before, cam, sizeof before) != 0) g_view_moved.store(hle_video_flip_count() + 1, std::memory_order_relaxed);
     return 0;
 }
 
@@ -1759,8 +1765,8 @@ int api_hud_hide(const char* name, int hidden) {
 }
 
 // BbWorldState's flags from the game's own state: its world, loads,
-// cutscenes and menus, and the plugins' hold (world_state; the in-game
-// menus' interruptions, plugins_frame).
+// cutscenes and menus, the plugins' hold and their views (world_state; the
+// in-game menus' interruptions, plugins_frame).
 std::uint32_t world_flags() {
     std::uint32_t f = 0;
     if (loading_in_world()) f |= BB_WORLD_IN;
@@ -1769,6 +1775,9 @@ std::uint32_t world_flags() {
     // A plugin's own menu in the game's dialog (engine/plugin_dialog.h) is not one of the game's.
     if ((menu_pointer_in_menu() && !plugin_dialog::alone()) || debug_menu_open()) f |= BB_WORLD_MENU;
     if (world_pause_held()) f |= BB_WORLD_PAUSED;
+    // A plugin's view drawn this flip or the last (view_hook).
+    if (const std::uint64_t moved = g_view_moved.load(std::memory_order_relaxed); moved && moved + 1 >= hle_video_flip_count())
+        f |= BB_WORLD_VIEW;
     return f;
 }
 

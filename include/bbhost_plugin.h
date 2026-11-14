@@ -417,6 +417,9 @@ typedef struct BbPad {
 #define BB_WORLD_PAUSED 16u    /* world_pause holds the world (any plugin's) */
 #define BB_WORLD_VISITING 32u  /* the player is in another player's world, or on the way there */
 #define BB_WORLD_OPEN 64u      /* the world's own session is up: players matched to it, or in it */
+#define BB_WORLD_VIEW 128u     /* another camera has the picture - a plugin's on_view moved the view this frame or
+                                  the last (a plugin's free camera). A plugin that moves the view itself sees its
+                                  own. */
 
 /* BbWorldState.session: the game's own session role. */
 #define BB_SESSION_NONE 0
@@ -870,8 +873,11 @@ typedef struct BbHostApi {
      * camera (a cutscene's) replaces it: what fn writes is what is drawn, while
      * the game's own camera - the one the follow camera keeps, the controls
      * move by and the aim reads - stays as on_camera left it. Not called in
-     * the game state on_camera reaches through its second hook (a warp's).
-     * Main thread. 0 on success; 1 for another eboot. */
+     * the game state on_camera reaches through its second hook (a warp's),
+     * nor, since version 29, while cutscene() is 1: a cutscene's camera is
+     * its own. A view fn changes is another camera's picture to the other
+     * plugins (world_state's BB_WORLD_VIEW, version 29). Main thread. 0 on
+     * success; 1 for another eboot. */
     int (*on_view)(void (*fn)(BbCamera* cam, void* user), void* user);
 
     /* Version 21: old-hardware sound. Everything the game plays - its final

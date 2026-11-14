@@ -187,7 +187,9 @@ gives the Binary Ninja address.
   into the scene's, before a scripted camera replaces it: what `fn` writes is
   drawn, while the game's own camera - which the follow camera keeps, the
   controls move by and the aim reads - stays as `on_camera` left it. The
-  Isometric plugin draws its view this way.
+  Isometric plugin draws its view this way. Since v29 it is not called during
+  a cutscene (`cutscene()`), and a view it changes is another camera's picture
+  to the other plugins (`world_state`'s `BB_WORLD_VIEW`).
 - `on_camera_target(fn, user)` (v28): the recompiled follow camera's target.
   Registered once, from `bb_plugin_image`; on the game thread at each of the
   camera's updates `fn` gets the character whose controls the camera uses and
@@ -264,9 +266,13 @@ over the game.
   game's menus or dialogs has the controls, its debug menu included),
   `BB_WORLD_PAUSED` (a plugin holds
   the world), `BB_WORLD_VISITING` (the player is in another player's world or
-  on the way there) and `BB_WORLD_OPEN` (the world's own session is up:
+  on the way there), `BB_WORLD_OPEN` (the world's own session is up:
   players matched to it, or in it - a bell rung alone does not open it; the
-  game makes the session when matchmaking finds a player). `others`: other
+  game makes the session when matchmaking finds a player) and `BB_WORLD_VIEW`
+  (another camera has the picture: a plugin's `on_view` moved the view this
+  frame or the last - a plugin's free camera - so a plugin whose own camera
+  is not the one drawn can give the hunter back to the game meanwhile; a
+  plugin that moves the view itself sees its own). `others`: other
   players' characters in this world now - co-operators, invaders, the host one
   visits. `arriving`: players on their way in - members of the world's session
   or of its matchmaking room who are not in the world yet, counted from the
