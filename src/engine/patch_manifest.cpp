@@ -803,7 +803,9 @@ std::vector<Manifest> built_in_manifests() {
 // setting, the HD Motion Blur patches are HD motion blur, Unlock Game Region
 // is all-languages without its online cost, the Intel Black Tonemap Fix's
 // six bytes are the performance patch's own (always on), and Disable Dynamic
-// Light Shadows is the Dynamic light shadows setting, and The Old Hunters is
+// Light Shadows is the Dynamic light shadows setting, 50% Text scale is the
+// Text scale setting (its constant scaled as the font is mapped: the patch's
+// 0.5 left in place too would halve it again), and The Old Hunters is
 // bbhost's own, always on. rgba8f color space and Lower specific renders left
 // the list (the PS1 plugin's 8-bit colour is scene-rgba8, API 18): a player
 // who had them on would otherwise keep them, with no row to turn them off. A
@@ -813,7 +815,7 @@ bool retired_file(const std::string& file) {
     return file.rfind("screen-space-reflections", 0) == 0 || file.rfind("performance-v3-", 0) == 0 || file == "fov-uncap.toml" ||
            file.rfind("hd-motion-blur-", 0) == 0 || file == "unlock-game-region.toml" || file == "intel-tonemap-fix.toml" ||
            file == "disable-dynamic-light-shadow.toml" || file == "old-hunters.toml" || file == "rgba8f-color-space.toml" ||
-           file == "lower-specific-renders.toml";
+           file == "lower-specific-renders.toml" || file == "text-scale-50.toml";
 }
 
 // By file name, a later directory's file replacing an earlier one's.

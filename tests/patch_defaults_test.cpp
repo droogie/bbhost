@@ -93,6 +93,8 @@ int main() {
     // colour space lives on as bbhost's own scene-rgba8 (plugin API 18).
     CHECK(seen.count("rgba8f-color-space") == 0);
     CHECK(seen.count("lower-specific-renders") == 0);
+    // 50% Text scale is the Text scale setting (2026-11-13): no file of its own.
+    CHECK(seen.count("text-scale-50") == 0);
 
     // The guard catches a dropped line: Smaller Hunter's own file without its
     // `enabled = false` reads as on.
