@@ -176,6 +176,7 @@ add_executable(bbhost
   src/host/ingame_menu.cpp
   src/host/plugin_panel.cpp
   src/host/game_font.cpp
+  src/host/game_menu_art.cpp
   src/host/controls_page.cpp
   src/host/framegen.cpp
   src/host/options.cpp
@@ -1191,6 +1192,14 @@ if(UNIX)
   target_compile_definitions(game_font_test PRIVATE BBHOST_GAME_FONT_NO_FS=1)
   add_test(NAME game_font_test COMMAND game_font_test)
   set_tests_properties(game_font_test PROPERTIES SKIP_RETURN_CODE 77)
+  # The game's menu art: its BC7 decoder against Pillow's, the tiling, the
+  # TPF, DCX, the five-part stretch and the packing (host/game_menu_art.h); with
+  # the dump (BBHOST_APP0) every piece of menu/common.tpf.dcx too.
+  add_executable(game_menu_art_test tests/game_menu_art_test.cpp src/host/game_menu_art.cpp)
+  target_include_directories(game_menu_art_test PRIVATE src)
+  target_compile_definitions(game_menu_art_test PRIVATE BBHOST_GAME_MENU_ART_NO_FS=1)
+  target_link_libraries(game_menu_art_test PRIVATE ZLIB::ZLIB)
+  add_test(NAME game_menu_art_test COMMAND game_menu_art_test)
   # Mouse sensitivity's scale and the old scale's settings read on it
   # (engine/mouse_camera_step.h).
   add_executable(mouse_sensitivity_test tests/mouse_sensitivity_test.cpp)
