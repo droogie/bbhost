@@ -7,8 +7,11 @@
 # The port takes the next free blocks - 116000 PC Settings, 117000 PC
 # Graphics, 118000 PC Controls, 119000 Key Bindings, 120000 PC Effects, 121000
 # PC Camera, 122000 the title menu's Quit Game, 123000 Steam Deck (shown on a
-# Deck only), 124000 PC Enhancements, 125000 PC Upscaling - and 110006..110014 for the System rows
-# that open them. All are unused in the shipped menu.msgbnd. (Motion blur,
+# Deck only), 124000 PC Enhancements, 125000 PC Upscaling, 126000 the plugins'
+# menu pages (rows whose texts the host points at its own, and 126020 the
+# title field's placeholder, engine/plugin_dialog.cpp) - and 110006..110015
+# for the System rows that open them. All are unused in the shipped
+# menu.msgbnd. (Motion blur,
 # depth of field and chromatic aberration moved to PC Effects with their
 # 117000 ids.)
 #
@@ -18,7 +21,9 @@
 # text lives here and nowhere else.
 #
 # Ids 920000..929999 are dialog text instead (group 78, the generic yes/no
-# dialog's - engine/live_resolution.cpp opens one); the help column is unused.
+# dialog's - engine/live_resolution.cpp opens one; group 204 for the options
+# screens' own questions, 920002 a plugin row's, written in memory); the help
+# column is unused.
 # Ids 14000332..14000399 are event text (group 30): the talk menus' entries and
 # the messages their scripts show - the Altar of Despair's rebirth
 # (engine/rebirth_script.h); the help column is unused.
@@ -37,6 +42,7 @@
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Additions to the game, each for the next start: the mirror, rebirth, five players and more.
 110014	PC Upscaling	TAA, FSR, DLSS, frame generation (Windows): quality, sharpness, character motion, reflections.
+110015	Plugins	The menus of the plugins that are turned on.
 116000	Vertical Sync	Wait for the display. Off can tear.
 116001	Fullscreen	Fill the screen: Borderless, or Fullscreen where Window mode (F10) says so.
 116009	Stay Borderless	Borderless never turns into exclusive fullscreen. AMD cards: may lower the frame rate.
@@ -175,6 +181,7 @@
 124006	Auto-Replenish Items	Requires a restart. Molotovs, knives and more refill from storage on a death or in the Dream.
 920000	Keep this resolution?\nIt goes back in 10 seconds unless you choose YES.	
 920001	Quit the game and return to the desktop?	
+920002	Go ahead?	
 14000332	Rebirth in the Nightmare	
 14000333	The altar is silent.\nIt awaits one who bears a sacred heirloom,\na consciousness that is only asleep.	
 14000334	Too many Blood Echoes are held to be reborn.\nSpend some, then return to the altar.	
@@ -201,3 +208,12 @@
 125040	TAA	
 125041	Precise	
 125042	Off	
+126000	Row	
+126001	Row	
+126002	Row	
+126003	Row	
+126004	Row	
+126005	Row	
+126006	Row	
+126007	Row	
+126020	Plugin	

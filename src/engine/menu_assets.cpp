@@ -44,7 +44,7 @@ using Bytes = std::vector<std::uint8_t>;
 
 // Bumped whenever a generator or the recipe changes, so installs remake their
 // assets instead of keeping the last generation.
-constexpr int kGeneratorVersion = 21;  // 21: PC Upscaling's Character Motion row (seven rows on Windows, six elsewhere); 20: every PC section's rows stacked top-down, a row's pick list over the rows after it; 19: PC Upscaling's sixth row on Windows (five rows elsewhere); 18: PC Settings' seventh row on Windows alone; 17: PC Settings' seventh row, Stay Borderless; 16: PC Enhancements' sixth row, Auto-Replenish Items; 15: PC Enhancements' fifth row, Full Phantom HP; 14: PC Settings' Texture Quality row's text; 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
+constexpr int kGeneratorVersion = 22;  // 22: a plugin's menu pages, PlugPage and PlugCorner, their titles named PlugTitle (engine/plugin_dialog.h); 21: PC Upscaling's Character Motion row (seven rows on Windows, six elsewhere); 20: every PC section's rows stacked top-down, a row's pick list over the rows after it; 19: PC Upscaling's sixth row on Windows (five rows elsewhere); 18: PC Settings' seventh row on Windows alone; 17: PC Settings' seventh row, Stay Borderless; 16: PC Enhancements' sixth row, Auto-Replenish Items; 15: PC Enhancements' fifth row, Full Phantom HP; 14: PC Settings' Texture Quality row's text; 13: PC Enhancements' fourth row, SKILL ISSUE; 12: UTF-16 text end fix; 11: PC Graphics' seventh row, HLSL Shaders; 10: PC Camera back to four rows (the camera tuning row hidden); 9: PC Camera's fifth row, the camera tuning; 8: PC Enhancements' three rows; 7: the PC Enhancements section; 6: event text (group 30) for the altar's rebirth
 
 const char kMessagesTsv[] =
 #include "pc_option_messages.inc"
@@ -401,6 +401,20 @@ std::uint16_t max_character_id(const Bytes& b) {
     return best;
 }
 
+// A section drawn smaller at the stage's bottom right, the world in view: its
+// every placement scaled toward the corner and the screen's dim left out (a
+// plugin's corner menu, BB_PANEL_CORNER: engine/plugin_dialog.h). The game
+// places the section itself where the donor is, so the children move, not
+// the section.
+struct Corner {
+    double scale = 0.7;
+    // The unscaled dialog's right and bottom edges on the 1920x1080 stage
+    // (its ornament's right end, its key guide's line), and how far from the
+    // stage's corner they go.
+    double right = 1417.0, bottom = 873.0;
+    double margin_x = 40.0, margin_y = 80.0;
+};
+
 struct SectionArgs {
     std::string clone = "ControllSetting", name, top = "Top";
     int section_depth = 383;
@@ -408,6 +422,10 @@ struct SectionArgs {
     std::vector<std::string> drop = {"Item_6_0"};
     std::optional<int> defaults_slot;
     int add_rows = 0;
+    std::optional<Corner> corner;
+    // An instance name for the title's placement (the donor's has none), so
+    // the host can set the title's text while the section is up.
+    std::optional<std::string> title_name;
 };
 
 bool starts_with(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
@@ -459,6 +477,82 @@ void stack_rows_down(Bytes& body) {
         }
         if (const auto it = to.find(u16(body, at)); it != to.end()) put16(body, at, it->second);
     }
+}
+
+// A 16.16 field of a matrix, as read, and back with the bits it needs.
+double fixed_of(std::uint32_t raw, int n) {
+    if (n == 0) return 0.0;
+    const std::int64_t v = (raw >> (n - 1)) & 1 ? static_cast<std::int64_t>(raw) - (std::int64_t{1} << n) : raw;
+    return static_cast<double>(v) / 65536.0;
+}
+void fixed_pair(double a, double c, int* n, std::uint32_t* ra, std::uint32_t* rc) {
+    const std::int64_t ia = std::llround(a * 65536.0), ic = std::llround(c * 65536.0);
+    *n = std::max(sbits(ia), sbits(ic));
+    const std::uint64_t mask = (std::uint64_t{1} << *n) - 1;
+    *ra = static_cast<std::uint32_t>(static_cast<std::uint64_t>(ia) & mask);
+    *rc = static_cast<std::uint32_t>(static_cast<std::uint64_t>(ic) & mask);
+}
+
+// child' = child * s + (ox, oy): the scale and the rotation fields scaled,
+// the translation (twips) scaled and moved.
+void scale_matrix(Matrix& m, double sc, std::int64_t ox, std::int64_t oy) {
+    const double sx = m.has_scale ? fixed_of(m.sa, m.sn) : 1.0, sy = m.has_scale ? fixed_of(m.sc, m.sn) : 1.0;
+    m.has_scale = true;
+    fixed_pair(sx * sc, sy * sc, &m.sn, &m.sa, &m.sc);
+    if (m.has_rot) fixed_pair(fixed_of(m.ra, m.rn) * sc, fixed_of(m.rc, m.rn) * sc, &m.rn, &m.ra, &m.rc);
+    m.tx = std::llround(static_cast<double>(m.tx) * sc) + ox;
+    m.ty = std::llround(static_cast<double>(m.ty) * sc) + oy;
+}
+
+// A section's sprite body (character id, frame count, tags) moved to the
+// stage's bottom right, `place` the donor's placement on the main timeline
+// (where the game puts the section): every placement and move scaled toward
+// the corner, and the full-screen dim - the donor's depth 1, one shape
+// stretched over the stage - left out with its moves.
+void corner_sprite(Bytes& body, const Corner& c, const Matrix& place) {
+    const double sc = c.scale;
+    // The stage point p goes to p * s + t, the dialog's corner kept margin_x and
+    // margin_y from the stage's.
+    const double tx = (1920.0 - c.margin_x - c.right * sc) * 20.0, ty = (1080.0 - c.margin_y - c.bottom * sc) * 20.0;
+    const std::int64_t ox = std::llround(tx - static_cast<double>(place.tx) * (1.0 - sc));
+    const std::int64_t oy = std::llround(ty - static_cast<double>(place.ty) * (1.0 - sc));
+    Bytes out(body.begin(), body.begin() + 4);
+    bool dim = false;
+    for (const Tag& t : tags(body, 4, body.size())) {
+        if (t.code == kPlace2) {
+            Place2 p = parse_place2(body, t.s, t.e);
+            if (p.depth == 1) {
+                // The dim: placed once, moved in every frame of its fades.
+                if (p.mat && p.cid && p.mat->tx < 0) dim = true;
+                continue;
+            }
+            if (p.mat) {
+                scale_matrix(*p.mat, sc, ox, oy);
+                app(out, tag_bytes(kPlace2, build_place2(p, p.depth, p.mat, p.name)));
+                continue;
+            }
+        } else if (t.code == kPlace3) {
+            // flags, flags2, depth, then (no class name in these) the character and the matrix.
+            const std::uint8_t f1 = body.at(t.s), f2 = body.at(t.s + 1);
+            if (f2 & 0x08) throw Fail{"a corner section's placement with a class name"};
+            if (u16(body, t.s + 2) == 1) continue;
+            if (f1 & 0x04) {
+                std::size_t i = t.s + 4 + ((f1 & 0x02) ? 2 : 0), end = 0;
+                Matrix m = read_matrix(body, i, &end);
+                scale_matrix(m, sc, ox, oy);
+                Bytes nb(body.begin() + t.s, body.begin() + i);
+                app(nb, write_matrix(m));
+                app(nb, body, end, t.e);
+                app(out, tag_bytes(kPlace3, nb));
+                continue;
+            }
+        } else if ((t.code == kRemove && u16(body, t.s + 2) == 1) || (t.code == kRemove2 && u16(body, t.s) == 1)) {
+            continue;
+        }
+        app(out, body, t.head, t.e);
+    }
+    if (!dim) throw Fail{"no full-screen dim at depth 1 in the corner section's donor"};
+    body = std::move(out);
 }
 
 // One PC section cloned from a donor section into the movie.
@@ -612,6 +706,16 @@ Bytes add_option_section(const Bytes& b, const SectionArgs& a) {
         if (title_cid && place_char(b, t.s, t.code) == title_old) {
             Bytes body(b.begin() + t.s, b.begin() + t.e);
             put16(body, t.code == kPlace3 ? 4 : 3, *title_cid);
+            if (a.title_name && t.code == kPlace3 && !(body[0] & 0x20) && (body[0] & 0x04) && !(body[0] & 0x18) && !(body[1] & 0x08)) {
+                // The name after the matrix (no colour transform or ratio here, no class name): PlaceObject3's order.
+                std::size_t end = 0;
+                read_matrix(body, 6, &end);
+                body[0] |= 0x20;
+                body.insert(body.begin() + static_cast<std::ptrdiff_t>(end), a.title_name->begin(), a.title_name->end());
+                body.insert(body.begin() + static_cast<std::ptrdiff_t>(end + a.title_name->size()), 0);
+            } else if (a.title_name) {
+                throw Fail{"the title's placement is not the PlaceObject3 a name can go into"};
+            }
             app(new_body, tag_bytes(t.code, body));
             continue;
         }
@@ -620,6 +724,7 @@ Bytes add_option_section(const Bytes& b, const SectionArgs& a) {
     stack_rows_down(new_body);
 
     if (!clone_p.mat) throw Fail{a.clone + " is placed without a matrix"};
+    if (a.corner) corner_sprite(new_body, *a.corner, *clone_p.mat);
     const Bytes new_section = tag_bytes(kPlace3, build_place3_hidden(new_cid, static_cast<std::uint16_t>(a.section_depth), *clone_p.mat, a.name));
 
     const std::size_t top_s = places[a.top].s;
@@ -849,6 +954,20 @@ Bytes build_option_movie(const Bytes& src) {
     section("PCEnhance", 124020, 390, 6, 0, {});
     // On Windows seven rows - the donor's six, one added - the label below them; elsewhere the donor's six.
     section("PCUpscale", 125020, 391, kPcUpscaleSlots, kPcUpscaleSlots - 6, {});
+    // A plugin's menu pages (engine/plugin_dialog.h): eight rows and no Defaults
+    // label, as Key Bindings; and the same at the bottom right, smaller, with the
+    // world in view (BB_PANEL_CORNER). Their title is the field PlugTitle,
+    // whose text the host sets for each page (126020 its placeholder).
+    for (const bool corner : {false, true}) {
+        SectionArgs a;
+        a.name = corner ? "PlugCorner" : "PlugPage";
+        a.title_id = 126020;
+        a.title_name = "PlugTitle";
+        a.section_depth = corner ? 393 : 392;
+        a.add_rows = 2;
+        if (corner) a.corner = Corner{};
+        m = add_option_section(m, a);
+    }
     return add_scrollbar(m, "Top", 1290, 354.5);
 }
 
@@ -1106,6 +1225,12 @@ std::map<std::int32_t, Message> read_messages() {
         };
         rows[std::atoi(parts[0].c_str())] = Message{unescape(parts[1]), parts.size() > 2 ? unescape(parts[2]) : ""};
     }
+    // The text the host writes in memory before it shows it (a plugin's
+    // question: engine/plugin_dialog.cpp): room for that many characters, the
+    // tsv's text first and spaces after.
+    auto question = rows.find(920002);
+    if (question == rows.end()) throw Fail{"pc_option_messages: no 920002"};
+    if (question->second.text.size() < kPluginQuestionRoom) question->second.text.append(kPluginQuestionRoom - question->second.text.size(), ' ');
     return rows;
 }
 
