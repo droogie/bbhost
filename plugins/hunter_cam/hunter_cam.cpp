@@ -102,6 +102,14 @@
 // for there is put off a frame (the stamina query answered 0), the aim dropped
 // for the roll, and the script, asking again, rolls the hunter the stick's way
 // as unaimed; the view is held still meanwhile and the aim given back its angles.
+//
+// Cutscenes and other cameras. A cutscene (plugin API 29's cutscene()) places
+// the hunter and the camera itself, and while another camera has the picture
+// (world_state's BB_WORLD_VIEW: another plugin's free camera) or another plugin
+// holds the world (BB_WORLD_PAUSED), ours is not the one drawn: either way the
+// camera, the facing and the body go back to the game - the whole hunter in
+// the other camera's picture - the keys and the mouse turn nothing here, and
+// Hunter Cam takes them up again after.
 #include "bbhost_plugin.h"
 
 #include <atomic>
@@ -119,7 +127,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "hunter_cam",
     "Hunter Cam",
-    "1.3.2",
+    "1.3.3",
     "Kyo",
     "The hunter from closer in: an over-the-shoulder camera (right or left, swapped with a key, zoomed with the wheel) "
     "or first person with only the arms and weapons drawn; the hunter can always face where the camera looks, the right "
@@ -505,7 +513,21 @@ bool in_cutscene() {
     return api && api->version >= 29 && api->size >= offsetof(BbHostApi, cutscene) + sizeof(void*) && api->cutscene &&
            api->cutscene() != 0;
 }
-bool aim_wanted() { return s.on && (s.face_camera || g_first) && !in_cutscene(); }
+// Another camera has the picture - world_state's BB_WORLD_VIEW, another
+// plugin's view (a free camera) - or another plugin holds the
+// world (BB_WORLD_PAUSED): the camera, the facing (the aim bit) and the body
+// go back to the game, as for a cutscene, so the picture shows the whole
+// hunter and the mouse that flies that camera turns nothing here; the keys
+// and the mouse are read and dropped meanwhile. Read on the main thread each
+// frame (world_state is the main thread's), used on the game's too.
+std::atomic<bool> g_elsewhere{false};
+bool world_elsewhere() {
+    BbWorldState w{};
+    w.size = sizeof(w);
+    if (!api || api->world_state(&w) != 0) return false;
+    return (w.flags & (BB_WORLD_PAUSED | BB_WORLD_VIEW)) != 0;
+}
+bool aim_wanted() { return s.on && (s.face_camera || g_first) && !in_cutscene() && !g_elsewhere.load(); }
 bool rolling() { return now_ns() < g_roll_until.load(); }
 
 // Once a frame, on the main thread: the bit set while it should be, cleared
@@ -852,6 +874,27 @@ void read_keys() {
 
 bool zoom_keys() { return api->version >= 26 && has_field(offsetof(BbHostApi, camera_zoom)); }
 
+// While another camera has the picture (g_elsewhere) or a cutscene plays: the
+// keys and the mouse read and dropped - what is held noted, so a key held on
+// past it is no press after it - and the wheel's notches, once ours, too.
+void drop_input() {
+    BbInput in;
+    if (api->input(&in) == 0) {
+        const Key keys[2] = {s.swap_key, s.first_key};
+        for (int i = 0; i < 2; ++i) {
+            bool down = false;
+            if (const std::uint16_t sc = scancode(keys[i])) down = in.key[sc] != 0;
+            else if (const std::uint32_t bit = mouse_bit(keys[i])) down = (in.buttons & bit) != 0;
+            view.keys_down[i] = down;
+        }
+    }
+    view.mouse_dx = view.mouse_dy = 0.0f;
+    if (view.zoom_taken && zoom_keys()) {
+        int steps = 0, reset = 0;
+        api->camera_zoom(&steps, &reset);
+    }
+}
+
 // The wheel's notches and the middle button since the last frame, once we
 // hold the keys: on the shoulder camera's zoom while it is in charge, else on
 // the game camera's as the host had it.
@@ -1050,12 +1093,15 @@ void on_camera(BbCamera* c, void*) {
     std::uint8_t* const follow = const_cast<std::uint8_t*>(f);
     std::uint8_t* const aim_cam = get<std::uint8_t*>(reinterpret_cast<std::uint8_t*>(c) - 0x10, kAimCam);
     const bool cutscene = in_cutscene();
-    if (!s.on || loading || cutscene) {
+    const bool elsewhere = g_elsewhere.load();
+    if (!s.on || loading || cutscene || elsewhere) {
         turning_off(follow, aim_cam);
         view.started = false;
         view.reach = -1.0f;
         view.have_focus = false;
-        if (!loading && !cutscene) {
+        if (s.on && (cutscene || elsewhere)) {
+            drop_input();
+        } else if (!loading && !cutscene) {
             read_zoom(false);
             game_camera_zoom(c, f, dt);
         }
@@ -1251,11 +1297,15 @@ void apply() {
 }
 
 void on_frame(void*) {
+    const bool elsewhere = world_elsewhere();
+    if (elsewhere != g_elsewhere.exchange(elsewhere) && s.on)
+        api->log("hunter_cam: %s", elsewhere ? "another camera has the picture: the hunter is the game's until it is ours again"
+                                             : "the picture is ours again");
     face_camera_frame();
     std::uint8_t* chr = player();
     const bool loading = api->loading_screen && api->loading_screen();
 
-    if (s.on && g_first && chr && !loading && !in_cutscene()) parts_hide(chr);
+    if (s.on && g_first && chr && !loading && !in_cutscene() && !elsewhere) parts_hide(chr);
     else parts_show();
 }
 
