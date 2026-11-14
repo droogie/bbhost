@@ -112,8 +112,15 @@ that cannot move it uses the old folder as it is.
 ## Saves
 
 Saves are in `<data>/saves/SPRJ0005`, where `<data>` defaults to
-`%LOCALAPPDATA%\bbhost\data` or `~/.local/share/bbhost/data`. Each time the
-game writes a save (at most every five minutes) a copy goes to
+`%LOCALAPPDATA%\bbhost\data` or `~/.local/share/bbhost/data`. The game writes
+a save into a copy beside it, `.SPRJ0005.stage`, and bbhost then moves the
+copy's files into `SPRJ0005` one by one, under a list in `.SPRJ0005.commit`
+(on Linux, where the file system can swap two folders in one step, it swaps
+them instead). If bbhost ends in the middle, its next start finishes the save
+or drops it, so `SPRJ0005` always holds a whole save, the new one or the one
+before; leave the copy and the list alone. On Windows the `SPRJ0005` folder
+itself never moves, so a File Explorer window open in it stays open. Each time
+the game writes a save (at most every five minutes) a copy goes to
 `<data>/save-backups/`, and the newest eight are kept. To restore one, quit and
 copy its files over `<data>/saves/SPRJ0005`.
 

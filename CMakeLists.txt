@@ -715,8 +715,9 @@ if(WIN32 AND CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   set_property(TARGET guest_console_test PROPERTY CROSSCOMPILING_EMULATOR wine)
 endif()
 add_test(NAME guest_console_test COMMAND guest_console_test)
-# A save written whole or not at all: the commit at unmount, and on Linux a
-# kill at each of its steps with the recovery after it (hle/save_commit.h).
+# A save written whole or not at all: the commit at unmount, and a kill at
+# each of its steps with the recovery after it (hle/save_commit.h; a child
+# process forked on Linux, the test run again on Windows).
 add_executable(save_commit_test tests/save_commit_test.cpp src/hle/save_commit.cpp)
 target_include_directories(save_commit_test PRIVATE src)
 target_compile_features(save_commit_test PRIVATE cxx_std_17)
