@@ -1393,10 +1393,11 @@ bool vk_present() {
                                static_cast<std::int32_t>(src_y), src_w, src_h, by_fsr);
         }
         // The host overlay goes over the game's frame: the pointer now, the text
-        // box and the options screen later. Drawing needs
+        // box and the options screen later; then the menus, a plugin's in-game
+        // menu among them (up while F10 is closed). Drawing needs
         // the image as a colour attachment rather than a transfer destination.
         bool as_colour = false;  // the image was moved to the colour-attachment layout, whether or not the overlay then drew
-        if (idx < g_vk.views.size() && g_vk.views[idx] && (!host_overlay_empty() || ingame_menu_open())) {
+        if (idx < g_vk.views.size() && g_vk.views[idx] && (!host_overlay_empty() || ingame_menu_open() || plugin_panel_shown())) {
             VkImageMemoryBarrier to_colour = to_dst;
             to_colour.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             to_colour.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
