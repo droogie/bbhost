@@ -96,12 +96,17 @@
 // Isometric plugin's, from Kyo's Modern Movement Lite: four-way quicksteps
 // without a lock) unless something already wrote them, which keeps them: the
 // patch list's Modern Movement Lite works beside the plugin at either setting,
-// and only what the plugin wrote is taken back. Aiming (facing the camera, first
-// person), a roll could only go straight ahead - the game holds the aiming
-// hunter's facing, and reads the aim before the script runs - so a roll asked
-// for there is put off a frame (the stamina query answered 0), the aim dropped
-// for the roll, and the script, asking again, rolls the hunter the stick's way
-// as unaimed; the view is held still meanwhile and the aim given back its angles.
+// and only what the plugin wrote is taken back. They go in as the host writes
+// a patch file in a running game - the new code first, the jumps to it last,
+// all or none - from the first frame, after Isometric has written its own as
+// the game starts; a jump the eboot's bytes are back in while the sidestep is
+// on (Modern Movement Lite switched off in the game) is written again.
+// Aiming (facing the camera, first person), a roll could only go straight
+// ahead - the game holds the aiming hunter's facing, and reads the aim before
+// the script runs - so a roll asked for there is put off a frame (the stamina
+// query answered 0), the aim dropped for the roll, and the script, asking
+// again, rolls the hunter the stick's way as unaimed; the view is held still
+// meanwhile and the aim given back its angles.
 //
 // Cutscenes and other cameras. A cutscene (plugin API 29's cutscene()) places
 // the hunter and the camera itself, and while another camera has the picture
@@ -127,7 +132,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "hunter_cam",
     "Hunter Cam",
-    "1.3.3",
+    "1.3.4",
     "Kyo",
     "The hunter from closer in: an over-the-shoulder camera (right or left, swapped with a key, zoomed with the wheel) "
     "or first person with only the arms and weapons drawn; the hunter can always face where the camera looks, the right "
@@ -370,6 +375,10 @@ bool sphere_cast(std::uint8_t* world, V3 from, V3 delta, float radius, float& fr
     return true;
 }
 
+long long now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // ---- the omni-roll (Sidestep) ------------------------------------------------
 
 struct Site {
@@ -386,38 +395,88 @@ constexpr std::size_t kSites = sizeof(kOmniRoll) / sizeof(kOmniRoll[0]);
 // nothing reaches without them.
 constexpr std::uint64_t kCaves = 0x4000000;
 
-bool omni_applied = false;
-bool omni_owned[kSites]{};  // written by us, not found already in place
+bool omni_applied = false;  // wanted on (whether or not every site went in)
+bool omni_owned[kSites]{};  // jumps written by us, not found already in place
+bool omni_whole = false;    // every site in: the jumps are kept in (omni_keep)
+long long omni_checked = 0; // when omni_keep last looked (steady clock, ns)
 
+bool omni_in_place(const Site& t) {
+    std::uint8_t now[4096];
+    return t.size <= sizeof(now) && api->read(t.address, now, t.size) == 0 && std::memcmp(now, t.bytes, t.size) == 0;
+}
+
+// Written as the host writes a patch file while the game runs: the new code
+// first and the jumps to it last, all of them or none - a jump in with its
+// cave not would run zeros, or another's bytes. Taken back, only the jumps
+// this plugin wrote go - the caves stay, as the host's own do: a thread may
+// still be inside one, and nothing reaches them. A site already as it writes
+// it is someone else's and is left to them: the patch list's Modern Movement
+// Lite, or Isometric, which writes them all as the game starts and keeps them.
 void omni_roll(bool on) {
     if (on == omni_applied) return;
-    int written = 0, already = 0, refused = 0;
-    for (std::size_t i = 0; i < kSites; ++i) {
-        const Site& t = kOmniRoll[i];
-        if (on) {
-            std::uint8_t now[4096];
-            const bool in_place = t.size <= sizeof(now) && api->read(t.address, now, t.size) == 0 &&
-                                  std::memcmp(now, t.bytes, t.size) == 0;
-            if (in_place) {
-                ++already;
-                omni_owned[i] = false;
-            } else if (api->patch(t.address, t.expect, t.bytes, t.size) == 0) {
-                ++written;
-                omni_owned[i] = true;
-            } else {
-                ++refused;
-                omni_owned[i] = false;
-            }
-        } else if (omni_owned[i] && t.address < kCaves) {
-            if (api->patch(t.address, t.bytes, t.expect, t.size) == 0) ++written;
+    omni_applied = on;
+    omni_whole = false;
+    int written = 0, already = 0;
+    if (!on) {
+        for (std::size_t i = 0; i < kSites; ++i) {
+            const Site& t = kOmniRoll[i];
+            if (omni_owned[i] && api->patch(t.address, t.bytes, t.expect, t.size) == 0) ++written;
             omni_owned[i] = false;
         }
-    }
-    omni_applied = on;
-    if (on)
-        api->log("hunter_cam: sidestep on (%d sites written, %d already in place, %d refused)", written, already, refused);
-    else
         api->log("hunter_cam: sidestep's own sites given back (%d)", written);
+        return;
+    }
+    for (int jumps = 0; jumps < 2; ++jumps) {
+        for (std::size_t i = 0; i < kSites; ++i) {
+            const Site& t = kOmniRoll[i];
+            if ((t.address < kCaves) != (jumps == 1)) continue;
+            if (omni_in_place(t)) {  // ours from before (omni_keep), or another's
+                ++already;
+                continue;
+            }
+            if (api->patch(t.address, t.expect, t.bytes, t.size) == 0) {
+                ++written;
+                omni_owned[i] = jumps == 1;
+                continue;
+            }
+            // Not the code expected: no jump goes in, and those that went
+            // in come out again.
+            int back = 0;
+            for (std::size_t k = 0; k < kSites; ++k) {
+                if (!omni_owned[k]) continue;
+                if (api->patch(kOmniRoll[k].address, kOmniRoll[k].bytes, kOmniRoll[k].expect, kOmniRoll[k].size) == 0) ++back;
+                omni_owned[k] = false;
+            }
+            api->log("hunter_cam: 0x%llx is not the code expected; the sidestep stays the game's (%d jumps taken out again)",
+                     static_cast<unsigned long long>(t.address), back);
+            return;
+        }
+    }
+    omni_whole = true;
+    omni_checked = now_ns();
+    api->log("hunter_cam: sidestep on (%d sites written, %d already in place)", written, already);
+}
+
+// Once a second while the sidestep is on: a jump that the eboot's bytes are
+// back in - Modern Movement Lite switched off in the game, whose sites they
+// were - is written again, ours now, so the sidestep goes on.
+void omni_keep() {
+    if (!omni_applied || !omni_whole) return;
+    const long long now = now_ns();
+    if (now - omni_checked < 1000000000) return;
+    omni_checked = now;
+    for (std::size_t i = 0; i < kSites; ++i) {
+        const Site& t = kOmniRoll[i];
+        std::uint8_t have[16];
+        if (t.address >= kCaves || t.size > sizeof(have) || api->read(t.address, have, t.size) != 0 ||
+            std::memcmp(have, t.expect, t.size) != 0)
+            continue;
+        api->log("hunter_cam: the sidestep's jump at 0x%llx was taken out by another; written again",
+                 static_cast<unsigned long long>(t.address));
+        omni_applied = false;
+        omni_roll(true);
+        return;
+    }
 }
 
 // ---- the game's own checks of the precision-shooting bit ---------------------
@@ -465,11 +524,6 @@ SiteSet g_items{kItems, sizeof(kItems) / sizeof(kItems[0]), "items"};
 // starts turns to the stick as unaimed rolls do.
 std::atomic<long long> g_roll_until{0};
 constexpr long long kRollTurnNs = 800000000;  // 0.8 s: the roll, then the aim again
-
-
-long long now_ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
 
 // The checks passed (on) or the game's again (off).
 void set_sites(SiteSet& g, bool on) {
@@ -1288,8 +1342,14 @@ void on_camera(BbCamera* c, void*) {
 
 // ---- the switches ------------------------------------------------------------
 
+// In the image phase (bb_plugin_image) the sidestep waits for the first
+// frame: Isometric, loaded after this plugin, writes the omni-roll's sites as
+// the game starts and keeps them all the run; found in place then, they are
+// left to it when Hunter Cam goes off.
+bool g_imaging = false;
+
 void apply() {
-    omni_roll(s.on && s.dodge == 1);
+    if (!g_imaging) omni_roll(s.on && s.dodge == 1);
     face_camera_frame();  // at once: the host may not call on_frame while the plugin is off
     if (!(s.on && g_first)) parts_show();
     const Key keys[2] = {s.swap_key, s.first_key};
@@ -1308,6 +1368,8 @@ void on_frame(void*) {
         g_elsewhere.store(false);
         return;
     }
+    omni_roll(s.dodge == 1);  // the first frame's (g_imaging); after, as the options left it
+    omni_keep();
     const bool elsewhere = world_elsewhere();
     if (elsewhere != g_elsewhere.exchange(elsewhere))
         api->log("hunter_cam: %s", elsewhere ? "another camera has the picture: the hunter is the game's until it is ours again"
@@ -1353,7 +1415,9 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     if (!g_env_hooked)
         host->log("hunter_cam: the script's env queries are not where they should be: facing the camera walks, Roll "
                   "stays the game's");
+    g_imaging = true;
     apply();
+    g_imaging = false;
     host->log("hunter_cam: Hunter Cam %s (%s, %s shoulder, face the camera %s, dodge %s)", s.on ? "on" : "off",
               g_first ? "first person" : s.camera ? "over the shoulder" : "game camera", s.shoulder > 0 ? "right" : "left",
               s.face_camera ? "on" : "off", s.dodge ? "sidestep" : "roll");
