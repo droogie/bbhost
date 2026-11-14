@@ -674,7 +674,10 @@ void set_drawn(std::uint8_t* disp, bool drawn) {
 }
 
 void parts_show() {
-    std::uint8_t* holder = parts.chr ? get<std::uint8_t*>(parts.chr, kPartsHolder) : nullptr;
+    // Only on the player still: a load frees the character the parts were hidden
+    // on, and its parts with it - they are left alone (Quake read such a
+    // character's parts after a lamp travel and crashed).
+    std::uint8_t* holder = parts.chr && parts.chr == player() ? get<std::uint8_t*>(parts.chr, kPartsHolder) : nullptr;
     for (int k = 0; k < kPartSlots; ++k) {
         if (holder && parts.hidden[k] && part_disp(holder, k) == parts.hidden[k]) set_drawn(parts.hidden[k], true);
         parts.hidden[k] = nullptr;

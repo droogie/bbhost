@@ -2904,9 +2904,17 @@ void take_input(bool on, bool moving = true) {
 void release() {
     g_on_ladder = false;
     g_ladder_exit_ms = -1.0;
-    if (g_held) hold_body(g_held, false, false);
+    // The held character's switches and parts go back only while it is still
+    // the player (Quake turned off, a cutscene, a loading screen coming up with
+    // the hunter still there). A load builds a new player and frees the old
+    // one, its switches and parts with it: writing those switches was a write
+    // into freed memory, and reading its parts crashed (in vm_show, at a lamp
+    // travel's arrival in Central Yharnam). A character that is gone is left
+    // alone; the dash hook is code, put back either way.
+    std::uint8_t* const held = g_held && g_held == player() ? g_held : nullptr;
+    if (held) hold_body(held, false, false);
     lift_dash(false);
-    vm_release(g_held ? g_held : player());
+    vm_release(held ? held : g_held ? nullptr : player());
     g_held = nullptr;
     if (g_active) take_input(false);
     g_active = false;
