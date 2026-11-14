@@ -16,8 +16,9 @@
 //   plasma = "A Call Beyond"   # or Blacksky Eye: what the plasma gun fires
 //
 // Every setting is live: the launcher's Plugins page and F9's change it while
-// playing. While another plugin holds the world still (photo mode's Frozen,
-// plugin API 29), Quake holds with it.
+// playing. While another plugin holds the world still (a photo mode's Frozen,
+// plugin API 29) or another camera has the picture (a free camera over the
+// running world: world_state's BB_WORLD_VIEW), Quake holds with it.
 //
 // Where it sits. The game's state update runs the camera manager's blend
 // (the follow camera's update, then the blend into the manager's own camera)
@@ -88,7 +89,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.23",
+    "0.3.24",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -326,8 +327,10 @@ const bool g_sounds = [] {
 }();
 
 // The world held still by another plugin - a photo mode's (plugin API 29's
-// world_pause) - as world_state read it on the main thread this frame; the
-// camera reads it on the game's.
+// world_pause) - or another camera's picture (BB_WORLD_VIEW: a free camera
+// that flies over the running world by the same keys and mouse), as
+// world_state read it on the main thread this frame; the camera reads it on
+// the game's.
 std::atomic<bool> g_world_held{false};
 
 // ---- the game ------------------------------------------------------------------
@@ -3204,9 +3207,10 @@ void camera(BbCamera& cam) {
     g_last = now;
     g_have_last = true;
     dt = std::min(dt, kMaxFrame);
-    // A world another plugin holds still (a photo mode's) holds Quake's time
-    // too: the player stays where the world was held and the view as it was,
-    // and what the keys and the mouse do meanwhile is that plugin's camera's.
+    // A world another plugin holds still (a photo mode's), or another camera's
+    // picture, holds Quake's time too: the player stays where the world was
+    // held and the view as it was, and what the keys and the mouse do
+    // meanwhile is that plugin's camera's.
     const bool held = g_world_held.load(std::memory_order_relaxed);
     if (held) dt = 0.0;
     g_now += dt;
@@ -3555,12 +3559,14 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
         g.log("quake: %s changed to %s (%s physics)", key, value ? value : "?", physics_name());
     }, nullptr);
     g.on_world_load([](std::uint32_t) { g_written_valid = false; });
-    // A world another plugin holds still (plugin API 29: a photo mode's).
+    // A world another plugin holds still (plugin API 29: a photo mode's), or
+    // another camera's picture (a free camera over the running world too).
     if (api->version >= 29 && api->size >= offsetof(BbHostApi, world_state) + sizeof(void*)) {
         g.every_frame([] {
             BbWorldState w{};
             w.size = sizeof(w);
-            g_world_held.store(g.api->world_state(&w) == 0 && (w.flags & BB_WORLD_PAUSED) != 0, std::memory_order_relaxed);
+            g_world_held.store(g.api->world_state(&w) == 0 && (w.flags & (BB_WORLD_PAUSED | BB_WORLD_VIEW)) != 0,
+                               std::memory_order_relaxed);
         });
     }
     // The guns' rows, once the tables are there and whenever the switch moves.
