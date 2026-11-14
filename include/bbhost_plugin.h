@@ -1085,7 +1085,8 @@ typedef struct BbHostApi {
     int (*post_look)(const char* name, const BbLook* look, uint32_t* available);
     /* The plugin's panel up (BbPanel) or down (NULL): the pages of its options
      * table it marks with BB_OPT_PANEL, drawn over the game at the bottom
-     * right in the look of the game's own menus and at one size for every
+     * right as the game's options dialog draws its pages - its art and
+     * letters, read from the player's dump - and at one size for every
      * page (its longest page and its longest help), their changes going to on_option as
      * the menus' do (the rows want BB_OPT_LIVE). The controller drives it -
      * the d-pad up and down to a row, left and right to change it, Cross to

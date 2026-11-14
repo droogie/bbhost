@@ -2038,6 +2038,17 @@ void plugins_load() {
         g_plugins.push_back(p);
     }
     aa_update();
+    // A plugin with a panel (BB_OPT_PANEL pages): the game's menu art read now,
+    // on a thread of its own, not on the presenter's at the panel's first frame.
+    for (const Plugin& p : g_plugins) {
+        bool panel = false;
+        for (const BbOption* o = p.options; o && o->type != BB_OPT_END && !panel; ++o)
+            panel = (o->type & 0xffu) == BB_OPT_HEADING && (o->type & BB_OPT_PANEL) != 0;
+        if (panel) {
+            plugin_panel_preload();
+            break;
+        }
+    }
     g_early = false;
 }
 

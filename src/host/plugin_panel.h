@@ -44,7 +44,18 @@ constexpr std::uint32_t kPanelPadButtons = 0x10u | 0x20u | 0x40u | 0x80u | 0x400
 // Page Down, Q, E and Escape.
 bool plugin_panel_key(int scancode);
 
+// The game's menu art (host/game_menu_art.h) read now, on a thread of its
+// own: a plugin with panel pages is loaded, and its panel's first frame then
+// does not wait the fifth of a second the art takes to read.
+void plugin_panel_preload();
+
 // Draws it into the current ImGui frame (the menus' context), at `scale`:
 // the presenter's thread, while no menu is up. `pad` is the controller in use
 // (the guide for it).
 void plugin_panel_draw(float scale, bool pad);
+
+// BBHOST_PANEL_PREVIEW=<plugin>[:<page>] (a test aid): that plugin's panel up
+// from the first frame the menus draw, wherever the game is - at the title
+// too - with BBHOST_PANEL_PREVIEW_GUIDE and BBHOST_PANEL_PREVIEW_GUIDE_KEYS
+// as its guide. Nothing without the variable. The presenter's thread.
+void plugin_panel_preview_tick();

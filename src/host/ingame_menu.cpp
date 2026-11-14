@@ -985,6 +985,7 @@ bool finish_frame(bool menu) {
 // presenter nothing but this check).
 bool build_frame(VkExtent2D extent) {
     const bool menu = host_options_open();
+    if (g_vk_ready) plugin_panel_preview_tick();       // BBHOST_PANEL_PREVIEW (a test aid)
     const bool panel = !menu && plugin_panel_shown();  // a plugin's panel (host/plugin_panel.h) while no menu is up
     if (!g_vk_ready || (!menu && !panel)) {
         g_ui.scanned = false;     // read the files again when it next opens
