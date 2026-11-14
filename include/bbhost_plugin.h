@@ -1130,11 +1130,12 @@ typedef struct BbHostApi {
      * starting, the player's character dying - not one already under way
      * when it opened. The game's messages leave it up, and a corner one
      * stays: the plugin takes it down. Where the game cannot open its dialog
-     * (another eboot, no options movie, its menus locked), the host draws the
-     * same pages in a panel of its own. One menu at a time - a later call
-     * replaces another plugin's - and the plugin being turned off takes it
-     * down. Main thread. 0 on success; 1 for an unknown plugin, a size under
-     * 8, a page it has not got (or `pages` naming one), or none at all. */
+     * (another eboot, no options movie, its menus locked or closed frame
+     * after frame), the host draws the same pages in a panel of its own. One
+     * menu at a time - a later call replaces another plugin's - and the
+     * plugin being turned off takes it down. Main thread. 0 on success; 1 for
+     * an unknown plugin, a size under 8, a page it has not got (or `pages`
+     * naming one), or none at all. */
     int (*panel_show)(const char* name, const BbPanel* panel);
     /* Whether the plugin's panel is up, whether it was closed since the last
      * call - by the player, or by the game (panel_show) - and its page

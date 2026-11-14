@@ -159,9 +159,13 @@ bool plugin_panel_native_turn(int dir);
 // opened) rather than closing the dialog; and going back: true when it did.
 bool plugin_panel_native_on_subpage();
 bool plugin_panel_native_back();
-// The dialog went: by the player (Circle, closed: panel_state's closed) or as
-// asked (hidden, interrupted).
-void plugin_panel_native_gone(bool by_player);
+// The dialog went: closed (panel_state's closed) by the player (Circle) or by
+// the game's menu flow (`by` says which, for the log), or as asked (hidden,
+// interrupted).
+void plugin_panel_native_gone(bool closed, const char* by = "the player");
+// A corner page still to be up (its plugin has not taken it down): the game's
+// menu flow took it, and the host brings it back.
+bool plugin_panel_native_corner_wanted();
 // The game's dialog could not show the panel after all (the flow would not
 // take it, or the page never opened): the host draws it instead (logged once).
 void plugin_panel_native_failed(const char* why);

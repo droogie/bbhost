@@ -523,9 +523,24 @@ int main(int argc, char** argv) {
         // The game's dialog's keys: the menus' own, not Q and E (photo mode's camera flies on them).
         CHECK(plugin_panel_native_key(82) && plugin_panel_native_key(40) && plugin_panel_native_key(41) && plugin_panel_native_key(42));
         CHECK(!plugin_panel_native_key(20) && !plugin_panel_native_key(8) && plugin_panel_key(20) && plugin_panel_key(8));
+        // A corner page the game's menu flow took is still wanted (the host brings it back); a centred one
+        // is not, and neither is one its plugin took down.
+        CHECK(!plugin_panel_native_corner_wanted());
+        how.corner = true;
+        CHECK(plugin_panel_show("menu_demo", how) && plugin_panel_native_corner_wanted());
+        plugin_panel_hide("menu_demo");
+        CHECK(!plugin_panel_native_corner_wanted());
+        how.corner = false;
+        CHECK(plugin_panel_show("menu_demo", how) && !plugin_panel_native_corner_wanted());
         // The game's dialog closed by the player: closed, read once.
         plugin_panel_native_gone(true);
         PluginPanelState st = panel_state();
+        CHECK(!st.shown && st.closed);
+        CHECK(!panel_state().closed);
+        // Taken by the game's menu flow (a centred page): closed all the same, read once.
+        CHECK(plugin_panel_show("menu_demo", how));
+        plugin_panel_native_gone(true, "the game's menu flow");
+        st = panel_state();
         CHECK(!st.shown && st.closed);
         CHECK(!panel_state().closed);
         // The System list's Plugins row: the named menus as a page; one picked is on top of it.

@@ -45,8 +45,18 @@
 // alive under the page to push it again would put one dialog more on the
 // eight the menus' context holds (its +0x50, filled by sub_201d420) than the
 // game ever has: a loading screen opening over both overflowed it (DL_PANIC).
-// sub_1fb27a0 counts its pushes at +0xb18 (sub_1fb26b0 its closes too), which
-// tells a refused push.
+// sub_1fb27a0 counts its pushes at +0xb18 and sub_1fb26b0 its closes, which
+// tells a refused push, and a page the game took: sub_1fb26b0 closes whatever
+// menu is open for the game's own reasons as well - a load (sub_1fb3140), the
+// world's prompts when the action they offer changes (sub_1c68f30), and frame
+// after frame while the hunter is dying (at 0 HP, until the death's load) -
+// which a menu that finishes by itself (Circle) does not count. A corner page
+// the game took comes back once the flow has been quiet a moment; the plugin
+// is not told. Where the flow closes its menus frame after frame, no page of
+// the game's dialog can stay: the host draws it instead (the fallback below),
+// as it does when the flow still refuses the page a second after the take or
+// takes it a third time within 10 s, and the game's dialog has it again the
+// next time it is shown.
 //
 // sub_1fb27a0 refuses (pushes nothing) while MenuMan's +0x2fc is set. Setting
 // +0xb12 asks the flow to close its open menu at its next update (sub_1fb26b0).
@@ -217,6 +227,22 @@ std::atomic<int> g_sound{-1};               // a menu sound for the game's threa
 std::uint64_t g_pushed = 0;                 // the flow's open menu right after our push (game thread)
 bool g_ours_on_flow = false;                // we pushed it (else it is inside the System list)
 bool g_close_sent = false;                  // the flow was asked to take our page away
+std::uint64_t g_pushed_changes = 0;         // the flow's +0xb18 right after our push
+// A corner page the game's menu flow took, to come back once the flow has
+// been quiet a moment (game thread).
+bool g_reopen = false;
+std::int64_t g_reopen_since_ms = 0;
+std::atomic<bool> g_reopen_pending{false};  // for pad_filter
+int g_reopens = 0;
+// When the flow took the corner page the last two times (0: not since it was
+// last shown by its plugin).
+std::atomic<std::int64_t> g_take_ms[2] = {0, 0};
+// The flow's closes and pushes that were not ours (game thread): when the
+// last two came, and the count last seen.
+std::uint64_t g_flow_seen = 0;
+std::int64_t g_flow_change_ms[2] = {0, 0};
+const char kBusy[] = "the game's menu flow closes its menus frame after frame here";
+const char kTaken[] = "the game's menu flow took the corner page three times in 10 s";
 
 void post_sound(int id) { g_sound.store(id, std::memory_order_relaxed); }
 
@@ -580,8 +606,57 @@ bool push(std::uint64_t f) {
     option_rows::release(screen);
     g_close_sent = false;
     // Refused, the menu that was open (if one was) still is.
-    g_pushed = rd64(f + kFlowChanges) != before ? rd64(f + kFlowMenu) : 0;
+    g_pushed_changes = rd64(f + kFlowChanges);
+    g_pushed = g_pushed_changes != before ? rd64(f + kFlowMenu) : 0;
     return g_pushed != 0;
+}
+
+// The game's menu flow closed or replaced the page we pushed (not Circle, which
+// it does not count, and not as we asked).
+bool taken_by_game(std::uint64_t f) { return g_ours_on_flow && f && rd64(f + kFlowChanges) != g_pushed_changes; }
+
+// The wait for a corner page the flow took is over; `why` the game's dialog
+// will not have it (the host draws it until it is next shown), or nullptr.
+void end_reopen(const char* why) {
+    g_reopen = false;
+    g_reopen_pending.store(false);
+    if (tracing()) host_log("plugin-dialog: the corner page's buttons go where they went before it was taken");
+    if (!why) return;
+    static bool told_busy = false, told_taken = false, told_refused = false;
+    bool& told = why == kBusy ? told_busy : why == kTaken ? told_taken : told_refused;
+    if (!told) {
+        told = true;
+        host_log("plugin-dialog: the corner page is drawn by the host: %s", why);
+    }
+    plugin_panel_native_failed(why);
+}
+
+// A page the game's flow took: a corner page waits to come back, a centred one
+// is closed, as by the player but said to be the game's.
+void game_took(bool came_up) {
+    const std::int64_t ms = now_ms();
+    g_flow_change_ms[1] = g_flow_change_ms[0];
+    g_flow_change_ms[0] = ms;
+    if (g_corner.load() && plugin_panel_native_corner_wanted()) {
+        // Taken a third time within 10 s: it would only flicker back and go.
+        const std::int64_t before_last = g_take_ms[1].load();
+        g_take_ms[1].store(g_take_ms[0].load());
+        g_take_ms[0].store(ms);
+        if (before_last && ms - before_last <= 10000) {
+            end_reopen(kTaken);
+            return;
+        }
+        if (g_reopens++ < 8)
+            host_log("plugin-dialog: the game's menu flow took the corner page%s; it comes back once the flow is quiet",
+                     came_up ? "" : " before it came up");
+        g_reopen = true;
+        g_reopen_pending.store(true);
+        g_reopen_since_ms = ms;
+        if (tracing()) host_log("plugin-dialog: the corner page's buttons kept from the game until it is back");
+        return;
+    }
+    host_log("plugin-dialog: down (taken by the game's menu flow%s)", came_up ? "" : " before it came up");
+    plugin_panel_native_gone(true, "the game's menu flow");
 }
 
 // Why the flow will not take a push now, or nullptr.
@@ -826,7 +901,9 @@ void rows_update() {
 
 bool available() { return g_available && option_rows::ready(); }
 
-bool open() {
+// The panel's page to the game's dialog: in place when it is up, else pushed at
+// the next frame.
+static bool open_page() {
     if (!available()) return false;
     Page p;
     if (!plugin_panel_native_page(p)) return false;
@@ -842,6 +919,15 @@ bool open() {
     g_want_close.store(false);
     g_want_open.store(true);
     return true;
+}
+
+bool open() {
+    // Shown by its plugin: the flow's takes are counted afresh.
+    if (g_state.load() != 2) {
+        g_take_ms[0].store(0);
+        g_take_ms[1].store(0);
+    }
+    return open_page();
 }
 
 void close() {
@@ -878,6 +964,26 @@ void frame() {
     }
     const std::uint64_t f = flow();
     const int state = g_state.load();
+    const std::int64_t ms = now_ms();
+    if (f) {
+        // The game's own closes and pushes while no page of ours is on the flow
+        // (ours are counted in as they are made).
+        const std::uint64_t c = rd64(f + kFlowChanges);
+        if (c != g_flow_seen && state == 0) {
+            g_flow_change_ms[1] = g_flow_change_ms[0];
+            g_flow_change_ms[0] = ms;
+        }
+        g_flow_seen = c;
+    }
+    const bool busy = ms - g_flow_change_ms[1] < 500;  // two in half a second
+    if (state == 1 && !alive() && taken_by_game(f) && rd64(f + kFlowMenu) != g_pushed) {
+        // The flow closed or replaced it before the page came up.
+        g_state.store(0);
+        g_b.dialog = nullptr;
+        release_under();
+        game_took(false);
+        return;
+    }
     if (state == 1 && !alive() && std::chrono::steady_clock::now() - g_b.opened_at > std::chrono::seconds(3)) {
         // Pushed, but the page never came up: the host draws it instead.
         g_state.store(0);
@@ -905,6 +1011,10 @@ void frame() {
             // game's it uncovers (that menu never saw it go down), nor roll.
             g_hold_pressed.store(true);
             const bool asked = g_want_close.exchange(false);
+            if (!asked && taken_by_game(f)) {
+                game_took(true);
+                return;
+            }
             host_log("plugin-dialog: down (%s)", asked ? "asked" : "closed");
             plugin_panel_native_gone(!asked);
             return;
@@ -934,10 +1044,35 @@ void frame() {
         }
         return;
     }
+    if (g_reopen) {
+        if (g_want_open.load() || !plugin_panel_native_corner_wanted()) {
+            // Shown again or taken down by its plugin meanwhile: as it asks.
+            end_reopen(nullptr);
+        } else {
+            // Back once the flow has neither closed nor pushed a menu for a
+            // moment and takes a push. A second after the take, drawn by the
+            // host instead where the flow keeps closing menus or will not take
+            // one, as the open below does.
+            const char* why = refused(f);
+            if (busy || why || ms - g_flow_change_ms[0] < 300) {
+                if ((busy || why) && ms - g_reopen_since_ms > 1000) end_reopen(busy ? kBusy : why);
+                return;
+            }
+            end_reopen(nullptr);
+            if (!open_page()) return;
+        }
+    }
     static std::chrono::steady_clock::time_point asked_at;
     static bool waiting = false;
     if (!g_want_open.load()) {
         waiting = false;
+        return;
+    }
+    if (busy) {
+        g_want_open.store(false);
+        static int told = 0;
+        if (told++ < 4) host_log("plugin-dialog: not opened: %s", kBusy);
+        plugin_panel_native_failed(kBusy);
         return;
     }
     if (const char* why = refused(f)) {
@@ -958,9 +1093,15 @@ void frame() {
     g_want_open.store(false);
     g_ours_on_flow = true;
     g_b.opened_at = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_corner.store(g_next.corner);
+    }
     g_state.store(1);
     hold_under();
-    if (!push(f)) {
+    const bool pushed = push(f);
+    g_flow_seen = rd64(f + kFlowChanges);
+    if (!pushed) {
         g_state.store(0);
         release_under();
         host_log("plugin-dialog: the flow did not take the page");
@@ -1006,6 +1147,8 @@ void pad_filter(std::uint32_t& buttons, std::uint8_t& lx, std::uint8_t& ly, std:
     if (g_state.load(std::memory_order_relaxed) != 2) {
         held_mask &= buttons;
         buttons &= ~held_mask;
+        // A corner page on its way back keeps its buttons from the game.
+        if (g_reopen_pending.load(std::memory_order_relaxed)) buttons &= ~kDialogButtons;
         return;
     }
     // L1 and R1 turn our pages, Circle goes back from a page on top - but

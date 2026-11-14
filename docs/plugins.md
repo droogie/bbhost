@@ -682,6 +682,12 @@ menu in a panel of its own instead (logged once).
   with it. One already under way when the menu opens (a load, a cutscene, the
   death's screen) leaves it up. A corner menu stays: the plugin takes it
   down when it should (photo mode ends itself at a load or a cutscene).
+  When the game closes its menus itself under a corner menu - a load, or
+  frame after frame while the hunter is dying - the host brings the corner
+  menu back as soon as the game lets it; where the game keeps closing them,
+  will not take one back within a second, or takes the menu a third time in
+  ten seconds, it draws the menu itself until it is next shown. The plugin
+  sees it up throughout.
 - The world keeps running while a menu is up, unless the plugin holds it with
   `world_pause`; the menu works either way.
 - Turning the plugin off takes its menu down.

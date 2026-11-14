@@ -751,12 +751,12 @@ bool plugin_panel_native_back() {
     return false;
 }
 
-void plugin_panel_native_gone(bool by_player) {
+void plugin_panel_native_gone(bool closed, const char* by) {
     std::lock_guard<std::mutex> lk(g_mu);
     if (!g_panel.owner.empty() && g_panel.native) {
-        if (by_player) {
+        if (closed) {
             g_closed[g_panel.owner] = true;
-            host_log("plugin: %s's panel closed by the player", g_panel.owner.c_str());
+            host_log("plugin: %s's panel closed by %s", g_panel.owner.c_str(), by ? by : "the player");
         }
         g_panel.owner.clear();
         g_shown.store(false);
@@ -766,6 +766,11 @@ void plugin_panel_native_gone(bool by_player) {
     g_list = false;
     g_native.store(false);
     g_exclusive.store(false);
+}
+
+bool plugin_panel_native_corner_wanted() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_shown.load() && g_panel.native && g_panel.corner && !g_panel.owner.empty();
 }
 
 void plugin_panel_native_failed(const char* why) {
