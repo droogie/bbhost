@@ -2476,6 +2476,13 @@ struct Clash {
 constexpr Clash kClashes[] = {
     {"quake", "enabled", "iso", "enabled",
      "Quake and Isometric don't work together: both take over the camera. Turn one of them off."},
+    // Hunter Cam beside either: Quake's first person and Isometric's view both
+    // replace its camera (under Isometric's view it gives the hunter back, as
+    // to any other camera's picture), and its facing fights Quake's movement.
+    {"quake", "enabled", "hunter_cam", "",
+     "Quake and Hunter Cam don't work together: both take over the camera. Turn one of them off."},
+    {"iso", "enabled", "hunter_cam", "",
+     "Isometric and Hunter Cam don't work together: both take over the camera. Turn one of them off."},
 };
 
 bool truthy(const std::string& v) { return v == "true" || v == "1" || v == "on" || v == "yes"; }
@@ -2494,11 +2501,13 @@ bool entry_on(const std::vector<PluginEntry>& list, const char* name, const char
 }  // namespace
 
 std::string plugins_clash(const std::vector<PluginEntry>& list, const std::string& name) {
+    // Every pair it is in that is on - Quake beside both Isometric and Hunter Cam has two - a line each.
+    std::string out;
     for (const Clash& c : kClashes) {
         if (name != c.a && name != c.b) continue;
-        if (entry_on(list, c.a, c.a_switch) && entry_on(list, c.b, c.b_switch)) return c.text;
+        if (entry_on(list, c.a, c.a_switch) && entry_on(list, c.b, c.b_switch)) out += (out.empty() ? "" : "\n") + std::string(c.text);
     }
-    return {};
+    return out;
 }
 
 // In game: a banner the first time a pair is on together, and again only

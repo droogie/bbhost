@@ -77,8 +77,8 @@ std::string plugins_ruleset();
 // The plugin of that name is loaded and on for this run (not a visitor):
 // what host features a plugin turns on ask (engine/debug_menu.h).
 bool plugins_active(const std::string& name);
-// Plugins that do not work together (Quake and Isometric: both own the
-// camera): the warning `name`'s page shows while it and a plugin it clashes
+// Plugins that do not work together (Quake, Isometric and Hunter Cam: each owns the
+// camera): the warnings `name`'s page shows - one a line - while it and a plugin it clashes
 // with are both turned on with their main switch on, among `list` (the
 // launcher's scan or the in-game catalog); "" otherwise. In game the same
 // warning is a banner, once, when the two first meet (plugins_frame).
