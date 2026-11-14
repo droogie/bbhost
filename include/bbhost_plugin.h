@@ -184,7 +184,7 @@ typedef struct BbOption {
     uint32_t type;        /* BB_OPT_*, maybe | BB_OPT_LIVE */
     const char* key;      /* the config key; an action's id */
     const char* label;
-    const char* help;     /* a line under it (may be NULL) */
+    const char* help;     /* a line under it (may be NULL); an in-game menu's line help shows its first sentence */
     const char* def;      /* the default, as text */
     double min, max;      /* INT / FLOAT range */
     const char* choices;  /* CHOICE: "a|b|c" */
@@ -470,13 +470,14 @@ typedef struct BbLook {
 
 /* Version 29: a plugin's panel (panel_show, panel_state) - an in-game menu. */
 #define BB_PANEL_DEFAULTS 1u  /* each page ends with a Defaults row: its rows back to their defaults */
-#define BB_PANEL_CORNER 2u    /* at the bottom right, the world in view (photo mode's); without it the game's
-                                 dialog: centred, the options dialog's size, the screen dimmed behind it */
+#define BB_PANEL_CORNER 2u    /* the game's dialog smaller at the bottom right, the world in view (photo mode's);
+                                 without it the dialog at its place, the screen dimmed behind it */
 typedef struct BbPanel {
     uint32_t size;           /* sizeof(BbPanel) as the plugin knows it */
     uint32_t flags;          /* BB_PANEL_* */
     const char* page;        /* the page to show: its heading's key; NULL or "" for the one shown last */
-    const char* guide;       /* a line under the rows while the controller is in use (may be NULL) */
+    const char* guide;       /* a hint after the row's help on the help line while the controller is in use,
+                                kept short ("L1 R1: page    R3: show"); NULL: the page keys, for a menu of pages */
     const char* guide_keys;  /* the same while the keyboard and mouse are (may be NULL) */
     const char* const* pages;  /* the menu's pages, in L1/R1 order (`page` among them); NULL: the table's
                                   menu that holds `page` (BB_OPT_MENU), or all its pages without one */
@@ -1080,7 +1081,8 @@ typedef struct BbHostApi {
      * together for the screen (the point frame generation takes its picture
      * without the HUD from), so nothing of the game's own state changes - its
      * HUD option keeps its value. bbhost's own overlay and menus are drawn as
-     * always. `hidden` 1 asks for it for the plugin named `name`, 0 lets it
+     * always, and so is a plugin's menu in the game's dialog: while one is up
+     * the game's HUD option is held off instead (prompts may show). `hidden` 1 asks for it for the plugin named `name`, 0 lets it
      * go; it is left out while any plugin asks, and the plugin being turned
      * off lets go. From the next frame; while on, two copies of the picture a
      * frame. `hidden` -1 asks for the HUD shown instead, even where the
@@ -1104,24 +1106,32 @@ typedef struct BbHostApi {
     int (*post_look)(const char* name, const BbLook* look, uint32_t* available);
     /* The plugin's in-game menu up (BbPanel) or down (NULL) - docs/plugins.md,
      * In-game menus: the pages of its options table it marks with
-     * BB_OPT_PANEL, drawn over the game as the game's options dialog draws
-     * its pages - its art, letters and menu sounds, read from the player's
-     * dump - centred at that dialog's size with the screen dimmed behind it,
-     * or at the bottom right with BB_PANEL_CORNER, at one size for every page;
-     * their changes going to on_option as the menus' do (the rows want
-     * BB_OPT_LIVE). The controller drives it - the d-pad up and down to a row,
-     * left and right to change it, Cross to set a switch or press a button,
-     * L1 and R1 the pages, Circle goes back or closes it - as do the keyboard
-     * (the arrows, Enter, Page Up and Page Down or Q and E, Escape or
-     * Backspace) and the pointer, which is free while it is up. While a
-     * centred menu is up neither the game nor any plugin reads the
-     * controller, the keyboard or the mouse; while a corner panel is, those
-     * buttons and keys only (the plugin's pad and input read the rest). The
-     * game's own interruptions close a centred menu as the player would
+     * BB_OPT_PANEL, as pages of the game's own options dialog - its rows,
+     * cursor, sounds, line help and key guide, read from the player's dump -
+     * at the dialog's place with the screen dimmed behind it, or smaller at
+     * the bottom right with BB_PANEL_CORNER; their changes going to on_option
+     * as the menus' do (the rows want BB_OPT_LIVE). A BOOL is the game's
+     * On/Off, a CHOICE of two its pair, a number its slider (an INT from 0 to
+     * 10 the game's own; another range a position a step - 1 for an INT, a
+     * hundredth of the range for a FLOAT - its number the host's). The line
+     * help shows a row's help as one line: its first sentence, cut at a word
+     * with "..." to fit, then the guide - about 68 characters in all - so a
+     * row's help wants a short first sentence. The controller drives it - the
+     * d-pad up and down to a row, left and right to change it, Cross to set a
+     * switch or press a button, L1 and R1 the pages, Circle goes back or
+     * closes it - as do the keyboard (the arrows, Enter, Page Up and Page
+     * Down, Escape or Backspace) and the pointer. While a centred menu is up
+     * neither the game's play nor any plugin reads the controller, the
+     * keyboard or the mouse; while a corner one is, only what the dialog
+     * moves by, which reaches it even when the plugin takes the controller
+     * from the game (the plugin's pad and input read the rest). The game's
+     * own interruptions close a centred menu as the player would
      * (panel_state's `closed`): a loading screen coming up, a cutscene
      * starting, the player's character dying - not one already under way
-     * when it opened. The game's messages leave it up, and a corner panel
-     * stays: the plugin takes it down. One menu at a time - a later call
+     * when it opened. The game's messages leave it up, and a corner one
+     * stays: the plugin takes it down. Where the game cannot open its dialog
+     * (another eboot, no options movie, its menus locked), the host draws the
+     * same pages in a panel of its own. One menu at a time - a later call
      * replaces another plugin's - and the plugin being turned off takes it
      * down. Main thread. 0 on success; 1 for an unknown plugin, a size under
      * 8, a page it has not got (or `pages` naming one), or none at all. */

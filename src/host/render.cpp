@@ -9,6 +9,7 @@
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "engine/loading.h"
+#include "engine/plugin_dialog.h"
 #include "engine/render_scale.h"
 #include "engine/texture_origin.h"
 #include "host/clip_control.h"
@@ -27138,7 +27139,9 @@ static bool draw_impl(const GpuDraw& d) {
     // HUD's first draw, and put back into the target before the display
     // buffer's pass reads it.
     const std::uint32_t dither = scene_look_dither();
-    const bool hud_hidden = scene_look_hud_hidden();
+    // (Not while a plugin's page is up in the game's dialog, itself the
+    // game's 2D: plugins_frame holds the game's HUD option off instead.)
+    const bool hud_hidden = scene_look_hud_hidden() && !plugin_dialog::up();
     if ((upscale_pass_hudless_due_locked() || dither || hud_hidden || hud_hide_held_locked()) && s.color[0]) {
         static std::uint64_t hud_target = 0;
         // The target's last write (RtImage::last_write) as the display

@@ -22,6 +22,9 @@
 #include <vector>
 
 struct PluginOptionDesc;
+namespace plugin_dialog {
+struct Page;
+}
 
 struct PluginPanelShow {
     std::string page;              // its heading's key; empty: the page shown last
@@ -71,6 +74,17 @@ void plugin_panel_world(std::uint32_t flags, std::int64_t hp);
 
 // Any plugin's panel is up: the pad, the keys and the pointer go to it.
 bool plugin_panel_shown();
+// It is up in the host's own drawing (the overlay below), not the game's
+// dialog: the overlay's input and drawing. The game's dialog
+// (engine/plugin_dialog.h) is the game's menu, which the game drives.
+bool plugin_panel_overlay_shown();
+// A centred page is up in the game's dialog: the plugins read nothing.
+bool plugin_panel_native_centred();
+// The controller's buttons a panel in the game's own dialog moves by
+// (kPanelPadButtons while one is up, else 0): they reach the game whatever a
+// plugin takes from it, and not the plugins (host/window.cpp, and the test
+// taps in hle/system.cpp).
+std::uint32_t plugin_panel_dialog_buttons();
 // The panel up is a centred menu, which takes every input: the game and the
 // plugins read nothing of the controller, the keyboard or the mouse while it
 // is (a corner panel takes the buttons and keys below only).
@@ -78,9 +92,17 @@ bool plugin_panel_exclusive();
 // The controller's buttons the panel takes while up (the menus' bits, as
 // host_pad_input_bit gives them): the d-pad, Cross, Circle, L1 and R1.
 constexpr std::uint32_t kPanelPadButtons = 0x10u | 0x20u | 0x40u | 0x80u | 0x4000u | 0x2000u | 0x400u | 0x800u;
+// The characters the game's dialog's help line holds inside its frame: a
+// row's help (its first sentence, cut to fit) and the menu's guide together.
+constexpr std::size_t kPanelHelpLine = 68;
 // A key the panel takes while up (SDL scancode): the arrows, Enter, Page Up,
 // Page Down, Q, E, Escape and Backspace.
 bool plugin_panel_key(int scancode);
+// The same for a panel in the game's own dialog, whose keys are the game's
+// menus': the arrows, Enter, Escape, Backspace and the player's Menu Previous
+// and Next Page keys (Page Up and Page Down unless moved) - not Q and E, which
+// stay the plugins' (photo mode's camera flies on them).
+bool plugin_panel_native_key(int scancode);
 
 // The game's menu art (host/game_menu_art.h) read now, on a thread of its
 // own: a plugin with panel pages is loaded, and its panel's first frame then
@@ -109,3 +131,43 @@ int plugin_panel_take_sound(int* priority);
 // with Defaults rows (photo mode's). Nothing without the variable. The
 // presenter's thread.
 void plugin_panel_preview_tick();
+
+// ---- the game's own dialog's side (engine/plugin_dialog.h) ----------------------
+// A plugin's menu goes into the game's own options dialog wherever it can
+// open there (the 1.09 eboot, the generated movie's sections, a menu flow
+// that takes it), the host's panel above being the fallback
+// (BBHOST_PANEL_OVERLAY=1 forces it, a test aid). These are what the dialog
+// asks, from the game's and the menu's threads.
+//
+// The page up now - its title, its rows as the dialog shows them, the
+// Defaults row last when the plugin asked for one - or false for none.
+bool plugin_panel_native_page(plugin_dialog::Page& out);
+// The player on row `row` of that page: Left or Right on a stepper or a list
+// (dir -1, +1), a game widget's new value (On/Off, a pair, a slider), Cross.
+// True when the page's values changed.
+bool plugin_panel_native_step(int row, int dir);
+bool plugin_panel_native_set(int row, int value);
+// Cross: 0 nothing, 1 done (the values may have changed), 2 another page up
+// (a page opened on top, a menu picked from the Plugins list), 3 a question
+// to ask first (`question`, YES then plugin_panel_native_confirm).
+int plugin_panel_native_press(int row, std::string* question);
+// YES to a row's question: true when another page is up.
+bool plugin_panel_native_confirm(int row);
+// L1 / R1: true when the menu's page turned.
+bool plugin_panel_native_turn(int dir);
+// Whether Circle goes back (a page opened on top, or a menu the Plugins list
+// opened) rather than closing the dialog; and going back: true when it did.
+bool plugin_panel_native_on_subpage();
+bool plugin_panel_native_back();
+// The dialog went: by the player (Circle, closed: panel_state's closed) or as
+// asked (hidden, interrupted).
+void plugin_panel_native_gone(bool by_player);
+// The game's dialog could not show the panel after all (the flow would not
+// take it, or the page never opened): the host draws it instead (logged once).
+void plugin_panel_native_failed(const char* why);
+// The System list's Plugins row: whether it has anything to list, and the
+// list as the page when it is picked.
+bool plugin_panel_native_menus_any();
+void plugin_panel_native_list();
+// The game's thread, once a frame: a TEXT row's answer from the host's box.
+void plugin_panel_native_frame();

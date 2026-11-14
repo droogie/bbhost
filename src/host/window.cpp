@@ -1397,7 +1397,7 @@ bool vk_present() {
         // menu among them (up while F10 is closed). Drawing needs
         // the image as a colour attachment rather than a transfer destination.
         bool as_colour = false;  // the image was moved to the colour-attachment layout, whether or not the overlay then drew
-        if (idx < g_vk.views.size() && g_vk.views[idx] && (!host_overlay_empty() || ingame_menu_open() || plugin_panel_shown())) {
+        if (idx < g_vk.views.size() && g_vk.views[idx] && (!host_overlay_empty() || ingame_menu_open() || plugin_panel_overlay_shown())) {
             VkImageMemoryBarrier to_colour = to_dst;
             to_colour.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             to_colour.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1842,11 +1842,19 @@ void update_pad() {
     const std::uint32_t take_buttons = g_ppad_take_buttons.load(std::memory_order_relaxed);
     // A plugin's panel up (host/plugin_panel.h): the buttons and keys it moves
     // by are its own - neither the game nor the plugins' pad and input read them.
-    const bool panel = plugin_panel_shown();
+    // In the game's own dialog (engine/plugin_dialog.h) they are the game's,
+    // and still not the plugins' (L1 turns a page, it does not also slow
+    // photo mode's camera); a centred one there leaves the plugins nothing.
+    const bool panel = plugin_panel_overlay_shown();
+    const bool panel_plugins = plugin_panel_shown();
+    const bool native_centred = plugin_panel_native_centred();
+    // The buttons the game's dialog moves by reach the game whatever a plugin
+    // takes (photo mode takes them all while its camera flies).
+    const std::uint32_t dialog_buttons = plugin_panel_dialog_buttons();
     // A button or key the panel had stays its own until let go: the Circle or
     // Escape that closes it must not then press anything (end photo mode,
     // open the game's menu).
-    static std::uint32_t panel_held_pad = 0;
+    static std::uint32_t panel_held_pad = 0, plugin_held_pad = 0;
     if (menu_closed_now) panel_held_pad = ~0u;  // every button held as a centred menu closes: the menu's until let go
     // The same for a button a plugin takes (pad_take): one held as the take
     // ends - the L3 or Cross that ends a photo mode - stays the plugin's until
@@ -1909,9 +1917,11 @@ void update_pad() {
                 held[i] = false;
                 continue;
             }
-            ctl.buttons |= bit;
-            ctl.play |= host_pad_play_bit(i);
-            if ((take_buttons | taken_held_pad) & bit) held[i] = false;
+            if (!native_centred && !((panel_plugins && (bit & kPanelPadButtons)) || (plugin_held_pad & bit))) {
+                ctl.buttons |= bit;
+                ctl.play |= host_pad_play_bit(i);
+            }
+            if ((take_buttons | taken_held_pad) & ~dialog_buttons & bit) held[i] = false;
         }
         for (int i = 0; i < kPadInputs; ++i) {
             if (!held[i]) continue;
@@ -1983,6 +1993,8 @@ void update_pad() {
         }
     }
     panel_held_pad = ((panel ? kPanelPadButtons : 0u) | panel_held_pad) & held_now;
+    plugin_held_pad = ((panel_plugins ? kPanelPadButtons : 0u) | plugin_held_pad) & held_now;
+    if (native_centred) ctl.lx = ctl.ly = ctl.rx = ctl.ry = 128, ctl.l2 = ctl.r2 = 0;
     taken_held_pad = (take_buttons | taken_held_pad) & held_now;
     // The keyboard, DS3-shaped and rebindable (host/bindings.h): each action
     // held sets its pad bit or stick direction.
@@ -2002,7 +2014,7 @@ void update_pad() {
     const int end_key = g_text_end_key.load(std::memory_order_relaxed);
     if (end_key >= 0 && !(keys && end_key < nkeys && keys[end_key])) g_text_end_key.store(-1, std::memory_order_relaxed);
     // The panel's keys while it is up, and any of them still held since.
-    static bool panel_held_key[SDL_SCANCODE_COUNT] = {};
+    static bool panel_held_key[SDL_SCANCODE_COUNT] = {}, plugin_held_key[SDL_SCANCODE_COUNT] = {};
     if (menu_closed_now) {
         for (bool& k : panel_held_key) k = true;  // every key held as a centred menu closes: the menu's until let go
     }
@@ -2011,6 +2023,9 @@ void update_pad() {
         const bool down_now = keys && i < nkeys && keys[i];
         panel_held_key[i] = down_now && ((panel && plugin_panel_key(i)) || panel_held_key[i]);
         panel_keys = panel_keys || panel_held_key[i];
+        // The plugins' read: not the dialog's keys while one is up, nor any key under a centred one in the game's dialog.
+        const bool dialog_key = panel ? plugin_panel_key(i) : plugin_panel_native_key(i);
+        plugin_held_key[i] = down_now && ((panel_plugins && (dialog_key || native_centred)) || plugin_held_key[i] || panel_held_key[i]);
     }
     if (keys && (SDL_GetKeyboardFocus() == g_window || scripted)) {
         auto down = [&](SDL_Scancode sc) { return sc < nkeys && keys[sc] && static_cast<int>(sc) != g_text_end_key.load(std::memory_order_relaxed); };
@@ -2024,7 +2039,8 @@ void update_pad() {
         // returns with (engine/menu_pointer.h).
         if (menu_down(SDL_SCANCODE_RETURN) || menu_down(SDL_SCANCODE_KP_ENTER)) p.menu_buttons |= menu_confirm_button();
         if (down(SDL_SCANCODE_BACKSPACE)) p.menu_buttons |= menu_back_button();
-        if (menu_down(SDL_SCANCODE_ESCAPE)) p.menu_buttons |= kOptions;
+        // (In a plugin's page in the game's dialog Escape goes back, as Backspace does.)
+        if (menu_down(SDL_SCANCODE_ESCAPE)) p.menu_buttons |= dialog_buttons ? menu_back_button() : kOptions;
         if (p.menu_buttons) p.connected = true;
         // A plugin's own read of the keys, and the ones it takes from the game
         // while the mouse turns the camera.
@@ -2048,7 +2064,7 @@ void update_pad() {
         }
         {
             std::lock_guard<std::mutex> lock(g_take_mu);
-            for (int i = 0; i < 512; ++i) g_plugin_keys[i] = i < nkeys && keys[i] && !(i < SDL_SCANCODE_COUNT && panel_held_key[i]) ? 1 : 0;
+            for (int i = 0; i < 512; ++i) g_plugin_keys[i] = i < nkeys && keys[i] && !(i < SDL_SCANCODE_COUNT && plugin_held_key[i]) ? 1 : 0;
         }
         bool held[kBindCount];
         const int masked_key = g_text_end_key.load(std::memory_order_relaxed);

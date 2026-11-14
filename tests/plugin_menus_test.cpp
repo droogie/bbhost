@@ -21,6 +21,8 @@
 #include "host/game_menu_art.h"
 #include "host/plugin_menu.h"
 #include "host/plugin_panel.h"
+#include "host/plugins.h"
+#include "engine/plugin_dialog.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -31,6 +33,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -173,6 +176,36 @@ std::vector<PluginEntry> plugins_catalog() { return g_catalog; }
 namespace game_menu_art {
 void preload() {}
 }  // namespace game_menu_art
+// The rest of the host it reaches: the options (a config of this test's)
+// and the game's dialog (engine/plugin_dialog.h), absent at first - the
+// host's own panel then, the fallback - and there for the native checks.
+struct Native {
+    bool available = false;
+    int opens = 0, closes = 0, changes = 0;
+    std::vector<std::string> options, actions;  // "key=value", the action keys
+    std::map<std::string, std::string> config;
+} N;
+std::string plugins_option_value(const PluginEntry&, const PluginOptionDesc& o) {
+    const auto it = N.config.find(o.key);
+    return it != N.config.end() ? it->second : o.def;
+}
+void plugins_set_option(const std::string&, const std::string& key, const std::string& value) {
+    N.options.push_back(key + "=" + value);
+    N.config[key] = value;
+}
+void plugins_menu_option(const std::string&, const std::string& key, const std::string& value) { N.options.push_back(key + "=" + value); }
+void plugins_run_action(const std::string&, const std::string& action) { N.actions.push_back(action); }
+namespace plugin_dialog {
+bool available() { return N.available; }
+bool open() {
+    ++N.opens;
+    return N.available;
+}
+void close() { ++N.closes; }
+void changed(bool) { ++N.changes; }
+bool up() { return false; }
+bool corner_up() { return false; }
+}  // namespace plugin_dialog
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -210,7 +243,11 @@ int main(int argc, char** argv) {
             d.flags = o->type & ~0xffu;
             d.key = o->key ? o->key : "";
             d.label = o->label ? o->label : "";
+            d.help = o->help ? o->help : "";
             d.def = o->def ? o->def : "";
+            d.choices = o->choices ? o->choices : "";
+            d.min = o->min;
+            d.max = o->max;
             t.push_back(d);
         }
         const plugin_menu::Layout l = plugin_menu::layout_of(t);
@@ -300,6 +337,8 @@ int main(int argc, char** argv) {
     {
         PluginEntry e;
         e.name = "menu_demo";
+        e.title = "Menu demo";
+        e.loaded = e.enabled = true;
         e.options = table;
         g_catalog = {e};
         constexpr std::uint32_t kIn = BB_WORLD_IN;
@@ -371,6 +410,142 @@ int main(int argc, char** argv) {
         plugin_panel_hide("menu_demo");
         st = panel_state();
         CHECK(!st.shown && !st.closed);
+    }
+    // ---- a row's help on the game's dialog's one line (host/plugin_menu.h one_line)
+    {
+        using plugin_menu::one_line;
+        CHECK(one_line("How fast.", 96) == "How fast.");
+        CHECK(one_line("How fast. Slow is half, fast twice.", 96) == "How fast.");
+        CHECK(one_line("No full stop at all", 96) == "No full stop at all");
+        CHECK(one_line("Version 1.0 of it. More", 96) == "Version 1.0 of it.");  // a stop inside a number is not one
+        CHECK(one_line("Line one\nline two. Then", 96) == "Line one line two.");
+        CHECK(one_line("Every lamp but the Dream's goes out, and the rest of it too", 30) == "Every lamp but the Dream's...");
+        CHECK(one_line("Supercalifragilisticexpialidocious", 12) == "Supercali...");  // one word longer than the line
+        CHECK(one_line("Short words, cut here, after", 20) == "Short words, cut...");  // no comma before the dots
+        CHECK(one_line("", 96).empty());
+        CHECK(one_line("Ça va très bien. Oui", 96) == "Ça va très bien.");  // code points, not bytes
+        CHECK(one_line("Ééééé ééééé", 8) == "Ééééé...");
+        CHECK(one_line("Ééééé ééé", 9) == "Ééééé ééé");  // nine characters in eighteen bytes: it fits
+        CHECK(one_line("Alpha beta gamma delta", 15) == "Alpha beta...");  // the room ends inside a word: cut before it
+    }
+    // ---- the game's own dialog: the page the host gives it, and the player's presses
+    {
+        N.available = true;
+        const Rows* list = last_rows("lamps");
+        CHECK(list && plugin_panel_rows("menu_demo", "lamps", list->rows));
+        PluginPanelShow how;
+        how.page = "lamps";
+        const int opens = N.opens;
+        CHECK(plugin_panel_show("menu_demo", how) && N.opens == opens + 1);
+        CHECK(!plugin_panel_overlay_shown() && plugin_panel_shown());  // the game's dialog, not the host's panel
+        plugin_dialog::Page pg;
+        CHECK(plugin_panel_native_page(pg));
+        CHECK(pg.title == "Lamps   1/2" && !pg.corner && list && pg.rows.size() == list->rows.size());
+        if (pg.rows.size() >= 4 && list) {
+            CHECK(pg.rows[0].widget == plugin_dialog::Widget::Text && pg.rows[0].value == list->rows[0].def && !pg.rows[0].steps &&
+                  !pg.rows[0].presses);  // INFO
+            CHECK(pg.rows[1].widget == plugin_dialog::Widget::Pair && pg.rows[1].pair[0] == "Story" && pg.rows[1].pair[1] == "Name" &&
+                  pg.rows[1].on == (list->rows[1].def == "Name" ? 1 : 0));  // a choice of two
+            CHECK(pg.rows[2].widget == plugin_dialog::Widget::Text && pg.rows[2].presses && pg.rows[2].label == list->rows[2].label);
+            CHECK(pg.rows[1].help.find("L1 R1: page") != std::string::npos);  // a menu of pages: its keys after the help
+        }
+        // The choice of two set by the game's widget: the run-time row's value, with its page.
+        N.options.clear();
+        CHECK(plugin_panel_native_set(1, 1) && !N.options.empty() && N.options.back() == "lamps/sort=Name");
+        // A lamp's button (OPEN): the plugin told, the sub-page up, Circle there goes back.
+        std::string question;
+        N.actions.clear();
+        CHECK(plugin_panel_native_press(2, &question) == 2 && N.actions.size() == 1 && list && N.actions[0] == "lamps/" + list->rows[2].key);
+        const Rows* one = last_rows("lamp");  // what the plugin filled the sub-page with (its on_action, earlier)
+        CHECK(one && plugin_panel_rows("menu_demo", "lamp", one->rows));
+        CHECK(plugin_panel_native_page(pg) && pg.title == "Lamp");  // a page on top shows no page count
+        CHECK(plugin_panel_native_on_subpage());
+        CHECK(plugin_panel_native_back());
+        CHECK(plugin_panel_native_page(pg) && pg.title == "Lamps   1/2" && pg.cursor == 2);  // back on the button
+        CHECK(!plugin_panel_native_on_subpage() && !plugin_panel_native_back());  // the menu's own page: Circle closes
+        // L1 / R1.
+        CHECK(plugin_panel_native_turn(1) && plugin_panel_native_page(pg) && pg.title == "History   2/2");
+        CHECK(plugin_panel_native_turn(-1) && plugin_panel_native_page(pg) && pg.title == "Lamps   1/2");
+        // Tools: a choice of three steps (a text row), a CONFIRM asks first, Defaults asks then puts every row back.
+        how.page = "tools";
+        how.defaults = true;
+        CHECK(plugin_panel_show("menu_demo", how) && plugin_panel_native_page(pg));
+        CHECK(pg.rows.size() == 4 && pg.rows.back().label == "Defaults" && pg.rows.back().presses);
+        if (pg.rows.size() == 4) {
+            CHECK(pg.rows[0].widget == plugin_dialog::Widget::Text && pg.rows[0].steps && pg.rows[0].value == "Normal");
+            N.options.clear();
+            CHECK(plugin_panel_native_step(0, 1) && N.options.size() == 1 && N.options[0] == "speed=Fast");
+            CHECK(plugin_panel_native_step(0, 1) && N.options.back() == "speed=Slow");  // round
+            CHECK(plugin_panel_native_page(pg) && pg.rows[0].value == "Slow");
+            CHECK(!plugin_panel_native_step(1, 1));  // INFO does not step
+            N.actions.clear();
+            question.clear();
+            CHECK(plugin_panel_native_press(2, &question) == 3 && question.rfind("Forget every lamp?", 0) == 0 && N.actions.empty());
+            CHECK(!plugin_panel_native_confirm(2) && N.actions.size() == 1 && N.actions[0] == "reset");
+            question.clear();
+            CHECK(plugin_panel_native_press(3, &question) == 3 && !question.empty());
+            N.options.clear();
+            CHECK(!plugin_panel_native_confirm(3) && N.options.size() == 1 && N.options[0] == "speed=Normal");
+        }
+        // Numbers: an INT from 0 to 10 is the game's own slider; any other range the game's slider with a
+        // position a step (1 for an INT, a hundredth of the range for a FLOAT), its number the host's.
+        how.page = "more";
+        how.defaults = false;
+        CHECK(plugin_panel_show("menu_demo", how) && plugin_panel_native_page(pg) && pg.title == "More   2/2");
+        CHECK(pg.rows.size() == 3);
+        if (pg.rows.size() == 3) {
+            CHECK(pg.rows[0].widget == plugin_dialog::Widget::Slider && pg.rows[0].positions == 0 && pg.rows[0].on == 3);
+            CHECK(pg.rows[1].widget == plugin_dialog::Widget::Slider && pg.rows[1].positions == 100 && pg.rows[1].on == 60 &&
+                  pg.rows[1].value == "10" && pg.rows[1].steps);
+            CHECK(pg.rows[2].widget == plugin_dialog::Widget::Slider && pg.rows[2].positions == 100 && pg.rows[2].on == 25 &&
+                  pg.rows[2].value == "0.25");
+            N.options.clear();
+            CHECK(plugin_panel_native_set(1, 61) && N.options.size() == 1 && N.options[0] == "level=11");  // a position
+            CHECK(plugin_panel_native_set(0, 7) && N.options.back() == "count=7");                         // the game's number
+            CHECK(plugin_panel_native_step(2, 1) && N.options.back() == "mix=0.26");                     // a step of a hundredth
+            CHECK(plugin_panel_native_page(pg) && pg.rows[1].on == 61 && pg.rows[1].value == "11" && pg.rows[2].on == 26 &&
+                  pg.rows[2].value == "0.26");
+            CHECK(plugin_panel_native_step(1, -1) && plugin_panel_native_page(pg) && pg.rows[1].value == "10");
+            N.config.erase("level");
+            N.config.erase("mix");
+            N.config.erase("count");
+        }
+        // The help line: the row's first sentence and the guide, inside the line's characters (the
+        // CONFIRM row's 36-character help is cut to leave the guide its share).
+        how.page = "tools";
+        how.guide = "L1 R1: page    R3: show again";
+        CHECK(plugin_panel_show("menu_demo", how) && plugin_panel_native_page(pg));
+        for (const plugin_dialog::Row& r : pg.rows) {
+            CHECK(r.help.size() <= kPanelHelpLine);
+            CHECK(r.help.size() >= how.guide.size() && r.help.compare(r.help.size() - how.guide.size(), std::string::npos, how.guide) == 0);
+        }
+        how.guide.clear();
+        // The game's dialog's keys: the menus' own, not Q and E (photo mode's camera flies on them).
+        CHECK(plugin_panel_native_key(82) && plugin_panel_native_key(40) && plugin_panel_native_key(41) && plugin_panel_native_key(42));
+        CHECK(!plugin_panel_native_key(20) && !plugin_panel_native_key(8) && plugin_panel_key(20) && plugin_panel_key(8));
+        // The game's dialog closed by the player: closed, read once.
+        plugin_panel_native_gone(true);
+        PluginPanelState st = panel_state();
+        CHECK(!st.shown && st.closed);
+        CHECK(!panel_state().closed);
+        // The System list's Plugins row: the named menus as a page; one picked is on top of it.
+        CHECK(plugin_panel_native_menus_any());
+        plugin_panel_native_list();
+        CHECK(plugin_panel_native_page(pg) && pg.title == "Plugins" && pg.rows.size() == 2);
+        CHECK(pg.rows.size() == 2 && pg.rows[0].label == "Travel" && pg.rows[1].label == "Tools" && pg.rows[1].presses);
+        CHECK(plugin_panel_native_press(1, nullptr) == 2 && plugin_panel_native_page(pg) && pg.title == "Tools   1/2");
+        CHECK(plugin_panel_native_on_subpage());  // its own page: Circle goes back to the list
+        CHECK(plugin_panel_native_back() && plugin_panel_native_page(pg) && pg.title == "Plugins");
+        st = panel_state();
+        CHECK(!st.shown && st.closed);  // the plugin: its menu closed by the player
+        plugin_panel_native_gone(true);
+        CHECK(!plugin_panel_shown());
+        // No game dialog (another eboot, an old movie): the host's own panel, as before.
+        N.available = false;
+        how = PluginPanelShow{};
+        how.page = "lamps";
+        CHECK(plugin_panel_show("menu_demo", how) && plugin_panel_overlay_shown() && !plugin_panel_native_page(pg));
+        plugin_panel_hide("menu_demo");
     }
     if (g_failures) {
         std::printf("plugin_menus_test: %d failure(s)\n", g_failures);

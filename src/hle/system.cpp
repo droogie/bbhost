@@ -14,6 +14,7 @@
 #include "engine/camera.h"
 #include "engine/debug_menu.h"
 #include "engine/menu_pointer.h"
+#include "engine/plugin_dialog.h"
 #include "engine/mouse_camera.h"
 #include "host/bindings.h"
 #include "host/ingame_menu.h"
@@ -2097,10 +2098,13 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
     {
         const std::uint32_t tapped = p.buttons & ~before_taps.buttons;
         const auto moved = [](std::uint8_t now, std::uint8_t was) { return now != was ? now : kStickRest; };
-        host_plugin_pad_test(tapped, moved(p.lx, before_taps.lx), moved(p.ly, before_taps.ly), moved(p.rx, before_taps.rx),
+        // As the controller's own (host/window.cpp): a panel in the game's
+        // dialog has its buttons, whatever a plugin takes, and the plugins not.
+        const std::uint32_t dialog = plugin_panel_dialog_buttons();
+        host_plugin_pad_test(tapped & ~dialog, moved(p.lx, before_taps.lx), moved(p.ly, before_taps.ly), moved(p.rx, before_taps.rx),
                              moved(p.ry, before_taps.ry));
         const std::uint32_t take_axes = host_plugin_pad_taken_axes();
-        p.buttons &= ~(tapped & host_plugin_pad_taken_buttons());
+        p.buttons &= ~(tapped & host_plugin_pad_taken_buttons() & ~dialog);
         if (take_axes & kPadTakeLeftStick) {
             p.lx = before_taps.lx;
             p.ly = before_taps.ly;
@@ -2170,6 +2174,10 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         p.connected = connected;
         p.timestamp = ts;
     }
+    // A plugin's menu in the game's dialog keeps what is not the dialog's
+    // (engine/plugin_dialog.h): Circle on a page opened on top, Up and Down
+    // at a long page's ends, and a corner page's camera.
+    plugin_dialog::pad_filter(p.buttons, p.lx, p.ly, p.rx, p.ry, p.l2, p.r2);
     {
         const std::uint32_t was = g_pad_delivered.exchange(p.buttons, std::memory_order_relaxed);
         if (p.buttons & ~was & 0x6000u)  // Cross or Circle went down

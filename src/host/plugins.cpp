@@ -21,6 +21,7 @@
 #include "gcn/container.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
+#include "engine/plugin_dialog.h"
 #include "engine/world_chr.h"
 #include "engine/lua_events.h"
 #include "engine/loading.h"
@@ -1760,7 +1761,8 @@ std::uint32_t world_flags() {
     if (loading_in_world()) f |= BB_WORLD_IN;
     if (loading_screen_up()) f |= BB_WORLD_LOADING;
     if (loading_cutscene()) f |= BB_WORLD_CUTSCENE;
-    if (menu_pointer_in_menu() || debug_menu_open()) f |= BB_WORLD_MENU;
+    // A plugin's own menu in the game's dialog (engine/plugin_dialog.h) is not one of the game's.
+    if ((menu_pointer_in_menu() && !plugin_dialog::alone()) || debug_menu_open()) f |= BB_WORLD_MENU;
     if (world_pause_held()) f |= BB_WORLD_PAUSED;
     return f;
 }
@@ -2145,8 +2147,13 @@ void plugins_frame() {
     chr_watch_tick();      // BBHOST_CHR_WATCH
     // A plugin's HUD shown (hud_hide with -1): the game's own HUD option held
     // on, and the player's put back once none asks (before the early return,
-    // so a plugin turned off lets it go).
-    player_hud_option_hold(scene_look_hud_shown());
+    // so a plugin turned off lets it go). A plugin's HUD left out while a
+    // plugin's page is up in the game's dialog: the option held off instead -
+    // the picture keeps the game's 2D for the page (host/render.cpp), and the
+    // HUD stays out of it.
+    player_hud_option_hold(scene_look_hud_shown()                         ? 1
+                           : scene_look_hud_hidden() && plugin_dialog::up() ? 0
+                                                                            : -1);
     // A plugin's panel's sounds (the cursor, a change, a page, opening and
     // closing): the game's own menu sounds, posted as its widgets post them.
     {
@@ -2154,6 +2161,9 @@ void plugins_frame() {
         const int id = plugin_panel_take_sound(&priority);
         menu_sound_post(id, priority);
     }
+    // A plugin's menu in the game's own dialog: opened, closed and followed
+    // on this thread (engine/plugin_dialog.h).
+    plugin_dialog::frame();
     // The game's own interruptions close a plugin's centred menu: a loading
     // screen coming up, a cutscene starting, the player's character dying.
     if (g_image && api_eboot_is_109()) {

@@ -134,6 +134,7 @@ add_executable(bbhost
   src/engine/auto_replenish.cpp
   src/engine/maiden_events.cpp
   src/engine/option_menu.cpp
+  src/engine/plugin_dialog.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
   src/engine/menu_close.cpp

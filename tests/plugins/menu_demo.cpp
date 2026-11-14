@@ -139,8 +139,10 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_CHOICE | BB_OPT_LIVE, "speed", "Speed", "How fast.", "Normal", 0, 0, "Slow|Normal|Fast"},
     {BB_OPT_INFO, "version", "Version", "This plugin's.", "1.0.0"},
     {BB_OPT_ACTION | BB_OPT_CONFIRM, "reset", "Forget every lamp", "Every lamp but the Dream's goes out."},
-    {BB_OPT_HEADING | BB_OPT_PANEL, "more", "More", "A number."},
+    {BB_OPT_HEADING | BB_OPT_PANEL, "more", "More", "Numbers."},
     {BB_OPT_INT | BB_OPT_LIVE, "count", "Count", "From 0 to 10.", "3", 0, 10},
+    {BB_OPT_INT | BB_OPT_LIVE, "level", "Level", "From -50 to 50.", "10", -50, 50},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "mix", "Mix", "From 0 to 1.", "0.25", 0, 1},
     {0}};
 
 extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {

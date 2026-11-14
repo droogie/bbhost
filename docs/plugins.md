@@ -271,7 +271,8 @@ over the game.
   picture is put together for the screen - the point frame generation takes
   its picture without the HUD from - so nothing of the game's own state
   changes, and its HUD option keeps its value. bbhost's overlay and menus are
-  drawn as always. The HUD is left out while any plugin asks; turning the
+  drawn as always, and so is a plugin's menu in the game's dialog: while one
+  is up, the game's HUD option is held off instead, and prompts may show. The HUD is left out while any plugin asks; turning the
   plugin off lets go. It costs two copies of the picture a frame while on.
   `hidden` -1 asks for the HUD shown instead, even where the player's own HUD
   option hides it: the option is held on while any plugin asks so (and none
@@ -307,32 +308,23 @@ over the game.
   (`NULL`). Its pages are the plugin's own options table: a `BB_OPT_HEADING`
   with `BB_OPT_PANEL` or-ed in starts a page, the rows under it up to the next
   heading are on it, and neither shows in the menus. It is an in-game menu
-  (see [In-game menus](#in-game-menus-v29)): drawn over the game as the game's
-  own options dialog draws its pages - centred at that dialog's size with the
-  screen dimmed behind it, or at the bottom right with `BB_PANEL_CORNER` -
-  with the game's own art read from the player's dump at start (nothing of it
-  is shipped): its menu letters, the slate its menus lie on, the dialog's
-  ornament at the top and foot, the filigree and the column rule between the
-  labels and the values, each label's line and each value's scrolled line, the
-  golden glow on the row with the cursor, the arrows either side of a choice,
-  the sliders' track, and the key guide's button icons in the controller's
-  guide; the game's own menu sounds as the cursor moves, a value changes, a
-  page turns and the panel opens and closes. A piece the dump lacks is drawn
-  plainly instead (thin rules, a dark plate, a gold band, drawn arrows). It
-  keeps one size for every page (its longest page's rows and room for its
-  longest help), so it never moves as rows or pages change; Menu hue and Menu
-  vibrance, which colour bbhost's menus, leave it as it is. Its rows' changes
-  go to `on_option` as the menus' do (so its rows want `BB_OPT_LIVE`), the
-  help of the row in use under them, then `guide` or `guide_keys` - whichever
-  device the player used last. The controller drives it (the d-pad up and down
-  to a row, left and right to change it, Cross to set a switch or press a
-  button, L1 and R1 the pages, Circle goes back or closes it), as do the
-  keyboard (the arrows, Enter, Page Up and Page Down or Q and E, Escape or
-  Backspace) and the pointer, which is free while it is up. While a centred
-  menu is up neither the game nor the plugins read the controller, the
-  keyboard or the mouse; while a corner panel is, those buttons and keys only,
-  and everything else is as it was. `BB_PANEL_DEFAULTS` ends each page with a
-  Defaults row. One panel at a time; turning the plugin off takes it down.
+  (see [In-game menus](#in-game-menus-v29)): pages of the game's own options
+  dialog - its rows, cursor, sounds, line help and key guide, read from the
+  player's dump (nothing of it is shipped) - at the dialog's place with the
+  screen dimmed behind it, or smaller at the bottom right with
+  `BB_PANEL_CORNER`. Its rows' changes go to `on_option` as the menus' do (so
+  its rows want `BB_OPT_LIVE`); the line help shows the first sentence of the
+  row's help, then `guide` or `guide_keys` - whichever device the player used
+  last. The controller drives it (the d-pad up and down to a row, left and
+  right to change it, Cross to set a switch or press a button, L1 and R1 the
+  pages, Circle goes back or closes it), as do the keyboard (the arrows,
+  Enter, Page Up and Page Down, Escape or Backspace) and the pointer. While a
+  centred menu is up neither the game's play nor the plugins read the
+  controller, the keyboard or the mouse; while a corner one is, only what the
+  dialog moves by, and everything else is as it was. Where the game cannot
+  open its dialog, the host draws the same pages in a panel of its own.
+  `BB_PANEL_DEFAULTS` ends each page with a Defaults row. One panel at a time;
+  turning the plugin off takes it down.
 - `panel_state(name, &state)`: `BbPanelState` (set `state.size` first) -
   whether the panel is up, whether the player closed it (Circle, Escape) since
   the last call, and the page shown or shown last, by its heading's key.
@@ -578,40 +570,61 @@ into another player's modded world.
 
 ## In-game menus (v29)
 
-A plugin can have menus that look and sound like the game's own: its options
-dialog's art, letters and sounds, read from the player's dump (nothing of
-them is shipped). A menu is pages of the plugin's options table, and a page
-is a `BB_OPT_HEADING` with `BB_OPT_PANEL` or-ed in and the rows under it, up
-to the next heading. Those rows are not in the settings of the in-game plugin
-menu (F10); the menu shows them.
+A plugin can have menus that are the game's own: pages of its options dialog,
+with its rows, cursor, scrolling, sounds, line help and key guide - the
+machinery bbhost's PC Settings pages use, read from the player's dump
+(nothing of the game's is shipped). A menu is pages of the plugin's options
+table, and a page is a `BB_OPT_HEADING` with `BB_OPT_PANEL` or-ed in and the
+rows under it, up to the next heading. Those rows are not in the settings of
+the in-game plugin menu (F10); the menu shows them.
 
 **Declaring menus.** `BB_OPT_MENU` on a page's heading starts a menu, named
 by the heading's `def` (its label when `NULL`); the pages after it, up to the
 next `BB_OPT_MENU` heading, are that menu's, in L1/R1 order. For each named
-menu the plugin's entry in F10 has an *Open* button, so a plugin needs only
-its table to have a menu: no input code. A plugin with no `BB_OPT_MENU`
-heading has one unnamed menu of all its pages and no button; it shows it
-itself with `panel_show` (photo mode does, on L3). `BB_OPT_SUBPAGE` on a page's
-heading keeps it out of the L1/R1 order: it is opened on top of another page,
-by a row or by `panel_open`.
+menu the plugin's entry in F10 has an *Open* button, and the game's System
+menu has a *Plugins* row (beside PC Settings) that lists every turned-on
+plugin's named menus - so a plugin needs only its table to have a menu: no
+input code. A plugin with no `BB_OPT_MENU` heading has one unnamed menu of
+all its pages and no button; it shows it itself with `panel_show` (photo mode
+does, on L3). `BB_OPT_SUBPAGE` on a page's heading keeps it out of the L1/R1
+order: it is opened on top of another page, by a row or by `panel_open`.
 
-**The rows.** Switches, numbers, choices, buttons and text as anywhere else,
-and:
+**The rows.** Each row is one of the dialog's own:
 
+- `BB_OPT_BOOL`: the game's On/Off row.
+- `BB_OPT_CHOICE`: of two choices, the game's left/right pair; of more, a row
+  whose value Left and Right step through (wrapping).
+- `BB_OPT_INT`, `BB_OPT_FLOAT`: the game's slider. An INT from 0 to 10 is the
+  game's own slider; any other range has one position a step - 1 for an INT,
+  a hundredth of the range for a FLOAT - its bar at the value's share of the
+  range and its number the host's (a FLOAT to its step's decimals). Left and
+  Right step it, held they repeat.
 - `BB_OPT_INFO`: a label and a value the player cannot change (`def`).
+- `BB_OPT_ACTION`: a button; Cross presses it.
 - `BB_OPT_ACTION | BB_OPT_OPEN`: the button opens the page named by its `def`
   on top of the one shown and calls `on_action`, which can fill that page;
   Circle there comes back to the button.
 - `BB_OPT_ACTION | BB_OPT_CONFIRM`: the host asks first, in the game's yes/no
-  dialog ("*label*?", the row's help under it, No lit); `on_action` comes only
-  on Yes.
+  dialog ("*label*?", the first sentence of the row's help under it);
+  `on_action` comes only on Yes.
 - `BB_OPT_TEXT`: Cross or Enter opens the host's text box (the one the game's
   name and glyph dialogs use) with the row's label and value; Enter accepts and
   Escape cancels. A keyboard types in it; a controller alone can only accept
   or cancel it, as with the game's own name dialog.
+- A row whose `BB_OPT_WHEN` is not met is shown dimmed and does nothing.
 
-A row in the table is a setting: the config keeps it, and its changes come
-to `on_option` with its key, as the F10 settings' do.
+A page of more than eight rows scrolls. The game's fields hold about 24
+characters of a label and 18 of a value; longer ones are set smaller to fit,
+so keep them short. A row in the table is a setting: the config keeps it, and
+its changes come to `on_option` with its key, as the F10 settings' do.
+
+**The help line.** The dialog's line help is one line under the rows: the
+cursor's row's help, **its first sentence** (up to the first `.`, `!` or `?`
+followed by a space), cut at a word with `...` when it does not fit, then the
+menu's guide. The line holds about 68 characters inside the dialog's frame,
+the guide's included, so give each row a short first sentence that says what
+it does, and the details after it: F10 and the host's own panel show the
+whole help.
 
 **Rows set at run time.** `panel_rows(name, page, rows, n)` gives `page` rows
 of the plugin's own from then on - a list (lamps, items, saves), info, or
@@ -625,40 +638,52 @@ menu is up or not. `panel_open(name, page)` opens a page on top of the one
 shown - from `on_action`, say, after filling the page with one item's
 details.
 
-**Showing a menu.** F10's *Open* button, or `panel_show(name, &panel)` from
-the plugin's own key or button. `BbPanel.page` is the page to start at
-(`NULL`: the one shown last); `pages` and `page_count` name the pages of the
-menu in L1/R1 order when they are not the table's; `guide` and `guide_keys`
-the line under the rows (the host writes its own when both are `NULL`).
-Without `BB_PANEL_CORNER` the menu is the game's dialog: centred at the size
-of its options dialog, with the screen dimmed behind it. With it, the menu is
-a panel at the bottom right that leaves the world in view (photo mode's).
-`BB_PANEL_DEFAULTS` ends each page with a Defaults row.
+**Showing a menu.** The System menu's *Plugins* row, F10's *Open* button, or
+`panel_show(name, &panel)` from the plugin's own key or button, at the title
+or in the world. `BbPanel.page` is the page to start at (`NULL`: the one shown
+last); `pages` and `page_count` name the pages of the menu in L1/R1 order when
+they are not the table's; `guide` and `guide_keys` the hint after the help on
+the help line, for the controller and for the keyboard - keep them short
+("L1 R1: page    R3: show"); without them the host puts the menu's page keys
+there when it has more than one page. Without `BB_PANEL_CORNER` the menu is
+the game's dialog at its normal place, the screen dimmed behind it. With it,
+the dialog is smaller at the bottom right and leaves the world in view (photo
+mode's). `BB_PANEL_DEFAULTS` ends each page with a Defaults row. Where the
+game cannot open its dialog - another eboot, a dump the options movie could
+not be made from, a moment its menus stay locked - the host draws the same
+menu in a panel of its own instead (logged once).
 
 **The rules.**
 
 - One menu at a time: a `panel_show` from another plugin replaces it, and a
   new one starts its pages again.
-- L1 and R1 (Q and E, Page Up and Page Down) turn the menu's pages; Circle
-  (Escape, Backspace) goes back from a page opened on top, and on a page of
-  the menu closes it, which `panel_state` reports as `closed`.
-- Input: while a centred menu is up neither the game nor any plugin reads the
-  controller, the keyboard or the mouse, and what is held as it closes stays
-  out of both until let go. A corner panel takes only the buttons and keys it
-  moves by; the plugin's own `pad` and `input` still read the rest.
-- The overlay (F9, F10) opens over a menu and hides it until it closes. The
-  game's own menus cannot be opened while a centred menu has the input; a
-  message the game shows itself (an item picked up, a notice) shows under it
-  and leaves it up.
+- L1 and R1 (Page Up and Page Down, or the player's Menu Previous and Next
+  Page keys) turn the menu's pages; Circle (Backspace, Escape) goes back from
+  a page opened on top, and on a page of the menu closes it, which
+  `panel_state` reports as `closed`.
+- Input: while a centred menu is up neither the game's play nor any plugin
+  reads the controller, the keyboard or the mouse, and what is held as it
+  closes stays out of both until let go. A corner menu takes only what the
+  dialog moves by - the d-pad, Cross, Circle, L1 and R1; the arrows, Enter,
+  Backspace, Escape and the page keys - and gets them even when the plugin
+  takes the controller from the game; the sticks, the triggers and the other
+  buttons and keys stay the plugin's (`pad`, `input`). The pointer works the
+  rows as it does the game's own settings.
+- `world_state` does not count a plugin's menu as one of the game's.
+- A menu shown over the title's holds that one - no input, out of view -
+  until it is gone, as the game does when it opens a menu from another. One
+  shown over a menu of the game's in the world takes that menu's place, as
+  the game's own menus do, and closing it leaves the player in the world.
+  The overlay (F9, F10) opens over a menu and hides it until it closes.
 - The game's own interruptions close a centred menu: a loading screen coming
   up (lamp travel, the one after a death), a cutscene starting, or the
   player's character dying. `panel_state` then reads `shown` 0 and `closed`
   1, as when the player closes it, and a text box or a yes/no open on it goes
   with it. One already under way when the menu opens (a load, a cutscene, the
-  death's screen) leaves it up. A corner panel stays: the plugin takes it
+  death's screen) leaves it up. A corner menu stays: the plugin takes it
   down when it should (photo mode ends itself at a load or a cutscene).
 - The world keeps running while a menu is up, unless the plugin holds it with
-  `world_pause`.
+  `world_pause`; the menu works either way.
 - Turning the plugin off takes its menu down.
 
 The example below is `examples/plugins/menu/menu.c`, built with bbhost as

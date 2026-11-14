@@ -115,6 +115,40 @@ int Nav::back() {
     return row;
 }
 
+std::string one_line(const std::string& help, std::size_t room) {
+    // Where the first sentence ends.
+    std::size_t end = help.size();
+    for (std::size_t i = 0; i < help.size(); ++i) {
+        const char c = help[i];
+        if ((c == '.' || c == '!' || c == '?') && (i + 1 == help.size() || help[i + 1] == ' ' || help[i + 1] == '\n')) {
+            end = i + 1;
+            break;
+        }
+    }
+    std::string first = help.substr(0, end);
+    for (char& c : first) {
+        if (c == '\n') c = ' ';
+    }
+    std::size_t chars = 0;
+    for (const char c : first) chars += (static_cast<unsigned char>(c) & 0xc0) != 0x80;
+    if (chars <= room) return first;
+    // Too long: the words that fit with "..." after them.
+    const std::size_t keep = room > 3 ? room - 3 : 0;
+    std::size_t bytes = 0, n = 0;
+    while (bytes < first.size() && n < keep) {
+        ++bytes;
+        while (bytes < first.size() && (static_cast<unsigned char>(first[bytes]) & 0xc0) == 0x80) ++bytes;
+        ++n;
+    }
+    std::size_t cut = bytes;
+    if (cut < first.size() && first[cut] != ' ') {
+        const std::size_t space = first.rfind(' ', cut);
+        if (space != std::string::npos && space > 0) cut = space;
+    }
+    while (cut > 0 && (first[cut - 1] == ' ' || first[cut - 1] == ',' || first[cut - 1] == ';' || first[cut - 1] == ':')) --cut;
+    return first.substr(0, cut) + "...";
+}
+
 const char* Interruptions::step(const World& now) {
     const World before = was;
     was = now;

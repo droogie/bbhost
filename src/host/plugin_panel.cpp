@@ -3,6 +3,7 @@
 
 #include "bbhost_plugin.h"
 #include "engine/menu_pointer.h"
+#include "engine/plugin_dialog.h"
 #include "host/game_menu_art.h"
 #include "host/plugin_menu.h"
 #include "host/plugins.h"
@@ -23,6 +24,7 @@
 #include <vector>
 
 #if defined(BBHOST_HAVE_SDL3)
+#include "host/bindings.h"
 #include "host/launcher_ui.h"
 #include "host/text_entry.h"
 #include "host/window.h"
@@ -42,6 +44,8 @@ struct Panel {
     bool corner = false;     // BB_PANEL_CORNER; else the game's dialog, centred, the screen dimmed
     int focused_row = 0;     // the row the cursor is on (the draw's): a page opened on top comes back to it
     int cursor_to = -1;      // the row the cursor goes to on the next frame (back from a page on top)
+    bool native = false;     // in the game's own options dialog (engine/plugin_dialog.h), not the host's panel
+    bool from_list = false;  // opened from the Plugins list: Circle on its menu's own page goes back to it
 };
 std::mutex g_mu;
 Panel g_panel;                                     // under g_mu
@@ -51,6 +55,8 @@ std::map<std::string, std::string> g_last_page;    // under g_mu: the menu page 
 std::map<std::string, plugin_menu::Runtime> g_runtime;  // under g_mu: what each plugin set at run time
 std::map<std::string, std::shared_ptr<const plugin_menu::Layout>> g_layouts;  // under g_mu: each plugin's, read once
 std::atomic<bool> g_shown{false};
+std::atomic<bool> g_native{false};                 // the panel up is in the game's own dialog
+bool g_list = false;                               // under g_mu: the game's dialog shows the Plugins list
 std::atomic<bool> g_exclusive{false};              // the panel up is a centred menu: every input its own
 std::atomic<bool> g_appeared{false};               // shown since the last frame drew it: give it the focus
 std::atomic<bool> g_opened{false};                 // shown, not just a page turned: the game's menu-opening sound
@@ -76,6 +82,66 @@ bool catalog_entry(const std::string& name, PluginEntry& out) {
         }
     }
     return false;
+}
+
+std::vector<std::string> split(const std::string& s, char sep) {
+    std::vector<std::string> out;
+    std::string cur;
+    std::istringstream in(s);
+    while (std::getline(in, cur, sep)) out.push_back(cur);
+    return out;
+}
+
+// A number's step as the menus take it: 1 for an INT, a hundredth of its range for a FLOAT.
+double number_step(const PluginOptionDesc& o) { return o.type == BB_OPT_INT ? 1.0 : (o.max - o.min) / 100.0; }
+
+// A row's value as text for the config (plugins_set_option).
+std::string number_text(const PluginOptionDesc& o, double v) {
+    char t[32];
+    if (o.type == BB_OPT_INT) std::snprintf(t, sizeof(t), "%d", static_cast<int>(std::lround(v)));
+    else std::snprintf(t, sizeof(t), "%.3g", v);
+    return t;
+}
+
+// Greyed out (BB_OPT_WHEN) unless another of the plugin's options holds one of its values.
+bool greyed(const PluginEntry& p, const PluginOptionDesc& o) {
+    const std::size_t eq = o.when.find('=');
+    if (eq == std::string::npos) return false;
+    const std::string key = o.when.substr(0, eq);
+    const std::vector<std::string> want = split(o.when.substr(eq + 1), '|');
+    for (const PluginOptionDesc& other : p.options) {
+        if (other.key == key) return std::find(want.begin(), want.end(), plugins_option_value(p, other)) == want.end();
+    }
+    return false;
+}
+
+// Whether a plugin's menu goes into the game's own dialog: it can open
+// there (engine/plugin_dialog.h), and no test asks for the host's panel
+// (BBHOST_PANEL_OVERLAY=1).
+bool native_wanted() {
+    static const bool overlay = [] {
+        const char* e = std::getenv("BBHOST_PANEL_OVERLAY");
+        return e && e[0] == '1';
+    }();
+    return !overlay && plugin_dialog::available();
+}
+
+// The panel up in the host's own drawing after all: the game's dialog could
+// not take it (logged once).
+void fall_back(const char* why) {
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (!g_panel.native) return;
+        g_panel.native = false;
+        g_native.store(false);
+        g_exclusive.store(!g_panel.corner && g_shown.load());
+        g_opened.store(true);
+    }
+    static bool told = false;
+    if (!told) {
+        told = true;
+        host_log("plugin: a plugin's menu is drawn by the host: %s", why);
+    }
 }
 
 // A plugin's pages and menus, read from its table the first time (the table
@@ -134,7 +200,10 @@ void plugin_panel_preview_tick() {
     }
 }
 
-bool plugin_panel_show(const std::string& name, const PluginPanelShow& how) {
+namespace {
+
+// The panel's state for `name` at `how` (plugin_panel_show), under g_mu.
+bool set_panel(const std::string& name, const PluginPanelShow& how) {
     PluginEntry entry;
     if (!catalog_entry(name, entry)) return false;
     const std::shared_ptr<const plugin_menu::Layout> layout = layout_for(name);
@@ -172,23 +241,46 @@ bool plugin_panel_show(const std::string& name, const PluginPanelShow& how) {
     g_panel.guide_keys = how.guide_keys;
     g_panel.defaults = how.defaults;
     g_panel.corner = how.corner;
+    g_panel.native = native_wanted();
+    g_list = false;
     g_last_page[name] = g_panel.nav.shown();
     if (!was) {
         g_appeared.store(true);
-        g_opened.store(true);
-        host_log("plugin: %s's panel up at its page %s%s", name.c_str(), g_last_page[name].c_str(), how.corner ? "" : ", centred");
+        g_opened.store(!g_panel.native);  // the game's dialog plays its own
+        host_log("plugin: %s's panel up at its page %s%s%s", name.c_str(), g_last_page[name].c_str(), how.corner ? "" : ", centred",
+                 g_panel.native ? ", in the game's dialog" : "");
     }
-    g_exclusive.store(!how.corner);
+    g_native.store(g_panel.native);
+    g_exclusive.store(!how.corner && !g_panel.native);
     g_shown.store(true);
     return true;
 }
 
+}  // namespace
+
+bool plugin_panel_show(const std::string& name, const PluginPanelShow& how) {
+    if (!set_panel(name, how)) return false;
+    bool native = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        native = g_panel.native && g_panel.owner == name;
+    }
+    if (native && !plugin_dialog::open()) fall_back("the game's dialog cannot open it");
+    return true;
+}
+
 void plugin_panel_hide(const std::string& name) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    if (g_panel.owner != name) return;
-    g_panel.owner.clear();
-    g_exclusive.store(false);
-    if (g_shown.exchange(false)) host_log("plugin: %s's panel down", name.c_str());
+    bool native = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_panel.owner != name) return;
+        native = g_panel.native;
+        g_panel.owner.clear();
+        g_exclusive.store(false);
+        g_native.store(false);
+        if (g_shown.exchange(false)) host_log("plugin: %s's panel down", name.c_str());
+    }
+    if (native) plugin_dialog::close();
 }
 
 void plugin_panel_state(const std::string& name, PluginPanelState& out) {
@@ -201,33 +293,57 @@ void plugin_panel_state(const std::string& name, PluginPanelState& out) {
 }
 
 void plugin_panel_world(std::uint32_t flags, std::int64_t hp) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    const char* why = g_interruptions.step({flags, hp});
-    if (!why || !g_shown.load() || g_panel.owner.empty() || g_panel.corner) return;
-    g_closed[g_panel.owner] = true;
-    host_log("plugin: %s's menu closed by %s", g_panel.owner.c_str(), why);
-    g_panel.owner.clear();
-    g_exclusive.store(false);
-    g_shown.store(false);
+    bool native = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        const char* why = g_interruptions.step({flags, hp});
+        if (!why || !g_shown.load() || g_panel.corner || (g_panel.owner.empty() && !g_list)) return;
+        if (!g_panel.owner.empty()) g_closed[g_panel.owner] = true;
+        host_log("plugin: %s's menu closed by %s", g_panel.owner.empty() ? "the Plugins list" : g_panel.owner.c_str(), why);
+        native = g_panel.native || g_list;
+        g_panel.owner.clear();
+        g_list = false;
+        g_exclusive.store(false);
+        g_native.store(false);
+        g_shown.store(false);
+    }
+    if (native) plugin_dialog::close();
 }
 
 bool plugin_panel_rows(const std::string& name, const std::string& page, const std::vector<PluginOptionDesc>& rows) {
     const std::shared_ptr<const plugin_menu::Layout> layout = layout_for(name);
-    std::lock_guard<std::mutex> lk(g_mu);
-    return layout && plugin_menu::set_rows(*layout, g_runtime[name], page, rows);
+    bool shown_native = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (!layout || !plugin_menu::set_rows(*layout, g_runtime[name], page, rows)) return false;
+        shown_native = g_panel.native && g_panel.owner == name && g_panel.nav.shown() == page;
+    }
+    if (shown_native) plugin_dialog::changed(true);
+    return true;
 }
 
 bool plugin_panel_value(const std::string& name, const std::string& page, const std::string& key, const std::string& value) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    const auto it = g_runtime.find(name);
-    return it != g_runtime.end() && plugin_menu::set_value(it->second, page, key, value);
+    bool shown_native = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        const auto it = g_runtime.find(name);
+        if (it == g_runtime.end() || !plugin_menu::set_value(it->second, page, key, value)) return false;
+        shown_native = g_panel.native && g_panel.owner == name && g_panel.nav.shown() == page;
+    }
+    if (shown_native) plugin_dialog::changed(false);
+    return true;
 }
 
 bool plugin_panel_open(const std::string& name, const std::string& page) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    if (!g_shown.load() || g_panel.owner != name || !g_panel.layout || !g_panel.layout->page(page)) return false;
-    g_panel.nav.open(page, g_panel.focused_row);
-    g_appeared.store(true);
+    bool native = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (!g_shown.load() || g_panel.owner != name || !g_panel.layout || !g_panel.layout->page(page)) return false;
+        g_panel.nav.open(page, g_panel.focused_row);
+        g_appeared.store(true);
+        native = g_panel.native;
+    }
+    if (native) plugin_dialog::changed(true);
     return true;
 }
 
@@ -241,9 +357,479 @@ std::vector<PluginMenuEntry> plugin_panel_menus(const std::string& name) {
     return out;
 }
 
+// ---- the game's own dialog (engine/plugin_dialog.h) -------------------------------
+
+namespace {
+
+// The Plugins list's rows: each loaded plugin's named menus (host/plugin_menu.h).
+struct ListRow {
+    std::string plugin, page, name, help;
+};
+std::vector<ListRow> list_rows() {
+    std::vector<ListRow> out;
+    for (const PluginEntry& e : plugins_catalog()) {
+        if (!e.loaded || e.visitor || !e.enabled) continue;
+        const std::shared_ptr<const plugin_menu::Layout> layout = layout_for(e.name);
+        if (!layout) continue;
+        for (const plugin_menu::MenuDecl& m : layout->menus) {
+            if (!m.pages.empty()) out.push_back({e.name, m.pages.front(), m.name, e.title.empty() ? e.name : e.title});
+        }
+    }
+    return out;
+}
+
+// The controller in use, for which guide the help line gives.
+bool keys_in_use() {
+#if defined(BBHOST_HAVE_SDL3)
+    return host_input_device() == InputDevice::KeyboardMouse;
+#else
+    return false;
+#endif
+}
+
+// The keys that turn a menu's pages in the game's dialog: the player's own
+// Menu Previous Page and Menu Next Page bindings (PageUp and PageDown unless
+// moved), or L1 and R1.
+std::string page_keys() {
+#if defined(BBHOST_HAVE_SDL3)
+    if (keys_in_use()) {
+        const char* l = host_key_name(host_binding_key(kBindMenuPageL));
+        const char* r = host_key_name(host_binding_key(kBindMenuPageR));
+        if (l && r) return std::string(l) + " " + r + ": page";
+    }
+#endif
+    return "L1 R1: page";
+}
+
+// A row's line in the game's dialog: its first sentence (host/plugin_menu.h
+// one_line), with the plugin's guide - or the menu's pages' keys - after it,
+// the two together in the characters the dialog's help line holds inside its
+// frame (kPanelHelpLine; the guide's own share first, the help at least 20).
+std::string native_help(const std::string& help, const std::string& guide) {
+    const std::size_t room = guide.empty() ? kPanelHelpLine : std::max<std::size_t>(20, kPanelHelpLine - std::min(kPanelHelpLine, guide.size() + 4));
+    const std::string line = plugin_menu::one_line(help, room);
+    if (guide.empty()) return line;
+    return line.empty() ? guide : line + "    " + guide;
+}
+
+constexpr const char* kDefaultsLabel = "Defaults";
+
+// An INT from 0 to 10: the game's own slider, its number the game's.
+bool game_slider(const PluginOptionDesc& o) { return o.type == BB_OPT_INT && o.min == 0.0 && o.max == 10.0; }
+
+// A number as the host's slider shows it: a FLOAT to its step's decimals
+// (a range of 1 in hundredths, of 10 in tenths, of 100 in whole numbers).
+std::string shown_number(const PluginOptionDesc& o, double v) {
+    char t[32];
+    if (o.type == BB_OPT_INT) {
+        std::snprintf(t, sizeof(t), "%d", static_cast<int>(std::lround(v)));
+    } else {
+        const double step = number_step(o);
+        const int places = step > 0.0 ? std::clamp(static_cast<int>(std::ceil(-std::log10(step) - 1e-9)), 0, 4) : 2;
+        std::snprintf(t, sizeof(t), "%.*f", places, v);
+    }
+    return t;
+}
+
+// The snapshot a native call works on (under g_mu).
+struct NativeView {
+    Panel p;
+    plugin_menu::Runtime rt;
+    std::string page_key;
+    const plugin_menu::Page* page = nullptr;
+    std::vector<plugin_menu::Row> rows;
+};
+bool native_view(NativeView& v) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_panel.owner.empty() || !g_panel.layout || !g_panel.native) return false;
+    v.p = g_panel;
+    const auto it = g_runtime.find(v.p.owner);
+    if (it != g_runtime.end()) v.rt = it->second;
+    v.page_key = v.p.nav.shown();
+    v.page = v.p.layout->page(v.page_key);
+    if (!v.page) return false;
+    v.rows = plugin_menu::rows_of(*v.page, v.rt);
+    return true;
+}
+
+std::string value_now(const NativeView& v, const plugin_menu::Row& r) {
+    return r.runtime ? plugin_menu::value_of(v.rt, v.page_key, r) : plugins_option_value(*v.p.entry, r.desc);
+}
+
+// Greyed out (BB_OPT_WHEN) unless the row it names holds one of its values:
+// a run-time row of this page, else one of the table's.
+bool grey_now(const NativeView& v, const plugin_menu::Row& r) {
+    const std::size_t eq = r.desc.when.find('=');
+    if (eq == std::string::npos) return false;
+    const std::string key = r.desc.when.substr(0, eq);
+    const std::vector<std::string> want = split(r.desc.when.substr(eq + 1), '|');
+    for (const plugin_menu::Row& other : v.rows) {
+        if (other.runtime && other.desc.key == key) return std::find(want.begin(), want.end(), value_now(v, other)) == want.end();
+    }
+    return greyed(*v.p.entry, r.desc);
+}
+
+// A row's value set as the menus set it: the config's for a table row, the
+// menu's own for a run-time one, the plugin told either way.
+void apply_native(const NativeView& v, const plugin_menu::Row& r, const std::string& value) {
+    if (r.runtime) {
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            plugin_menu::set_value(g_runtime[v.p.owner], v.page_key, r.desc.key, value);
+        }
+        plugins_menu_option(v.p.owner, plugin_menu::event_key(v.page_key, r), value);
+    } else {
+        plugins_set_option(v.p.owner, r.desc.key, value);
+    }
+}
+
+// A TEXT row being typed in the host's text box, from the game's dialog.
+struct NativeTyping {
+    bool on = false;
+    std::string owner, page, key;
+    bool runtime = false;
+} g_native_typing;  // under g_mu
+
+}  // namespace
+
+bool plugin_panel_native_page(plugin_dialog::Page& out) {
+    out = plugin_dialog::Page{};
+    bool list = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        list = g_list;
+    }
+    if (list) {
+        // (list_rows reads the layouts, which take g_mu themselves.)
+        out.title = "Plugins";
+        for (const ListRow& l : list_rows()) {
+            plugin_dialog::Row r;
+            r.label = l.name;
+            r.help = native_help(l.help + ".", "");
+            r.presses = true;
+            out.rows.push_back(std::move(r));
+        }
+        return !out.rows.empty();
+    }
+    NativeView v;
+    if (!native_view(v)) return false;
+    const int pages = static_cast<int>(v.p.nav.cycle.size());
+    out.title = v.page->title;
+    if (pages > 1 && !v.p.nav.on_subpage()) out.title += "   " + std::to_string(v.p.nav.at + 1) + "/" + std::to_string(pages);
+    out.corner = v.p.corner;
+    std::string guide = keys_in_use() ? v.p.guide_keys : v.p.guide;
+    if (guide.empty() && pages > 1 && !v.p.nav.on_subpage()) guide = page_keys();
+    for (const plugin_menu::Row& r : v.rows) {
+        plugin_dialog::Row row;
+        const PluginOptionDesc& o = r.desc;
+        row.label = o.label;
+        row.help = native_help(o.help, guide);
+        row.grey = grey_now(v, r);
+        const std::string value = value_now(v, r);
+        switch (o.type) {
+        case BB_OPT_BOOL:
+            row.widget = plugin_dialog::Widget::Toggle;
+            row.on = value == "true" || value == "1";
+            row.value = row.on ? "On" : "Off";
+            row.steps = true;  // as a text row (a long page): Left and Right switch it
+            break;
+        case BB_OPT_CHOICE: {
+            const std::vector<std::string> choices = split(o.choices, '|');
+            int cur = 0;
+            for (std::size_t i = 0; i < choices.size(); ++i) {
+                if (choices[i] == value) cur = static_cast<int>(i);
+            }
+            row.value = choices.empty() ? std::string() : choices[static_cast<std::size_t>(cur)];
+            if (choices.size() == 2) {
+                row.widget = plugin_dialog::Widget::Pair;
+                row.pair[0] = choices[0];
+                row.pair[1] = choices[1];
+                row.on = cur;
+            }
+            row.steps = choices.size() > 1;
+            break;
+        }
+        case BB_OPT_INT:
+        case BB_OPT_FLOAT: {
+            const double x = std::atof(value.c_str());
+            row.value = shown_number(o, x);
+            row.widget = plugin_dialog::Widget::Slider;
+            if (game_slider(o)) {
+                row.on = std::clamp(static_cast<int>(std::lround(x)), 0, 10);
+            } else {
+                // The game's slider with a position a step of the plugin's, and its number.
+                const double step = number_step(o);
+                const double span = o.max > o.min && step > 0.0 ? (o.max - o.min) / step : 1.0;
+                row.positions = static_cast<int>(std::clamp(std::lround(span), 1L, 1L << 20));
+                const long at = step > 0.0 ? std::lround((x - o.min) / step) : 0L;
+                row.on = static_cast<int>(std::clamp(at, 0L, static_cast<long>(row.positions)));
+            }
+            row.steps = true;
+            break;
+        }
+        case BB_OPT_TEXT:
+            row.value = value;
+            row.presses = true;
+            break;
+        case BB_OPT_ACTION:
+            row.presses = true;
+            break;
+        default:  // BB_OPT_INFO, and a type this host does not know
+            row.value = value;
+            break;
+        }
+        out.rows.push_back(std::move(row));
+    }
+    if (v.p.defaults) {
+        plugin_dialog::Row d;
+        d.label = kDefaultsLabel;
+        d.help = native_help("Every row here back to its default.", guide);
+        d.presses = true;
+        out.rows.push_back(std::move(d));
+    }
+    out.cursor = std::clamp(v.p.cursor_to >= 0 ? v.p.cursor_to : 0, 0, std::max(0, static_cast<int>(out.rows.size()) - 1));
+    return !out.rows.empty();
+}
+
+bool plugin_panel_native_step(int row, int dir) {
+    NativeView v;
+    if (!native_view(v) || row < 0 || row >= static_cast<int>(v.rows.size()) || !dir) return false;
+    const plugin_menu::Row& r = v.rows[static_cast<std::size_t>(row)];
+    const PluginOptionDesc& o = r.desc;
+    const std::string value = value_now(v, r);
+    if (o.type == BB_OPT_BOOL) {
+        apply_native(v, r, value == "true" || value == "1" ? "false" : "true");
+        return true;
+    }
+    if (o.type == BB_OPT_CHOICE) {
+        const std::vector<std::string> choices = split(o.choices, '|');
+        const int n = static_cast<int>(choices.size());
+        if (n < 2) return false;
+        int cur = 0;
+        for (int i = 0; i < n; ++i) {
+            if (choices[static_cast<std::size_t>(i)] == value) cur = i;
+        }
+        apply_native(v, r, choices[static_cast<std::size_t>(((cur + dir) % n + n) % n)]);
+        return true;
+    }
+    if (o.type == BB_OPT_INT || o.type == BB_OPT_FLOAT) {
+        const double was = std::atof(value.c_str());
+        const double to = std::clamp(was + dir * number_step(o), o.min, o.max);
+        if (to == was) return false;
+        apply_native(v, r, number_text(o, to));
+        return true;
+    }
+    return false;
+}
+
+bool plugin_panel_native_set(int row, int value) {
+    NativeView v;
+    if (!native_view(v) || row < 0 || row >= static_cast<int>(v.rows.size())) return false;
+    const plugin_menu::Row& r = v.rows[static_cast<std::size_t>(row)];
+    const PluginOptionDesc& o = r.desc;
+    if (o.type == BB_OPT_BOOL) {
+        apply_native(v, r, value ? "true" : "false");
+    } else if (o.type == BB_OPT_CHOICE) {
+        const std::vector<std::string> choices = split(o.choices, '|');
+        if (value < 0 || value >= static_cast<int>(choices.size())) return false;
+        apply_native(v, r, choices[static_cast<std::size_t>(value)]);
+    } else if (o.type == BB_OPT_INT || o.type == BB_OPT_FLOAT) {
+        // The game's own slider gives the number; one of the host's, its position.
+        const double to = game_slider(o) ? value : std::clamp(o.min + value * number_step(o), o.min, o.max);
+        apply_native(v, r, number_text(o, to));
+    } else {
+        return false;
+    }
+    return true;
+}
+
+int plugin_panel_native_press(int row, std::string* question) {
+    // The Plugins list: the menu picked, its first page on top of the list.
+    {
+        std::unique_lock<std::mutex> lk(g_mu);
+        if (g_list) {
+            lk.unlock();
+            const std::vector<ListRow> rows = list_rows();
+            if (row < 0 || row >= static_cast<int>(rows.size())) return 0;
+            PluginPanelShow how;
+            how.page = rows[static_cast<std::size_t>(row)].page;
+            if (!set_panel(rows[static_cast<std::size_t>(row)].plugin, how)) return 0;
+            std::lock_guard<std::mutex> again(g_mu);
+            g_panel.native = true;
+            g_panel.from_list = true;
+            g_native.store(true);
+            g_exclusive.store(false);
+            return 2;
+        }
+    }
+    NativeView v;
+    if (!native_view(v) || row < 0) return 0;
+    if (v.p.defaults && row == static_cast<int>(v.rows.size())) {
+        if (question) *question = "Every row on this page back to its default?";
+        return 3;
+    }
+    if (row >= static_cast<int>(v.rows.size())) return 0;
+    const plugin_menu::Row& r = v.rows[static_cast<std::size_t>(row)];
+    const PluginOptionDesc& o = r.desc;
+    if (o.type == BB_OPT_TEXT) {
+#if defined(BBHOST_HAVE_SDL3)
+        host_text_entry_begin(value_now(v, r).c_str(), 128, false, o.label.c_str(), TextCharset::BasicLatin, true);
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_native_typing = {true, v.p.owner, v.page_key, o.key, r.runtime};
+#endif
+        return 1;
+    }
+    if (o.type != BB_OPT_ACTION) return 0;
+    if (o.flags & BB_OPT_CONFIRM) {
+        if (question) *question = o.label + "?" + (o.help.empty() ? std::string() : "\n" + plugin_menu::one_line(o.help, 96));
+        return 3;
+    }
+    plugins_run_action(v.p.owner, plugin_menu::event_key(v.page_key, r));
+    if ((o.flags & BB_OPT_OPEN) && v.p.layout->page(o.def)) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_panel.owner == v.p.owner) {
+            g_panel.nav.open(o.def, row);
+            g_panel.cursor_to = 0;
+        }
+        return 2;
+    }
+    return 1;
+}
+
+bool plugin_panel_native_confirm(int row) {
+    NativeView v;
+    if (!native_view(v) || row < 0) return false;
+    if (v.p.defaults && row == static_cast<int>(v.rows.size())) {
+        for (const plugin_menu::Row& r : v.rows) {
+            if (r.desc.type != BB_OPT_ACTION && r.desc.type != BB_OPT_INFO) apply_native(v, r, r.desc.def);
+        }
+        return false;
+    }
+    if (row >= static_cast<int>(v.rows.size())) return false;
+    const plugin_menu::Row& r = v.rows[static_cast<std::size_t>(row)];
+    plugins_run_action(v.p.owner, plugin_menu::event_key(v.page_key, r));
+    if ((r.desc.flags & BB_OPT_OPEN) && v.p.layout->page(r.desc.def)) {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_panel.owner == v.p.owner) {
+            g_panel.nav.open(r.desc.def, row);
+            g_panel.cursor_to = 0;
+        }
+        return true;
+    }
+    return false;
+}
+
+bool plugin_panel_native_turn(int dir) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_list || g_panel.owner.empty() || !g_panel.native || !g_panel.nav.turn(dir)) return false;
+    g_last_page[g_panel.owner] = g_panel.nav.shown();
+    g_panel.cursor_to = 0;
+    return true;
+}
+
+bool plugin_panel_native_on_subpage() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    return !g_list && !g_panel.owner.empty() && g_panel.native && (g_panel.nav.on_subpage() || g_panel.from_list);
+}
+
+bool plugin_panel_native_back() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_list || g_panel.owner.empty() || !g_panel.native) return false;
+    if (g_panel.nav.on_subpage()) {
+        g_panel.cursor_to = g_panel.nav.back();
+        g_last_page[g_panel.owner] = g_panel.nav.shown();
+        return true;
+    }
+    if (g_panel.from_list) {
+        // Out of a menu the list opened: the list again (the plugin's menu closed by the player).
+        g_closed[g_panel.owner] = true;
+        host_log("plugin: %s's panel closed by the player (back to the Plugins list)", g_panel.owner.c_str());
+        g_panel = Panel{};
+        g_list = true;
+        return true;
+    }
+    return false;
+}
+
+void plugin_panel_native_gone(bool by_player) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_panel.owner.empty() && g_panel.native) {
+        if (by_player) {
+            g_closed[g_panel.owner] = true;
+            host_log("plugin: %s's panel closed by the player", g_panel.owner.c_str());
+        }
+        g_panel.owner.clear();
+        g_shown.store(false);
+    } else if (g_list) {
+        g_shown.store(false);
+    }
+    g_list = false;
+    g_native.store(false);
+    g_exclusive.store(false);
+}
+
+void plugin_panel_native_failed(const char* why) {
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_list) {
+            // The Plugins list has no page of the host's: nothing to show.
+            g_list = false;
+            g_native.store(false);
+            g_shown.store(false);
+            return;
+        }
+    }
+    fall_back(why);
+}
+
+bool plugin_panel_native_menus_any() { return !list_rows().empty(); }
+
+void plugin_panel_native_list() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_panel = Panel{};
+    g_list = true;
+    g_native.store(true);
+    g_exclusive.store(false);
+    g_shown.store(true);
+    host_log("plugin: the Plugins list up in the game's dialog");
+}
+
+void plugin_panel_native_frame() {
+#if defined(BBHOST_HAVE_SDL3)
+    NativeTyping t;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (!g_native_typing.on) return;
+        t = g_native_typing;
+    }
+    std::string text;
+    const int r = host_text_entry_poll(text);
+    if (r == 0) return;
+    host_text_entry_end();
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_native_typing.on = false;
+        if (r == 1 && g_panel.owner == t.owner) {
+            if (t.runtime) plugin_menu::set_value(g_runtime[t.owner], t.page, t.key, text);
+        }
+    }
+    if (r == 1) {
+        if (t.runtime) plugins_menu_option(t.owner, t.page + "/" + t.key, text);
+        else plugins_set_option(t.owner, t.key, text);
+        plugin_dialog::changed(false);
+    }
+#endif
+}
+
 bool plugin_panel_shown() { return g_shown.load(std::memory_order_relaxed); }
 
+bool plugin_panel_overlay_shown() { return g_shown.load(std::memory_order_relaxed) && !g_native.load(std::memory_order_relaxed); }
+
 bool plugin_panel_exclusive() { return g_shown.load(std::memory_order_relaxed) && g_exclusive.load(std::memory_order_relaxed); }
+
+bool plugin_panel_native_centred() { return plugin_dialog::up() && !plugin_dialog::corner_up(); }
+
+std::uint32_t plugin_panel_dialog_buttons() { return plugin_panel_shown() && !plugin_panel_overlay_shown() ? kPanelPadButtons : 0u; }
 
 bool plugin_panel_key(int sc) {
     // SDL scancodes (USB usages): the arrows, Enter (and the keypad's), Page
@@ -260,37 +846,24 @@ bool plugin_panel_key(int sc) {
     }
 }
 
+bool plugin_panel_native_key(int sc) {
+    switch (sc) {
+    case 79: case 80: case 81: case 82:  // right, left, down, up
+    case 40: case 88:                    // Return, keypad Enter
+    case 41: case 42:                    // Escape, Backspace
+        return true;
+    default:
+#if defined(BBHOST_HAVE_SDL3)
+        return sc != 0 && (sc == host_binding_key(kBindMenuPageL) || sc == host_binding_key(kBindMenuPageR));
+#else
+        return false;
+#endif
+    }
+}
+
 #if defined(BBHOST_HAVE_SDL3)
 
 namespace {
-
-std::vector<std::string> split(const std::string& s, char sep) {
-    std::vector<std::string> out;
-    std::string cur;
-    std::istringstream in(s);
-    while (std::getline(in, cur, sep)) out.push_back(cur);
-    return out;
-}
-
-// A row's value as text for the config (plugins_set_option).
-std::string number_text(const PluginOptionDesc& o, double v) {
-    char t[32];
-    if (o.type == BB_OPT_INT) std::snprintf(t, sizeof(t), "%d", static_cast<int>(std::lround(v)));
-    else std::snprintf(t, sizeof(t), "%.3g", v);
-    return t;
-}
-
-// Greyed out (BB_OPT_WHEN) unless another of the plugin's options holds one of its values.
-bool greyed(const PluginEntry& p, const PluginOptionDesc& o) {
-    const std::size_t eq = o.when.find('=');
-    if (eq == std::string::npos) return false;
-    const std::string key = o.when.substr(0, eq);
-    const std::vector<std::string> want = split(o.when.substr(eq + 1), '|');
-    for (const PluginOptionDesc& other : p.options) {
-        if (other.key == key) return std::find(want.begin(), want.end(), plugins_option_value(p, other)) == want.end();
-    }
-    return false;
-}
 
 // A step left or right on the row with the focus: the d-pad or the arrows, held to repeat.
 int step_pressed() {
@@ -561,8 +1134,7 @@ RowOut row(const RowIn& in, ImVec2 a, ImVec2 b, float mid, float s, bool cursor,
         }
         if (!ImGui::IsItemActive() && ImGui::IsItemFocused() && !grey) {
             if (const int d = step_pressed()) {
-                const double step = o.type == BB_OPT_INT ? 1.0 : (o.max - o.min) / 100.0;
-                v = std::clamp(v + d * step, o.min, o.max);
+                v = std::clamp(v + d * number_step(o), o.min, o.max);
                 changed = true;
             }
         }

@@ -645,7 +645,7 @@ void panel_event(const SDL_Event& e, float ratio) {
     };
     // The host's text box (a menu's TEXT row) has the keys while it is up.
     if (host_text_entry_open()) return;
-    const bool up = plugin_panel_shown();
+    const bool up = plugin_panel_overlay_shown();
     if (up && !was) {
         // Where the pointer is now: it has been the camera's until this.
         Input focus;
@@ -991,7 +991,7 @@ bool build_frame(VkExtent2D extent) {
         plugin_panel_preview_tick();  // BBHOST_PANEL_PREVIEW (a test aid)
         plugin_panel_settle();        // a plugin's menu's box or yes/no, its menu gone
     }
-    const bool panel = !menu && plugin_panel_shown();  // a plugin's panel (host/plugin_panel.h) while no menu is up
+    const bool panel = !menu && plugin_panel_overlay_shown();  // a plugin's panel (host/plugin_panel.h) while no menu is up
     if (!g_vk_ready || (!menu && !panel)) {
         g_ui.scanned = false;     // read the files again when it next opens
         g_patches.read = false;

@@ -96,6 +96,12 @@ struct Nav {
     int back();
 };
 
+// A row's help as the game's options dialog shows it, on its one line: the
+// first sentence - up to the first '.', '!' or '?' with a space or the end
+// after it - and when that is longer than `room` characters, cut after the
+// last whole word that fits with "..." after it. Characters are code points.
+std::string one_line(const std::string& help, std::size_t room);
+
 // The world on a frame, as the host reads it for the game's own
 // interruptions of a centred menu (host/plugin_panel.h).
 struct World {
