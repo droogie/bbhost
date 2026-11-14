@@ -84,6 +84,7 @@ thread_local constinit int t_import_fall = -1;                  // gpu_internal.
 
 void device_lost_locked(const char* where, bool declared = false);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
+void markers_window_locked();                // the same: the markers' window, where a recording begins
 
 namespace {
 
@@ -3729,7 +3730,15 @@ void start_memory_reserve();  // below, beside the image heap
 void vram_reserve_init();     // the same
 
 bool g_use_buffer_marker = false;  // VK_AMD_buffer_marker checkpoints (gpu_checkpoint)
-bool g_dry_buffer_marker = false;  // BBHOST_GPU_CHECKPOINTS=amd-dry on a device without them: recorded, not written
+bool g_dry_buffer_marker = false;  // BBHOST_GPU_CHECKPOINTS=amd-dry or loading-dry on a device without them: recorded, not written
+// When they are written (host/gpu_markers.h): while a loading screen is up by
+// default; the window as the command processor records it (markers_live), and
+// where it stands, under g.mu.
+gpu_markers::Mode g_marker_mode = gpu_markers::Mode::kOff;
+std::atomic<bool> g_markers_live{false};
+gpu_markers::Window g_marker_window;
+bool g_marker_after_loss = false;  // BBHOST_GPU_CHECKPOINTS=after-loss: the starts after a loss mark everything
+std::atomic<std::uint32_t> g_marker_windows{0};  // windows begun (the exit line's, read without g.mu)
 // The dry run's marker write: nothing.
 VKAPI_ATTR void VKAPI_CALL dry_buffer_marker(VkCommandBuffer, VkPipelineStageFlagBits, VkBuffer, VkDeviceSize, std::uint32_t) {}
 
@@ -4173,42 +4182,37 @@ bool init_locked() {
         // Other programs' hooks, loaded with the instance (most come in as an
         // implicit Vulkan layer): said now, and again if the device is lost.
         if (const std::string hooks = host_foreign_hooks(); !hooks.empty()) host_log("gpu: hooked into this process: %s", hooks.c_str());
-        // BBHOST_GPU_CHECKPOINTS=1: a checkpoint before every draw and
-        // dispatch, so a device-lost report says how far the GPU got. Off by
-        // default: vkCmdSetCheckpointNV was ~160 ns of each draw's ~11 us on
-        // the command processor.
+        // The GPU's progress markers, which name the draw or dispatch the GPU
+        // was in when the device is lost (host/gpu_markers.h; AMD's driver has
+        // said nothing through VK_EXT_device_fault): AMD's buffer markers
+        // (NVIDIA's drivers have them too) while a loading screen is up -
+        // where the losses come - and nothing of them in the world, where they
+        // cost frames: two marker writes a draw. BBHOST_GPU_CHECKPOINTS=amd
+        // writes them everywhere and =0 never; =1 puts NVIDIA's checkpoints
+        // before every draw and dispatch instead (vkCmdSetCheckpointNV was
+        // ~160 ns of each draw's ~11 us on the command processor, and they are
+        // recorded in place); =after-loss marks everything for the three
+        // starts after a lost device (its note beside the pipeline cache),
+        // with whichever this driver has - buffer markers first: they land in
+        // host memory, readable after the loss, and NVIDIA's Linux driver
+        // returned no checkpoints at all at three losses (an RTX 2060,
+        // 615.71); =amd-dry and =loading-dry record them where the device has
+        // none (lavapipe; with BBHOST_MARKER_TRACE), the writes left out.
         const char* e = std::getenv("BBHOST_GPU_CHECKPOINTS");
-        bool want_nv = c.checkpoints && e && e[0] == '1';
-        // AMD's buffer markers name the draw or dispatch the GPU was in when
-        // the device is lost (the first AMD run lost it at the title, and the
-        // driver's VK_EXT_device_fault said nothing). On while AMD runs were
-        // new; off by default since they cost the Steam Deck ~2% - two marker
-        // writes a draw, and a draw recorded with checkpoints cannot go to
-        // the recorder thread, so the command processor recorded every one.
-        // BBHOST_GPU_CHECKPOINTS=amd turns them on.
-        bool want_amd = c.buffer_marker && e && std::strcmp(e, "amd") == 0;
-        // BBHOST_GPU_CHECKPOINTS=amd-dry (a check of the markers' recording on a
-        // device without the extension - lavapipe; with BBHOST_MARKER_TRACE):
-        // every marker recorded as it would be, the GPU's writes left out.
-        if (e && std::strcmp(e, "amd-dry") == 0) {
-            want_amd = true;
-            g_dry_buffer_marker = !c.buffer_marker;
-        }
-        // Unset, and the last run lost the device (its note beside the
-        // pipeline cache): these starts run with whichever this driver has -
-        // buffer markers first where there are any (NVIDIA's drivers have
-        // them too): they land in host memory, readable after the loss, and
-        // NVIDIA's Linux driver returned no checkpoints at all at three
-        // losses (an RTX 2060, 615.71). BBHOST_GPU_CHECKPOINTS=0 keeps them off.
+        gpu_markers::Arming arm = gpu_markers::arming(e, c.buffer_marker, c.checkpoints);
+        if (arm.unknown) host_log("gpu: BBHOST_GPU_CHECKPOINTS=%s is not understood: as unset (amd, 0, 1, after-loss)", e);
         std::string why;
-        if (!e && (c.checkpoints || c.buffer_marker) && take_marked_start(why)) {
-            (c.buffer_marker ? want_amd : want_nv) = true;
-            host_log("gpu: the last run lost the device (%s): this start runs with the GPU's progress markers (%s), so another loss "
-                     "names the draw the GPU was in; BBHOST_GPU_CHECKPOINTS=0 turns them off",
+        if (arm.after_loss && take_marked_start(why)) {
+            gpu_markers::after_loss_start(arm, c.buffer_marker);
+            host_log("gpu: the last run lost the device (%s): this start runs with the GPU's progress markers everywhere (%s), so another "
+                     "loss names the draw the GPU was in (BBHOST_GPU_CHECKPOINTS=after-loss)",
                      why.c_str(), c.buffer_marker ? "buffer markers" : "NVIDIA's checkpoints");
         }
-        g.has_checkpoints = want_nv || want_amd;
-        g_use_buffer_marker = want_amd;
+        g_marker_mode = arm.mode;
+        g_marker_after_loss = arm.after_loss;
+        g_dry_buffer_marker = arm.dry;
+        g_use_buffer_marker = arm.mode != gpu_markers::Mode::kOff;
+        g.has_checkpoints = arm.nv || g_use_buffer_marker;
     }
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(g.phys, &props);
@@ -4925,9 +4929,11 @@ bool init_locked() {
         } else {
             std::memset(g.marker_buf.map, 0, 256);
             host_log("gpu: AMD buffer markers on each draw and dispatch, and the front end's word before the ops between them where "
-                     "it stops or the pass changes (BBHOST_GPU_CHECKPOINTS=amd; a device loss names the work; BBHOST_GPU_MARKER_OPS=all: "
-                     "before every op)%s",
-                     g_dry_buffer_marker ? " - recorded only, the device has no buffer markers (BBHOST_GPU_CHECKPOINTS=amd-dry)" : "");
+                     "it stops or the pass changes, %s (a device loss names the work; BBHOST_GPU_MARKER_OPS=all: before every op)%s",
+                     g_marker_mode == gpu_markers::Mode::kAlways
+                         ? "everywhere (BBHOST_GPU_CHECKPOINTS=amd)"
+                         : "while a loading screen is up - none in the world (BBHOST_GPU_CHECKPOINTS=amd: everywhere, =0: never)",
+                     g_dry_buffer_marker ? " - recorded only, the device has no buffer markers (BBHOST_GPU_CHECKPOINTS=amd-dry, loading-dry)" : "");
         }
     }
     if (g.device && g.has_checkpoints && !g_use_buffer_marker) {
@@ -5375,6 +5381,7 @@ void begin_recording_locked() {
         gxvk_begin_recording_locked();  // GX buffers by handle: retired entries taken back
         homes_begin_recording_locked();  // stage 4b.3c: the homes made and ended since, ended ones taken back
         busy_begin_locked(g.slots[g.slot]);
+        markers_window_locked();  // a loading screen's markers begin or end here (host/gpu_markers.h)
         gpu_checkpoint(kGpuMarkSubmission, g.flushes * 4 + 1);
         glitch_begin_recording_locked();
         occlusion_begin_recording_locked();
@@ -6939,12 +6946,36 @@ void gpu_write_op_marker(VkCommandBuffer cmd, std::uint32_t seq) {
     g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.marker_buf.buffer, gpu_markers::kOpReached, seq);
 }
 
+// Where a recording begins (begin_recording_locked, under g.mu): the markers'
+// window steps (host/gpu_markers.h Window) - open from the first recording
+// after a loading screen came up to the first one kWindowGraceMs after it
+// went, by default - and a beginning or an end is recorded here, in the
+// stream's order, for the recorder to meet.
+[[gnu::noinline]] void markers_window_locked() {  // (out of begin_recording_locked's own code)
+    if (!g.cmd_buffer_marker) return;
+    const bool loading = loading_screen_now();
+    const std::uint64_t now = g_marker_window.needs_clock(g_marker_mode, loading) ? static_cast<std::uint64_t>(steady_ms()) : 0;
+    const std::uint32_t value = g_marker_window.step(g_marker_mode, loading, now);
+    if (!value) return;
+    g_markers_live.store(g_marker_window.open, std::memory_order_relaxed);
+    g_marker_windows.store(g_marker_window.number, std::memory_order_relaxed);
+    rec().marker_window(value);
+    if (g_marker_mode == gpu_markers::Mode::kLoading && g_marker_window.number <= 2) {
+        host_log("gpu: the GPU's progress markers %s, flip %llu (submission %llu)%s",
+                 g_marker_window.open ? "on for a loading screen" : "off in the world", static_cast<unsigned long long>(hle_video_flip_count()),
+                 static_cast<unsigned long long>(g.flushes), g_marker_window.number == 2 && !g_marker_window.open ? " - said no more" : "");
+    }
+}
+
 }  // namespace gpu
 // The presenter's command buffer (window.cpp): an op's marker at its start and at its end, noted as another thread's
-// (host/gpu_markers.h). The presenter records it under the renderer's lock.
+// (host/gpu_markers.h), while the markers' window is open - the window its start found, for both. The presenter records
+// it under the renderer's lock.
 void host_gpu_present_markers(void* cmd, bool end) {
     using namespace gpu;
-    if (!g.cmd_buffer_marker || !cmd) return;
+    static thread_local bool marked = false;
+    if (!end) marked = g.cmd_buffer_marker && markers_live();
+    if (!marked || !cmd) return;
     gpu_write_op_marker(static_cast<VkCommandBuffer>(cmd), recorder_note_op(static_cast<std::uint16_t>(stream::Op::kForeignSubmit), end ? 1 : 0));
 }
 namespace gpu {
@@ -6952,7 +6983,8 @@ namespace gpu {
 void gpu_checkpoint(unsigned kind, std::uint64_t index) {
     if (g.cmd_buffer_marker) {
         // An op of the stream: recording it in place would drain the
-        // recorder at every dispatch of a start after a lost device.
+        // recorder at every dispatch of a start after a lost device. (Only
+        // in the markers' window: Rec::marker.)
         rec().marker(gpu_marker_value(kind, index));
         return;
     }
@@ -6964,7 +6996,7 @@ void gpu_checkpoint(unsigned kind, std::uint64_t index) {
 // recorded on the command processor beside the stream).
 void gpu_checkpoint_cmd(VkCommandBuffer cmd, unsigned kind, std::uint64_t index) {
     if (g.cmd_buffer_marker) {
-        gpu_write_markers(cmd, gpu_marker_value(kind, index));
+        if (markers_live()) gpu_write_markers(cmd, gpu_marker_value(kind, index));
         return;
     }
     if (!g.cmd_checkpoint) return;
@@ -6982,12 +7014,17 @@ std::string submission_mark(std::uint64_t which) {
 const char* g_dispatch_names[256] = {};
 void note_dispatch_name(std::uint64_t index, const char* name) { g_dispatch_names[index % 256] = name; }
 
-// A marker value as words: "draw N", "dispatch N", a submission's mark.
+// A marker value as words: "draw N", "dispatch N", a submission's mark, a
+// loading screen's markers' window beginning or ending (host/gpu_markers.h).
 std::string marker_text(std::uint32_t v) {
     const unsigned kind = v >> 30;
     const std::uint64_t which = v & 0x3fffffff;
     if (kind == kGpuMarkSubmission) return submission_mark(which);
-    return std::string(kind == 1 ? "draw " : kind == 2 ? "dispatch " : "(none) ") + std::to_string(which);
+    if (kind == 0) {
+        if (!v) return "(none)";
+        return std::string(v & 1 ? "the beginning" : "the end") + " of markers' window " + std::to_string(which >> 1);
+    }
+    return std::string(kind == 1 ? "draw " : "dispatch ") + std::to_string(which);
 }
 
 // The word the recorder writes before each op between the draws (host/gpu_markers.h): the last op the GPU's front end
@@ -7003,7 +7040,9 @@ void report_between_draws(std::uint32_t started) {
     host_log("gpu: AMD marker: of the ops between draws, the GPU's front end had reached op %u%s%s", reached, s.empty() ? "" : ": ",
              s.c_str());
     const unsigned kind = started >> 30;
-    if (kind != 1 && kind != 2) return;
+    // (A window's beginning, its ops noted as after it: the ops listed, nothing inferred of a draw.)
+    const bool window = kind == 0 && (started & 1);
+    if (kind != 1 && kind != 2 && !window) return;
     std::vector<std::string> lines;
     const gpu_markers::Reach r = recorder_reach_after(started, reached, lines, 24);
     const std::string what = marker_text(started);
@@ -7023,6 +7062,7 @@ void report_between_draws(std::uint32_t started) {
              r.known ? "" : "; the ring has moved past the first of them");
     for (const std::string& l : lines) host_log("gpu: AMD marker:   %s", l.c_str());
     if (r.ops > lines.size()) host_log("gpu: AMD marker:   (and %zu more)", static_cast<std::size_t>(r.ops - lines.size()));
+    if (window) return;
     if (r.holds) {
         host_log("gpu: AMD marker: past op %u, a barrier that holds the front end until the work before it has finished: %s had "
                  "finished, and the GPU stopped in the ops after that barrier up to op %u, or before the next marker (barriers hold "
@@ -7041,26 +7081,67 @@ void report_checkpoints() {
     if (!g.has_checkpoints) return;
     if (g.cmd_buffer_marker && g.marker_buf.map) {
         std::uint32_t started = 0, finished = 0;
-        std::memcpy(&started, g.marker_buf.map, 4);
-        std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + 4, 4);
+        std::memcpy(&started, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kStarted, 4);
+        std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kFinishedBefore, 4);
+        if (g_dry_buffer_marker) {
+            host_log("gpu: AMD markers: recorded only, the device has none to write - nothing to read (BBHOST_GPU_CHECKPOINTS=amd-dry, "
+                     "loading-dry)");
+            return;
+        }
         const auto say = [](const char* what, std::uint32_t v) {
             const unsigned kind = v >> 30;
             const std::uint64_t which = v & 0x3fffffff;
-            if (kind == kGpuMarkSubmission) {
-                host_log("gpu: AMD marker: the GPU had %s %s", what, submission_mark(which).c_str());
-                return;
-            }
-            host_log("gpu: AMD marker: the GPU had %s %s %llu", what, kind == 1 ? "draw" : kind == 2 ? "dispatch" : "(none yet)",
-                     static_cast<unsigned long long>(which));
+            host_log("gpu: AMD marker: the GPU had %s %s", what, marker_text(v).c_str());
             if (kind == 1) describe_draw_record(which);
             if (kind == 2) {
                 const char* n = g_dispatch_names[which % 256];
                 host_log("    dispatch[%llu] %s", static_cast<unsigned long long>(which), n ? n : "?");
             }
         };
-        say("finished everything before", finished);
-        say("started", started);
-        report_between_draws(started);
+        // Where the window was, as the words have it (host/gpu_markers.h read_words): a window's beginning and end
+        // write all three, so a loss after its end reads as such and never as the last op before it.
+        const bool loading_only = g_marker_mode == gpu_markers::Mode::kLoading;
+        const gpu_markers::Reading at = gpu_markers::read_words(started, finished);
+        switch (at.where) {
+        case gpu_markers::Where::kNothing:
+            if (loading_only) {
+                host_log("gpu: AMD markers: the GPU had reached none - they are written only while a loading screen is up, and this "
+                         "run's GPU work had not reached one's: the device was lost in the world or at the title, where the markers "
+                         "are off. BBHOST_GPU_CHECKPOINTS=amd writes them there too, at some cost to the frame rate");
+            } else {
+                host_log("gpu: AMD markers: the GPU had reached none yet");
+            }
+            return;
+        case gpu_markers::Where::kEnded:
+            host_log("gpu: AMD markers: the GPU's front end had passed %s: the device was lost in work recorded after that loading "
+                     "screen, in the world, where the markers are off - BBHOST_GPU_CHECKPOINTS=amd writes them there too, at some cost to "
+                     "the frame rate",
+                     marker_text(started).c_str());
+            if (at.finished_all) {
+                host_log("gpu: AMD markers: everything recorded before that end had finished");
+            } else {
+                say("finished everything before", finished);
+                host_log("gpu: AMD markers: not everything before that end had finished: the GPU may have stopped in the loading "
+                         "screen's last work from there on");
+            }
+            return;
+        case gpu_markers::Where::kBegun:
+            host_log("gpu: AMD markers: the GPU's front end had reached %s%s, and none of its draws or dispatches", marker_text(started).c_str(),
+                     loading_only ? " (a loading screen's)" : "");
+            if (!at.finished_all) say("finished everything before", finished);
+            report_between_draws(started);
+            return;
+        case gpu_markers::Where::kInside:
+            if (loading_only) {
+                host_log("gpu: AMD markers: the device was lost inside a loading screen's markers' window (the loading screen and the "
+                         "%llu ms after it)",
+                         static_cast<unsigned long long>(gpu_markers::kWindowGraceMs));
+            }
+            say("finished everything before", finished);
+            say("started", started);
+            report_between_draws(started);
+            return;
+        }
         return;
     }
     auto get_data = reinterpret_cast<PFN_vkGetQueueCheckpointDataNV>(vkGetDeviceProcAddr(g.device, "vkGetQueueCheckpointDataNV"));
@@ -7180,11 +7261,12 @@ void report_device_fault() {
     }
 }
 
-// A run that loses the device leaves a note beside the pipeline cache, and the
-// next kMarkedRuns starts run with the GPU's progress markers on (NVIDIA's
-// checkpoints, AMD's buffer markers): off by default for what they cost, they
-// are what names the draw the GPU was in when it is lost again - AMD's driver
-// has said nothing through VK_EXT_device_fault.
+// A run that loses the device leaves a note beside the pipeline cache, and
+// with BBHOST_GPU_CHECKPOINTS=after-loss the next kMarkedRuns starts run with
+// the GPU's progress markers everywhere (NVIDIA's checkpoints, AMD's buffer
+// markers) - what names the draw the GPU was in when it is lost again in the
+// world, where by default they are off for what they cost (AMD's driver has
+// said nothing through VK_EXT_device_fault).
 constexpr int kMarkedRuns = 3;
 std::string device_lost_note_path() {
     const char* root = hle_fs_data_root();
@@ -7251,7 +7333,13 @@ void device_lost_locked(const char* where, bool declared) {
         std::ofstream out(path, std::ios::trunc);
         out << "starts-left " << kMarkedRuns << '\n' << "flip " << flip << ", " << where << (hooks.empty() ? "" : ", with ") << hooks << '\n';
     }
-    if (!g.has_checkpoints) host_log("gpu: no progress markers this run; the next %d starts run with them", kMarkedRuns);
+    if (!g.has_checkpoints) {
+        const char* e = std::getenv("BBHOST_GPU_CHECKPOINTS");
+        host_log("gpu: no progress markers this run (%s%s)%s", e ? "BBHOST_GPU_CHECKPOINTS=" : "the driver has no buffer markers", e ? e : "",
+                 g_marker_after_loss ? "; the next starts run with them everywhere (BBHOST_GPU_CHECKPOINTS=after-loss)" : "");
+    } else if (g_marker_after_loss && g_marker_mode != gpu_markers::Mode::kAlways) {
+        host_log("gpu: the next %d starts run with the GPU's progress markers everywhere (BBHOST_GPU_CHECKPOINTS=after-loss)", kMarkedRuns);
+    }
     // Everything stops after this, so say what was in flight: the last draws
     // name the pipeline that faulted or hung.
     host_gpu_hang_report();  // with the command stream's last op (recorder.cpp)
@@ -14257,21 +14345,25 @@ void host_gpu_report() {
     }
     if (g.cmd_buffer_marker && g.marker_buf.map) {
         // The words once the GPU has run all it was given (a lost device answers at once): with nothing in flight
-        // they agree - the last started is the last finished before (the last submission's end, as a rule) - and the
-        // last op the front end reached is the last noted with a word, but for ops recorded and never submitted before
-        // the exit (the command processor runs ahead of the GPU uncapped) - so a start's exit line checks the markers
-        // themselves.
-        {
+        // they agree - the last started is the last finished before (the last submission's end, as a rule, or the
+        // last loading screen's window's end) - and the last op the front end reached is the last noted with a word,
+        // but for ops recorded and never submitted before the exit (the command processor runs ahead of the GPU
+        // uncapped) - so a start's exit line checks the markers themselves. (A window closed long before needs no
+        // wait: its end's words are the last written.)
+        const std::uint32_t windows = g_marker_windows.load(std::memory_order_relaxed);
+        const bool open = markers_live();
+        if (open) {
             QueueGuard queue;
             vkQueueWaitIdle(g.queue);
         }
         std::uint32_t started = 0, finished = 0, reached = 0;
-        std::memcpy(&started, g.marker_buf.map, 4);
+        std::memcpy(&started, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kStarted, 4);
         std::memcpy(&finished, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kFinishedBefore, 4);
         std::memcpy(&reached, static_cast<const std::uint8_t*>(g.marker_buf.map) + gpu_markers::kOpReached, 4);
-        host_log("gpu: AMD markers at exit: last started %s, everything finished before %s; ops between draws: the last the front end "
-                 "reached %u (the last noted with a word %u)",
-                 marker_text(started).c_str(), marker_text(finished).c_str(), reached, recorder_last_op_note());
+        host_log("gpu: AMD markers at exit (%s, %u window%s, the last %s): last started %s, everything finished before %s; ops between "
+                 "draws: the last the front end reached %u (the last noted with a word %u)",
+                 g_marker_mode == gpu_markers::Mode::kAlways ? "everywhere" : "in loading screens", windows, windows == 1 ? "" : "s",
+                 open ? "open" : "closed", marker_text(started).c_str(), marker_text(finished).c_str(), reached, recorder_last_op_note());
     }
     host_log("gpu: dispatches=%llu draws=%llu draw-failures=%llu flushes=%llu failures=%llu pipelines=%llu/%llu dummy-images=%llu gpu-time=%llu ms",
              static_cast<unsigned long long>(g.dispatches.load()), static_cast<unsigned long long>(g.draws.load()),

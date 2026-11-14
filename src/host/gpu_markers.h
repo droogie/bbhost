@@ -1,6 +1,7 @@
 // The GPU's progress markers between the draws, for a device-loss report
-// (VK_AMD_buffer_marker: on a start after a lost device, or with
-// BBHOST_GPU_CHECKPOINTS=amd; gpu.cpp gpu_write_markers).
+// (VK_AMD_buffer_marker, which NVIDIA's drivers have too: while a loading
+// screen is up by default, everywhere with BBHOST_GPU_CHECKPOINTS=amd;
+// gpu.cpp gpu_write_markers - the loading screens' window is at the end).
 //
 // Each draw and dispatch has two marker writes before it: the top of the pipe
 // (the GPU reached it) and the bottom (everything before it had finished). On
@@ -30,7 +31,7 @@
 // NVIDIA's GPUs a word between two copies or fills held them apart too (an RTX
 // 3070 Ti Laptop GPU, Central Yharnam uncapped, against the two words a draw
 // alone: 10.7% slower with those, 4.2% with a word before every op, 1.5% as
-// it is) - and the three starts after a loss run with the markers on.
+// it is).
 //
 // What the report infers from the op word rests on barriers holding the
 // front end: the GPU does not go past a pipeline barrier until the work its
@@ -124,6 +125,151 @@ Reach reach_after(const Ring<N>& ring, std::uint32_t started, std::uint32_t reac
         r.first = seq;
         if (seq != reached && c == kHolds && !r.holds) r.holds = seq;
     }
+    return r;
+}
+
+// ---- When they are written: the loading screens' window ----
+//
+// By default the markers are written only while a loading screen is up, and
+// nothing of them is written or done in the world. Losses come in loading
+// screens: four of five on one RTX 2060 under Windows were in or just after
+// one, most of them a Chalice Dungeon's - where the fast loading screens run
+// the GPU flat out, several hundred frames a second - and none of them named
+// where the GPU was, the markers being off. In the world they cost frames
+// (the 1.5% above); a loading screen's length is set by the work the game's
+// loaders do, not by how many frames show. BBHOST_GPU_CHECKPOINTS=amd writes
+// them everywhere, =0 never.
+enum class Mode : int { kOff, kLoading, kAlways };
+
+// What BBHOST_GPU_CHECKPOINTS asks (`env`, null when unset) on a device with
+// AMD's buffer markers (`buffer_markers`) or NVIDIA's checkpoints:
+//   unset        the buffer markers while a loading screen is up
+//   0            none, not even in loading screens
+//   amd          the buffer markers everywhere
+//   1            NVIDIA's checkpoints before every draw and dispatch instead
+//   after-loss   as unset, and a start after a lost device marks everything,
+//                for the three starts its note gives (gpu.cpp take_marked_start)
+//   amd-dry, loading-dry
+//                everywhere / in loading screens, recorded as they would be and
+//                the GPU's writes left out where the device has no buffer
+//                markers (lavapipe: a check of the recording)
+// Anything else is taken as unset, and said.
+struct Arming {
+    Mode mode = Mode::kOff;   // the buffer markers: when
+    bool dry = false;         // recorded only: the device has none to write
+    bool nv = false;          // NVIDIA's checkpoints instead
+    bool after_loss = false;  // a start after a lost device marks everything
+    bool unknown = false;     // a value not understood
+};
+inline Arming arming(const char* env, bool buffer_markers, bool nv_checkpoints) {
+    Arming a;
+    const Mode loading = buffer_markers ? Mode::kLoading : Mode::kOff;
+    const auto is = [env](const char* v) {
+        std::size_t i = 0;
+        for (; v[i]; ++i) {
+            if (env[i] != v[i]) return false;
+        }
+        return env[i] == 0;
+    };
+    if (!env || !*env) {
+        a.mode = loading;
+    } else if (env[0] == '0') {
+        // none
+    } else if (env[0] == '1') {
+        a.nv = nv_checkpoints;
+    } else if (is("amd")) {
+        a.mode = buffer_markers ? Mode::kAlways : Mode::kOff;
+    } else if (is("amd-dry")) {
+        a.mode = Mode::kAlways;
+        a.dry = !buffer_markers;
+    } else if (is("loading-dry")) {
+        a.mode = Mode::kLoading;
+        a.dry = !buffer_markers;
+    } else if (is("after-loss")) {
+        a.mode = loading;
+        a.after_loss = buffer_markers || nv_checkpoints;
+    } else {
+        a.mode = loading;
+        a.unknown = true;
+    }
+    return a;
+}
+// A start after a lost device with after-loss: everything marked, by the
+// buffer markers where there are any, NVIDIA's checkpoints otherwise.
+inline void after_loss_start(Arming& a, bool buffer_markers) {
+    if (buffer_markers) {
+        a.mode = Mode::kAlways;
+    } else {
+        a.nv = true;
+    }
+}
+
+// A window's own mark in the started and finished words: kind 0, which no
+// draw, dispatch or submission has, with its number and whether it begins or
+// ends there - never 0, what the buffer holds before anything is written.
+constexpr std::uint32_t window_value(std::uint32_t number, bool begins) {
+    return (number & 0x1fffffffu) << 1 | (begins ? 1u : 0u);
+}
+
+// How long a window stays open after the loading screen has gone: the command
+// processor records the game's frames a frame or two after the game made
+// them, so its last frames - and the world's first, where a loss right after
+// a load falls - come after the game has left the loading screen.
+constexpr std::uint64_t kWindowGraceMs = 200;
+
+// The command processor's window, stepped where each recording (a
+// submission) begins - where no draw, dispatch or run is open, so every one
+// is wholly in or out of it: it begins at the first recording after the
+// loading screen came up and ends at the first one kWindowGraceMs after it
+// went. step() returns the window's mark to record there (0: no change),
+// which the recorder meets in the stream's order: from a beginning it notes
+// the ops and writes their words, at an end it stops (recorder.cpp
+// record_marker_window), so the words always come from one side of it.
+struct Window {
+    bool open = false;
+    std::uint32_t number = 0;   // windows begun so far
+    bool going = false;         // open, the loading screen gone: since
+    std::uint64_t gone_ms = 0;  // (the clock is read only then)
+    std::uint32_t step(Mode mode, bool loading_screen, std::uint64_t now_ms) {
+        bool want = mode == Mode::kAlways || (mode == Mode::kLoading && loading_screen);
+        if (open && !want && mode == Mode::kLoading) {
+            if (!going) {
+                going = true;
+                gone_ms = now_ms;
+            }
+            if (now_ms - gone_ms < kWindowGraceMs) return 0;
+        }
+        going = false;
+        if (want == open) return 0;
+        open = want;
+        if (want && ((++number & 0x1fffffffu) == 0)) number = 1;
+        return window_value(number, want);
+    }
+    // Whether step() needs the clock: open, with the loading screen gone.
+    bool needs_clock(Mode mode, bool loading_screen) const { return open && mode == Mode::kLoading && !loading_screen; }
+};
+
+// What the started and finished words say of the window: nothing written
+// yet; the front end had reached a window's beginning and no draw or
+// dispatch of it; inside one (a draw's, a dispatch's or a submission's mark);
+// past a window's end, into work recorded without markers. `finished_all`:
+// everything recorded before that beginning or end had finished.
+enum class Where : int { kNothing, kBegun, kInside, kEnded };
+struct Reading {
+    Where where = Where::kNothing;
+    std::uint32_t window = 0;
+    bool finished_all = false;
+};
+constexpr Reading read_words(std::uint32_t started, std::uint32_t finished) {
+    Reading r;
+    if (!started) return r;
+    if (started >> 30) {
+        r.where = Where::kInside;
+        return r;
+    }
+    r.where = (started & 1) ? Where::kBegun : Where::kEnded;
+    r.window = (started & 0x3fffffffu) >> 1;
+    r.finished_all = finished == started;
     return r;
 }
 

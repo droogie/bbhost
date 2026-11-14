@@ -2713,6 +2713,17 @@ std::string depth_layouts_report();  // "" when off
 constexpr unsigned kGpuMarkSubmission = 3;
 void gpu_checkpoint(unsigned kind, std::uint64_t index);
 void gpu_checkpoint_cmd(VkCommandBuffer cmd, unsigned kind, std::uint64_t index);
+// AMD's markers are written in what the command processor records now: their
+// window is open (host/gpu_markers.h Window - a loading screen's by default).
+// It changes only where a recording begins (gpu.cpp markers_window_locked,
+// under g.mu), so a draw, a dispatch or a run is wholly in it or out of it,
+// and a run's parts read it as the run's.
+extern std::atomic<bool> g_markers_live;
+inline bool markers_live() { return g_markers_live.load(std::memory_order_relaxed); }
+// The draws are recorded in the recent-draw ring for the markers: NVIDIA's
+// checkpoints, or AMD's markers in their window (their draw numbers are the
+// ring's places).
+inline bool markers_record_draws() { return (g.has_checkpoints && !g.cmd_buffer_marker) || markers_live(); }
 // AMD's buffer markers: the 32-bit value for a kind and index, and the two
 // writes (the top of the pipe, then the bottom) into g.marker_buf.
 std::uint32_t gpu_marker_value(unsigned kind, std::uint64_t index);
@@ -3025,6 +3036,9 @@ public:
     void dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z);
     void dispatch_indirect(VkBuffer buffer, VkDeviceSize offset);
     void marker(std::uint32_t value);  // gpu_write_markers
+    // The markers' window begins or ends here (host/gpu_markers.h Window;
+    // `value` its window_value): recorder.cpp record_marker_window.
+    void marker_window(std::uint32_t value);
     void clear_depth_stencil_image(VkImage image, VkImageLayout layout, const VkClearDepthStencilValue& value, std::uint32_t n,
                                    const VkImageSubresourceRange* ranges);
     void copy_image(VkImage src, VkImageLayout src_layout, VkImage dst, VkImageLayout dst_layout, std::uint32_t n, const VkImageCopy* regions);

@@ -27677,9 +27677,10 @@ static bool draw_impl(const GpuDraw& d) {
     }
     draw_stamp.to(kRenderCostGeometry);
     if (g.cmd_buffer_marker) {
-        // A list-mode draw has no marker of its own - no number in the recent-draw ring, committed beside the command
-        // processor: its splice is an op the recorder notes, and the report names the draws marked around it.
-        if (!(run && run->list)) cmds.marker(gpu_marker_value(1, part ? run->record : g_draw_rec_next));
+        // In the markers' window (a loading screen's by default: host/gpu_markers.h). A list-mode draw has none of its
+        // own - no number in the recent-draw ring, committed beside the command processor: its splice is an op the
+        // recorder notes, and the report names the draws marked around it.
+        if (markers_live() && !(run && run->list)) cmds.marker(gpu_marker_value(1, part ? run->record : g_draw_rec_next));
     } else if (!(run && run->list)) {  // (stage 4b.1b: refused with NVIDIA's checkpoints - lists_commit)
         gpu_checkpoint(1, g_draw_rec_next);  // (a run is not forked with checkpoints recorded in place)
     }
@@ -28095,7 +28096,7 @@ static bool draw_impl(const GpuDraw& d) {
     }
     // The recent-draw ring (gpu_internal.h): tooling, the glitch hunt's, and
     // the GPU's progress markers, whose draw numbers are its places.
-    if ((host_tooling() || glitch_on() || g.has_checkpoints) && !(run && run->list)) {  // (a list-mode draw keeps none)
+    if ((host_tooling() || glitch_on() || markers_record_draws()) && !(run && run->list)) {  // (a list-mode draw keeps none)
         DrawRec& r = g_draw_recs[(part ? run->record : g_draw_rec_next++) % kDrawRecs];  // a run part's: its reserved number
         const std::size_t name_len = std::min<std::size_t>(pl.name.size(), sizeof(r.name) - 1);  // no snprintf: every draw
         std::memcpy(r.name, pl.name.data(), name_len);
@@ -28520,7 +28521,7 @@ int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uin
     const std::uint32_t params = g.queued;
     g.queued += kRunParamsEach * n;
     const std::uint64_t packets = recorder_reserve_packets(n);
-    const bool records = host_tooling() || glitch_on() || g.has_checkpoints;
+    const bool records = host_tooling() || glitch_on() || markers_record_draws();
     const std::uint64_t record = g_draw_rec_next;
     if (records) g_draw_rec_next += n;
     for (std::uint32_t i = 0; i < n; ++i) {
@@ -30747,9 +30748,13 @@ void host_gpu_hang_report() {
     }
     const std::uint64_t next = g_draw_rec_next;
     const std::uint64_t first = next > 6 ? next - 6 : 0;
-    host_log("hang: %llu draws recorded, %llu dispatches, %llu queued, pass %s",
+    // The recent-draw ring is kept for the progress markers only in their window (host/gpu_markers.h - a loading
+    // screen's by default): out of it, the draws it lists are that window's last, not the ones at this hang.
+    const bool kept = host_tooling() || glitch_on() || markers_record_draws();
+    host_log("hang: %llu draws recorded, %llu dispatches, %llu queued, pass %s%s",
              static_cast<unsigned long long>(g.draws.load()), static_cast<unsigned long long>(g.dispatches.load()),
-             static_cast<unsigned long long>(g.queued), g_pass.active ? "open" : "closed");
+             static_cast<unsigned long long>(g.queued), g_pass.active ? "open" : "closed",
+             next && !kept ? "; the draws below are the progress markers' last window's (a loading screen's), not this hang's" : "");
     for (std::uint64_t i = first; i < next; ++i) {
         const DrawRec& r = g_draw_recs[i % kDrawRecs];
         host_log("  hang draw[%llu] %s n=%u prim=%u vp=(%.0f,%.0f %.0fx%.0f) rt0=0x%llx tex=0x%llx,0x%llx",

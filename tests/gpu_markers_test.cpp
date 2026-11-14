@@ -6,6 +6,16 @@
 // after that draw, and the barrier among them past which the draw had
 // finished; other threads' notes in between left out, and nothing claimed
 // when the ring has moved past them.
+//
+// And when they are written: what BBHOST_GPU_CHECKPOINTS asks on devices with
+// and without buffer markers (by default only while a loading screen is up,
+// nothing in the world); the window's steps where recordings begin - opened
+// at the first after a loading screen came up, held for its grace after it
+// went and opened again only by the next, never in the world, and once for
+// good with =amd; its marks, which no draw's, dispatch's or submission's is
+// and never 0; and the words read back as the report reads them - nothing
+// reached, a window begun, inside one, past its end, and whether what came
+// before had finished.
 #include "host/gpu_markers.h"
 
 #include <cstdint>
@@ -115,6 +125,139 @@ int main() {
     // Nothing reached yet.
     r = reach_after(w, d5, 0, classify);
     check(r.known && r.ops == 0, "no op word yet");
+
+    // ---- When they are written ----
+    {
+        // Unset (null or empty): while a loading screen is up, where the device has buffer markers; nothing otherwise.
+        Arming a = arming(nullptr, true, true);
+        check(a.mode == Mode::kLoading && !a.dry && !a.nv && !a.after_loss && !a.unknown, "unset: loading screens");
+        a = arming("", true, false);
+        check(a.mode == Mode::kLoading && !a.unknown, "empty: as unset");
+        a = arming(nullptr, false, true);
+        check(a.mode == Mode::kOff && !a.nv && !a.after_loss, "unset without buffer markers: none, not NVIDIA's checkpoints either");
+        // =0: none at all, not even in loading screens.
+        a = arming("0", true, true);
+        check(a.mode == Mode::kOff && !a.nv && !a.after_loss && !a.dry, "=0: none");
+        // =amd: everywhere where there are buffer markers.
+        a = arming("amd", true, true);
+        check(a.mode == Mode::kAlways && !a.dry && !a.nv, "=amd: everywhere");
+        a = arming("amd", false, true);
+        check(a.mode == Mode::kOff && !a.nv, "=amd without buffer markers: none");
+        // =1: NVIDIA's checkpoints, no buffer markers.
+        a = arming("1", true, true);
+        check(a.nv && a.mode == Mode::kOff, "=1: NVIDIA's checkpoints instead");
+        a = arming("1", true, false);
+        check(!a.nv && a.mode == Mode::kOff, "=1 without them: none");
+        // The dry ones: recorded where the device has none.
+        a = arming("amd-dry", false, false);
+        check(a.mode == Mode::kAlways && a.dry, "=amd-dry on lavapipe: everywhere, recorded only");
+        a = arming("amd-dry", true, false);
+        check(a.mode == Mode::kAlways && !a.dry, "=amd-dry with buffer markers: written");
+        a = arming("loading-dry", false, false);
+        check(a.mode == Mode::kLoading && a.dry, "=loading-dry on lavapipe: loading screens, recorded only");
+        a = arming("loading-dry", true, false);
+        check(a.mode == Mode::kLoading && !a.dry, "=loading-dry with buffer markers: written");
+        // =after-loss: loading screens, and the starts after a loss everything - by buffer markers first.
+        a = arming("after-loss", true, true);
+        check(a.mode == Mode::kLoading && a.after_loss && !a.nv, "=after-loss: loading screens, and armed");
+        after_loss_start(a, true);
+        check(a.mode == Mode::kAlways && !a.nv, "a start after a loss: everywhere, by buffer markers");
+        a = arming("after-loss", false, true);
+        check(a.mode == Mode::kOff && a.after_loss, "=after-loss with NVIDIA's checkpoints alone: armed");
+        after_loss_start(a, false);
+        check(a.nv && a.mode == Mode::kOff, "a start after a loss: NVIDIA's checkpoints");
+        a = arming("after-loss", false, false);
+        check(!a.after_loss && a.mode == Mode::kOff, "=after-loss with neither: nothing to arm");
+        // Not understood: as unset, and said. A prefix of a value is not the value.
+        a = arming("amdx", true, false);
+        check(a.unknown && a.mode == Mode::kLoading, "a value not understood: as unset");
+        a = arming("am", true, false);
+        check(a.unknown && a.mode == Mode::kLoading, "a prefix of amd is not amd");
+        a = arming("after", true, false);
+        check(a.unknown && !a.after_loss, "a prefix of after-loss is not after-loss");
+        a = arming("amd-dryer", false, false);
+        check(a.unknown && !a.dry && a.mode == Mode::kOff, "amd-dry with more after it is not amd-dry");
+    }
+    {
+        // The marks: kind 0, never 0, the beginning's low bit set, the number above it; apart from every draw's,
+        // dispatch's and submission's.
+        static const std::uint32_t kNumbers[] = {1u, 2u, 3u, 1000u, 0x1fffffffu};
+        for (std::uint32_t n : kNumbers) {
+            const std::uint32_t b = window_value(n, true), e = window_value(n, false);
+            check(b && e && b != e, "a window's marks are not 0 and not each other", n);
+            check((b >> 30) == 0 && (e >> 30) == 0, "kind 0: no draw's, dispatch's or submission's", n);
+            check((b & 1) && !(e & 1), "the beginning's low bit", n);
+            check(read_words(b, b).window == n && read_words(e, e).window == n, "the number read back", n);
+            for (unsigned kind = 1; kind < 4; ++kind) check(window_value(n, true) != mark(kind, n), "not a draw's, dispatch's or submission's", n);
+        }
+    }
+    {
+        // =0 (or a device without buffer markers): the window never opens, loading screen or not.
+        Window w;
+        bool any = false;
+        for (int k = 0; k < 50; ++k) any = any || w.step(Mode::kOff, k % 3 == 0, 1000u * k);
+        check(!any && !w.open && w.number == 0, "never opens with the markers off");
+        // =amd: open at the first recording, for good.
+        Window al;
+        check(al.step(Mode::kAlways, false, 0) == window_value(1, true) && al.open, "=amd: opens at the first recording");
+        any = false;
+        for (int k = 0; k < 50; ++k) any = any || al.step(Mode::kAlways, k % 2 == 0, 1000u * k);
+        check(!any && al.open && al.number == 1, "=amd: never ends, never begins again");
+        check(!al.needs_clock(Mode::kAlways, false), "=amd: no clock read");
+    }
+    {
+        // By default: the world (nothing), a loading screen (opens at once), its end (held for the grace), the world.
+        Window w;
+        check(w.step(Mode::kLoading, false, 100) == 0 && !w.open, "the world: closed");
+        check(!w.needs_clock(Mode::kLoading, false), "the world: no clock read while closed");
+        check(w.step(Mode::kLoading, true, 200) == window_value(1, true) && w.open, "a loading screen: opens at the first recording");
+        check(w.step(Mode::kLoading, true, 300) == 0 && w.open, "open while it is up");
+        check(!w.needs_clock(Mode::kLoading, true), "no clock read while it is up");
+        check(w.needs_clock(Mode::kLoading, false), "the clock read once it has gone");
+        check(w.step(Mode::kLoading, false, 1000) == 0 && w.open, "gone: still open (the grace)");
+        check(w.step(Mode::kLoading, false, 1000 + kWindowGraceMs - 1) == 0 && w.open, "open to the grace's last ms");
+        check(w.step(Mode::kLoading, false, 1000 + kWindowGraceMs) == window_value(1, false) && !w.open, "closed at the grace's end");
+        check(w.step(Mode::kLoading, false, 5000) == 0 && !w.open, "the world after it: closed");
+        // The next loading screen: window 2; back during its grace: still open, the grace counted afresh from the next end.
+        check(w.step(Mode::kLoading, true, 6000) == window_value(2, true), "the next loading screen: window 2");
+        check(w.step(Mode::kLoading, false, 7000) == 0, "gone");
+        check(w.step(Mode::kLoading, true, 7100) == 0 && w.open, "up again within the grace: the same window");
+        check(w.step(Mode::kLoading, false, 8000) == 0 && w.open, "gone again: the grace from now");
+        check(w.step(Mode::kLoading, false, 8000 + kWindowGraceMs - 1) == 0 && w.open, "not the first gone's grace");
+        check(w.step(Mode::kLoading, false, 8000 + kWindowGraceMs) == window_value(2, false) && !w.open, "closed at the second grace's end");
+        check(w.number == 2, "two windows");
+        // The count's wrap: never a 0 mark.
+        Window wrap;
+        wrap.number = 0x1fffffffu;
+        const std::uint32_t v = wrap.step(Mode::kLoading, true, 0);
+        check(v && v == window_value(1, true), "the number skips 0 as it wraps");
+    }
+    {
+        // The words as the report reads them.
+        Reading r = read_words(0, 0);
+        check(r.where == Where::kNothing, "nothing written: nothing reached");
+        r = read_words(mark(1, 77), mark(1, 76));
+        check(r.where == Where::kInside, "a draw's: inside a window");
+        r = read_words(mark(2, 5), mark(1, 76));
+        check(r.where == Where::kInside, "a dispatch's: inside");
+        r = read_words(mark(3, 4 * 9 + 1), mark(1, 76));
+        check(r.where == Where::kInside, "a submission's: inside");
+        r = read_words(window_value(5, true), window_value(5, true));
+        check(r.where == Where::kBegun && r.window == 5 && r.finished_all, "a beginning reached, all before it finished");
+        r = read_words(window_value(5, true), window_value(4, false));
+        check(r.where == Where::kBegun && !r.finished_all, "a beginning reached, the work before it not all finished");
+        r = read_words(window_value(5, false), window_value(5, false));
+        check(r.where == Where::kEnded && r.window == 5 && r.finished_all, "past an end, all before it finished");
+        r = read_words(window_value(5, false), mark(1, 900));
+        check(r.where == Where::kEnded && r.window == 5 && !r.finished_all, "past an end, its last work not all finished");
+        // A window's marks from its steps, read back.
+        Window w;
+        const std::uint32_t begun = w.step(Mode::kLoading, true, 0);
+        check(read_words(begun, begun).where == Where::kBegun && read_words(begun, begun).window == 1, "the step's beginning reads as one");
+        w.step(Mode::kLoading, false, 10);
+        const std::uint32_t ended = w.step(Mode::kLoading, false, 10 + kWindowGraceMs);
+        check(read_words(ended, ended).where == Where::kEnded && read_words(ended, ended).window == 1, "the step's end reads as one");
+    }
 
     if (g_failures) {
         std::printf("gpu_markers_test: %d failures\n", g_failures);

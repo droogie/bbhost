@@ -83,7 +83,8 @@ const char* stream::op_name(stream::Op op) {
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
                                         "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker",
-                                        "push buffers",   "list draw",    "execute commands", "list run",      "update buffer"};
+                                        "push buffers",   "list draw",    "execute commands", "list run",      "update buffer",
+                                        "marker window"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -422,6 +423,12 @@ std::atomic<std::uint64_t> g_list_binds_skipped{0}, g_list_chained{0};
 // their execution.
 gpu_markers::Ring<4096> g_op_notes;  // under g_op_notes_mu
 std::mutex g_op_notes_mu;
+// The markers' window as the replay has met it (host/gpu_markers.h Window):
+// set at a beginning and cleared at an end (record_marker_window), by whichever
+// thread replays them in the stream's order - bb-record, or the command
+// processor where the ops are recorded in place - so the ops between them,
+// and none outside, are noted and get their words.
+std::atomic<bool> g_ops_live{false};
 thread_local std::uint32_t t_after = 0;            // the last draw or dispatch marker replayed on this thread
 thread_local std::uint32_t t_dispatch_marker = 0;  // a dispatch's marker, waiting for its dispatch (the notes' "after")
 thread_local bool t_secondary_pass = false;        // in a pass of secondary command buffers alone
@@ -490,12 +497,13 @@ bool word_on(Op kind) {
     case Op::kDispatch:
     case Op::kDispatchIndirect:
     case Op::kExecuteCommands:
-    case Op::kForeignSubmit: return true;
+    case Op::kForeignSubmit:
+    case Op::kMarkerWindow: return true;
     default: return false;
     }
 }
 void op_marker(VkCommandBuffer cmd, Op kind, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0) {
-    if (!g.cmd_buffer_marker || t_secondary_pass) return;
+    if (!g_ops_live.load(std::memory_order_relaxed) || t_secondary_pass) return;
     std::uint32_t seq;
     std::string traced;
     {
@@ -512,6 +520,38 @@ void op_marker(VkCommandBuffer cmd, Op kind, std::uint64_t a = 0, std::uint64_t 
         host_log("marker trace: op %u: %s", seq, recorder_op_note_text_locked(*g_op_notes.find(seq)).c_str());
     }
     if (word_on(kind)) gpu_write_op_marker(cmd, seq);
+}
+// The markers' window begins or ends here (host/gpu_markers.h Window, its
+// mark `value`): noted as an op, and its mark written into all three words -
+// the started and finished words (top and bottom of the pipe: the front end
+// reached it, and everything before it had finished) and the op word - so a
+// loss past it reads as past it, whatever the words said before. From a
+// beginning the ops are noted as after it; at an end nothing more is written
+// until the next beginning.
+void record_marker_window(VkCommandBuffer cmd, std::uint32_t value) {
+    if (!g.cmd_buffer_marker) return;
+    const bool begins = (value & 1) != 0;
+    if (begins) {
+        g_ops_live.store(true, std::memory_order_relaxed);
+        t_after = value;
+    }
+    t_dispatch_marker = 0;
+    std::uint32_t seq;
+    {
+        std::lock_guard<std::mutex> lk(g_op_notes_mu);
+        seq = g_op_notes.note(static_cast<std::uint16_t>(Op::kMarkerWindow), t_after, value >> 1, begins ? 1 : 0, 0);
+    }
+    gpu_write_markers(cmd, value);
+    gpu_write_op_marker(cmd, seq);
+    static std::atomic<int> traced{0};
+    if (!marker_trace().prefix.empty() && traced.fetch_add(1, std::memory_order_relaxed) < 8) {
+        host_log("marker trace: op %u: the markers' window %u %s", seq, value >> 1, begins ? "begins" : "ends");
+    }
+    if (!begins) {
+        g_ops_live.store(false, std::memory_order_relaxed);
+        t_after = 0;
+        t_tracing = false;
+    }
 }
 bool secondary_only(VkRenderingFlags flags) {
     return (flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) && !(flags & VK_RENDERING_CONTENTS_INLINE_BIT_KHR);
@@ -951,6 +991,7 @@ void replay_block(const Block& b) {
             if ((value >> 30) == 2) t_dispatch_marker = value;  // a dispatch's: the ops after its dispatch are noted as after it
             break;
         }
+        case Op::kMarkerWindow: record_marker_window(cmd, reinterpret_cast<const stream::Marker*>(p)->value); break;
         case Op::kCopyImage: {
             const auto* r = reinterpret_cast<const stream::CopyImage*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
@@ -1432,6 +1473,7 @@ std::string recorder_op_note_text_locked(const gpu_markers::Note& n) {
     case Op::kDispatchIndirect: std::snprintf(w, sizeof(w), "the host's own, arguments in buffer 0x%llx at %llu", a, b); break;
     case Op::kPushBuffers: std::snprintf(w, sizeof(w), "buffer 0x%llx and %llu more into set %llu", a, c ? c - 1 : 0, b); break;
     case Op::kForeignSubmit: std::snprintf(w, sizeof(w), "the presenter's command buffer, its %s", a ? "end" : "start"); break;
+    case Op::kMarkerWindow: std::snprintf(w, sizeof(w), "the markers' window %llu %s", a, b ? "begins" : "ends"); break;
     default: break;
     }
     const unsigned kind = n.after >> 30;
@@ -2103,9 +2145,18 @@ void Rec::push_buffers(VkPipelineBindPoint bind_point, VkPipelineLayout layout, 
 }
 
 void Rec::marker(std::uint32_t value) {
+    if (!markers_live()) return;  // outside the markers' window (host/gpu_markers.h): nothing
     if (!stream_on()) return gpu_write_markers(in_place(REC_SITE), value);
     before_op(REC_SITE);
     std::uint8_t* at = append_record(Op::kMarker, sizeof(stream::Marker));
+    *put_struct<stream::Marker>(at) = stream::Marker{value, 0};
+    after_op();
+}
+
+void Rec::marker_window(std::uint32_t value) {
+    if (!stream_on()) return record_marker_window(in_place(REC_SITE), value);
+    before_op(REC_SITE);
+    std::uint8_t* at = append_record(Op::kMarkerWindow, sizeof(stream::Marker));
     *put_struct<stream::Marker>(at) = stream::Marker{value, 0};
     after_op();
 }

@@ -464,7 +464,7 @@ void device_lost_exit(bool windowed) {
         } else if (const std::string hooks = host_foreign_hooks(); !hooks.empty()) {
             text += "Hooked into bbhost: " + hooks + ". Overlays like these can cause this; try again without them.\n\n";
         }
-        text += "The next starts record where the GPU was, so if it happens again the log says more. Please send the log "
+        text += "Loading screens record where the GPU was, so if it happens again in one, the log says more. Please send the log "
                 "(run-bbhost.bat writes it to the logs folder).";
         // The box on a thread of its own: the exit goes on after a while even
         // if nobody closes it.
