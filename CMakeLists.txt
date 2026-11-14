@@ -1006,6 +1006,7 @@ if(UNIX)
   # Stage 4b.3c: the index of live homes by address and its page filter, against a plain list (host/gxvk_homes_index.h).
   add_executable(gxvk_homes_test tests/gxvk_homes_test.cpp)
   target_include_directories(gxvk_homes_test PRIVATE src include)
+  target_link_libraries(gxvk_homes_test PRIVATE Threads::Threads)
   add_test(NAME gxvk_homes_test COMMAND gxvk_homes_test)
   add_executable(gxvk_rest_test tests/gxvk_rest_test.cpp)
   target_include_directories(gxvk_rest_test PRIVATE src include)

@@ -1273,7 +1273,11 @@ memory at its first use, unless that use is a copy-back over all of it.
 What reads a home without a handle - a dispatch, a copy, a device address -
 finds it by address; a CPU copy of its stale guest bytes is refused; a
 page-table walk that reads it gets it copied back to its memory first, and
-it stays the home. A home ends with its buffer, and a buffer made past the
+it stays the home. The command processor's index of the homes by address
+changes in place, so the draw pool's threads read a copy published for them
+instead - the homes touching each 4 KiB page as an immutable list swapped by
+pointer, freed once no reader can hold it, a run of changes seen whole or not
+at all - and change nothing. A home ends with its buffer, and a buffer made past the
 pool's budget (128 MiB, `BBHOST_GXVK_HOMES_BUDGET_MB`) takes today's path for
 its life. Off on an integrated GPU, and with small video memory under 5,000
 MiB free at the start unless a budget is given (on a 4 GB card the pool's ~80
