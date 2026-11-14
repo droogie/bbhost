@@ -647,8 +647,16 @@ a panel at the bottom right that leaves the world in view (photo mode's).
   out of both until let go. A corner panel takes only the buttons and keys it
   moves by; the plugin's own `pad` and `input` still read the rest.
 - The overlay (F9, F10) opens over a menu and hides it until it closes. The
-  game's own menus cannot be opened while a centred menu has the input; one
-  the game opens itself (a message, a death) shows under it.
+  game's own menus cannot be opened while a centred menu has the input; a
+  message the game shows itself (an item picked up, a notice) shows under it
+  and leaves it up.
+- The game's own interruptions close a centred menu: a loading screen coming
+  up (lamp travel, the one after a death), a cutscene starting, or the
+  player's character dying. `panel_state` then reads `shown` 0 and `closed`
+  1, as when the player closes it, and a text box or a yes/no open on it goes
+  with it. One already under way when the menu opens (a load, a cutscene, the
+  death's screen) leaves it up. A corner panel stays: the plugin takes it
+  down when it should (photo mode ends itself at a load or a cutscene).
 - The world keeps running while a menu is up, unless the plugin holds it with
   `world_pause`.
 - Turning the plugin off takes its menu down.

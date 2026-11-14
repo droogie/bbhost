@@ -115,4 +115,15 @@ int Nav::back() {
     return row;
 }
 
+const char* Interruptions::step(const World& now) {
+    const World before = was;
+    was = now;
+    const auto came = [&](std::uint32_t flag) { return (now.flags & flag) && !(before.flags & flag); };
+    const auto dead = [](const World& w) { return (w.flags & BB_WORLD_IN) && w.hp == 0; };
+    if (came(BB_WORLD_LOADING)) return "a loading screen";
+    if (came(BB_WORLD_CUTSCENE)) return "a cutscene";
+    if (dead(now) && !dead(before)) return "the character's death";
+    return nullptr;
+}
+
 }  // namespace plugin_menu

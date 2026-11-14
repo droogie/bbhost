@@ -13,7 +13,9 @@
 // the pointer, which is free while it is up. A centred menu has every input
 // while it is up; a corner panel those buttons and keys, which the game and
 // the plugins' pad and input then do not read (host/window.cpp). One menu at
-// a time.
+// a time. The game's own interruptions - a loading screen coming up, a
+// cutscene starting, the player's character dying - close a centred menu
+// (plugin_panel_world); a corner panel is its plugin's to take down.
 
 #include <cstdint>
 #include <string>
@@ -52,12 +54,20 @@ void plugin_panel_hide(const std::string& name);
 
 struct PluginPanelState {
     bool shown = false;
-    bool closed = false;  // the player closed it since the last call
+    bool closed = false;  // the player closed it since the last call, or the game did (plugin_panel_world)
     std::string page;
 };
-// Whether `name`'s panel is up, whether the player closed it since the last
-// call (which clears that), and the page shown or shown last.
+// Whether `name`'s panel is up, whether it was closed since the last call
+// (which clears that), and the page shown or shown last.
 void plugin_panel_state(const std::string& name, PluginPanelState& out);
+
+// The world's signals, once a frame from the game's thread (plugins_frame):
+// BbWorldState's flags and the player's character's hit points (-1 with
+// none loaded). A centred menu up when a loading screen comes up, a cutscene
+// starts or the character dies (host/plugin_menu.h Interruptions) closes as
+// the player closes it - shown 0, closed 1 - without its sound; a corner
+// panel stays.
+void plugin_panel_world(std::uint32_t flags, std::int64_t hp);
 
 // Any plugin's panel is up: the pad, the keys and the pointer go to it.
 bool plugin_panel_shown();
@@ -81,6 +91,10 @@ void plugin_panel_preload();
 // the presenter's thread, while no menu is up. `pad` is the controller in use
 // (the guide for it).
 void plugin_panel_draw(float scale, bool pad);
+// The presenter's thread, every frame the menus could draw: a TEXT row's
+// box or a yes/no left open when their menu went (the game closed it, or its
+// plugin took it down) go with it.
+void plugin_panel_settle();
 
 // The game's menu sound the panel asks for since the last call (the cursor
 // moved, a value changed, a page turned, Defaults pressed, the panel up or

@@ -45,7 +45,8 @@ struct Panel {
 };
 std::mutex g_mu;
 Panel g_panel;                                     // under g_mu
-std::map<std::string, bool> g_closed;              // under g_mu: closed by the player since its plugin last asked
+std::map<std::string, bool> g_closed;              // under g_mu: closed (the player, the game) since its plugin last asked
+plugin_menu::Interruptions g_interruptions;        // under g_mu: the world's last frame (plugin_panel_world)
 std::map<std::string, std::string> g_last_page;    // under g_mu: the menu page each plugin's panel showed last
 std::map<std::string, plugin_menu::Runtime> g_runtime;  // under g_mu: what each plugin set at run time
 std::map<std::string, std::shared_ptr<const plugin_menu::Layout>> g_layouts;  // under g_mu: each plugin's, read once
@@ -197,6 +198,17 @@ void plugin_panel_state(const std::string& name, PluginPanelState& out) {
     out.closed = it != g_closed.end() && it->second;
     if (it != g_closed.end()) it->second = false;
     out.page = out.shown ? g_panel.nav.shown() : g_last_page[name];
+}
+
+void plugin_panel_world(std::uint32_t flags, std::int64_t hp) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    const char* why = g_interruptions.step({flags, hp});
+    if (!why || !g_shown.load() || g_panel.owner.empty() || g_panel.corner) return;
+    g_closed[g_panel.owner] = true;
+    host_log("plugin: %s's menu closed by %s", g_panel.owner.c_str(), why);
+    g_panel.owner.clear();
+    g_exclusive.store(false);
+    g_shown.store(false);
 }
 
 bool plugin_panel_rows(const std::string& name, const std::string& page, const std::vector<PluginOptionDesc>& rows) {
@@ -787,6 +799,20 @@ struct Typing {
 } g_typing;
 
 }  // namespace
+
+void plugin_panel_settle() {
+    if (!g_typing.on && !g_confirm.on) return;
+    std::string owner;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_shown.load()) owner = g_panel.owner;
+    }
+    if (g_typing.on && g_typing.owner != owner) {
+        host_text_entry_end();
+        g_typing.on = false;
+    }
+    if (g_confirm.on && g_confirm.owner != owner) g_confirm.on = false;
+}
 
 void plugin_panel_draw(float scale, bool pad) {
     if (!g_shown.load(std::memory_order_relaxed)) return;
@@ -1456,6 +1482,8 @@ void plugin_panel_draw(float scale, bool pad) {
 }
 
 #else
+
+void plugin_panel_settle() {}
 
 void plugin_panel_draw(float, bool) {}
 

@@ -8,11 +8,19 @@
 // run-time row's change comes with its page ("lamps/sort", "lamp/rename")
 // and the list is set again in that order, by that name; travel (a CONFIRM
 // row) updates two values (panel_value); its own page list goes in the
-// corner (panel_show with pages and BB_PANEL_CORNER).
+// corner (panel_show with pages and BB_PANEL_CORNER). Then its menus in the
+// host's panel (host/plugin_panel.cpp, on a catalog of this test's) through
+// the world's states frame by frame: a loading screen coming up, a cutscene
+// starting and the character dying close a centred menu - panel_state reads
+// shown 0 and closed 1, once - while one under way when it opened, the
+// game's messages and menus, a pause and other players do not, and a corner
+// panel stays through all of them.
 //
 //   plugin_menus_test <menu_demo.so>
 #include "bbhost_plugin.h"
+#include "host/game_menu_art.h"
 #include "host/plugin_menu.h"
+#include "host/plugin_panel.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -150,7 +158,21 @@ std::string labels(const Rows* r, int* count = nullptr) {
     return s;
 }
 
+std::vector<PluginEntry> g_catalog;  // what plugins_catalog gives host/plugin_panel.cpp
+
+PluginPanelState panel_state() {
+    PluginPanelState st;
+    plugin_panel_state("menu_demo", st);
+    return st;
+}
+
 }  // namespace
+
+// host/plugin_panel.cpp's catalog: the test plugin's table.
+std::vector<PluginEntry> plugins_catalog() { return g_catalog; }
+namespace game_menu_art {
+void preload() {}
+}  // namespace game_menu_art
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -179,8 +201,9 @@ int main(int argc, char** argv) {
         CHECK(H.rows.empty() && !H.option_fn);
     }
     // ---- its table as the host reads it
+    std::vector<PluginOptionDesc> table;
     {
-        std::vector<PluginOptionDesc> t;
+        std::vector<PluginOptionDesc>& t = table;
         for (const BbOption* o = p.options; o->type; ++o) {
             PluginOptionDesc d;
             d.type = o->type & 0xffu;
@@ -249,6 +272,106 @@ int main(int argc, char** argv) {
     H.action_fn("corner", nullptr);
     CHECK(H.shows == 1 && H.shown_page == "tools" && (H.shown_flags & BB_PANEL_CORNER));
     CHECK(H.shown_pages.size() == 2 && H.shown_pages[0] == "tools" && H.shown_pages[1] == "lamps");
+    // ---- the game's own interruptions (host/plugin_menu.h), frame by frame
+    {
+        constexpr std::uint32_t kIn = BB_WORLD_IN, kLoad = BB_WORLD_LOADING, kCut = BB_WORLD_CUTSCENE;
+        plugin_menu::Interruptions w;
+        const auto step = [&](std::uint32_t flags, std::int64_t hp) {
+            const char* why = w.step({flags, hp});
+            return std::string(why ? why : "-");
+        };
+        CHECK(step(kIn, 76) == "-");
+        CHECK(step(kLoad, 76) == "a loading screen");
+        CHECK(step(kLoad, 76) == "-");  // still up: once
+        CHECK(step(kIn, 76) == "-");    // the world again
+        CHECK(step(kIn | kCut, 76) == "a cutscene");
+        CHECK(step(kIn | kCut, 76) == "-");
+        CHECK(step(kIn, 76) == "-");
+        CHECK(step(kIn | BB_WORLD_MENU, 40) == "-");  // a message, a hit
+        CHECK(step(kIn | BB_WORLD_PAUSED | BB_WORLD_OPEN | BB_WORLD_VISITING, 40) == "-");
+        CHECK(step(kIn, -1) == "-");  // no character read
+        CHECK(step(kIn, 0) == "the character's death");
+        CHECK(step(kIn, 0) == "-");  // dead still: once
+        CHECK(step(kLoad, 0) == "a loading screen");  // the load after it
+        CHECK(step(0, 0) == "-");    // out of the world, 0 HP is no death
+        CHECK(step(kLoad | kCut, 76) == "a loading screen");  // both at once: one interruption
+        CHECK(step(0, 0) == "-");    // the title, its record at 0 HP: no death
+    }
+    {
+        PluginEntry e;
+        e.name = "menu_demo";
+        e.options = table;
+        g_catalog = {e};
+        constexpr std::uint32_t kIn = BB_WORLD_IN;
+        PluginPanelShow centred, corner;
+        centred.page = "lamps";
+        corner.page = "tools";
+        corner.corner = true;
+        // In the world, a centred menu up: the game's messages and menus, a
+        // pause, a player on the way or visiting - none closes it.
+        plugin_panel_world(kIn, 76);
+        CHECK(plugin_panel_show("menu_demo", centred));
+        for (const std::uint32_t f : {kIn | BB_WORLD_MENU, kIn, kIn | BB_WORLD_PAUSED, kIn | BB_WORLD_OPEN, kIn | BB_WORLD_VISITING, kIn})
+            plugin_panel_world(f, 76);
+        plugin_panel_world(kIn, 40);  // hit, not dead
+        PluginPanelState st = panel_state();
+        CHECK(st.shown && !st.closed && plugin_panel_exclusive());
+        // A loading screen comes up (lamp travel): closed as the player closes it, read once.
+        plugin_panel_world(BB_WORLD_LOADING, 40);
+        st = panel_state();
+        CHECK(!st.shown && st.closed && st.page == "lamps");
+        CHECK(!plugin_panel_shown() && !plugin_panel_exclusive());
+        st = panel_state();
+        CHECK(!st.shown && !st.closed);
+        // Opened during the load: it stays through the load and the world's coming in.
+        CHECK(plugin_panel_show("menu_demo", centred));
+        plugin_panel_world(BB_WORLD_LOADING, 40);
+        plugin_panel_world(kIn, 76);
+        st = panel_state();
+        CHECK(st.shown && !st.closed);
+        // A cutscene starts.
+        plugin_panel_world(kIn | BB_WORLD_CUTSCENE, 76);
+        st = panel_state();
+        CHECK(!st.shown && st.closed);
+        // Opened during it: it stays through the cutscene and its end.
+        CHECK(plugin_panel_show("menu_demo", centred));
+        plugin_panel_world(kIn | BB_WORLD_CUTSCENE, 76);
+        plugin_panel_world(kIn, 76);
+        CHECK(panel_state().shown);
+        // Taken down by its plugin (not "closed"); a cutscene and a load come
+        // with nothing up, and a menu opened during that load stays.
+        plugin_panel_hide("menu_demo");
+        st = panel_state();
+        CHECK(!st.shown && !st.closed);
+        plugin_panel_world(kIn | BB_WORLD_CUTSCENE, 76);
+        plugin_panel_world(BB_WORLD_LOADING, 76);
+        CHECK(plugin_panel_show("menu_demo", centred));
+        plugin_panel_world(BB_WORLD_LOADING, 76);
+        plugin_panel_world(kIn, 76);
+        st = panel_state();
+        CHECK(st.shown && !st.closed);
+        // The character dies.
+        plugin_panel_world(kIn, 0);
+        st = panel_state();
+        CHECK(!st.shown && st.closed);
+        // Opened on the death's screen: it stays until the load after it comes up.
+        CHECK(plugin_panel_show("menu_demo", centred));
+        plugin_panel_world(kIn, 0);
+        CHECK(panel_state().shown);
+        plugin_panel_world(BB_WORLD_LOADING, 0);
+        st = panel_state();
+        CHECK(!st.shown && st.closed);
+        // A corner panel stays through every one of them; its plugin takes it down (not "closed").
+        plugin_panel_world(kIn, 76);
+        CHECK(plugin_panel_show("menu_demo", corner));
+        for (const std::uint32_t f : {BB_WORLD_LOADING, kIn, kIn | BB_WORLD_CUTSCENE, kIn}) plugin_panel_world(f, 76);
+        plugin_panel_world(kIn, 0);
+        st = panel_state();
+        CHECK(st.shown && !st.closed && !plugin_panel_exclusive());
+        plugin_panel_hide("menu_demo");
+        st = panel_state();
+        CHECK(!st.shown && !st.closed);
+    }
     if (g_failures) {
         std::printf("plugin_menus_test: %d failure(s)\n", g_failures);
         return 1;

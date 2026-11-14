@@ -10,6 +10,7 @@
 
 #include "host/plugins.h"
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -93,6 +94,25 @@ struct Nav {
     // to, the one that opened it - or -1 when the shown page is the cycle's:
     // the menu closes.
     int back();
+};
+
+// The world on a frame, as the host reads it for the game's own
+// interruptions of a centred menu (host/plugin_panel.h).
+struct World {
+    std::uint32_t flags = 0;  // BbWorldState's BB_WORLD_*
+    std::int64_t hp = -1;     // the player's character's hit points; -1 with none loaded
+};
+// The game's own interruptions of a centred menu: a loading screen coming
+// up, a cutscene starting, the player's character dying (0 HP in the
+// world). Fed every frame, a menu up or not. The game's messages and menus
+// (BB_WORLD_MENU), a pause and other players are none.
+struct Interruptions {
+    World was;
+    // This frame's world: the interruption that came since the last frame -
+    // "a loading screen", "a cutscene" or "the character's death" - or
+    // nullptr. Only a change counts: one already under way when a menu opens
+    // (a load, a cutscene, the death's screen) leaves it up.
+    const char* step(const World& now);
 };
 
 }  // namespace plugin_menu

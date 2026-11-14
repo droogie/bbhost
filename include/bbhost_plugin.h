@@ -485,7 +485,8 @@ typedef struct BbPanel {
 typedef struct BbPanelState {
     uint32_t size;      /* set to sizeof(BbPanelState) before the call: the host fills as much as both know */
     int32_t shown;      /* 1 while the panel is up */
-    int32_t closed;     /* 1 when the player closed it (Circle, Escape) since the last call */
+    int32_t closed;     /* 1 when it closed since the last call: the player closed it (Circle, Escape), or the
+                           game did - a centred menu at a loading screen, a cutscene or the character's death */
     char page[32];      /* the page shown or shown last: its heading's key */
 } BbPanelState;
 
@@ -1115,15 +1116,20 @@ typedef struct BbHostApi {
      * Backspace) and the pointer, which is free while it is up. While a
      * centred menu is up neither the game nor any plugin reads the
      * controller, the keyboard or the mouse; while a corner panel is, those
-     * buttons and keys only (the plugin's pad and input read the rest). One
-     * menu at a time - a later call replaces another plugin's - and the
-     * plugin being turned off takes it down. Main thread. 0 on success; 1 for
-     * an unknown plugin, a size under 8, a page it has not got (or `pages`
-     * naming one), or none at all. */
+     * buttons and keys only (the plugin's pad and input read the rest). The
+     * game's own interruptions close a centred menu as the player would
+     * (panel_state's `closed`): a loading screen coming up, a cutscene
+     * starting, the player's character dying - not one already under way
+     * when it opened. The game's messages leave it up, and a corner panel
+     * stays: the plugin takes it down. One menu at a time - a later call
+     * replaces another plugin's - and the plugin being turned off takes it
+     * down. Main thread. 0 on success; 1 for an unknown plugin, a size under
+     * 8, a page it has not got (or `pages` naming one), or none at all. */
     int (*panel_show)(const char* name, const BbPanel* panel);
-    /* Whether the plugin's panel is up, whether the player closed it since
-     * the last call, and its page (BbPanelState; set out->size first). Main
-     * thread. 0 on success; 1 for an unknown plugin or a size under 8. */
+    /* Whether the plugin's panel is up, whether it was closed since the last
+     * call - by the player, or by the game (panel_show) - and its page
+     * (BbPanelState; set out->size first). Main thread. 0 on success; 1 for
+     * an unknown plugin or a size under 8. */
     int (*panel_state)(const char* name, BbPanelState* out);
     /* One of the plugin's options set to `value` (text, as the config holds
      * it) as the menus set it: kept in the player's config, and on_option

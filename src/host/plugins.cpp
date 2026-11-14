@@ -1752,14 +1752,23 @@ int api_hud_hide(const char* name, int hidden) {
     return 0;
 }
 
+// BbWorldState's flags from the game's own state: its world, loads,
+// cutscenes and menus, and the plugins' hold (world_state; the in-game
+// menus' interruptions, plugins_frame).
+std::uint32_t world_flags() {
+    std::uint32_t f = 0;
+    if (loading_in_world()) f |= BB_WORLD_IN;
+    if (loading_screen_up()) f |= BB_WORLD_LOADING;
+    if (loading_cutscene()) f |= BB_WORLD_CUTSCENE;
+    if (menu_pointer_in_menu() || debug_menu_open()) f |= BB_WORLD_MENU;
+    if (world_pause_held()) f |= BB_WORLD_PAUSED;
+    return f;
+}
+
 int api_world_state(BbWorldState* out) {
     if (!out || out->size < 8 || !g_image || !api_eboot_is_109()) return 1;
     BbWorldState w{};
-    if (loading_in_world()) w.flags |= BB_WORLD_IN;
-    if (loading_screen_up()) w.flags |= BB_WORLD_LOADING;
-    if (loading_cutscene()) w.flags |= BB_WORLD_CUTSCENE;
-    if (menu_pointer_in_menu() || debug_menu_open()) w.flags |= BB_WORLD_MENU;
-    if (world_pause_held()) w.flags |= BB_WORLD_PAUSED;
+    w.flags = world_flags();
     w.others = other_players();
     // Who is on the way: the matchmaking room's other members - the earliest a
     // player coming in shows, at the server's member-joined event - or the
@@ -2144,6 +2153,13 @@ void plugins_frame() {
         int priority = 0;
         const int id = plugin_panel_take_sound(&priority);
         menu_sound_post(id, priority);
+    }
+    // The game's own interruptions close a plugin's centred menu: a loading
+    // screen coming up, a cutscene starting, the player's character dying.
+    if (g_image && api_eboot_is_109()) {
+        std::int64_t hp = -1;
+        if (!player_stat_get("hp", &hp)) hp = -1;
+        plugin_panel_world(world_flags(), hp);
     }
     std::vector<FrameCallback> now;
     std::vector<WorldLoadCallback> loads;

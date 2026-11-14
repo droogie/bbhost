@@ -803,13 +803,14 @@ if(UNIX)
   add_dependencies(photo_mode_plugin_test bb_plugin_photo_mode)
   add_test(NAME photo_mode_plugin_test COMMAND photo_mode_plugin_test $<TARGET_FILE:bb_plugin_photo_mode>)
   # The in-game menus' test plugin (tests/plugins/menu_demo.cpp: every part of
-  # plugin API 29's menus) on a pretend host. Built beside the tests, never into
-  # plugins/, where bbhost would load it.
+  # plugin API 29's menus) on a pretend host, and its menus in the host's panel
+  # through the world's states (the game's own interruptions). Built beside the
+  # tests, never into plugins/, where bbhost would load it.
   add_library(menu_demo MODULE tests/plugins/menu_demo.cpp)
   target_include_directories(menu_demo PRIVATE include)
   target_compile_features(menu_demo PRIVATE cxx_std_17)
   set_target_properties(menu_demo PROPERTIES PREFIX "")
-  add_executable(plugin_menus_test tests/plugin_menus_test.cpp src/host/plugin_menu.cpp)
+  add_executable(plugin_menus_test tests/plugin_menus_test.cpp src/host/plugin_menu.cpp src/host/plugin_panel.cpp)
   target_include_directories(plugin_menus_test PRIVATE src include)
   target_compile_features(plugin_menus_test PRIVATE cxx_std_17)
   target_link_libraries(plugin_menus_test PRIVATE ${CMAKE_DL_LIBS})
