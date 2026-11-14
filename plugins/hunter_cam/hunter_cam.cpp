@@ -1273,8 +1273,10 @@ void on_option(const char* key, const char* value, void*) {
 
 extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     api = host;
-    if (host->version < 13 || !has_field(offsetof(BbHostApi, key_bound))) {
-        host->log("hunter_cam: needs plugin API 13 (on_camera); this host has %u", host->version);
+    // Version 29 with its last call, cutscene() (in_cutscene): a cutscene's
+    // camera and hunter are the game's.
+    if (host->version < 29 || !has_field(offsetof(BbHostApi, cutscene))) {
+        host->log("hunter_cam: needs plugin API 29 (cutscene()); this host has %u", host->version);
         return 1;
     }
     if (!host->eboot_is_109()) {

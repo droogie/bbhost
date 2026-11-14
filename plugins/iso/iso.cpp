@@ -636,8 +636,10 @@ void on_option(const char* key, const char* value, void*) {
 
 extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     api = host;
-    if (host->version < 20 || host->size < offsetof(BbHostApi, on_view) + sizeof(void*)) {
-        host->log("iso: needs plugin API 20 (on_view); this host has %u", host->version);
+    // Version 29 with its last call, cutscene() (in_cutscene): a cutscene's
+    // camera is the game's.
+    if (host->version < 29 || host->size < offsetof(BbHostApi, cutscene) + sizeof(void*)) {
+        host->log("iso: needs plugin API 29 (cutscene()); this host has %u", host->version);
         return 1;
     }
     if (!host->eboot_is_109()) {

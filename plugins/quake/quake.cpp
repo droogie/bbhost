@@ -3533,7 +3533,13 @@ int probe_emit(BbHookCtx* c, void* which) {
 }  // namespace
 
 extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
-    if (!g.attach(api, 13)) return 1;
+    // Version 29 with its last call, cutscene() (in_cutscene): a cutscene's
+    // hunter is the game's.
+    if (api->version < 29 || api->size < offsetof(BbHostApi, cutscene) + sizeof(void*)) {
+        api->log("quake: needs plugin API 29 (cutscene()); this host has %u", api->version);
+        return 1;
+    }
+    if (!g.attach(api, 29)) return 1;
     if (!api->eboot_is_109()) return 1;
     read_options();
     parse_test();
