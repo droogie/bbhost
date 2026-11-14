@@ -1300,8 +1300,16 @@ void apply() {
 }
 
 void on_frame(void*) {
+    // Off - BB_PLUGIN_LIVE_SWITCH loads it off too, for every player who has
+    // the file: nothing of it is left in the game (apply() gave the aim bit,
+    // the sites and the parts back as it went off), so a frame asks nothing of
+    // the game or the host.
+    if (!s.on) {
+        g_elsewhere.store(false);
+        return;
+    }
     const bool elsewhere = world_elsewhere();
-    if (elsewhere != g_elsewhere.exchange(elsewhere) && s.on)
+    if (elsewhere != g_elsewhere.exchange(elsewhere))
         api->log("hunter_cam: %s", elsewhere ? "another camera has the picture: the hunter is the game's until it is ours again"
                                              : "the picture is ours again");
     face_camera_frame();
