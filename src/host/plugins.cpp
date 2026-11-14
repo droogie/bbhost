@@ -1961,10 +1961,12 @@ void plugins_load() {
     // that does not verify was changed after signing and is not loaded;
     // plugins.signed_only = true loads official plugins alone.
     const bool signed_only = config_value("plugins.signed_only") == "true";
-    // Photo mode is Nox-'s bbphoto rebuilt on the plugin API: while it is on,
-    // bbphoto is not loaded - nor started, for a renamed copy found by its
-    // name - so the two never both answer L3 and P. [plugins] photo_mode =
-    // false loads bbphoto again.
+    // A photo_mode plugin - Nox-'s photo mode, carried on in his own
+    // repository on the plugin API made for his bbphoto - replaces bbphoto:
+    // while one is in the plugins folders and not switched off, bbphoto is not
+    // loaded - nor started, for a renamed copy found by its name - so the two
+    // never both answer L3 and P. [plugins] photo_mode = false loads bbphoto
+    // again.
     const auto stem = [](const std::string& n) { return n.substr(0, n.rfind('.')); };
     bool photo_mode_on = false;
     if (config_switch("photo_mode") != 0) {

@@ -214,8 +214,8 @@ game's code or data.
   Imedved's camera auto-rotation and Lance McDonald's region unlock (shipped as
   patch files); Kyo's 60 FPS++ timing list and yogesh1239's high-FPS fixes
   (built into the frame-rate code); and Nox-'s
-  [bbphoto](https://github.com/Noxde/bbhost-photo-mode-plugin), which the photo
-  mode plugin is rebuilt from.
+  [bbphoto](https://github.com/Noxde/bbhost-photo-mode-plugin), for which the
+  plugin API's camera, world, input and picture calls were made.
 - [shadPS4](https://github.com/shadps4-emu/shadPS4), a reference for the PS4's
   system behaviour and a working run to compare against.
 - SDL3, Vulkan, FFmpeg, SPIRV-Tools, the DirectX Shader Compiler (DXC),

@@ -303,7 +303,6 @@ bb_plugin(quake plugins/quake/quake.cpp)
 bb_plugin(lohit plugins/lohit/lohit.cpp)
 bb_plugin(ps1 plugins/ps1/ps1.cpp)
 bb_plugin(iso plugins/iso/iso.cpp)
-bb_plugin(photo_mode plugins/photo_mode/photo_mode.cpp)
 # The Debug Menu plugin carries its glyphs (plugins/debug_menu/font14.bin,
 # tools/make_debug_font.py) as bytes: build/gen/debug_font14.inc, rewritten
 # only when the file changes.
@@ -795,14 +794,6 @@ if(UNIX)
   target_link_libraries(ps1_plugin_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(ps1_plugin_test bb_plugin_ps1)
   add_test(NAME ps1_plugin_test COMMAND ps1_plugin_test $<TARGET_FILE:bb_plugin_ps1>)
-  # The photo mode plugin on a pretend host (plugins/photo_mode): when it starts
-  # and ends - nobody else in the world - and what it asks of the host meanwhile.
-  add_executable(photo_mode_plugin_test tests/photo_mode_plugin_test.cpp)
-  target_include_directories(photo_mode_plugin_test PRIVATE include)
-  target_compile_features(photo_mode_plugin_test PRIVATE cxx_std_17)
-  target_link_libraries(photo_mode_plugin_test PRIVATE ${CMAKE_DL_LIBS})
-  add_dependencies(photo_mode_plugin_test bb_plugin_photo_mode)
-  add_test(NAME photo_mode_plugin_test COMMAND photo_mode_plugin_test $<TARGET_FILE:bb_plugin_photo_mode>)
   # The in-game menus' test plugin (tests/plugins/menu_demo.cpp: every part of
   # plugin API 29's menus) on a pretend host, and its menus in the host's panel
   # through the world's states (the game's own interruptions). Built beside the
@@ -1613,7 +1604,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_CROSSCOMPILING)
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     # The official plugins too: the package carries them, and a CI build makes
     # nothing it is not asked for (v0.2.0's Windows zip shipped without them).
-    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_iso bb_plugin_photo_mode bb_plugin_debug_menu
+    DEPENDS bbhost bb_plugin_randomizer bb_plugin_boss_rush bb_plugin_mutators bb_plugin_quake bb_plugin_lohit bb_plugin_ps1 bb_plugin_iso bb_plugin_debug_menu
     USES_TERMINAL)
 else()
   add_custom_target(smoke

@@ -1758,10 +1758,10 @@ void host_options_load() {
             }
             if (key == "old_hunters") continue;  // v0.2.9's PC enhancement: The Old Hunters is always on now
             // The Debug camera: it switched a patch manifest no package carries
-            // (patches/debug-camera.toml), and photo mode (plugins/photo_mode)
-            // took its place. A saved one is set aside; the next save drops it.
+            // (patches/debug-camera.toml), so it never worked in a release. A
+            // saved one is set aside; the next save drops it.
             if (key == "debug_camera") {
-                if (val == "On") host_log("options: the Debug camera is gone - photo mode is its place (P, or hold L3); the saved On is set aside");
+                if (val == "On") host_log("options: the Debug camera is gone (it never worked in a release); the saved On is set aside");
                 continue;
             }
             // Looked at again once the file's version is known (below).
