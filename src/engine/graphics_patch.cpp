@@ -14,6 +14,7 @@
 #include "engine/fmod_ring.h"
 #include "engine/sf_text_layout.h"
 #include "engine/frame_rate.h"
+#include "engine/font_handle_set.h"
 #include "engine/live_resolution.h"
 #include "engine/loading.h"
 #include "engine/menu_memory.h"
@@ -597,9 +598,15 @@ bool font_map_write(float k) {
     return false;
 }
 
+// A change while the game runs is written only with the font-handle set's
+// removal fixed as well (font_set_remove_hook, text_scale_install); without it
+// the setting takes effect at the next start.
+std::atomic<bool> g_text_scale_live{false};
+
 void text_scale_set(float k) {
     k = std::clamp(k, 0.5f, 1.0f);
     g_text_scale.store(k);
+    if (!g_text_scale_live.load()) return;
     std::lock_guard<std::mutex> lk(g_font_map_mu);
     if (g_font_map && !font_map_write(k)) host_log("graphics: text scale %g: MenuFont_01's mapping is gone", static_cast<double>(k));
 }
@@ -625,6 +632,100 @@ GUEST_ABI std::int64_t map_font_hook(std::uint64_t, const std::uint64_t* saved) 
     host_log("graphics: MenuFont_01 mapped at %g (the game's %g, text scale %g)", static_cast<double>(*scale),
              static_cast<double>(g_font_base), static_cast<double>(k));
     return 0;
+}
+
+// Scaleform's FontManager keeps the font handles its movie made in a set keyed
+// by font name and flags (CreatedFonts), and every removal from it goes
+// through one function, HashSet RemoveAlt (0x27d6a80: from the FontHandle
+// destructor 0x27d6ca0, RemoveFontHandle 0x4fbaa0 and FindOrCreateHandle
+// 0x4fbaf0). FindOrCreateHandle reuses a handle only at the scale the font map
+// asks for (the handle's +0x28); at another it makes a new handle with the
+// same font, name and flags and adds it at its chain's head (0x27d6250) - two
+// entries with one key. The stock game never maps a font at two scales; Text
+// scale changed while the game runs does (font_map_write): a movie made before
+// the change - the HUD's - makes MenuFont_01's new handle beside its old one.
+// RemoveAlt takes the first entry of the chain that is the handle OR has its
+// name and flags, so freeing the old handle unlinked the new one's entry and
+// left the freed handle's in the set, read by the next lookup: a crash at
+// 0x27d69f1 (sub_27d6980) as the Hunter's Dream's cutscene ended, 2 of 2 after
+// a live change. This hook removes the entry that holds the handle itself
+// (engine/font_handle_set.h), as RemoveAlt unlinks one, and leaves every other
+// call - a key no entry holds - to the game's RemoveAlt, so the stock game,
+// whose sets never hold two entries of one key, removes exactly as before.
+constexpr std::uint64_t kFontSetRemove = 0x27d6a80;
+// push rbp; mov rbp, rsp; push r15..r12; push rbx; sub rsp, 0x18
+const std::uint8_t kFontSetRemovePrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+                                               0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
+
+// BBHOST_FONT_SET_TRACE=1 (a test): each removal through the hook that the
+// game's matching would have made differently - another entry of the chain
+// holding the handle's name and flags - logged with the set's count, and the
+// largest count such a set reached.
+bool font_trace_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_FONT_SET_TRACE");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+std::uint32_t font_handle_flags(std::uint64_t h) {
+    std::uint32_t f = 0, g = 0;
+    std::memcpy(&f, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(h + 0x18)), 4);
+    if (const std::uint64_t font = guest_u64(h + 0x30))
+        std::memcpy(&g, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(font + 0x18)), 4);
+    return f | g;
+}
+// The handle's own name (+0x20, a String: low two bits flags, UTF-8 at +0xc), or
+// null where the name is its font's (RemoveAlt asks the font then).
+const char* font_handle_name(std::uint64_t h) {
+    const std::uint64_t s = guest_u64(h + 0x20) & ~3ull;
+    if (!s || (guest_u64(s) & 0x7fffffffffffffffull) == 0) return nullptr;
+    return reinterpret_cast<const char*>(static_cast<std::uintptr_t>(s + 0xc));
+}
+bool font_names_same(const char* a, const char* b) {
+    for (;; ++a, ++b) {
+        const char x = static_cast<char>((*a >= 'A' && *a <= 'Z') ? *a + 32 : *a), y = static_cast<char>((*b >= 'A' && *b <= 'Z') ? *b + 32 : *b);
+        if (x != y) return false;
+        if (!x) return true;
+    }
+}
+void font_trace(std::uint64_t table, std::uint64_t handle) {
+    const std::uint64_t count = guest_u64(table), mask = guest_u64(table + 8);
+    if (mask > 0xffff) return;
+    const char* name = font_handle_name(handle);
+    const std::uint32_t flags = font_handle_flags(handle);
+    int same = 0;
+    for (std::uint64_t i = 0; i <= mask; ++i) {
+        const std::uint64_t e = table + 16 + i * 32;
+        const std::uint64_t h = guest_u64(e + 16);
+        if (static_cast<std::int64_t>(guest_u64(e)) == -2 || h == handle || !name) continue;
+        const char* other = font_handle_name(h);
+        if (other && ((font_handle_flags(h) ^ flags) & 0x313) == 0 && font_names_same(name, other)) ++same;
+    }
+    static std::atomic<std::uint64_t> most{0};
+    static std::atomic<int> logs{0};
+    if (!same) return;
+    std::uint64_t was = most.load();
+    while (count > was && !most.compare_exchange_weak(was, count)) {
+    }
+    if (logs.fetch_add(1) < 64)
+        host_log("graphics: font set: %s's handle 0x%llx removed by itself, %d more of its name in the set (%llu handles; the most "
+                 "such a set held %llu)",
+                 name ? name : "?", static_cast<unsigned long long>(handle), same, static_cast<unsigned long long>(count),
+                 static_cast<unsigned long long>(most.load()));
+}
+
+// HashSet RemoveAlt's entry: the set in rdi (its table pointer first), a
+// pointer to the FontHandle* in rsi. Returns what RemoveAlt returns (1:
+// removed) when it removed the entry itself.
+GUEST_ABI std::int64_t font_set_remove_hook(std::uint64_t, const std::uint64_t* saved) {
+    const std::uint64_t set = saved[5], key = saved[4];
+    const std::uint64_t table = set ? guest_u64(set) : 0, handle = key ? guest_u64(key) : 0;
+    if (!table || !handle) return 0;
+    if (font_trace_on()) font_trace(table, handle);
+    if (!font_set_remove_handle(reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(table)), handle)) return 0;
+    const_cast<std::uint64_t*>(saved)[-1] = 1;
+    return 1;
 }
 
 }  // namespace
@@ -2386,7 +2487,21 @@ void graphics_look_set(const GraphicsLook& look) {
 void text_scale_install(ElfImage* image) {
     const std::uint64_t at = image->mem.slide + (kMapFont - kPreferredGuestSlide);
     if (install_prologue_hook(image, at, kMapFontPrologue, sizeof(kMapFontPrologue), reinterpret_cast<void*>(&map_font_hook))) {
-        host_log("graphics: text scale %g, live (MenuFont_01's mapping hooked)", static_cast<double>(g_text_scale.load()));
+        // Live only with the font-handle set's removal fixed: a change while
+        // the game runs makes a second MenuFont_01 handle in the movies made
+        // before it (font_set_remove_hook).
+        const std::uint64_t rm = image->mem.slide + (kFontSetRemove - kPreferredGuestSlide);
+        const bool live = install_prologue_hook(image, rm, kFontSetRemovePrologue, sizeof(kFontSetRemovePrologue),
+                                                reinterpret_cast<void*>(&font_set_remove_hook));
+        g_text_scale_live.store(live);
+        if (live)
+            host_log("graphics: text scale %g, live (MenuFont_01's mapping hooked; Scaleform's font-handle set removes the handle it is "
+                     "given)",
+                     static_cast<double>(g_text_scale.load()));
+        else
+            host_log("graphics: text scale %g, at each start: 0x%llx is not Scaleform's font-handle removal, which a change while the "
+                     "game runs needs",
+                     static_cast<double>(g_text_scale.load()), static_cast<unsigned long long>(kFontSetRemove));
         return;
     }
     // No hook: the constant MapFont is called with, read once - the setting

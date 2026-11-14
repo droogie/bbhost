@@ -143,6 +143,7 @@ add_executable(bbhost
   src/engine/yebis.cpp
   src/engine/yebis_bind.cpp
   src/engine/graphics_patch.cpp
+  src/engine/font_handle_set.cpp
   src/engine/live_resolution.cpp
   src/engine/render_scale.cpp
   src/engine/loading.cpp
@@ -1192,6 +1193,13 @@ if(UNIX)
   target_include_directories(camera_settings_test PRIVATE src)
   target_link_libraries(camera_settings_test PRIVATE Threads::Threads)
   add_test(NAME camera_settings_test COMMAND camera_settings_test)
+  # Scaleform's font-handle set removed by the handle's own pointer (engine/font_handle_set.h)
+  # against models of the game's add, lookup and removal: the stock game's tables the same, two
+  # handles of one name (a live Text scale change) without the use-after-free.
+  add_executable(font_handle_set_test tests/font_handle_set_test.cpp src/engine/font_handle_set.cpp)
+  target_include_directories(font_handle_set_test PRIVATE src)
+  add_test(NAME font_handle_set_test COMMAND font_handle_set_test)
+  set_tests_properties(font_handle_set_test PROPERTIES TIMEOUT 60)
   set_tests_properties(settings_store_test camera_settings_test PROPERTIES TIMEOUT 30)
   # A plugin's look's arithmetic (engine/look_math.h): what apply_look writes
   # into YEBIS's block for the motion blur's samples and the depth of field.
@@ -1300,6 +1308,9 @@ if(UNIX)
   bbhost_decomp_test(item_lots SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(talk_evaluator SOURCES src/engine/esd.cpp LIBS gcn)
   bbhost_decomp_test(chalice_ritual)
+  # Scaleform's font-handle set: the removal by pointer (engine/font_handle_set.h) against the game's
+  # HashSet RemoveAlt on sets its own add builds - the same bytes with one entry a key, the right entry with two.
+  bbhost_decomp_test(font_set_removal SOURCES src/engine/font_handle_set.cpp)
   bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
   bbhost_decomp_test(sfx_step_gate SOURCES src/decomp/sfx/node_update.cpp src/decomp/sfx/node_emit.cpp)
