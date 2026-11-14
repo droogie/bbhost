@@ -54,11 +54,11 @@ and keyboard instead, pick the Gamepad layout in its controller settings
   compiling during play cost ~2 fps), and are used from the start after.
 - **30 or 60 fps**: System, Steam Deck, Frame Rate. 30 fps renders at the
   screen's own 1280x800, the game's own pace and the Deck's default here.
-  60 fps renders at 960x600 and bbhost scales the picture up to the screen
-  with AMD's FSR 1, which keeps edges sharp, with Model Detail at Low (it
-  draws distant buildings one step coarser, which is hard to see on this
-  screen): the heaviest views found, like the first gate in Central
-  Yharnam, hold 60. The resolution and the model detail change at once; the
+  60 fps draws the 3D at 960x600 and brings it up to the screen - the HUD,
+  the menus and the post effects stay at the screen's own 1280x800 - with
+  Model Detail at Low (it draws distant buildings one step coarser, which is
+  hard to see on this screen): the heaviest views found, like the first gate
+  in Central Yharnam, hold 60. The resolution and the model detail change at once; the
   frame rate itself on the next start. The Deck's GPU cannot draw the game
   at its full 1280x800 sixty times a second (about 45). The same section's
   Model Detail can be set on its own (Normal at 60 fps holds 60 walking,
@@ -73,7 +73,7 @@ and keyboard instead, pick the Gamepad layout in its controller settings
   FSR 3 smooths the edges the 60 fps profile's 960x600 leaves jagged, but it
   costs the Deck's GPU about 6 ms a frame at 1280x800, more than drawing
   fewer pixels saves: at 60 fps only its Performance setting (640x400
-  rendered) stays close to 60, so the profile keeps FSR 1. At 30 fps FSR 3
+  rendered) stays close to 60, so the profile keeps Upscaling Off. At 30 fps FSR 3
   Quality holds 30 at the same power as the full 1280x800. Character Motion
   in the same section is Precise by default, clean edges on the hunter and
   enemies under FSR 3 and TAA; Off saves 0.2-0.4 ms of the GPU's frame here
