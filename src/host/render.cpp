@@ -23781,7 +23781,9 @@ bool look_samplers(const DrawState& s, const GfxPipeline& pl, StageImages& si) {
 // (look_samplers). False in a run part's draw that stopped for a sampler to
 // be made in order.
 bool stretch_samplers(const DrawState& s, const GfxPipeline& pl, StageImages& si) {
-    if (pl.name != "0b0acf50+ccbf44a6" || upscaler_method() || scene_look_scale() || !s.color[0]) return true;
+    // Every draw asks: the render scale's flag first (one load, false at the
+    // Resolution of the window), the pipeline's name only under it.
+    if (!s.color[0] || !render_scale_on() || pl.name != "0b0acf50+ccbf44a6" || upscaler_method() || scene_look_scale()) return true;
     RenderScale rs;
     if (!render_scale_on(&rs) || s.color[0]->width != rs.output_w || s.color[0]->height != rs.output_h) return true;
     const std::vector<std::uint32_t>& pairs = pl.ps_sampler_images;
