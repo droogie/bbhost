@@ -451,8 +451,9 @@ struct RowOut {
 // the value column after it. With the game's art: the label's line fading out
 // to the left, the value's line with its scrolled ends, a slider's track and
 // its filled part (all under the widget, the draw list's first channel), and
-// the choice's arrows the dialog's own. What the player does to it comes back
-// in RowOut; the caller keeps it (the config or the menu's run-time values).
+// a choice's and a slider's arrows the dialog's own. What the player does to
+// it comes back in RowOut; the caller keeps it (the config or the menu's
+// run-time values).
 RowOut row(const RowIn& in, ImVec2 a, ImVec2 b, float mid, float s, bool cursor, const Art& art) {
     RowOut out;
     const PluginOptionDesc& o = *in.o;
@@ -469,6 +470,8 @@ RowOut row(const RowIn& in, ImVec2 a, ImVec2 b, float mid, float s, bool cursor,
     ImGui::SetCursorScreenPos(val_a);
     ImGui::SetNextItemWidth(val_size.x);
     bool arrows = false;      // the value is one of a list: arrows either side while it has the cursor
+    bool slider = false;      // a number on a track: arrows either side of the track and the number, as the game's
+    bool less = false, more = false;  // a slider's value is above its least, below its most: the arrow that way shows
     bool underline = false;   // its value's line under it (the game's art)
     const auto change = [&](const std::string& v) {
         out.changed = true;
@@ -547,6 +550,10 @@ RowOut row(const RowIn& in, ImVec2 a, ImVec2 b, float mid, float s, bool cursor,
             const ImU32 col = grey ? look::kTextDim : ImGui::IsItemFocused() ? look::kTextLit : look::kText;
             dl->AddText(nf, nfs, ImVec2(b.x - ts.x, val_a.y + (frame_h - ts.y) * 0.5f), col, t.c_str());
         }
+        const double ends = (o.max - o.min) * 1e-6;  // a float's value read back from its text, at an end
+        slider = true;
+        less = v > o.min + ends;
+        more = v < o.max - ends;
         take_cursor(cursor);
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             changed = true;
@@ -625,14 +632,31 @@ RowOut row(const RowIn& in, ImVec2 a, ImVec2 b, float mid, float s, bool cursor,
                   art_tint);
         dl->ChannelsSetCurrent(kWidgetLayer);
     }
-    if (arrows && out.focused) {
+    // The arrows, on the row with the cursor: a choice's at the ends of its
+    // value; a slider's either side of its track and number, as the game's -
+    // the left one in the middle of the gap between the column rule and the
+    // track, the right one as far past the number - each gone at its end.
+    if ((arrows || slider) && out.focused) {
+        const float cy = val_a.y + frame_h * 0.5f, side = (val_a.x - mid) * 0.5f;  // a slider's arrows' middles: mid + side, b.x + side
         if (art.has(game_menu_art::kArrow)) {
             const float ah = std::round(ImGui::GetFontSize() * 1.05f), aw = ah * art.atlas->piece[game_menu_art::kArrow].w /
                                                                              static_cast<float>(art.atlas->piece[game_menu_art::kArrow].h);
-            const float cy = val_a.y + frame_h * 0.5f, in_ = 4.0f * s;
+            const float in_ = 4.0f * s;
             const ImU32 t = grey ? IM_COL32(255, 255, 255, 110) : IM_COL32(255, 255, 255, 255);
-            art.image(dl, game_menu_art::kArrow, ImVec2(val_a.x + in_, cy - ah * 0.5f), ImVec2(val_a.x + in_ + aw, cy + ah * 0.5f), t, true);
-            art.image(dl, game_menu_art::kArrow, ImVec2(b.x - in_ - aw, cy - ah * 0.5f), ImVec2(b.x - in_, cy + ah * 0.5f), t);
+            float l0 = val_a.x + in_, l1 = val_a.x + in_ + aw, r0 = b.x - in_ - aw, r1 = b.x - in_;
+            if (slider) {
+                l0 = mid + side - aw * 0.5f;
+                l1 = l0 + aw;
+                r0 = b.x + side - aw * 0.5f;
+                r1 = r0 + aw;
+            }
+            if (!slider || less) art.image(dl, game_menu_art::kArrow, ImVec2(l0, cy - ah * 0.5f), ImVec2(l1, cy + ah * 0.5f), t, true);
+            if (!slider || more) art.image(dl, game_menu_art::kArrow, ImVec2(r0, cy - ah * 0.5f), ImVec2(r1, cy + ah * 0.5f), t);
+        } else if (slider) {
+            const float h = 5.0f * s, w = 4.5f * s, lm = mid + side, rm = b.x + side;
+            const ImU32 col = grey ? look::kTextDim : look::kGold;
+            if (less) dl->AddTriangleFilled(ImVec2(lm - w * 0.5f, cy), ImVec2(lm + w * 0.5f, cy - h), ImVec2(lm + w * 0.5f, cy + h), col);
+            if (more) dl->AddTriangleFilled(ImVec2(rm + w * 0.5f, cy), ImVec2(rm - w * 0.5f, cy - h), ImVec2(rm - w * 0.5f, cy + h), col);
         } else {
             value_arrows(dl, val_a, val_a + val_size, s, grey ? look::kTextDim : look::kGold);
         }
