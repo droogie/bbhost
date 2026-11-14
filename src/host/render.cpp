@@ -24180,7 +24180,8 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     // The game's occlusion culling under a smaller 3D (render scale: FSR 3, FSR
-    // 4 and DLSS below Native AA; a plugin's look at its own size): its proxies
+    // 4 and DLSS below Native AA, TAA or Upscaling Off at a Resolution below
+    // the window's; a plugin's look at its own size): its proxies
     // - boxes drawn depth-tested with no colour and no depth write, between
     // ZPASS_DONE dumps (host/occlusion.cpp) - are drawn against
     // DefDepthStencil at the output size, which the scene no longer draws into
@@ -27145,16 +27146,24 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
     }
-    // A plugin's look with no upscaler or frame generation (host/scene_look.h):
-    // the scene and its depth learned the same way, for look_camera_draw.
-    else if (scene_look_camera()) {
+    // A plugin's look with no upscaler or frame generation (host/scene_look.h),
+    // or the 3D drawn smaller with none running (Upscaling Off at a Resolution
+    // below the window's, engine/render_scale.cpp): the scene and its depth
+    // learned the same way - for look_camera_draw, and for the occlusion
+    // culling's proxies, which take the scene's depth when it is smaller than
+    // theirs (above). Without it, Upscaling Off's proxies were tested against
+    // the output-size depth the 3D never draws into: every box passed, the
+    // game culled nothing, and Central Yharnam's frame drew ~1240 draws where
+    // TAA at the same sizes draws ~940.
+    else if (scene_look_camera() || render_scale_on()) {
         UpscaleFrame& u = g_upscale;
         if (pl.name == "0b0acf50+ccbf44a6") {
             for (const StageImages::Image& im : stage_images[1].images) {
                 if (!im.resolved) continue;
                 const std::uint64_t b = image_base(im);
                 if (b != u.scene) {
-                    host_log("render: the scene is 0x%llx (YEBIS's copy samples it), for a plugin's look", static_cast<unsigned long long>(b));
+                    host_log("render: the scene is 0x%llx (YEBIS's copy samples it), for %s", static_cast<unsigned long long>(b),
+                             scene_look_camera() ? "a plugin's look" : "the occlusion culling's depth (no upscaler running)");
                     u.scene = b;
                     u.depth = 0;
                 }
