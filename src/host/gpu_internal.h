@@ -1477,6 +1477,9 @@ struct ListNotes {
     std::uint32_t nsegs = 0;
     std::uint32_t seg[4] = {};        // the list arena's segments its constant-buffer copies went into
     std::uint64_t seg_lap[4] = {};
+    std::uint32_t ngx = 0;
+    std::uint32_t gx_seg[2] = {};     // the GX tables ring's pool-arena segments its tables went into (host/gx_tables_ring.h)
+    std::uint64_t gx_lap[2] = {};
     std::uint64_t packet_index = 0;  // its token slot's list packet (recorder_list_packet)
     std::uint64_t call_flip = 0;     // its GX call's flip (the list arena's copies are shared within one)
     std::uint64_t set_key[2] = {};
@@ -1501,8 +1504,19 @@ struct ListNotes {
         view_target = 0;
         set_key[0] = set_key[1] = 0;
         set[0] = set[1] = VK_NULL_HANDLE;
-        nhomes = nsegs = 0;
+        nhomes = nsegs = ngx = 0;
         full = false;
+    }
+    void note_gx(std::uint32_t s, std::uint64_t lap) {
+        for (std::uint32_t k = 0; k < ngx; ++k) {
+            if (gx_seg[k] == s && gx_lap[k] == lap) return;
+        }
+        if (ngx < 2) {
+            gx_seg[ngx] = s;
+            gx_lap[ngx++] = lap;
+        } else {
+            full = true;
+        }
     }
     void note_home(std::uint32_t handle) {
         for (std::uint32_t k = 0; k < nhomes; ++k) {

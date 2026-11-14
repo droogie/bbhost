@@ -889,6 +889,14 @@ pool's constant-buffer copies take the last 16 MiB of the command processor's
 ring, which keeps the rest while the pool runs, so on a card with a small
 window of video memory the CPU writes both stay in video memory (in host
 memory the GPU read them across the bus: +11% GPU time on an RTX 4070).
+Their tables - the vertex and resource tables a draw's user data points at -
+take the last 16 MiB of GX's tables ring in the same way, in 1 MiB segments a
+pool thread owns while it places there, each taken again only once no commit
+placed in it can still be spliced and the recordings its commits went into
+have run; the command processor's part of that ring waits, at a lap, for the
+recording that last placed in a segment to have run. (Until 2026-11-13 a pool
+thread kept a chunk of the shared ring until it was full - across a rest at a
+frame cap too - and could write over tables the ring had handed out since.)
 Unset, the switch follows the constant buffers' homes: segments where the
 homes bind by handle, off elsewhere (small video memory, an integrated GPU)
 with the reason in the log; the pool needs 8 hardware threads or more.

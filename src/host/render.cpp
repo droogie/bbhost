@@ -48,6 +48,7 @@
 #include "host/gxvk_lists_internal.h"
 #include "host/list_cb_memo.h"
 #include "host/gxvk_table.h"
+#include "host/gx_tables_ring.h"
 #include "host/draw_capture.h"
 #include "host/shaders/particleargs.spv.h"
 #include "host/shaders/gbuffer_flat_frag.spv.h"
@@ -745,13 +746,19 @@ const bool g_vs_invariant = [] {
 // Rendering from GX: the tables a draw's user data points at
 // (the fetch shader's vertex table, resource tables, extended blocks) live in
 // a host-owned ring the GPU page table reaches, instead of the command
-// stream's memory.
+// stream's memory (host/gx_tables_ring.h): the command processor's part, round
+// which its placements go under the ring's lock with its serial guard, and
+// stage 4b.1b's pool's arena at its end (g_list_gx).
 struct GxRing {
     std::mutex mu;
-    std::uint64_t base = 0, size = 0, cursor = 0;
+    std::uint64_t base = 0, size = 0;
     bool failed = false;
+    gx_ring::Guard guard;  // (under mu)
 };
 GxRing g_gx_ring;
+gx_ring::Arena g_list_gx;
+std::atomic<std::uint64_t> g_list_gx_base{0};  // the arena's address, once the ring is made with the pool committing draws
+thread_local gx_ring::Arena::Cursor t_list_gx;
 // Whether [base, +bytes) lies in the ring: a table a draw's user data placed there (gx_ring_place), whose bytes that
 // draw's commit wrote. (The base is set once, under the ring's lock, before any placement is handed out.)
 bool gx_ring_holds(std::uint64_t base, std::uint64_t bytes) {
@@ -14824,9 +14831,19 @@ void render_report() {
         }
     }
     if (g_vertex_tables.load() || g_gx_user_stages.load() || g_gx_user_fallbacks.load()) {
-        host_log("render: GX vertex tables from the call %llu; stage user data built %llu, left to the command stream %llu (ring at 0x%llx)",
+        std::uint64_t laps = 0, waits = 0, base = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_gx_ring.mu);
+            laps = g_gx_ring.guard.laps;
+            waits = g_gx_ring.guard.waits;
+            base = g_gx_ring.base;
+        }
+        host_log("render: GX vertex tables from the call %llu; stage user data built %llu, left to the command stream %llu (ring at 0x%llx: "
+                 "%llu laps, %llu waits for the GPU at a segment's reuse; the pool's arena: %llu segments taken, none free %llu)",
                  static_cast<unsigned long long>(g_vertex_tables.load()), static_cast<unsigned long long>(g_gx_user_stages.load()),
-                 static_cast<unsigned long long>(g_gx_user_fallbacks.load()), static_cast<unsigned long long>(g_gx_ring.base));
+                 static_cast<unsigned long long>(g_gx_user_fallbacks.load()), static_cast<unsigned long long>(base),
+                 static_cast<unsigned long long>(laps), static_cast<unsigned long long>(waits),
+                 static_cast<unsigned long long>(g_list_gx.takes.load()), static_cast<unsigned long long>(g_list_gx.full.load()));
     }
     if (g_render_cost_enabled) {
         const auto per = [](int k) {
@@ -18531,45 +18548,84 @@ void compare_gx_fetch(std::uint64_t user_fetch, const GxDrawObjects& o) {
 }
 
 // Reserves bytes in the ring (8-byte aligned), copies them there and returns
-// their address; 0 when no ring could be mapped. Tables come to a few MiB a
-// frame at most, so the 128 MiB ring does not reuse a copy before the queued
-// work reading it has run.
+// their address; 0 when no ring could be mapped, or for a run part's or a
+// pool thread's draw that stopped instead (the guard, host/gx_tables_ring.h).
 // BBHOST_DRAW_CONTEXT: a draw context's placements come from a chunk of the
 // ring it owns, taken as a placement of the chunk's size would be.
 constexpr std::uint64_t kGxCtxChunk = 64u << 10;
+std::uint64_t gx_list_place(const std::uint8_t* data, std::uint64_t bytes, std::uint64_t align);
 std::uint64_t gx_ring_place(const std::uint8_t* data, std::uint64_t bytes, std::uint64_t align = 8) {
+    if (list_draw()) return gx_list_place(data, bytes, align);
     GxRing& ring = g_gx_ring;
     std::uint64_t va = 0;
     DrawCtx* const ctx = draw_ctx();
     if (ctx) {
         if (!bytes) return 0;
-        ctx->take_recording(list_draw() ? 1 : g.flushes);  // (a pool thread's chunk is its own: no recording to follow)
+        ctx->take_recording(g.flushes);
         va = (ctx->gx_next + align - 1) & ~(align - 1);
     }
     if (!ctx || !ctx->gx_end || va + bytes > ctx->gx_end) {
         const std::uint64_t take = ctx ? std::max<std::uint64_t>(kGxCtxChunk, bytes + align) : bytes;
         std::lock_guard<std::mutex> lk(ring.mu);
         if (!ring.base && !ring.failed) {
-            ring.size = 128ull << 20;
+            ring.size = gx_ring::kRingBytes;
             ring.base = hle_kernel_map_host(ring.size);
             ring.failed = ring.base == 0;
             if (ring.failed) host_log("render: no host mapping for GX tables; they stay on the command stream");
+            // Stage 4b.1b's pool places its draws' tables in the ring's last 16 MiB (its arena), the command processor
+            // in the rest.
+            if (ring.base && gxvk_lists::splice()) {
+                ring.guard.end = ring.size - gx_ring::Arena::kBytes;
+                g_list_gx_base.store(ring.base + ring.guard.end, std::memory_order_release);
+            }
         }
-        if (!ring.base || !bytes || take > ring.size) return 0;
-        ring.cursor = (ring.cursor + align - 1) & ~(align - 1);
-        if (ring.cursor + take > ring.size) ring.cursor = 0;
-        va = ring.base + ring.cursor;
-        ring.cursor += take;
+        if (!ring.base || !bytes) return 0;
+        // A segment entered in a new lap: the recording that last placed there has run, or is waited for (a run
+        // part's draw stops instead).
+        const bool part = run_part();
+        const std::uint64_t at = ring.guard.take(
+            take, align, g.flushes, part, [](std::uint64_t serial) { return g.completed_submits > serial; },
+            [](std::uint64_t serial) { wait_submission_locked(serial); });
+        if (at == gx_ring::Guard::kNone) {
+            if (part) run_part_stop(kRunStopRing);
+            return 0;
+        }
+        va = ring.base + at;
         if (ctx) {
             ctx->gx_end = va + take;
             list_resolve::count(list_resolve::kCtxGxChunks);
-            if (list_resolve::draw_ctx_compare()) list_resolve::check_chunk(0, g.flushes, va, va + take, ring.base, ring.base + ring.size);
+            if (list_resolve::draw_ctx_compare()) list_resolve::check_chunk(0, g.flushes, va, va + take, ring.base, ring.base + ring.guard.end);
         }
     }
     if (ctx) {
         ctx->gx_next = va + bytes;
         list_resolve::count(list_resolve::kCtxGxBytes, bytes);
     }
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(va)), data, static_cast<std::size_t>(bytes));
+    return va;
+}
+
+// Stage 4b.1b: a pool thread's list-mode draw places its tables in the pool's
+// arena of the ring (host/gx_tables_ring.h Arena), in the segment the thread
+// owns, the segment and its lap noted for the splice; 0 and the draw stopped
+// when the ring is not made yet (the command processor's draws make it) or no
+// segment is free.
+std::uint64_t gx_list_place(const std::uint8_t* data, std::uint64_t bytes, std::uint64_t align) {
+    const std::uint64_t base = g_list_gx_base.load(std::memory_order_acquire);
+    ListNotes* const notes = t_run_draw ? t_run_draw->list : nullptr;
+    if (!base || !bytes || !notes || align > 256) {
+        run_part_stop(kRunStopRing);
+        return 0;
+    }
+    gx_ring::Arena::Cursor& c = t_list_gx;
+    const std::uint64_t at = g_list_gx.place(c, bytes, align, hle_video_flip_count(), g_completed_submits_seen.load(std::memory_order_acquire),
+                                             kListMaxAge);
+    if (at == gx_ring::Arena::kNone) {
+        run_part_stop(kRunStopRing);
+        return 0;
+    }
+    notes->note_gx(c.seg, c.lap);  // (more segments than its notes hold: not committed)
+    const std::uint64_t va = base + at;
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(va)), data, static_cast<std::size_t>(bytes));
     return va;
 }
@@ -29339,6 +29395,9 @@ bool host_gpu_splice(std::uint64_t id) {
     for (std::uint32_t k = 0; k < n.nsegs; ++k) {
         if (g_list_arena.lap[n.seg[k]].load(std::memory_order_acquire) != n.seg_lap[k]) return fall(kSwArena);
     }
+    for (std::uint32_t k = 0; k < n.ngx; ++k) {
+        if (!g_list_gx.lap_is(n.gx_seg[k], n.gx_lap[k])) return fall(kSwArena);  // (its tables' segment taken again)
+    }
     if (!occlusion_draw_plain()) return fall(kSwOcclusion);
     if (g.queued + 2 >= kMaxQueued * kStageSlots) return fall(kSwOther);  // (a mid-frame submit: in order)
     if (gxvk_lists::splice_compare()) {  // drawn in order, and compared with this commit after (host_gpu_splice_compare)
@@ -29350,6 +29409,11 @@ bool host_gpu_splice(std::uint64_t id) {
     if (std::uint64_t want = cw_now; !c.word.compare_exchange_strong(want, lc_word(id, kLcTaken), std::memory_order_acq_rel)) return fall(kSwSegment);
     if (!occlusion_draw_entry()) return fall(kSwOcclusion);  // (issued: plain, so no predicate skips it)
     begin_recording_locked();
+    // Its tables' segments in the GX ring's pool arena stamped with this recording, then their laps asked again: a take
+    // claims a lap before it reads the stamp (host/gx_tables_ring.h).
+    for (std::uint32_t k = 0; k < n.ngx; ++k) {
+        if (!g_list_gx.splice(n.gx_seg[k], n.gx_lap[k], g.flushes)) return fall(kSwArena);
+    }
     // (Stage 4b.2 without maintenance7: a pass begun for segments holds no inline draw - begun again for it.)
     if ((g_pass.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) && !(g_pass.flags & VK_RENDERING_CONTENTS_INLINE_BIT_KHR))
         pass_restart_locked(0);
@@ -29737,6 +29801,7 @@ struct Segment {
     std::vector<Set> sets;
     std::vector<std::uint32_t> homes;
     std::vector<std::pair<std::uint32_t, std::uint64_t>> cb_segs, pr_segs;  // the list arena's and the params region's segments, laps
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> gx_segs;           // the GX ring's pool arena's (host/gx_tables_ring.h)
     struct Pipe {
         GfxPipeline* p;
         std::uint32_t draws, gx;
@@ -30075,6 +30140,7 @@ void build_segment(const gxvk_lists::detail::ListRec& r, const std::uint64_t* wo
     sg.sets.clear();
     sg.homes.clear();
     sg.cb_segs.clear();
+    sg.gx_segs.clear();
     sg.pipes.clear();
     sg.vs_other.clear();
     const ListCommit& head = all[r.id[m0] & (kListCommits - 1)];
@@ -30110,6 +30176,11 @@ void build_segment(const gxvk_lists::detail::ListRec& r, const std::uint64_t* wo
             bool noted = false;
             for (const auto& [s2, l2] : sg.cb_segs) noted |= s2 == ln.seg[i] && l2 == ln.seg_lap[i];
             if (!noted) sg.cb_segs.emplace_back(ln.seg[i], ln.seg_lap[i]);
+        }
+        for (std::uint32_t i = 0; i < ln.ngx; ++i) {
+            bool noted = false;
+            for (const auto& [s2, l2] : sg.gx_segs) noted |= s2 == ln.gx_seg[i] && l2 == ln.gx_lap[i];
+            if (!noted) sg.gx_segs.emplace_back(ln.gx_seg[i], ln.gx_lap[i]);
         }
         if (GfxPipeline* const p = static_cast<GfxPipeline*>(c.drew)) {
             std::uint32_t pat = static_cast<std::uint32_t>(sg.pipes.size());
@@ -30408,6 +30479,9 @@ bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word) {
     for (const auto& [s2, lap] : sg.pr_segs) {
         if (g_list_params.lap[s2].load(std::memory_order_acquire) != lap) return fall(kSfArena);
     }
+    for (const auto& [s2, lap] : sg.gx_segs) {
+        if (!g_list_gx.lap_is(s2, lap)) return fall(kSfArena);
+    }
     if (!occlusion_draw_plain()) return fall(kSfOcclusion);
     if (gxvk_lists::segments_compare()) {  // drawn in order, each member compared with its commit (host_gpu_splice_compare)
         std::memcpy(t_seg_would, sg.ids, sizeof(std::uint64_t) * sg.count);
@@ -30416,6 +30490,9 @@ bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word) {
         return fall(kSfCompare);
     }
     begin_recording_locked();
+    for (const auto& [s2, lap] : sg.gx_segs) {  // (stamped, then asked again: as host_gpu_splice)
+        if (!g_list_gx.splice(s2, lap, g.flushes)) return fall(kSfArena);
+    }
     if (g_seg_inline) {
         // Replayed by the recorder into the command buffer itself, chained (a pass begun for secondaries ends first).
         if ((g_pass.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) && !(g_pass.flags & VK_RENDERING_CONTENTS_INLINE_BIT_KHR))
