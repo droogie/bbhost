@@ -175,6 +175,7 @@ add_executable(bbhost
   src/host/present_pass.cpp
   src/host/ingame_menu.cpp
   src/host/plugin_panel.cpp
+  src/host/plugin_menu.cpp
   src/host/game_font.cpp
   src/host/game_menu_art.cpp
   src/host/controls_page.cpp
@@ -269,6 +270,11 @@ endif()
 add_library(bb_plugin_hello MODULE examples/plugins/hello/hello.c)
 target_include_directories(bb_plugin_hello PRIVATE include)
 set_target_properties(bb_plugin_hello PROPERTIES OUTPUT_NAME hello PREFIX "")
+# The in-game menu example (plugin API 29, docs/plugins.md's In-game menus,
+# which holds it whole - plugin_menu_docs_test checks they are the same).
+add_library(bb_plugin_menu_example MODULE examples/plugins/menu/menu.c)
+target_include_directories(bb_plugin_menu_example PRIVATE include)
+set_target_properties(bb_plugin_menu_example PROPERTIES OUTPUT_NAME menu PREFIX "")
 
 # The shader overrides' example (plugin API 27, examples/plugins/shader_tint):
 # built only when asked for (and by its test).
@@ -796,6 +802,19 @@ if(UNIX)
   target_link_libraries(photo_mode_plugin_test PRIVATE ${CMAKE_DL_LIBS})
   add_dependencies(photo_mode_plugin_test bb_plugin_photo_mode)
   add_test(NAME photo_mode_plugin_test COMMAND photo_mode_plugin_test $<TARGET_FILE:bb_plugin_photo_mode>)
+  # The in-game menus' test plugin (tests/plugins/menu_demo.cpp: every part of
+  # plugin API 29's menus) on a pretend host. Built beside the tests, never into
+  # plugins/, where bbhost would load it.
+  add_library(menu_demo MODULE tests/plugins/menu_demo.cpp)
+  target_include_directories(menu_demo PRIVATE include)
+  target_compile_features(menu_demo PRIVATE cxx_std_17)
+  set_target_properties(menu_demo PROPERTIES PREFIX "")
+  add_executable(plugin_menus_test tests/plugin_menus_test.cpp src/host/plugin_menu.cpp)
+  target_include_directories(plugin_menus_test PRIVATE src include)
+  target_compile_features(plugin_menus_test PRIVATE cxx_std_17)
+  target_link_libraries(plugin_menus_test PRIVATE ${CMAKE_DL_LIBS})
+  add_dependencies(plugin_menus_test menu_demo)
+  add_test(NAME plugin_menus_test COMMAND plugin_menus_test $<TARGET_FILE:menu_demo>)
   # The shader overrides' example on a pretend host (examples/plugins/shader_tint):
   # its own source asked for until met, patched, on and off by turns, its
   # strength in its shader data each frame; nothing asked of an older host.
@@ -1192,6 +1211,15 @@ if(UNIX)
   target_compile_definitions(game_font_test PRIVATE BBHOST_GAME_FONT_NO_FS=1)
   add_test(NAME game_font_test COMMAND game_font_test)
   set_tests_properties(game_font_test PROPERTIES SKIP_RETURN_CODE 77)
+  # A plugin's in-game menus as the host keeps them (host/plugin_menu.h): the
+  # pages and menus a table declares, rows set at run time, the back stack.
+  add_executable(plugin_menu_test tests/plugin_menu_test.cpp src/host/plugin_menu.cpp)
+  target_include_directories(plugin_menu_test PRIVATE src include)
+  add_test(NAME plugin_menu_test COMMAND plugin_menu_test)
+  # docs/plugins.md's In-game menus example is examples/plugins/menu/menu.c as it is.
+  add_executable(plugin_menu_docs_test tests/plugin_menu_docs_test.cpp)
+  add_test(NAME plugin_menu_docs_test COMMAND plugin_menu_docs_test ${CMAKE_SOURCE_DIR}/docs/plugins.md
+           ${CMAKE_SOURCE_DIR}/examples/plugins/menu/menu.c)
   # The game's menu art: its BC7 decoder against Pillow's, the tiling, the
   # TPF, DCX, the five-part stretch and the packing (host/game_menu_art.h); with
   # the dump (BBHOST_APP0) every piece of menu/common.tpf.dcx too.

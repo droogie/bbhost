@@ -4,6 +4,7 @@
 #include "bbhost_plugin.h"
 #include "engine/menu_pointer.h"
 #include "host/game_menu_art.h"
+#include "host/plugin_menu.h"
 #include "host/plugins.h"
 #include "log.h"
 
@@ -23,6 +24,8 @@
 
 #if defined(BBHOST_HAVE_SDL3)
 #include "host/launcher_ui.h"
+#include "host/text_entry.h"
+#include "host/window.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 #endif
@@ -32,16 +35,22 @@ namespace {
 struct Panel {
     std::string owner;                         // the plugin whose panel is up; empty: none
     std::shared_ptr<const PluginEntry> entry;  // its options, as they were when it was shown
-    std::vector<std::string> pages;  // its pages' heading keys, in order
-    int page = 0;
+    std::shared_ptr<const plugin_menu::Layout> layout;  // its pages and menus (host/plugin_menu.h)
+    plugin_menu::Nav nav;                      // the menu up: its L1/R1 pages and the pages opened on top
     std::string guide, guide_keys;
     bool defaults = false;
+    bool corner = false;     // BB_PANEL_CORNER; else the game's dialog, centred, the screen dimmed
+    int focused_row = 0;     // the row the cursor is on (the draw's): a page opened on top comes back to it
+    int cursor_to = -1;      // the row the cursor goes to on the next frame (back from a page on top)
 };
 std::mutex g_mu;
 Panel g_panel;                                     // under g_mu
 std::map<std::string, bool> g_closed;              // under g_mu: closed by the player since its plugin last asked
-std::map<std::string, std::string> g_last_page;    // under g_mu: the page each plugin's panel showed last
+std::map<std::string, std::string> g_last_page;    // under g_mu: the menu page each plugin's panel showed last
+std::map<std::string, plugin_menu::Runtime> g_runtime;  // under g_mu: what each plugin set at run time
+std::map<std::string, std::shared_ptr<const plugin_menu::Layout>> g_layouts;  // under g_mu: each plugin's, read once
 std::atomic<bool> g_shown{false};
+std::atomic<bool> g_exclusive{false};              // the panel up is a centred menu: every input its own
 std::atomic<bool> g_appeared{false};               // shown since the last frame drew it: give it the focus
 std::atomic<bool> g_opened{false};                 // shown, not just a page turned: the game's menu-opening sound
 // The menu sound asked for since plugins_frame last took one: (priority << 16) | id + 1, 0 none.
@@ -55,6 +64,33 @@ void ask_sound(int id) {
     std::uint32_t was = g_sound.load(std::memory_order_relaxed);
     while ((was == 0 || (was >> 16) <= priority) && !g_sound.compare_exchange_weak(was, want, std::memory_order_relaxed)) {
     }
+}
+
+// A loaded plugin's catalog entry (its options table as the menus have it).
+bool catalog_entry(const std::string& name, PluginEntry& out) {
+    for (PluginEntry& e : plugins_catalog()) {
+        if (e.name == name && !e.visitor) {
+            out = std::move(e);
+            return true;
+        }
+    }
+    return false;
+}
+
+// A plugin's pages and menus, read from its table the first time (the table
+// does not change while it runs). Not under g_mu: the catalog is read
+// without it.
+std::shared_ptr<const plugin_menu::Layout> layout_for(const std::string& name) {
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        const auto it = g_layouts.find(name);
+        if (it != g_layouts.end()) return it->second;
+    }
+    PluginEntry e;
+    if (!catalog_entry(name, e)) return nullptr;
+    auto l = std::make_shared<const plugin_menu::Layout>(plugin_menu::layout_of(e.options));
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_layouts.emplace(name, l).first->second;
 }
 
 }  // namespace
@@ -86,9 +122,11 @@ void plugin_panel_preview_tick() {
     if (colon != std::string::npos) how.page = want.substr(colon + 1);
     const char* g = std::getenv("BBHOST_PANEL_PREVIEW_GUIDE");
     const char* gk = std::getenv("BBHOST_PANEL_PREVIEW_GUIDE_KEYS");
+    const char* corner = std::getenv("BBHOST_PANEL_PREVIEW_CORNER");
     how.guide = g ? g : "";
     how.guide_keys = gk ? gk : "";
-    how.defaults = true;
+    how.corner = corner && corner[0] == '1';
+    how.defaults = how.corner;  // photo mode's: its corner panel has Defaults rows
     if (plugin_panel_show(name, how)) {
         done = true;
         host_log("plugin: %s's panel shown for a preview (BBHOST_PANEL_PREVIEW)", name.c_str());
@@ -97,45 +135,49 @@ void plugin_panel_preview_tick() {
 
 bool plugin_panel_show(const std::string& name, const PluginPanelShow& how) {
     PluginEntry entry;
-    bool found = false;
-    for (PluginEntry& e : plugins_catalog()) {
-        if (e.name == name && !e.visitor) {
-            entry = std::move(e);
-            found = true;
-            break;
-        }
-    }
-    if (!found) return false;
-    std::vector<std::string> pages;
-    for (const PluginOptionDesc& o : entry.options) {
-        if (o.type == BB_OPT_HEADING && !o.page.empty() && o.page == o.key) pages.push_back(o.key);
-    }
-    if (pages.empty()) return false;
+    if (!catalog_entry(name, entry)) return false;
+    const std::shared_ptr<const plugin_menu::Layout> layout = layout_for(name);
     std::lock_guard<std::mutex> lk(g_mu);
+    if (!layout || layout->pages.empty()) return false;
+    for (const std::string& pg : how.pages) {
+        if (!layout->page(pg)) return false;  // a page it has not got
+    }
+    if (!how.page.empty() && !layout->page(how.page)) return false;
     std::string want = how.page.empty() ? g_last_page[name] : how.page;
-    int page = 0;
-    if (!want.empty()) {
-        const auto it = std::find(pages.begin(), pages.end(), want);
-        if (it == pages.end()) {
-            if (!how.page.empty()) return false;  // a page it has not got
-        } else {
-            page = static_cast<int>(it - pages.begin());
+    if (!how.pages.empty() && std::find(how.pages.begin(), how.pages.end(), want) == how.pages.end()) {
+        if (!how.page.empty()) return false;  // a page outside the menu it names
+        want = how.pages.front();
+    }
+    if (want.empty() || !layout->page(want)) {
+        want = layout->pages.front().key;
+        for (const plugin_menu::Page& pg : layout->pages) {
+            if (!pg.subpage) {
+                want = pg.key;
+                break;
+            }
         }
     }
+    plugin_menu::Nav nav;
+    nav.cycle = how.pages.empty() ? plugin_menu::cycle_of(*layout, want) : how.pages;
+    nav.at = static_cast<int>(std::find(nav.cycle.begin(), nav.cycle.end(), want) - nav.cycle.begin());
+    if (nav.at >= static_cast<int>(nav.cycle.size())) nav.at = 0;
     const bool was = g_shown.load() && g_panel.owner == name;
+    g_panel = Panel{};
     g_panel.owner = name;
     g_panel.entry = std::make_shared<const PluginEntry>(std::move(entry));
-    g_panel.pages = std::move(pages);
-    g_panel.page = page;
+    g_panel.layout = layout;
+    g_panel.nav = std::move(nav);
     g_panel.guide = how.guide;
     g_panel.guide_keys = how.guide_keys;
     g_panel.defaults = how.defaults;
-    g_last_page[name] = g_panel.pages[static_cast<std::size_t>(page)];
+    g_panel.corner = how.corner;
+    g_last_page[name] = g_panel.nav.shown();
     if (!was) {
         g_appeared.store(true);
         g_opened.store(true);
-        host_log("plugin: %s's panel up at its page %s", name.c_str(), g_last_page[name].c_str());
+        host_log("plugin: %s's panel up at its page %s%s", name.c_str(), g_last_page[name].c_str(), how.corner ? "" : ", centred");
     }
+    g_exclusive.store(!how.corner);
     g_shown.store(true);
     return true;
 }
@@ -144,6 +186,7 @@ void plugin_panel_hide(const std::string& name) {
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_panel.owner != name) return;
     g_panel.owner.clear();
+    g_exclusive.store(false);
     if (g_shown.exchange(false)) host_log("plugin: %s's panel down", name.c_str());
 }
 
@@ -153,20 +196,52 @@ void plugin_panel_state(const std::string& name, PluginPanelState& out) {
     auto it = g_closed.find(name);
     out.closed = it != g_closed.end() && it->second;
     if (it != g_closed.end()) it->second = false;
-    out.page = g_last_page[name];
+    out.page = out.shown ? g_panel.nav.shown() : g_last_page[name];
+}
+
+bool plugin_panel_rows(const std::string& name, const std::string& page, const std::vector<PluginOptionDesc>& rows) {
+    const std::shared_ptr<const plugin_menu::Layout> layout = layout_for(name);
+    std::lock_guard<std::mutex> lk(g_mu);
+    return layout && plugin_menu::set_rows(*layout, g_runtime[name], page, rows);
+}
+
+bool plugin_panel_value(const std::string& name, const std::string& page, const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    const auto it = g_runtime.find(name);
+    return it != g_runtime.end() && plugin_menu::set_value(it->second, page, key, value);
+}
+
+bool plugin_panel_open(const std::string& name, const std::string& page) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_shown.load() || g_panel.owner != name || !g_panel.layout || !g_panel.layout->page(page)) return false;
+    g_panel.nav.open(page, g_panel.focused_row);
+    g_appeared.store(true);
+    return true;
+}
+
+std::vector<PluginMenuEntry> plugin_panel_menus(const std::string& name) {
+    std::vector<PluginMenuEntry> out;
+    const std::shared_ptr<const plugin_menu::Layout> layout = layout_for(name);
+    if (!layout) return out;
+    for (const plugin_menu::MenuDecl& m : layout->menus) {
+        if (!m.pages.empty()) out.push_back({m.pages.front(), m.name});
+    }
+    return out;
 }
 
 bool plugin_panel_shown() { return g_shown.load(std::memory_order_relaxed); }
 
+bool plugin_panel_exclusive() { return g_shown.load(std::memory_order_relaxed) && g_exclusive.load(std::memory_order_relaxed); }
+
 bool plugin_panel_key(int sc) {
     // SDL scancodes (USB usages): the arrows, Enter (and the keypad's), Page
-    // Up, Page Down, Q, E and Escape.
+    // Up, Page Down, Q, E, Escape and Backspace.
     switch (sc) {
     case 79: case 80: case 81: case 82:  // right, left, down, up
     case 40: case 88:                    // Return, keypad Enter
     case 75: case 78:                    // Page Up, Page Down
     case 20: case 8:                     // Q, E
-    case 41:                             // Escape
+    case 41: case 42:                    // Escape, Backspace
         return true;
     default:
         return false;
@@ -243,9 +318,6 @@ constexpr ImU32 kGrabLit = IM_COL32(236, 202, 136, 210);
 constexpr ImU32 kFrame = IM_COL32(255, 244, 220, 16);
 constexpr ImU32 kFrameHot = IM_COL32(255, 244, 220, 28);
 }  // namespace look
-
-// The panel's letters: the serif nearest the game's menus' (host/launcher_ui.h).
-constexpr float kTextSize = 17.0f, kTitleSize = 22.0f, kSmallSize = 15.0f;  // before the scale
 
 // A thin rule across [x0, x1] at y with the game's small ornament at its
 // middle and its ends: a diamond, and short ticks.
@@ -347,9 +419,19 @@ bool value_button(const char* id, const std::string& text, ImVec2 size, bool lit
 // those under the widgets and the letters.
 constexpr int kGlowLayer = 0, kLineLayer = 1, kWidgetLayer = 2;
 
+struct RowIn {
+    const PluginOptionDesc* o = nullptr;
+    std::string value;    // its value now: the config's (a table row) or the menu's (a run-time row)
+    bool grey = false;    // BB_OPT_WHEN not met
+    std::string drag_id;  // where a slider keeps its value while the pointer drags it
+};
+
 struct RowOut {
     bool hot = false;      // the cursor or the pointer on it: its help shows
     bool focused = false;  // the cursor on it: lit
+    bool changed = false;  // the player changed its value to `value`
+    std::string value;
+    bool pressed = false;  // a button pressed (an ACTION), or a TEXT row's box asked for
     float glow_x = -1.0f;  // a slider's: its value's glow centred on its track, as the game's are (not on the mark)
 };
 
@@ -357,12 +439,14 @@ struct RowOut {
 // the value column after it. With the game's art: the label's line fading out
 // to the left, the value's line with its scrolled ends, a slider's track and
 // its filled part (all under the widget, the draw list's first channel), and
-// the choice's arrows the dialog's own.
-RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, float mid, float s, bool cursor, const Art& art) {
+// the choice's arrows the dialog's own. What the player does to it comes back
+// in RowOut; the caller keeps it (the config or the menu's run-time values).
+RowOut row(const RowIn& in, ImVec2 a, ImVec2 b, float mid, float s, bool cursor, const Art& art) {
     RowOut out;
+    const PluginOptionDesc& o = *in.o;
     ImGui::PushID(o.key.c_str());
-    const std::string value = plugins_option_value(p, o);
-    const bool grey = greyed(p, o);
+    const std::string& value = in.value;
+    const bool grey = in.grey;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float frame_h = ImGui::GetFrameHeight();
     const float gap = 14.0f * s;
@@ -374,6 +458,11 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
     ImGui::SetNextItemWidth(val_size.x);
     bool arrows = false;      // the value is one of a list: arrows either side while it has the cursor
     bool underline = false;   // its value's line under it (the game's art)
+    const auto change = [&](const std::string& v) {
+        out.changed = true;
+        out.value = v;
+        ask_sound(kMenuSoundMove);
+    };
     switch (o.type) {
     case BB_OPT_BOOL: {
         const bool on = value == "true" || value == "1";
@@ -381,16 +470,13 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
         if (value_button(o.key.c_str(), on ? "On" : "Off", val_size, false)) to = !on;
         take_cursor(cursor);
         if (ImGui::IsItemFocused() && !grey && step_pressed() != 0) to = !on;
-        if (to != on) {
-            plugins_set_option(p.name, o.key, to ? "true" : "false");
-            ask_sound(kMenuSoundMove);
-        }
+        if (to != on) change(to ? "true" : "false");
         arrows = underline = true;
         break;
     }
     case BB_OPT_INT:
     case BB_OPT_FLOAT: {
-        const std::string id = p.name + "." + o.key;
+        const std::string& id = in.drag_id;
         const auto it = g_drag.find(id);
         double v = it != g_drag.end() ? it->second : std::atof(value.c_str());
         bool changed = false;
@@ -408,7 +494,6 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
                                      nf->CalcTextSizeA(nfs, FLT_MAX, 0.0f, shown(o.max).c_str()).x) +
                             gap;
         const float bar_w = std::max(val_size.x - num_w, 8.0f * s);
-        out.glow_x = val_a.x + bar_w * 0.5f;
         const bool track = art.has(game_menu_art::kSliderTrack) && art.has(game_menu_art::kSliderFill);
         if (track) {  // the game's track and filling, a thin mark of ours: none of the widget's own
             ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
@@ -427,17 +512,18 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
             if (ImGui::SliderFloat("##v", &fv, static_cast<float>(o.min), static_cast<float>(o.max), "")) g_drag[id] = fv;
             v = fv;
         }
+        const float f = o.max > o.min ? std::clamp(static_cast<float>((v - o.min) / (o.max - o.min)), 0.0f, 1.0f) : 0.0f;
+        const float fx = val_a.x + 2.0f * s + (bar_w - 4.0f * s) * f;
+        out.glow_x = val_a.x + bar_w * 0.5f;  // the track's middle, as the game lights its sliders
         if (track) {
             ImGui::PopStyleColor(5);
             const float th = std::max(frame_h * 0.42f, 4.0f), fh = th * 0.5f;
             const float cy = val_a.y + frame_h * 0.5f;
-            const float f = o.max > o.min ? static_cast<float>((v - o.min) / (o.max - o.min)) : 0.0f;
             dl->ChannelsSetCurrent(kLineLayer);
             art.image(dl, game_menu_art::kSliderTrack, ImVec2(val_a.x, cy - th * 0.5f), ImVec2(val_a.x + bar_w, cy + th * 0.5f), art_tint);
-            const float fx = val_a.x + 2.0f * s + (bar_w - 4.0f * s) * std::clamp(f, 0.0f, 1.0f);
             if (fx > val_a.x + 2.0f * s)
                 art.image(dl, game_menu_art::kSliderFill, ImVec2(val_a.x + 2.0f * s, cy - fh * 0.5f), ImVec2(fx, cy + fh * 0.5f),
-                          art_tint, false, false, 0.0f, std::max(1.0f, art.atlas->piece[game_menu_art::kSliderFill].w * std::clamp(f, 0.0f, 1.0f)));
+                          art_tint, false, false, 0.0f, std::max(1.0f, art.atlas->piece[game_menu_art::kSliderFill].w * f));
             dl->ChannelsSetCurrent(kWidgetLayer);
             const bool lit = ImGui::IsItemFocused() || ImGui::IsItemActive();
             const ImU32 mark = grey ? look::kTextDim : lit ? look::kGoldLit : look::kGold;
@@ -461,10 +547,7 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
                 changed = true;
             }
         }
-        if (changed) {
-            plugins_set_option(p.name, o.key, number_text(o, v));
-            ask_sound(kMenuSoundMove);
-        }
+        if (changed) change(number_text(o, v));
         break;
     }
     case BB_OPT_CHOICE: {
@@ -481,24 +564,33 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
         if (ImGui::IsItemFocused() && !grey && n) {
             if (const int d = step_pressed()) to = (cur + d + n) % n;
         }
-        if (to != cur) {
-            plugins_set_option(p.name, o.key, choices[static_cast<std::size_t>(to)]);
-            ask_sound(kMenuSoundMove);
-        }
+        if (to != cur) change(choices[static_cast<std::size_t>(to)]);
         arrows = underline = true;
         break;
     }
+    case BB_OPT_TEXT:
+        // Its text; Cross, Enter or a click asks for the host's text box.
+        if (value_button(o.key.c_str(), value, val_size, false)) out.pressed = true;
+        take_cursor(cursor);
+        underline = true;
+        break;
     case BB_OPT_ACTION:
         ImGui::SetCursorScreenPos(ImVec2(a.x, val_a.y));
-        if (value_button(o.key.c_str(), o.label, ImVec2(b.x - a.x, frame_h), false)) {
-            plugins_run_action(p.name, o.key);
-            ask_sound(kMenuSoundDecide);
-        }
+        if (value_button(o.key.c_str(), o.label, ImVec2(b.x - a.x, frame_h), false)) out.pressed = true;
         take_cursor(cursor);
         break;
-    default:
-        ImGui::TextDisabled("%s", value.c_str());
+    default: {
+        // BB_OPT_INFO (and a type this host does not know): its value as
+        // text, which the cursor passes over; the pointer still shows its help.
+        ImFont* f = ImGui::GetFont();
+        const float fs = ImGui::GetFontSize();
+        const ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, value.c_str());
+        dl->AddText(f, fs, ImVec2(val_a.x + (val_size.x - ts.x) * 0.5f, val_a.y + (frame_h - ts.y) * 0.5f), look::kText, value.c_str());
+        ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+        ImGui::Dummy(val_size);
+        ImGui::PopItemFlag();
         break;
+    }
     }
     out.focused = ImGui::IsItemFocused();
     out.hot = out.focused || ImGui::IsItemHovered();
@@ -525,10 +617,10 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
         if (art.has(game_menu_art::kArrow)) {
             const float ah = std::round(ImGui::GetFontSize() * 1.05f), aw = ah * art.atlas->piece[game_menu_art::kArrow].w /
                                                                              static_cast<float>(art.atlas->piece[game_menu_art::kArrow].h);
-            const float cy = val_a.y + frame_h * 0.5f, in = 4.0f * s;
+            const float cy = val_a.y + frame_h * 0.5f, in_ = 4.0f * s;
             const ImU32 t = grey ? IM_COL32(255, 255, 255, 110) : IM_COL32(255, 255, 255, 255);
-            art.image(dl, game_menu_art::kArrow, ImVec2(val_a.x + in, cy - ah * 0.5f), ImVec2(val_a.x + in + aw, cy + ah * 0.5f), t, true);
-            art.image(dl, game_menu_art::kArrow, ImVec2(b.x - in - aw, cy - ah * 0.5f), ImVec2(b.x - in, cy + ah * 0.5f), t);
+            art.image(dl, game_menu_art::kArrow, ImVec2(val_a.x + in_, cy - ah * 0.5f), ImVec2(val_a.x + in_ + aw, cy + ah * 0.5f), t, true);
+            art.image(dl, game_menu_art::kArrow, ImVec2(b.x - in_ - aw, cy - ah * 0.5f), ImVec2(b.x - in_, cy + ah * 0.5f), t);
         } else {
             value_arrows(dl, val_a, val_a + val_size, s, grey ? look::kTextDim : look::kGold);
         }
@@ -659,6 +751,41 @@ bool guide_with_icons(ImDrawList* dl, ImFont* f, float size, float x0, float x1,
     return true;
 }
 
+// The panel's sizes before the menus' scale: the corner panel's, or the game's
+// options dialog's - on its 1080-line stage 915 x 738, its letters 24 px, its
+// rows 57 px apart, its ornaments at 0.6 of their pixels - at the menus'
+// scale (900 lines at a scale of 1).
+struct Metrics {
+    float text, title, small, where;  // the rows', the title's, the help's and the page count's letters
+    float width, height;              // height 0: as the longest page needs (the corner)
+    float pad_x, pad_y;
+    float row_gap;                    // a row's height over its frame's
+    float art_k;                      // the ornaments' pixels to a screen pixel
+    int most_rows;                    // the rows a page shows before it scrolls (the corner)
+};
+constexpr float kStage = 900.0f / 1080.0f;
+constexpr Metrics kCorner{17.0f, 22.0f, 15.0f, 15.0f, 560.0f, 0.0f, 26.0f, 12.0f, 6.0f, 0.53f, 12};
+constexpr Metrics kDialog{24.0f * kStage, 24.0f * kStage, 24.0f * kStage, 18.0f * kStage, 915.0f * kStage, 738.0f * kStage,
+                          40.0f * kStage, 14.0f * kStage, 26.0f * kStage, 0.6f * kStage, 0};
+
+// The confirm a BB_OPT_CONFIRM button asks for, in the game's yes/no dialog's
+// look: the presenter's thread only.
+struct Confirm {
+    bool on = false, appeared = false;
+    std::string owner, key;  // the plugin and the key its on_action gets on Yes
+    std::string question, help;
+    std::string open;        // BB_OPT_OPEN too: the page Yes opens
+    int row = 0;
+} g_confirm;
+
+// A TEXT row being typed in the host's text box (host/window.h): the
+// presenter's thread only.
+struct Typing {
+    bool on = false;
+    std::string owner, page, key;  // the row: its page and its own key
+    bool runtime = false;
+} g_typing;
+
 }  // namespace
 
 void plugin_panel_draw(float scale, bool pad) {
@@ -669,80 +796,132 @@ void plugin_panel_draw(float scale, bool pad) {
     }();
     pad = pad || preview_pad;
     Panel p;
+    plugin_menu::Runtime rt;
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        if (g_panel.owner.empty()) return;
+        if (g_panel.owner.empty() || !g_panel.layout) return;
         p = g_panel;
+        g_panel.cursor_to = -1;
+        const auto it = g_runtime.find(p.owner);
+        if (it != g_runtime.end()) rt = it->second;
     }
-    const int n = static_cast<int>(p.pages.size());
-    // The pages: L1 and R1, Page Up and Page Down, Q and E.
+    const plugin_menu::Layout& layout = *p.layout;
+    // A TEXT row's box: its answer, once the player gives one; nothing else
+    // reads the keys meanwhile.
+    if (g_typing.on) {
+        std::string text;
+        const int r = host_text_entry_poll(text);
+        if (r != 0) {
+            host_text_entry_end();
+            g_typing.on = false;
+            if (r == 1 && g_typing.owner == p.owner) {
+                if (g_typing.runtime) {
+                    {
+                        std::lock_guard<std::mutex> lk(g_mu);
+                        plugin_menu::set_value(g_runtime[p.owner], g_typing.page, g_typing.key, text);
+                    }
+                    plugins_menu_option(p.owner, g_typing.page + "/" + g_typing.key, text);
+                } else {
+                    plugins_set_option(p.owner, g_typing.key, text);
+                }
+                ask_sound(kMenuSoundDecide);
+            } else {
+                ask_sound(kMenuSoundCancel);
+            }
+        }
+    }
+    const bool modal = g_typing.on || g_confirm.on;  // the box or the yes/no has the input
+    const int n = static_cast<int>(p.nav.cycle.size());
+    // The pages: L1 and R1, Page Up and Page Down, Q and E - a menu's own,
+    // not on a page opened on top of one.
     int turn = 0;
-    if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_PageUp, false) ||
-        ImGui::IsKeyPressed(ImGuiKey_Q, false))
-        turn = -1;
-    if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_PageDown, false) ||
-        ImGui::IsKeyPressed(ImGuiKey_E, false))
-        turn = 1;
+    if (!modal && !p.nav.on_subpage()) {
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_PageUp, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_Q, false))
+            turn = -1;
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_PageDown, false) ||
+            ImGui::IsKeyPressed(ImGuiKey_E, false))
+            turn = 1;
+    }
     bool refocus = g_appeared.exchange(false);
     if (g_opened.exchange(false)) ask_sound(kMenuSoundOpen);
     if (turn && n > 1) {
-        p.page = (p.page + turn + n) % n;
+        p.nav.turn(turn);
         refocus = true;
         ask_sound(kMenuSoundMove);
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_panel.owner == p.owner) {
-            g_panel.page = p.page;
-            g_last_page[p.owner] = p.pages[static_cast<std::size_t>(p.page)];
+            g_panel.nav.turn(turn);
+            g_last_page[p.owner] = g_panel.nav.shown();
         }
     }
-    const std::string& page_key = p.pages[static_cast<std::size_t>(p.page)];
-    std::string title;
-    std::string page_help;
-    for (const PluginOptionDesc& o : p.entry->options) {
-        if (o.type == BB_OPT_HEADING && o.key == page_key) {
-            title = o.label;
-            page_help = o.help;
+    const std::string page_key = p.nav.shown();
+    const plugin_menu::Page* page = layout.page(page_key);
+    if (!page) return;
+    const std::vector<plugin_menu::Row>& rows = plugin_menu::rows_of(*page, rt);
+    // Circle, Escape and Backspace go back from a page opened on top, and
+    // close the menu on one of its own - unless a row holds them (a slider
+    // dragged) or the box or the yes/no has them.
+    const bool back_pressed = !modal && !ImGui::IsAnyItemActive() &&
+                              (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+                               ImGui::IsKeyPressed(ImGuiKey_Backspace, false));
+    bool close = back_pressed && !p.nav.on_subpage();
+    if (back_pressed && p.nav.on_subpage()) {
+        // From the next frame the page under it, the cursor on the row that opened it.
+        ask_sound(kMenuSoundCancel);
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_panel.owner == p.owner) {
+            g_panel.cursor_to = g_panel.nav.back();
+            g_appeared.store(true);
         }
     }
-    // Circle and Escape close it, unless a row holds them (a slider dragged).
-    bool close = !ImGui::IsAnyItemActive() &&
-                 (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false));
 
     const float s = scale;
-    const Art art = menu_art(s);
+    const Metrics& m = p.corner ? kCorner : kDialog;
+    Art art = menu_art(s);
+    art.k = m.art_k * s;
     using game_menu_art::kOrnament;
     using game_menu_art::kBand;
     const bool ornate = art.has(kOrnament) && art.has(kBand);         // the dialog's own top and foot
     const bool inner_art = art.has(game_menu_art::kRule) && art.has(game_menu_art::kFiligree);
-    ImGui::PushFont(launcher_ui::font_game(), kTextSize);
+    const bool glow_art = art.has(game_menu_art::kGlow);
+    ImGui::PushFont(launcher_ui::font_game(), m.text);
     const float text_size = ImGui::GetFontSize();
-    const float title_size = text_size * (kTitleSize / kTextSize), small_size = text_size * (kSmallSize / kTextSize);
-    // One size for every page, so that it never moves: the rows of its
-    // longest page, the Defaults row, and a help area the longest help fits
-    // in, whichever row it is.
-    const float width = 560.0f * s, pad_x = 26.0f * s, pad_y = 12.0f * s;
+    const float title_size = text_size * (m.title / m.text), small_size = text_size * (m.small / m.text);
+    const float where_size = text_size * (m.where / m.text);
+    // One size for every page, so that it never moves: the corner panel the
+    // rows of its longest page (up to a dozen: more scroll), the Defaults row
+    // and a help area the longest help fits in; the dialog the game's size.
+    const float width = m.width * s, pad_x = m.pad_x * s, pad_y = m.pad_y * s;
     const float inner = width - 2.0f * pad_x;
     const ImVec2 frame_pad(8.0f * s, 3.0f * s);
     const float frame_h = text_size + 2.0f * frame_pad.y;
-    const float row_h = frame_h + 6.0f * s;
+    const float row_h = frame_h + m.row_gap * s;
     // The help and the guide in the font at the small size: their lines a
     // line's height and the game's leading apart.
     ImFont* const font = ImGui::GetFont();
     const float leading = kLeading * s, advance = small_size + leading;
     const auto lines_of = [&](const std::string& t) { return t.empty() ? 0 : static_cast<int>(wrap_lines(font, small_size, t, inner).size()); };
     int most_rows = 0, help_lines = 0;
-    {
-        std::map<std::string, int> rows;
-        for (const PluginOptionDesc& o : p.entry->options) {
-            if (o.page.empty()) continue;
-            help_lines = std::max(help_lines, lines_of(o.help));
-            if (o.type != BB_OPT_HEADING) most_rows = std::max(most_rows, ++rows[o.page]);
-        }
+    for (const plugin_menu::Page& pg : layout.pages) {
+        const std::vector<plugin_menu::Row>& r = plugin_menu::rows_of(pg, rt);
+        most_rows = std::max(most_rows, static_cast<int>(r.size()));
+        help_lines = std::max(help_lines, lines_of(pg.help));
+        for (const plugin_menu::Row& row : r) help_lines = std::max(help_lines, lines_of(row.desc.help));
     }
+    if (m.most_rows) most_rows = std::min(most_rows, m.most_rows);
     // Room for two to five lines, and under the last for its descenders.
     help_lines = std::clamp(help_lines, 2, 5);
     const float help_h = static_cast<float>(help_lines) * advance - leading + descender_overhang(font, small_size);
-    const int guide_lines = std::max(lines_of(p.guide), lines_of(p.guide_keys));
+    // The guide: the plugin's, or the host's for the menu up.
+    std::string guide_pad = p.guide, guide_keys = p.guide_keys;
+    if (guide_pad.empty() && guide_keys.empty()) {
+        const bool pages = n > 1 && !p.nav.on_subpage();
+        const char* back = p.nav.on_subpage() ? "back" : "close";
+        guide_pad = std::string(pages ? "L1 R1: page    " : "") + "d-pad: choose and change    Cross: OK    Circle: " + back;
+        guide_keys = std::string(pages ? "Q E: page    " : "") + "arrows: choose and change    Enter: OK    Esc: " + back;
+    }
+    const int guide_lines = std::max(lines_of(guide_pad), lines_of(guide_keys));
     const float guide_h = (guide_lines ? static_cast<float>(guide_lines) * advance - leading : 0.0f) + (art.atlas ? small_size * 0.3f : 0.0f);
     const float rule_gap = 12.0f * s;
     // The game's top and foot are its ornament over its band; the rules about
@@ -751,15 +930,32 @@ void plugin_panel_draw(float scale, bool pad) {
     const float inner_gap = inner_art ? 18.0f * s : rule_gap;
     // Under the help's rule the filigree's curls hang 17 of its 42 rows: the help starts below them.
     const float help_drop = inner_art ? std::max(0.0f, 17.0f * art.k * 0.75f + 4.0f * s - inner_gap * 0.5f) : 0.0f;
-    const float title_h = title_size * 1.15f + (n > 1 ? small_size * 1.1f : 0.0f);
-    const float rows_h = static_cast<float>(most_rows) * row_h + (p.defaults ? row_h + 6.0f * s : 0.0f);
-    const float height = pad_y + outer_h + title_h + inner_gap + rows_h + inner_gap + help_drop + help_h + 10.0f * s + guide_h + outer_h + pad_y;
+    const float title_h = title_size * 1.15f + (n > 1 ? where_size * 1.1f : 0.0f);
+    const float defaults_h = p.defaults ? row_h + 6.0f * s : 0.0f;
+    const float fixed = pad_y + outer_h + title_h + inner_gap + inner_gap + help_drop + help_h + 10.0f * s + guide_h + outer_h + pad_y;
+    float rows_h, height;
+    if (m.height > 0.0f) {
+        // The dialog: its own height, the rows what is left of it.
+        rows_h = std::max(m.height * s - fixed - defaults_h, row_h);
+        most_rows = std::max(1, static_cast<int>(rows_h / row_h));
+        height = fixed + rows_h + defaults_h;
+    } else {
+        rows_h = static_cast<float>(most_rows) * row_h;
+        height = fixed + rows_h + defaults_h;
+    }
+    const bool scrolls = static_cast<int>(rows.size()) > most_rows;
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float margin = 24.0f * s;
-    ImGui::SetNextWindowPos(vp->WorkPos + vp->WorkSize - ImVec2(margin, margin), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    if (p.corner) {
+        const float margin = 24.0f * s;
+        ImGui::SetNextWindowPos(vp->WorkPos + vp->WorkSize - ImVec2(margin, margin), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    } else {
+        // The game's dialogs dim the screen behind them.
+        ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, vp->Pos + vp->Size, IM_COL32(0, 0, 0, 150));
+        ImGui::SetNextWindowPos(vp->WorkPos + vp->WorkSize * 0.5f, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    }
     ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
-    if (refocus) ImGui::SetNextWindowFocus();
+    if (refocus && !g_confirm.on) ImGui::SetNextWindowFocus();
     const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
                                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground;
     // The widgets in the game's colours: no frame but a faint one on the
@@ -784,8 +980,38 @@ void plugin_panel_draw(float scale, bool pad) {
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, art.atlas ? IM_COL32(0, 0, 0, 0) : look::kFrame);
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, art.atlas ? IM_COL32(0, 0, 0, 0) : look::kFrameHot);
     ImGui::PushStyleColor(ImGuiCol_NavCursor, IM_COL32(0, 0, 0, 0));
-    constexpr int kColours = 11, kVars = 6;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
+    constexpr int kColours = 12, kVars = 6;
     int click = 0;  // a page arrow clicked: the page turns from the next frame
+    int focus = -1;  // the row with the cursor, or the Defaults row (rows.size())
+    struct Pressed {
+        const plugin_menu::Row* row = nullptr;
+        int index = 0;
+    } pressed;
+    const auto apply = [&](const plugin_menu::Row& r, const std::string& v) {
+        if (r.runtime) {
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                plugin_menu::set_value(g_runtime[p.owner], page_key, r.desc.key, v);
+            }
+            plugins_menu_option(p.owner, plugin_menu::event_key(page_key, r), v);
+        } else {
+            plugins_set_option(p.owner, r.desc.key, v);
+        }
+    };
+    // Greyed out (BB_OPT_WHEN) unless the row it names holds one of its
+    // values: a run-time row of this page, else one of the table's.
+    const auto grey_of = [&](const plugin_menu::Row& r) {
+        const std::size_t eq = r.desc.when.find('=');
+        if (eq == std::string::npos) return false;
+        const std::string key = r.desc.when.substr(0, eq);
+        const std::vector<std::string> want = split(r.desc.when.substr(eq + 1), '|');
+        for (const plugin_menu::Row& other : rows) {
+            if (other.runtime && other.desc.key == key)
+                return std::find(want.begin(), want.end(), plugin_menu::value_of(rt, page_key, other)) == want.end();
+        }
+        return greyed(*p.entry, r.desc);
+    };
     if (ImGui::Begin("##plugin_panel", nullptr, flags)) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 o = ImGui::GetWindowPos();
@@ -817,40 +1043,40 @@ void plugin_panel_draw(float scale, bool pad) {
         }
         // The page's name in gold between its turns (the pointer's: the
         // d-pad's cursor goes over the rows only - L1 and R1 turn the pages),
-        // and where it is among them.
+        // and where it is among them; a page opened on top has neither.
         {
             ImFont* f = ImGui::GetFont();
-            const ImVec2 ts = f->CalcTextSizeA(title_size, FLT_MAX, 0.0f, title.c_str());
-            dl->AddText(f, title_size, ImVec2((x0 + x1 - ts.x) * 0.5f, y), look::kTitle, title.c_str());
-            const float arrow = title_size * 0.9f;
-            ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
-            ImGui::SetCursorScreenPos(ImVec2(x0, y + (title_size * 1.15f - arrow) * 0.5f));
-            if (ImGui::InvisibleButton("##prev", ImVec2(arrow, arrow))) click = -1;
-            const bool prev_hot = ImGui::IsItemHovered();
-            ImGui::SetCursorScreenPos(ImVec2(x1 - arrow, y + (title_size * 1.15f - arrow) * 0.5f));
-            if (ImGui::InvisibleButton("##next", ImVec2(arrow, arrow))) click = 1;
-            const bool next_hot = ImGui::IsItemHovered();
-            ImGui::PopItemFlag();
-            const float cy = y + title_size * 0.58f;
-            if (art.has(game_menu_art::kArrow)) {
-                const float ah = std::round(title_size * 0.85f), aw = ah * art.atlas->piece[game_menu_art::kArrow].w /
-                                                                      static_cast<float>(art.atlas->piece[game_menu_art::kArrow].h);
-                art.image(dl, game_menu_art::kArrow, ImVec2(x0 + 2.0f * s, cy - ah * 0.5f), ImVec2(x0 + 2.0f * s + aw, cy + ah * 0.5f),
-                          prev_hot ? look::kGoldLit : look::kGold, true);
-                art.image(dl, game_menu_art::kArrow, ImVec2(x1 - 2.0f * s - aw, cy - ah * 0.5f), ImVec2(x1 - 2.0f * s, cy + ah * 0.5f),
-                          next_hot ? look::kGoldLit : look::kGold);
-            } else {
-                const float h = 6.0f * s, w = 6.0f * s;
-                dl->AddTriangleFilled(ImVec2(x0 + 2.0f * s, cy), ImVec2(x0 + 2.0f * s + w, cy - h), ImVec2(x0 + 2.0f * s + w, cy + h),
-                                      prev_hot ? look::kGoldLit : look::kGold);
-                dl->AddTriangleFilled(ImVec2(x1 - 2.0f * s, cy), ImVec2(x1 - 2.0f * s - w, cy - h), ImVec2(x1 - 2.0f * s - w, cy + h),
-                                      next_hot ? look::kGoldLit : look::kGold);
-            }
-            if (n > 1) {
+            const ImVec2 ts = f->CalcTextSizeA(title_size, FLT_MAX, 0.0f, page->title.c_str());
+            dl->AddText(f, title_size, ImVec2((x0 + x1 - ts.x) * 0.5f, y), look::kTitle, page->title.c_str());
+            if (n > 1 && !p.nav.on_subpage()) {
+                const float arrow = title_size * 0.9f;
+                ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+                ImGui::SetCursorScreenPos(ImVec2(x0, y + (title_size * 1.15f - arrow) * 0.5f));
+                if (ImGui::InvisibleButton("##prev", ImVec2(arrow, arrow)) && !modal) click = -1;
+                const bool prev_hot = ImGui::IsItemHovered();
+                ImGui::SetCursorScreenPos(ImVec2(x1 - arrow, y + (title_size * 1.15f - arrow) * 0.5f));
+                if (ImGui::InvisibleButton("##next", ImVec2(arrow, arrow)) && !modal) click = 1;
+                const bool next_hot = ImGui::IsItemHovered();
+                ImGui::PopItemFlag();
+                const float cy = y + title_size * 0.58f;
+                if (art.has(game_menu_art::kArrow)) {
+                    const float ah = std::round(title_size * 0.85f), aw = ah * art.atlas->piece[game_menu_art::kArrow].w /
+                                                                          static_cast<float>(art.atlas->piece[game_menu_art::kArrow].h);
+                    art.image(dl, game_menu_art::kArrow, ImVec2(x0 + 2.0f * s, cy - ah * 0.5f), ImVec2(x0 + 2.0f * s + aw, cy + ah * 0.5f),
+                              prev_hot ? look::kGoldLit : look::kGold, true);
+                    art.image(dl, game_menu_art::kArrow, ImVec2(x1 - 2.0f * s - aw, cy - ah * 0.5f), ImVec2(x1 - 2.0f * s, cy + ah * 0.5f),
+                              next_hot ? look::kGoldLit : look::kGold);
+                } else {
+                    const float h = 6.0f * s, w = 6.0f * s;
+                    dl->AddTriangleFilled(ImVec2(x0 + 2.0f * s, cy), ImVec2(x0 + 2.0f * s + w, cy - h), ImVec2(x0 + 2.0f * s + w, cy + h),
+                                          prev_hot ? look::kGoldLit : look::kGold);
+                    dl->AddTriangleFilled(ImVec2(x1 - 2.0f * s, cy), ImVec2(x1 - 2.0f * s - w, cy - h), ImVec2(x1 - 2.0f * s - w, cy + h),
+                                          next_hot ? look::kGoldLit : look::kGold);
+                }
                 char where[32];
-                std::snprintf(where, sizeof(where), "%d / %d", p.page + 1, n);
-                const ImVec2 ws = f->CalcTextSizeA(small_size, FLT_MAX, 0.0f, where);
-                dl->AddText(f, small_size, ImVec2((x0 + x1 - ws.x) * 0.5f, y + title_size * 1.15f), look::kTextDim, where);
+                std::snprintf(where, sizeof(where), "%d / %d", p.nav.at + 1, n);
+                const ImVec2 ws = f->CalcTextSizeA(where_size, FLT_MAX, 0.0f, where);
+                dl->AddText(f, where_size, ImVec2((x0 + x1 - ws.x) * 0.5f, y + title_size * 1.15f), look::kTextDim, where);
             }
         }
         y += title_h;
@@ -874,16 +1100,14 @@ void plugin_panel_draw(float scale, bool pad) {
         inner_rule(rule_top, true);
         y += inner_gap;
         // Its rows, the one with the cursor lit; the glow and the lines go
-        // under the row's widget (the draw list's first channel).
-        std::string help = page_help;
-        dl->ChannelsSplit(3);
-        dl->ChannelsSetCurrent(kWidgetLayer);
-        const bool glow_art = art.has(game_menu_art::kGlow);
+        // under the row's widget (the draw list's first channel). A page with
+        // more than it shows scrolls with the cursor, in a region of its own.
+        std::string help = page->help;
         // `strength` 1 for the cursor's row; less for the one under the
-        // pointer (the art's glow only). `value_x` the value's centre (a
-        // slider's track); < 0 the value column's.
-        const auto light = [&](float top, bool label_side, float strength, float value_x) {
-            dl->ChannelsSetCurrent(kGlowLayer);
+        // pointer (the art's glow only). A slider's value is lit at its mark.
+        // An ACTION row's glow on its text, across the row (`value_x` its middle, `half_w` the glow's half).
+        const auto light = [&](ImDrawList* d, float top, bool label_side, float strength, float value_x, float half_w = -1.0f) {
+            d->ChannelsSetCurrent(kGlowLayer);
             if (glow_art) {
                 // The game's glow: brightest at the column rule, fading to the
                 // left behind the label; on the value, brightest at its middle.
@@ -891,50 +1115,95 @@ void plugin_panel_draw(float scale, bool pad) {
                 const ImU32 label_tint = IM_COL32(255, 255, 255, static_cast<int>(215.0f * strength));
                 const ImU32 value_tint = IM_COL32(255, 255, 255, static_cast<int>(170.0f * strength));
                 if (label_side)
-                    art.image(dl, game_menu_art::kGlow, ImVec2(x0 - pad_x * 0.6f, cy - gh * 0.5f), ImVec2(mid, cy + gh * 0.5f), label_tint);
-                const float vx = value_x >= 0.0f ? value_x : (mid + 14.0f * s + x1) * 0.5f, hw = (x1 - mid - 14.0f * s) * 0.45f,
-                            vh = row_h * 2.0f;
-                art.image(dl, game_menu_art::kGlow, ImVec2(vx - hw, cy - vh * 0.5f), ImVec2(vx, cy + vh * 0.5f), value_tint);
-                art.image(dl, game_menu_art::kGlow, ImVec2(vx, cy - vh * 0.5f), ImVec2(vx + hw, cy + vh * 0.5f), value_tint, true);
+                    art.image(d, game_menu_art::kGlow, ImVec2(x0 - pad_x * 0.6f, cy - gh * 0.5f), ImVec2(mid, cy + gh * 0.5f), label_tint);
+                const float hw = half_w > 0.0f ? half_w : (x1 - mid - 14.0f * s) * 0.45f, vh = row_h * 2.0f;
+                const float vx = value_x >= 0.0f ? value_x : (mid + 14.0f * s + x1) * 0.5f;
+                art.image(d, game_menu_art::kGlow, ImVec2(vx - hw, cy - vh * 0.5f), ImVec2(vx, cy + vh * 0.5f), value_tint);
+                art.image(d, game_menu_art::kGlow, ImVec2(vx, cy - vh * 0.5f), ImVec2(vx + hw, cy + vh * 0.5f), value_tint, true);
             } else if (strength >= 1.0f) {
                 const float cx = (x0 + x1) * 0.5f;
-                dl->AddRectFilledMultiColor(ImVec2(x0 - pad_x * 0.5f, top), ImVec2(cx, top + row_h), IM_COL32(0, 0, 0, 0), look::kGlow,
-                                            look::kGlow, IM_COL32(0, 0, 0, 0));
-                dl->AddRectFilledMultiColor(ImVec2(cx, top), ImVec2(x1 + pad_x * 0.5f, top + row_h), look::kGlow, IM_COL32(0, 0, 0, 0),
-                                            IM_COL32(0, 0, 0, 0), look::kGlow);
+                d->AddRectFilledMultiColor(ImVec2(x0 - pad_x * 0.5f, top), ImVec2(cx, top + row_h), IM_COL32(0, 0, 0, 0), look::kGlow,
+                                           look::kGlow, IM_COL32(0, 0, 0, 0));
+                d->AddRectFilledMultiColor(ImVec2(cx, top), ImVec2(x1 + pad_x * 0.5f, top + row_h), look::kGlow, IM_COL32(0, 0, 0, 0),
+                                           IM_COL32(0, 0, 0, 0), look::kGlow);
             }
-            dl->ChannelsSetCurrent(kWidgetLayer);
+            d->ChannelsSetCurrent(kWidgetLayer);
         };
-        bool first = true;
-        int i = 0, focus = -1;
-        for (const PluginOptionDesc& opt : p.entry->options) {
-            if (opt.page != page_key || opt.type == BB_OPT_HEADING) continue;
-            const float top = y + static_cast<float>(i) * row_h;
-            const RowOut r = row(*p.entry, opt, ImVec2(x0, top), ImVec2(x1, top + row_h), mid, s, first && refocus, art);
-            if (r.focused) {
-                light(top, opt.type != BB_OPT_ACTION, 1.0f, r.glow_x);
-                focus = i;
-            } else if (r.hot) {
-                light(top, opt.type != BB_OPT_ACTION, 0.4f, r.glow_x);
+        const float rows_top = y;
+        float rows_scroll = 0.0f;  // how far the rows' region is scrolled
+        // (in the draw list's two channels: the caller splits it)
+        const auto draw_rows = [&](ImDrawList* d, float top0) {
+            bool first = true;
+            for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+                const plugin_menu::Row& r = rows[static_cast<std::size_t>(i)];
+                const float top = top0 + static_cast<float>(i) * row_h;
+                RowIn in;
+                in.o = &r.desc;
+                in.value = r.runtime ? plugin_menu::value_of(rt, page_key, r) : plugins_option_value(*p.entry, r.desc);
+                in.grey = grey_of(r);
+                in.drag_id = p.owner + "." + plugin_menu::event_key(page_key, r);
+                const bool cursor = (refocus && !modal) && (p.cursor_to >= 0 ? i == p.cursor_to : first);
+                ImGui::BeginDisabled(modal);
+                const RowOut ro = row(in, ImVec2(x0, top), ImVec2(x1, top + row_h), mid, s, cursor, art);
+                ImGui::EndDisabled();
+                // An action's text is across the whole row: its glow is too.
+                const bool action = r.desc.type == BB_OPT_ACTION;
+                const float gx = action ? (x0 + x1) * 0.5f : ro.glow_x, gw = action ? (x1 - x0) * 0.32f : -1.0f;
+                if (ro.focused) {
+                    light(d, top, !action, 1.0f, gx, gw);
+                    focus = i;
+                } else if (ro.hot) {
+                    light(d, top, !action, 0.4f, gx, gw);
+                }
+                if (ro.hot) help = r.desc.help;
+                if (!art.has(game_menu_art::kLabelLine))
+                    d->AddLine(ImVec2(x0, top + row_h - 0.5f), ImVec2(x1, top + row_h - 0.5f), look::kRowLine, 1.0f);
+                if (ro.changed && !modal) apply(r, ro.value);
+                if (ro.pressed && !modal) pressed = {&r, i};
+                if (r.desc.type != BB_OPT_INFO) first = false;
             }
-            if (r.hot) help = opt.help;
-            if (!art.has(game_menu_art::kLabelLine))
-                dl->AddLine(ImVec2(x0, top + row_h - 0.5f), ImVec2(x1, top + row_h - 0.5f), look::kRowLine, 1.0f);
-            first = false;
-            ++i;
+        };
+        if (scrolls) {
+            // The rows in a region of their own, which the cursor scrolls
+            // (ImGui brings the row with it into view); its own draw list.
+            if (refocus) ImGui::SetNextWindowScroll(ImVec2(0.0f, p.cursor_to >= 0 ? -1.0f : 0.0f));
+            ImGui::SetCursorScreenPos(ImVec2(o.x, rows_top));
+            ImGui::BeginChild("##rows", ImVec2(width, rows_h), ImGuiChildFlags_NavFlattened,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBackground);
+            ImDrawList* cd = ImGui::GetWindowDrawList();
+            cd->ChannelsSplit(3);
+            cd->ChannelsSetCurrent(kWidgetLayer);
+            draw_rows(cd, rows_top - ImGui::GetScrollY());
+            cd->ChannelsMerge();
+            ImGui::SetCursorScreenPos(ImVec2(o.x, rows_top - ImGui::GetScrollY()));
+            ImGui::Dummy(ImVec2(width, static_cast<float>(rows.size()) * row_h));
+            const float scroll = ImGui::GetScrollY(), most = ImGui::GetScrollMaxY();
+            rows_scroll = scroll;
+            ImGui::EndChild();
+            // A thin mark at the right of where the page is, as the game's lists have.
+            const float tx = x1 + pad_x * 0.45f, total = static_cast<float>(rows.size()) * row_h;
+            const float thumb = std::max(rows_h * rows_h / total, 8.0f * s), at = most > 0.0f ? scroll / most : 0.0f;
+            dl->AddLine(ImVec2(tx, rows_top), ImVec2(tx, rows_top + rows_h), look::kRowLine, 1.0f);
+            dl->AddRectFilled(ImVec2(tx - 1.5f * s, rows_top + (rows_h - thumb) * at), ImVec2(tx + 1.5f * s, rows_top + (rows_h - thumb) * at + thumb),
+                              look::kGold);
         }
         // Defaults: the page's rows back to theirs, below them all, at the
         // same place on every page.
+        dl->ChannelsSplit(3);
+        dl->ChannelsSetCurrent(kWidgetLayer);
+        if (!scrolls) draw_rows(dl, rows_top);
         if (p.defaults) {
-            const float top = y + static_cast<float>(most_rows) * row_h + 6.0f * s;
+            const float top = rows_top + rows_h + 6.0f * s;
             ImGui::SetCursorScreenPos(ImVec2(mid + 14.0f * s, top + (row_h - frame_h) * 0.5f));
-            const bool pressed = value_button("defaults", "Defaults", ImVec2(x1 - mid - 14.0f * s, frame_h), false);
+            ImGui::BeginDisabled(modal);
+            const bool defaults_pressed = value_button("defaults", "Defaults", ImVec2(x1 - mid - 14.0f * s, frame_h), false);
+            ImGui::EndDisabled();
             const bool focused = ImGui::IsItemFocused(), hovered = ImGui::IsItemHovered();
             if (focused) {
-                light(top, false, 1.0f, -1.0f);
-                focus = most_rows;
+                light(dl, top, false, 1.0f, -1.0f);
+                focus = static_cast<int>(rows.size());
             } else if (hovered) {
-                light(top, false, 0.4f, -1.0f);
+                light(dl, top, false, 0.4f, -1.0f);
             }
             if (focused || hovered) help = "Every row on this page back to its default.";
             if (art.has(game_menu_art::kValueEnd) && art.has(game_menu_art::kRule)) {
@@ -946,10 +1215,9 @@ void plugin_panel_draw(float scale, bool pad) {
                 art.rule(dl, vx0 + ew - 1.0f, vx1 - ew + 1.0f, ly, art_tint);
                 dl->ChannelsSetCurrent(kWidgetLayer);
             }
-            if (pressed) {
-                for (const PluginOptionDesc& opt : p.entry->options) {
-                    if (opt.page == page_key && opt.type != BB_OPT_HEADING && opt.type != BB_OPT_ACTION)
-                        plugins_set_option(p.entry->name, opt.key, opt.def);
+            if (defaults_pressed && !modal) {
+                for (const plugin_menu::Row& r : rows) {
+                    if (r.desc.type != BB_OPT_ACTION && r.desc.type != BB_OPT_INFO) apply(r, r.desc.def);
                 }
                 ask_sound(kMenuSoundDecide);
             }
@@ -964,23 +1232,38 @@ void plugin_panel_draw(float scale, bool pad) {
             if (focus >= 0) last_focus = focus;
             last_page = page_key;
         }
-        y += rows_h;
+        y = rows_top + rows_h + defaults_h;
         // The rule over the help (its finial up the column rule), and the
         // column rule itself between the two.
         const float rule_foot = y + inner_gap * 0.5f;
         if (inner_art) {
+            // In pieces: not behind an action's text, which is across its row.
             const game_menu_art::Placed& q = art.atlas->piece[game_menu_art::kRule];
             const float t = std::max(art.h(game_menu_art::kRule), 3.0f), ya = rule_top + 6.0f * s, yb = rule_foot - 6.0f * s;
-            dl->AddImageQuad(art.tex, ImVec2(mid - t * 0.5f, ya), ImVec2(mid + t * 0.5f, ya), ImVec2(mid + t * 0.5f, yb),
-                             ImVec2(mid - t * 0.5f, yb), ImVec2(q.u0, q.v0), ImVec2(q.u0, q.v1), ImVec2(q.u1, q.v1), ImVec2(q.u1, q.v0),
-                             IM_COL32(255, 255, 255, 150));
+            std::vector<std::pair<float, float>> cuts;
+            for (int i = 0; i < static_cast<int>(rows.size()); ++i) {
+                if (rows[static_cast<std::size_t>(i)].desc.type != BB_OPT_ACTION) continue;
+                const float top = rows_top - rows_scroll + static_cast<float>(i) * row_h;
+                const float c0 = std::max(top + 2.0f * s, rows_top), c1 = std::min(top + row_h - 2.0f * s, rows_top + rows_h);
+                if (c1 > c0) cuts.emplace_back(c0, c1);
+            }
+            float from = ya;
+            cuts.emplace_back(yb, yb);
+            for (const auto& [c0, c1] : cuts) {
+                const float to = std::min(c0, yb);
+                if (to > from)
+                    dl->AddImageQuad(art.tex, ImVec2(mid - t * 0.5f, from), ImVec2(mid + t * 0.5f, from), ImVec2(mid + t * 0.5f, to),
+                                     ImVec2(mid - t * 0.5f, to), ImVec2(q.u0, q.v0), ImVec2(q.u0, q.v1), ImVec2(q.u1, q.v1),
+                                     ImVec2(q.u1, q.v0), IM_COL32(255, 255, 255, 150));
+                from = std::max(from, c1);
+            }
         }
         inner_rule(rule_foot, false);
         // The help clear of the filigree's curls under that rule (17 of its 42 rows, times its scale).
         y = std::max(y + inner_gap, inner_art ? rule_foot + 17.0f * kf + 4.0f * s : 0.0f);
         // The help of the row with the cursor (or the page's), then the controls.
         {
-            ImGui::PushFont(nullptr, kSmallSize);
+            ImGui::PushFont(nullptr, m.small);
             ImFont* f = ImGui::GetFont();
             // Its area holds its last line's descenders; the clip lets an
             // accented capital of its first line rise as far.
@@ -988,7 +1271,7 @@ void plugin_panel_draw(float scale, bool pad) {
             text_lines(dl, f, small_size, x0, x1, y, advance, look::kHelp, help, art.atlas != nullptr);
             ImGui::PopClipRect();
             y += help_h + 10.0f * s;
-            const std::string& guide = pad ? p.guide : p.guide_keys;
+            const std::string& guide = pad ? guide_pad : guide_keys;
             if (!guide.empty()) {
                 if (!(art.atlas && pad && guide_with_icons(dl, f, small_size, x0, x1, y, look::kGuide, guide, art)))
                     text_lines(dl, f, small_size, x0, x1, y, advance, look::kGuide, guide, art.atlas != nullptr);
@@ -1007,15 +1290,145 @@ void plugin_panel_draw(float scale, bool pad) {
         }
     }
     ImGui::End();
+    // A button pressed: a TEXT row asks for the host's box, a CONFIRM one for
+    // the yes/no first, an OPEN one opens its page on top after on_action.
+    if (pressed.row) {
+        const plugin_menu::Row& r = *pressed.row;
+        if (r.desc.type == BB_OPT_TEXT) {
+            const std::string v = r.runtime ? plugin_menu::value_of(rt, page_key, r) : plugins_option_value(*p.entry, r.desc);
+            host_text_entry_begin(v.c_str(), 128, false, r.desc.label.c_str(), TextCharset::BasicLatin, true);
+            g_typing = {true, p.owner, page_key, r.desc.key, r.runtime};
+            ask_sound(kMenuSoundDecide);
+        } else if (r.desc.flags & BB_OPT_CONFIRM) {
+            g_confirm = Confirm{};
+            g_confirm.on = g_confirm.appeared = true;
+            g_confirm.owner = p.owner;
+            g_confirm.key = plugin_menu::event_key(page_key, r);
+            g_confirm.question = r.desc.label + "?";
+            g_confirm.help = r.desc.help;
+            g_confirm.open = (r.desc.flags & BB_OPT_OPEN) ? r.desc.def : std::string();
+            g_confirm.row = pressed.index;
+            ask_sound(kMenuSoundDecide);
+        } else {
+            plugins_run_action(p.owner, plugin_menu::event_key(page_key, r));
+            ask_sound(kMenuSoundDecide);
+            if ((r.desc.flags & BB_OPT_OPEN) && layout.page(r.desc.def)) {
+                std::lock_guard<std::mutex> lk(g_mu);
+                if (g_panel.owner == p.owner) {
+                    g_panel.nav.open(r.desc.def, pressed.index);
+                    g_appeared.store(true);
+                }
+            }
+        }
+    }
+    // The yes/no: the game's small dialog over the menu, No lit at first.
+    if (g_confirm.on && g_confirm.owner == p.owner) {
+        const float cw = std::min(width, 640.0f * s);
+        const auto q_lines = wrap_lines(font, title_size, g_confirm.question, cw - 2.0f * pad_x);
+        const int h_lines = g_confirm.help.empty() ? 0 : static_cast<int>(wrap_lines(font, small_size, g_confirm.help, cw - 2.0f * pad_x).size());
+        const float ch = pad_y * 2.0f + outer_h * 2.0f + static_cast<float>(q_lines.size()) * (title_size + leading) +
+                         (h_lines ? 8.0f * s + static_cast<float>(h_lines) * advance : 0.0f) + 16.0f * s + row_h + 8.0f * s;
+        ImGui::SetNextWindowPos(vp->WorkPos + vp->WorkSize * 0.5f, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(cw, ch), ImGuiCond_Always);
+        if (g_confirm.appeared) ImGui::SetNextWindowFocus();
+        int answer = 0;  // 1 yes, 2 no
+        if (ImGui::Begin("##plugin_confirm", nullptr, flags)) {
+            ImDrawList* d = ImGui::GetWindowDrawList();
+            const ImVec2 o = ImGui::GetWindowPos();
+            const float cx0 = o.x + pad_x, cx1 = o.x + cw - pad_x;
+            if (art.has(game_menu_art::kSlate)) {
+                d->AddRectFilled(o, o + ImVec2(cw, ch), IM_COL32(0, 0, 0, 200));
+                art.image(d, game_menu_art::kSlate, o, o + ImVec2(cw, ch), IM_COL32(255, 255, 255, 250));
+            } else {
+                d->AddRectFilled(o, o + ImVec2(cw, ch), IM_COL32(7, 6, 5, 240));
+            }
+            float cy = o.y + pad_y;
+            if (ornate) {
+                art.span(d, kOrnament, cx0 - 14.0f * s, cx1 + 14.0f * s, cy, IM_COL32(255, 255, 255, 235), false);
+                art.span(d, kBand, cx0 - 14.0f * s, cx1 + 14.0f * s, cy + art.h(kOrnament), IM_COL32(255, 255, 255, 235), false);
+            } else {
+                rule(d, cx0, cx1, cy, s);
+            }
+            cy += outer_h;
+            text_lines(d, font, title_size, cx0, cx1, cy, title_size + leading, look::kTextLit, g_confirm.question, true);
+            cy += static_cast<float>(q_lines.size()) * (title_size + leading);
+            if (h_lines) {
+                cy += 8.0f * s;
+                text_lines(d, font, small_size, cx0, cx1, cy, advance, look::kHelp, g_confirm.help, true);
+                cy += static_cast<float>(h_lines) * advance;
+            }
+            cy += 16.0f * s;
+            const float bw = (cx1 - cx0) * 0.3f, gapx = (cx1 - cx0) * 0.1f, bx = (cx0 + cx1) * 0.5f;
+            d->ChannelsSplit(3);
+            d->ChannelsSetCurrent(kWidgetLayer);
+            const char* const names[2] = {"Yes", "No"};
+            for (int i = 0; i < 2; ++i) {
+                const float left = i == 0 ? bx - gapx * 0.5f - bw : bx + gapx * 0.5f;
+                ImGui::SetCursorScreenPos(ImVec2(left, cy + (row_h - frame_h) * 0.5f));
+                if (value_button(names[i], names[i], ImVec2(bw, frame_h), false)) answer = i == 0 ? 1 : 2;
+                if (i == 1) {
+                    ImGui::SetItemDefaultFocus();  // No lit at first, as the game's yes/no has it
+                    take_cursor(g_confirm.appeared);
+                }
+                if (ImGui::IsItemFocused() && glow_art) {
+                    d->ChannelsSetCurrent(kGlowLayer);
+                    const float gy = cy + row_h * 0.5f, gh = row_h * 2.0f, hw = bw * 0.5f;
+                    art.image(d, game_menu_art::kGlow, ImVec2(left + bw * 0.5f - hw, gy - gh * 0.5f), ImVec2(left + bw * 0.5f, gy + gh * 0.5f),
+                              IM_COL32(255, 255, 255, 170));
+                    art.image(d, game_menu_art::kGlow, ImVec2(left + bw * 0.5f, gy - gh * 0.5f), ImVec2(left + bw * 0.5f + hw, gy + gh * 0.5f),
+                              IM_COL32(255, 255, 255, 170), true);
+                    d->ChannelsSetCurrent(kWidgetLayer);
+                }
+            }
+            d->ChannelsMerge();
+            cy += row_h + 8.0f * s;
+            if (ornate) {
+                art.span(d, kBand, cx0 - 14.0f * s, cx1 + 14.0f * s, cy, IM_COL32(255, 255, 255, 235), true);
+                art.span(d, kOrnament, cx0 - 14.0f * s, cx1 + 14.0f * s, cy + art.h(kBand), IM_COL32(255, 255, 255, 235), true);
+            } else {
+                rule(d, cx0, cx1, cy + outer_h * 0.5f, s);
+            }
+            if (!g_confirm.appeared && (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+                                        ImGui::IsKeyPressed(ImGuiKey_Backspace, false)))
+                answer = 2;
+        }
+        ImGui::End();
+        g_confirm.appeared = false;
+        if (answer == 1) {
+            ask_sound(kMenuSoundDecide);
+            plugins_run_action(g_confirm.owner, g_confirm.key);
+            std::lock_guard<std::mutex> lk(g_mu);
+            if (g_panel.owner == p.owner) {
+                if (!g_confirm.open.empty() && layout.page(g_confirm.open))
+                    g_panel.nav.open(g_confirm.open, g_confirm.row);
+                else
+                    g_panel.cursor_to = g_confirm.row;  // the cursor back on the button
+                g_appeared.store(true);
+            }
+            g_confirm.on = false;
+        } else if (answer == 2) {
+            ask_sound(kMenuSoundCancel);
+            g_confirm.on = false;
+            std::lock_guard<std::mutex> lk(g_mu);
+            if (g_panel.owner == p.owner) {
+                g_panel.cursor_to = g_confirm.row;
+                g_appeared.store(true);
+            }
+        }
+    }
     ImGui::PopStyleColor(kColours);
     ImGui::PopStyleVar(kVars);
     ImGui::PopFont();
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_panel.owner == p.owner && focus >= 0 && focus < static_cast<int>(rows.size())) g_panel.focused_row = focus;
+    }
     if (click && n > 1) {
         ask_sound(kMenuSoundMove);
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_panel.owner == p.owner) {
-            g_panel.page = (p.page + click + n) % n;
-            g_last_page[p.owner] = g_panel.pages[static_cast<std::size_t>(g_panel.page)];
+            g_panel.nav.turn(click);
+            g_last_page[p.owner] = g_panel.nav.shown();
             g_appeared.store(true);
         }
     }
@@ -1025,6 +1438,7 @@ void plugin_panel_draw(float scale, bool pad) {
         if (g_panel.owner == p.owner) {
             g_closed[p.owner] = true;
             g_panel.owner.clear();
+            g_exclusive.store(false);
             g_shown.store(false);
             host_log("plugin: %s's panel closed by the player", p.owner.c_str());
         }

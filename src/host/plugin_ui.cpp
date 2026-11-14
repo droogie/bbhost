@@ -4,6 +4,8 @@
 
 #include "bbhost_plugin.h"
 #include "core/config.h"
+#include "host/options.h"
+#include "host/plugin_panel.h"
 #include "host/updater.h"
 
 #include "imgui.h"
@@ -337,6 +339,20 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
             }
         } else {
             ImGui::TextDisabled(p.options.empty() ? "No settings." : "Its settings are in its own panel, over the game.");
+        }
+        // The menus its table names (BB_OPT_MENU): each opened from here, in
+        // game, over the game as the game's own menus look.
+        if (ui.in_game && p.loaded && p.enabled) {
+            for (const PluginMenuEntry& m : plugin_panel_menus(p.name)) {
+                ImGui::Spacing();
+                if (ImGui::Button(("Open " + m.name + "##menu-" + m.page).c_str())) {
+                    PluginPanelShow how;
+                    how.page = m.page;
+                    if (plugin_panel_show(p.name, how)) host_options_close();
+                }
+                ImGui::SetItemTooltip("Closes this menu and shows %s's %s menu over the game. Circle or Escape closes it.", p.title.c_str(),
+                                      m.name.c_str());
+            }
         }
     }
     ImGui::EndChild();

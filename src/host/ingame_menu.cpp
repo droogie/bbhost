@@ -643,6 +643,8 @@ void panel_event(const SDL_Event& e, float ratio) {
         if (down && it == held.end()) held.push_back(k);
         if (!down && it != held.end()) held.erase(it);
     };
+    // The host's text box (a menu's TEXT row) has the keys while it is up.
+    if (host_text_entry_open()) return;
     const bool up = plugin_panel_shown();
     if (up && !was) {
         // Where the pointer is now: it has been the camera's until this.

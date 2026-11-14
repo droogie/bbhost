@@ -55,9 +55,17 @@ _Static_assert(offsetof(BbHostApi, panel_state) == offsetof(BbHostApi, panel_sho
 _Static_assert(offsetof(BbHostApi, option_set) == offsetof(BbHostApi, panel_state) + sizeof(void*), "option_set after panel_state");
 _Static_assert(offsetof(BbHostApi, input_take_as) == offsetof(BbHostApi, option_set) + sizeof(void*), "input_take_as after option_set");
 _Static_assert(offsetof(BbHostApi, input_as) == offsetof(BbHostApi, input_take_as) + sizeof(void*), "input_as after input_take_as");
-_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, input_as) + sizeof(void*), "input_as ends the API table");
+_Static_assert(offsetof(BbHostApi, panel_rows) == offsetof(BbHostApi, input_as) + sizeof(void*), "panel_rows after input_as");
+_Static_assert(offsetof(BbHostApi, panel_value) == offsetof(BbHostApi, panel_rows) + sizeof(void*), "panel_value after panel_rows");
+_Static_assert(offsetof(BbHostApi, panel_open) == offsetof(BbHostApi, panel_value) + sizeof(void*), "panel_open after panel_value");
+_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, panel_open) + sizeof(void*), "panel_open ends the API table");
 _Static_assert(BB_OPT_PANEL == 0x400u && BB_PANEL_DEFAULTS == 1u && BB_PANEL_CORNER == 2u, "the panel's flags");
-_Static_assert(offsetof(BbPanel, page) == 8 && sizeof(BbPanel) == 8 + 3 * sizeof(void*), "BbPanel");
+_Static_assert(BB_OPT_MENU == 0x800u && BB_OPT_SUBPAGE == 0x1000u && BB_OPT_OPEN == 0x2000u && BB_OPT_CONFIRM == 0x4000u &&
+                   BB_OPT_INFO == 8,
+               "the menus' option flags and INFO");
+_Static_assert(offsetof(BbPanel, page) == 8 && offsetof(BbPanel, pages) == 8 + 3 * sizeof(void*) &&
+                   offsetof(BbPanel, page_count) == 8 + 4 * sizeof(void*),
+               "BbPanel");
 _Static_assert(sizeof(BbPanelState) == 44 && offsetof(BbPanelState, page) == 12, "BbPanelState");
 _Static_assert(sizeof(BbLook) == 128 && BB_LOOK_DOF_RANGE == 64u, "BbLook");
 _Static_assert(offsetof(BbLook, vignette) == 28 && offsetof(BbLook, dof) == 32 && offsetof(BbLook, aberration) == 52, "BbLook's groups");

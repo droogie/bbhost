@@ -155,6 +155,8 @@ typedef struct BbPluginInfo {
 #define BB_OPT_TEXT 5
 #define BB_OPT_ACTION 6    /* a button (in game only) */
 #define BB_OPT_HEADING 7   /* a section title: label (and help) only */
+#define BB_OPT_INFO 8      /* version 29: a label and a value the player cannot change (`def`, or what panel_value
+                              sets) - on an in-game menu's page only; never in the config */
 #define BB_OPT_LIVE 0x100u /* or-ed into type: takes effect at once in game
                               (on_option); without it, at the next start */
 #define BB_OPT_WHEN 0x200u /* version 21, or-ed into the type of any option but a
@@ -167,6 +169,17 @@ typedef struct BbPluginInfo {
                               under it, up to the next heading, are a page of the
                               plugin's panel (panel_show) - drawn over the game while
                               the plugin shows it - and not in the menus */
+#define BB_OPT_MENU 0x800u /* version 29, or-ed into a PANEL heading's type: its page starts an in-game menu named
+                              by its `def` (its label when NULL) - the overlay's "Open <name>" button for it. The
+                              PANEL pages after it, up to the next MENU heading, are that menu's, in L1/R1 order.
+                              A plugin with no MENU heading has one unnamed menu of all its pages (no button). */
+#define BB_OPT_SUBPAGE 0x1000u /* version 29, or-ed into a PANEL heading's type: its page is out of its menu's
+                                  L1/R1 order, opened from a row (BB_OPT_OPEN) or panel_open; Circle there goes back */
+#define BB_OPT_OPEN 0x2000u /* version 29, or-ed into an ACTION's type: pressing it opens the page named by its
+                               `def` on top of the one shown (Circle there comes back) and calls on_action, which can
+                               fill that page (panel_rows) */
+#define BB_OPT_CONFIRM 0x4000u /* version 29, or-ed into an ACTION's type: the host asks first, in the game's yes/no
+                                  dialog ("<label>?" with the row's help under it, No lit): on_action only on Yes */
 typedef struct BbOption {
     uint32_t type;        /* BB_OPT_*, maybe | BB_OPT_LIVE */
     const char* key;      /* the config key; an action's id */
@@ -455,15 +468,19 @@ typedef struct BbLook {
     float dof_near_fade, dof_far_fade;
 } BbLook;
 
-/* Version 29: a plugin's panel (panel_show, panel_state). */
+/* Version 29: a plugin's panel (panel_show, panel_state) - an in-game menu. */
 #define BB_PANEL_DEFAULTS 1u  /* each page ends with a Defaults row: its rows back to their defaults */
-#define BB_PANEL_CORNER 2u    /* at the bottom right, the world in view (photo mode's): where every panel is drawn for now */
+#define BB_PANEL_CORNER 2u    /* at the bottom right, the world in view (photo mode's); without it the game's
+                                 dialog: centred, the options dialog's size, the screen dimmed behind it */
 typedef struct BbPanel {
     uint32_t size;           /* sizeof(BbPanel) as the plugin knows it */
     uint32_t flags;          /* BB_PANEL_* */
     const char* page;        /* the page to show: its heading's key; NULL or "" for the one shown last */
     const char* guide;       /* a line under the rows while the controller is in use (may be NULL) */
     const char* guide_keys;  /* the same while the keyboard and mouse are (may be NULL) */
+    const char* const* pages;  /* the menu's pages, in L1/R1 order (`page` among them); NULL: the table's
+                                  menu that holds `page` (BB_OPT_MENU), or all its pages without one */
+    uint32_t page_count;
 } BbPanel;
 typedef struct BbPanelState {
     uint32_t size;      /* set to sizeof(BbPanelState) before the call: the host fills as much as both know */
@@ -1084,21 +1101,25 @@ typedef struct BbHostApi {
      * Values outside what the post effect takes are clamped. Any thread. 0 on
      * success; 1 for an unknown plugin or a size under 8. */
     int (*post_look)(const char* name, const BbLook* look, uint32_t* available);
-    /* The plugin's panel up (BbPanel) or down (NULL): the pages of its options
-     * table it marks with BB_OPT_PANEL, drawn over the game at the bottom
-     * right as the game's options dialog draws its pages - its art, letters
-     * and menu sounds, read from the player's dump - and at one size for every
-     * page (its longest page and its longest help), their changes going to on_option as
-     * the menus' do (the rows want BB_OPT_LIVE). The controller drives it -
-     * the d-pad up and down to a row, left and right to change it, Cross to
-     * set a switch or press a button, L1 and R1 the pages, Circle closes it -
-     * as do the keyboard (the arrows, Enter, Page Up and Page Down or Q and E,
-     * Escape) and the pointer, which is free while it is up. While it is up
-     * the game reads none of those buttons and keys, and neither do the
-     * plugin's pad and input: the panel has them. One panel at a time - a
-     * later call replaces another plugin's - and the plugin being turned off
-     * takes it down. Main thread. 0 on success; 1 for an unknown plugin, a
-     * size under 8, a page it has not got, or none at all. */
+    /* The plugin's in-game menu up (BbPanel) or down (NULL) - docs/plugins.md,
+     * In-game menus: the pages of its options table it marks with
+     * BB_OPT_PANEL, drawn over the game as the game's options dialog draws
+     * its pages - its art, letters and menu sounds, read from the player's
+     * dump - centred at that dialog's size with the screen dimmed behind it,
+     * or at the bottom right with BB_PANEL_CORNER, at one size for every page;
+     * their changes going to on_option as the menus' do (the rows want
+     * BB_OPT_LIVE). The controller drives it - the d-pad up and down to a row,
+     * left and right to change it, Cross to set a switch or press a button,
+     * L1 and R1 the pages, Circle goes back or closes it - as do the keyboard
+     * (the arrows, Enter, Page Up and Page Down or Q and E, Escape or
+     * Backspace) and the pointer, which is free while it is up. While a
+     * centred menu is up neither the game nor any plugin reads the
+     * controller, the keyboard or the mouse; while a corner panel is, those
+     * buttons and keys only (the plugin's pad and input read the rest). One
+     * menu at a time - a later call replaces another plugin's - and the
+     * plugin being turned off takes it down. Main thread. 0 on success; 1 for
+     * an unknown plugin, a size under 8, a page it has not got (or `pages`
+     * naming one), or none at all. */
     int (*panel_show)(const char* name, const BbPanel* panel);
     /* Whether the plugin's panel is up, whether the player closed it since
      * the last call, and its page (BbPanelState; set out->size first). Main
@@ -1125,6 +1146,23 @@ typedef struct BbHostApi {
      * the game's, as input. 0 on success; 1 for an unknown plugin or without
      * a window (headless). */
     int (*input_as)(const char* name, BbInput* out);
+    /* Version 29: an in-game menu's page filled at run time. `page`'s rows
+     * from now on (`rows` copied, strings too; n 0 gives it the table's
+     * again): a list (lamps, items, saves), INFO rows, settings that are not
+     * kept. The page must be a PANEL heading of the table, which gives its
+     * title, help and menu. Its rows' values are the host's, never in the
+     * config, each its `def` until panel_value or the player changes it; a
+     * change comes to on_option and a press to on_action with the key
+     * "<page>/<key>" (a table row's come with its own key, as before). Main
+     * thread. 0 on success; 1 for an unknown plugin or page. */
+    int (*panel_rows)(const char* name, const char* page, const BbOption* rows, size_t n);
+    /* One run-time row's value (panel_rows), shown at once if its page is up.
+     * Main thread. 0 on success; 1 for an unknown plugin, page or row. */
+    int (*panel_value)(const char* name, const char* page, const char* key, const char* value);
+    /* `page` opened on top of the page shown (a sub-page: an item's details
+     * from its list's on_action); Circle there comes back. Main thread. 0 on
+     * success; 1 for an unknown plugin or page, or no menu of its up. */
+    int (*panel_open)(const char* name, const char* page);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

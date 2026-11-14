@@ -865,6 +865,7 @@ std::vector<ActionCallback> g_action_callbacks;  // under g_frame_mu
 struct MenuRequest {
     bool action;
     std::string name, key, value;
+    bool kept = true;  // a setting the config keeps; false: a menu's run-time row (panel_rows), on_option only
 };
 std::vector<MenuRequest> g_menu_requests;  // under g_frame_mu
 
@@ -1679,7 +1680,34 @@ int api_panel_show(const char* name, const BbPanel* panel) {
     how.guide = b.guide ? b.guide : "";
     how.guide_keys = b.guide_keys ? b.guide_keys : "";
     how.defaults = (b.flags & BB_PANEL_DEFAULTS) != 0;
+    how.corner = (b.flags & BB_PANEL_CORNER) != 0;
+    if (b.pages) {
+        for (std::uint32_t i = 0; i < b.page_count; ++i) {
+            if (!b.pages[i]) return 1;
+            how.pages.emplace_back(b.pages[i]);
+        }
+    }
     return plugin_panel_show(name, how) ? 0 : 1;
+}
+
+PluginOptionDesc option_desc(const BbOption& o);
+
+int api_panel_rows(const char* name, const char* page, const BbOption* rows, size_t n) {
+    if (!plugin_named(name) || !page || (n && !rows)) return 1;
+    std::vector<PluginOptionDesc> out;
+    out.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) out.push_back(option_desc(rows[i]));
+    return plugin_panel_rows(name, page, out) ? 0 : 1;
+}
+
+int api_panel_value(const char* name, const char* page, const char* key, const char* value) {
+    if (!plugin_named(name) || !page || !key) return 1;
+    return plugin_panel_value(name, page, key, value ? value : "") ? 0 : 1;
+}
+
+int api_panel_open(const char* name, const char* page) {
+    if (!plugin_named(name) || !page) return 1;
+    return plugin_panel_open(name, page) ? 0 : 1;
 }
 
 int api_panel_state(const char* name, BbPanelState* out) {
@@ -1791,6 +1819,7 @@ const BbHostApi g_api = {
     &api_on_camera_target,
     &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state, &api_hud_hide, &api_post_look,
     &api_panel_show, &api_panel_state, &api_option_set, &api_input_take_as, &api_input_as,
+    &api_panel_rows, &api_panel_value, &api_panel_open,
 };
 
 std::string read_file(const std::string& path) {
@@ -1824,6 +1853,25 @@ std::string toml_value(const std::string& v) {
     return q + "\"";
 }
 
+// One BbOption as the menus keep it (copied, strings too): its type, flags,
+// texts and range; BB_OPT_WHEN's condition from `choices` (anything but a
+// CHOICE).
+PluginOptionDesc option_desc(const BbOption& o) {
+    PluginOptionDesc d;
+    d.type = o.type & 0xffu;
+    d.flags = o.type & ~0xffu;
+    d.live = (o.type & BB_OPT_LIVE) != 0;
+    d.key = o.key ? o.key : "";
+    d.label = o.label ? o.label : d.key;
+    d.help = o.help ? o.help : "";
+    d.def = o.def ? o.def : "";
+    d.choices = o.choices ? o.choices : "";
+    if ((o.type & BB_OPT_WHEN) && d.type != BB_OPT_CHOICE) d.when = d.choices;
+    d.min = o.min;
+    d.max = o.max;
+    return d;
+}
+
 PluginEntry entry_of(const std::string& file_name, const std::string& path, const BbPluginInfo* info, const BbOption* options) {
     PluginEntry e;
     e.file = file_name;
@@ -1841,23 +1889,13 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
     std::string group_when;  // the last heading's BB_OPT_WHEN
     std::string group_page;  // the last heading's key, when it starts a panel page (BB_OPT_PANEL)
     for (const BbOption* o = options; o && o->type != BB_OPT_END; ++o) {
-        PluginOptionDesc d;
-        d.type = o->type & 0xffu;
-        d.live = (o->type & BB_OPT_LIVE) != 0;
-        d.key = o->key ? o->key : "";
-        d.label = o->label ? o->label : d.key;
-        d.help = o->help ? o->help : "";
-        d.def = o->def ? o->def : "";
-        d.choices = o->choices ? o->choices : "";
-        if ((o->type & BB_OPT_WHEN) && d.type != BB_OPT_CHOICE) d.when = d.choices;
+        PluginOptionDesc d = option_desc(*o);
         // A heading's condition covers the rows under it, up to the next heading.
         if (d.type == BB_OPT_HEADING) group_when = d.when;
         else if (d.when.empty()) d.when = group_when;
         // A panel page: its heading and the rows under it, up to the next heading.
         if (d.type == BB_OPT_HEADING) group_page = (o->type & BB_OPT_PANEL) && !d.key.empty() ? d.key : std::string();
         d.page = group_page;
-        d.min = o->min;
-        d.max = o->max;
         e.options.push_back(std::move(d));
     }
     return e;
@@ -2149,7 +2187,7 @@ void plugins_frame() {
             host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
             if (render_hooks_plugin_on(r.name, on)) republish_settings();
             aa_update();
-        } else {
+        } else if (r.kept) {
             const std::string raw = toml_value(r.value);
             config_value_set(r.name + "." + r.key, raw);
             config_set_values(config_user_file(), {{r.name, r.key, raw}});
@@ -2282,6 +2320,11 @@ void plugins_set_option(const std::string& name, const std::string& key, const s
 void plugins_run_action(const std::string& name, const std::string& action) {
     std::lock_guard<std::mutex> lk(g_frame_mu);
     g_menu_requests.push_back({true, name, action, ""});
+}
+
+void plugins_menu_option(const std::string& name, const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lk(g_frame_mu);
+    g_menu_requests.push_back({false, name, key, value, false});
 }
 
 namespace {

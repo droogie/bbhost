@@ -1800,7 +1800,14 @@ void update_pad() {
         std::lock_guard<std::mutex> lock(g_text_mu);
         typing = g_text_want;
     }
-    if (host_options_open() || ingame_menu_open() || binding || typing) {
+    // And so is a plugin's centred menu (host/plugin_panel.h): the game and
+    // the plugins read nothing while it is up; what is still held as it
+    // closes stays out of both until let go (below).
+    const bool menu_modal = plugin_panel_exclusive();
+    static bool was_menu_modal = false;
+    const bool menu_closed_now = was_menu_modal && !menu_modal;
+    was_menu_modal = menu_modal;
+    if (host_options_open() || ingame_menu_open() || binding || typing || menu_modal) {
         p.connected = true;
         g_key_strong.store(false, std::memory_order_relaxed);
         {
@@ -1839,6 +1846,7 @@ void update_pad() {
     // Escape that closes it must not then press anything (end photo mode,
     // open the game's menu).
     static std::uint32_t panel_held_pad = 0;
+    if (menu_closed_now) panel_held_pad = ~0u;  // every button held as a centred menu closes: the menu's until let go
     // The same for a button a plugin takes (pad_take): one held as the take
     // ends - the L3 or Cross that ends a photo mode - stays the plugin's until
     // let go, so the game never sees it go down. One a take leaves out while
@@ -1994,6 +2002,9 @@ void update_pad() {
     if (end_key >= 0 && !(keys && end_key < nkeys && keys[end_key])) g_text_end_key.store(-1, std::memory_order_relaxed);
     // The panel's keys while it is up, and any of them still held since.
     static bool panel_held_key[SDL_SCANCODE_COUNT] = {};
+    if (menu_closed_now) {
+        for (bool& k : panel_held_key) k = true;  // every key held as a centred menu closes: the menu's until let go
+    }
     bool panel_keys = false;
     for (int i = 0; i < SDL_SCANCODE_COUNT; ++i) {
         const bool down_now = keys && i < nkeys && keys[i];
