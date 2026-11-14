@@ -2100,6 +2100,13 @@ void plugins_frame() {
     // on, and the player's put back once none asks (before the early return,
     // so a plugin turned off lets it go).
     player_hud_option_hold(scene_look_hud_shown());
+    // A plugin's panel's sounds (the cursor, a change, a page, opening and
+    // closing): the game's own menu sounds, posted as its widgets post them.
+    {
+        int priority = 0;
+        const int id = plugin_panel_take_sound(&priority);
+        menu_sound_post(id, priority);
+    }
     std::vector<FrameCallback> now;
     std::vector<WorldLoadCallback> loads;
     std::vector<MenuRequest> requests;

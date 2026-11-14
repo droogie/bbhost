@@ -2,6 +2,7 @@
 #include "host/plugin_panel.h"
 
 #include "bbhost_plugin.h"
+#include "engine/menu_pointer.h"
 #include "host/game_menu_art.h"
 #include "host/plugins.h"
 #include "log.h"
@@ -40,7 +41,27 @@ std::map<std::string, bool> g_closed;              // under g_mu: closed by the 
 std::map<std::string, std::string> g_last_page;    // under g_mu: the page each plugin's panel showed last
 std::atomic<bool> g_shown{false};
 std::atomic<bool> g_appeared{false};               // shown since the last frame drew it: give it the focus
+std::atomic<bool> g_opened{false};                 // shown, not just a page turned: the game's menu-opening sound
+// The menu sound asked for since plugins_frame last took one: (priority << 16) | id + 1, 0 none.
+std::atomic<std::uint32_t> g_sound{0};
+
+// The game's menu sound for something the player did on the panel: the
+// loudest asked for since the game's thread last took one.
+void ask_sound(int id) {
+    const std::uint32_t priority = id == kMenuSoundDecide || id == kMenuSoundCancel ? 1 : 0;
+    const std::uint32_t want = (priority << 16) | static_cast<std::uint32_t>(id + 1);
+    std::uint32_t was = g_sound.load(std::memory_order_relaxed);
+    while ((was == 0 || (was >> 16) <= priority) && !g_sound.compare_exchange_weak(was, want, std::memory_order_relaxed)) {
+    }
+}
+
 }  // namespace
+
+int plugin_panel_take_sound(int* priority) {
+    const std::uint32_t s = g_sound.exchange(0, std::memory_order_relaxed);
+    if (priority) *priority = static_cast<int>(s >> 16);
+    return s ? static_cast<int>(s & 0xffffu) - 1 : -1;
+}
 
 void plugin_panel_preload() { game_menu_art::preload(); }
 
@@ -110,6 +131,7 @@ bool plugin_panel_show(const std::string& name, const PluginPanelShow& how) {
     g_last_page[name] = g_panel.pages[static_cast<std::size_t>(page)];
     if (!was) {
         g_appeared.store(true);
+        g_opened.store(true);
         host_log("plugin: %s's panel up at its page %s", name.c_str(), g_last_page[name].c_str());
     }
     g_shown.store(true);
@@ -353,6 +375,7 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
         if (ImGui::IsItemFocused() && !grey && step_pressed() != 0) to = !on;
         if (to != on) {
             plugins_set_option(p.name, o.key, to ? "true" : "false");
+            ask_sound(kMenuSoundMove);
         }
         arrows = underline = true;
         break;
@@ -431,6 +454,7 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
         }
         if (changed) {
             plugins_set_option(p.name, o.key, number_text(o, v));
+            ask_sound(kMenuSoundMove);
         }
         break;
     }
@@ -450,6 +474,7 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
         }
         if (to != cur) {
             plugins_set_option(p.name, o.key, choices[static_cast<std::size_t>(to)]);
+            ask_sound(kMenuSoundMove);
         }
         arrows = underline = true;
         break;
@@ -458,6 +483,7 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
         ImGui::SetCursorScreenPos(ImVec2(a.x, val_a.y));
         if (value_button(o.key.c_str(), o.label, ImVec2(b.x - a.x, frame_h), false)) {
             plugins_run_action(p.name, o.key);
+            ask_sound(kMenuSoundDecide);
         }
         take_cursor(cursor);
         break;
@@ -625,9 +651,11 @@ void plugin_panel_draw(float scale, bool pad) {
         ImGui::IsKeyPressed(ImGuiKey_E, false))
         turn = 1;
     bool refocus = g_appeared.exchange(false);
+    if (g_opened.exchange(false)) ask_sound(kMenuSoundOpen);
     if (turn && n > 1) {
         p.page = (p.page + turn + n) % n;
         refocus = true;
+        ask_sound(kMenuSoundMove);
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_panel.owner == p.owner) {
             g_panel.page = p.page;
@@ -842,13 +870,14 @@ void plugin_panel_draw(float scale, bool pad) {
             dl->ChannelsSetCurrent(1);
         };
         bool first = true;
-        int i = 0;
+        int i = 0, focus = -1;
         for (const PluginOptionDesc& opt : p.entry->options) {
             if (opt.page != page_key || opt.type == BB_OPT_HEADING) continue;
             const float top = y + static_cast<float>(i) * row_h;
             const RowOut r = row(*p.entry, opt, ImVec2(x0, top), ImVec2(x1, top + row_h), mid, s, first && refocus, art);
             if (r.focused) {
                 light(top, opt.type != BB_OPT_ACTION, 1.0f);
+                focus = i;
             } else if (r.hot) {
                 light(top, opt.type != BB_OPT_ACTION, 0.4f);
             }
@@ -867,6 +896,7 @@ void plugin_panel_draw(float scale, bool pad) {
             const bool focused = ImGui::IsItemFocused(), hovered = ImGui::IsItemHovered();
             if (focused) {
                 light(top, false, 1.0f);
+                focus = most_rows;
             } else if (hovered) {
                 light(top, false, 0.4f);
             }
@@ -885,9 +915,19 @@ void plugin_panel_draw(float scale, bool pad) {
                     if (opt.page == page_key && opt.type != BB_OPT_HEADING && opt.type != BB_OPT_ACTION)
                         plugins_set_option(p.entry->name, opt.key, opt.def);
                 }
+                ask_sound(kMenuSoundDecide);
             }
         }
         dl->ChannelsMerge();
+        // The cursor moved to another row of the same page: the game's sound
+        // for it (a page turned has made its own).
+        {
+            static std::string last_page;
+            static int last_focus = -1;
+            if (focus >= 0 && last_focus >= 0 && focus != last_focus && last_page == page_key && !turn) ask_sound(kMenuSoundMove);
+            if (focus >= 0) last_focus = focus;
+            last_page = page_key;
+        }
         y += rows_h;
         // The rule over the help (its finial up the column rule), and the
         // column rule itself between the two.
@@ -940,6 +980,7 @@ void plugin_panel_draw(float scale, bool pad) {
     ImGui::PopStyleVar(kVars);
     ImGui::PopFont();
     if (click && n > 1) {
+        ask_sound(kMenuSoundMove);
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_panel.owner == p.owner) {
             g_panel.page = (p.page + click + n) % n;
@@ -948,6 +989,7 @@ void plugin_panel_draw(float scale, bool pad) {
         }
     }
     if (close) {
+        ask_sound(kMenuSoundCancel);
         std::lock_guard<std::mutex> lk(g_mu);
         if (g_panel.owner == p.owner) {
             g_closed[p.owner] = true;

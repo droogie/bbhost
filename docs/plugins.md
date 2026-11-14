@@ -314,21 +314,22 @@ over the game.
   labels and the values, each label's line and each value's scrolled line, the
   golden glow on the row with the cursor, the arrows either side of a choice,
   the sliders' track, and the key guide's button icons in the controller's
-  guide. A piece the dump lacks is drawn plainly instead (thin rules, a dark
-  plate, a gold band, drawn arrows). It keeps one size for every page (its
-  longest page's rows and room for its longest help), so it never moves as
-  rows or pages change; Menu hue and Menu vibrance, which colour bbhost's
-  menus, leave it as it is. Its rows' changes go to `on_option` as the menus'
-  do (so its rows want `BB_OPT_LIVE`), the help of the row in use under them,
-  then `guide` or `guide_keys` - whichever device the player used last. The
-  controller drives it (the d-pad up and down to a row, left and right to
-  change it, Cross to set a switch or press a button, L1 and R1 the pages,
-  Circle closes it), as do the keyboard (the arrows, Enter, Page Up and Page
-  Down or Q and E, Escape) and the pointer, which is free while it is up.
-  While it is up neither the game nor the plugins' `pad` and `input` read
-  those buttons and keys; everything else is as it was. `BB_PANEL_DEFAULTS`
-  ends each page with a Defaults row. One panel at a time; turning the plugin
-  off takes it down.
+  guide; the game's own menu sounds as the cursor moves, a value changes, a
+  page turns and the panel opens and closes. A piece the dump lacks is drawn
+  plainly instead (thin rules, a dark plate, a gold band, drawn arrows). It
+  keeps one size for every page (its longest page's rows and room for its
+  longest help), so it never moves as rows or pages change; Menu hue and Menu
+  vibrance, which colour bbhost's menus, leave it as it is. Its rows' changes
+  go to `on_option` as the menus' do (so its rows want `BB_OPT_LIVE`), the
+  help of the row in use under them, then `guide` or `guide_keys` - whichever
+  device the player used last. The controller drives it (the d-pad up and down
+  to a row, left and right to change it, Cross to set a switch or press a
+  button, L1 and R1 the pages, Circle closes it), as do the keyboard (the
+  arrows, Enter, Page Up and Page Down or Q and E, Escape) and the pointer,
+  which is free while it is up. While it is up neither the game nor the
+  plugins' `pad` and `input` read those buttons and keys; everything else is
+  as it was. `BB_PANEL_DEFAULTS` ends each page with a Defaults row. One panel
+  at a time; turning the plugin off takes it down.
 - `panel_state(name, &state)`: `BbPanelState` (set `state.size` first) -
   whether the panel is up, whether the player closed it (Circle, Escape) since
   the last call, and the page shown or shown last, by its heading's key.

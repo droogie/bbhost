@@ -54,6 +54,12 @@ void plugin_panel_preload();
 // (the guide for it).
 void plugin_panel_draw(float scale, bool pad);
 
+// The game's menu sound the panel asks for since the last call (the cursor
+// moved, a value changed, a page turned, Defaults pressed, the panel up or
+// closed: engine/menu_pointer.h's ids), the loudest of them, with its
+// priority; -1 when none. For the game's thread to post (plugins_frame).
+int plugin_panel_take_sound(int* priority);
+
 // BBHOST_PANEL_PREVIEW=<plugin>[:<page>] (a test aid): that plugin's panel up
 // from the first frame the menus draw, wherever the game is - at the title
 // too - with BBHOST_PANEL_PREVIEW_GUIDE and BBHOST_PANEL_PREVIEW_GUIDE_KEYS
