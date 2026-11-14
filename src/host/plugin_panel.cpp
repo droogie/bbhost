@@ -13,10 +13,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 #if defined(BBHOST_HAVE_SDL3)
@@ -340,9 +342,15 @@ bool value_button(const char* id, const std::string& text, ImVec2 size, bool lit
     return pressed;
 }
 
+// The rows' layers in the draw list's channels: the cursor's glow under the
+// rows' tracks and lines, as the game's dialog lights a row behind them, and
+// those under the widgets and the letters.
+constexpr int kGlowLayer = 0, kLineLayer = 1, kWidgetLayer = 2;
+
 struct RowOut {
     bool hot = false;      // the cursor or the pointer on it: its help shows
     bool focused = false;  // the cursor on it: lit
+    float glow_x = -1.0f;  // a slider's: its value's glow centred on its track, as the game's are (not on the mark)
 };
 
 // One row in [a, b]: its label right-aligned before `mid`, its widget across
@@ -400,6 +408,7 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
                                      nf->CalcTextSizeA(nfs, FLT_MAX, 0.0f, shown(o.max).c_str()).x) +
                             gap;
         const float bar_w = std::max(val_size.x - num_w, 8.0f * s);
+        out.glow_x = val_a.x + bar_w * 0.5f;
         const bool track = art.has(game_menu_art::kSliderTrack) && art.has(game_menu_art::kSliderFill);
         if (track) {  // the game's track and filling, a thin mark of ours: none of the widget's own
             ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(0, 0, 0, 0));
@@ -423,13 +432,13 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
             const float th = std::max(frame_h * 0.42f, 4.0f), fh = th * 0.5f;
             const float cy = val_a.y + frame_h * 0.5f;
             const float f = o.max > o.min ? static_cast<float>((v - o.min) / (o.max - o.min)) : 0.0f;
-            dl->ChannelsSetCurrent(0);
+            dl->ChannelsSetCurrent(kLineLayer);
             art.image(dl, game_menu_art::kSliderTrack, ImVec2(val_a.x, cy - th * 0.5f), ImVec2(val_a.x + bar_w, cy + th * 0.5f), art_tint);
             const float fx = val_a.x + 2.0f * s + (bar_w - 4.0f * s) * std::clamp(f, 0.0f, 1.0f);
             if (fx > val_a.x + 2.0f * s)
                 art.image(dl, game_menu_art::kSliderFill, ImVec2(val_a.x + 2.0f * s, cy - fh * 0.5f), ImVec2(fx, cy + fh * 0.5f),
                           art_tint, false, false, 0.0f, std::max(1.0f, art.atlas->piece[game_menu_art::kSliderFill].w * std::clamp(f, 0.0f, 1.0f)));
-            dl->ChannelsSetCurrent(1);
+            dl->ChannelsSetCurrent(kWidgetLayer);
             const bool lit = ImGui::IsItemFocused() || ImGui::IsItemActive();
             const ImU32 mark = grey ? look::kTextDim : lit ? look::kGoldLit : look::kGold;
             dl->AddRectFilled(ImVec2(fx - 1.5f * s, cy - th * 0.8f), ImVec2(fx + 1.5f * s, cy + th * 0.8f), mark);
@@ -499,18 +508,18 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
         const float y = b.y - 4.0f * s;
         const float ew = art.w(game_menu_art::kValueEnd), eh = art.h(game_menu_art::kValueEnd);
         const float x0 = val_a.x + 2.0f * s, x1 = b.x - 2.0f * s;
-        dl->ChannelsSetCurrent(0);
+        dl->ChannelsSetCurrent(kLineLayer);
         art.image(dl, game_menu_art::kValueEnd, ImVec2(x0, y - 1.0f), ImVec2(x0 + ew, y - 1.0f + eh), art_tint, false, true);
         art.image(dl, game_menu_art::kValueEnd, ImVec2(x1 - ew, y - 1.0f), ImVec2(x1, y - 1.0f + eh), art_tint, true, true);
         art.rule(dl, x0 + ew - 1.0f, x1 - ew + 1.0f, y, art_tint);
-        dl->ChannelsSetCurrent(1);
+        dl->ChannelsSetCurrent(kWidgetLayer);
     }
     if (o.type != BB_OPT_ACTION && art.has(game_menu_art::kLabelLine)) {
         const float lh = std::max(art.h(game_menu_art::kLabelLine), 2.0f);
-        dl->ChannelsSetCurrent(0);
+        dl->ChannelsSetCurrent(kLineLayer);
         art.image(dl, game_menu_art::kLabelLine, ImVec2(a.x, b.y - 2.0f * s - lh * 0.5f), ImVec2(mid - 3.0f * s, b.y - 2.0f * s + lh * 0.5f),
                   art_tint);
-        dl->ChannelsSetCurrent(1);
+        dl->ChannelsSetCurrent(kWidgetLayer);
     }
     if (arrows && out.focused) {
         if (art.has(game_menu_art::kArrow)) {
@@ -538,31 +547,55 @@ RowOut row(const PluginEntry& p, const PluginOptionDesc& o, ImVec2 a, ImVec2 b, 
     return out;
 }
 
-// The height `text` takes wrapped to `width` in the current font at `size`.
-float wrapped_height(const std::string& text, float size, float width) {
-    if (text.empty()) return 0.0f;
-    return ImGui::GetFont()->CalcTextSizeA(size, FLT_MAX, width, text.c_str()).y;
+// The help's and the guide's lines. The game sets its multi-line texts (its
+// dialogs' help, its item descriptions) a line's height apart plus their
+// fields' leading - 2 px on its 1080-line stage, in nearly all of them - and
+// so does the panel, at its scale (900 lines at a scale of 1).
+constexpr float kLeading = 2.0f * 900.0f / 1080.0f;
+
+// How far the font's descenders (g j p q y, the brackets) reach under a line's
+// box at `size`: the game's letters go a quarter of an em under the baseline,
+// twice the descent the font gives, which is all a line's height keeps.
+float descender_overhang(ImFont* f, float size) {
+    ImFontBaked* b = f->GetFontBaked(size);
+    float bottom = size;
+    for (const char* c = "gjpqy()[]{},;"; *c; ++c) {
+        if (const ImFontGlyph* g = b->FindGlyphNoFallback(static_cast<ImWchar>(*c))) bottom = std::max(bottom, g->Y1);
+    }
+    return bottom - size;
 }
 
-// Text across [x0, x1] from `top`, wrapped at the width and each line centred,
-// as the game's dialogs set their help: the height it took.
-float centred_text(ImDrawList* dl, ImFont* f, float size, float x0, float x1, float top, ImU32 col, const std::string& text) {
+// `text` wrapped at `width` in `f` at `size`, line by line (ImGui's word wrap,
+// an explicit new line kept): each line's [begin, end) without its trailing
+// spaces.
+std::vector<std::pair<const char*, const char*>> wrap_lines(ImFont* f, float size, const std::string& text, float width) {
+    std::vector<std::pair<const char*, const char*>> lines;
     const char* at = text.c_str();
     const char* end = at + text.size();
-    float y = top;
-    const float line = f->CalcTextSizeA(size, FLT_MAX, 0.0f, "A").y;
     while (at < end) {
-        const char* brk = f->CalcWordWrapPosition(size, at, end, x1 - x0);
+        const char* brk = f->CalcWordWrapPosition(size, at, end, width);
+        if (const char* nl = static_cast<const char*>(std::memchr(at, '\n', static_cast<std::size_t>(brk - at)))) brk = nl + 1;
         if (brk == at) brk = at + 1;
         const char* stop = brk;
         while (stop > at && (stop[-1] == ' ' || stop[-1] == '\n')) --stop;
-        const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0.0f, at, stop);
-        dl->AddText(f, size, ImVec2((x0 + x1 - ts.x) * 0.5f, y), col, at, stop);
-        y += line;
+        lines.emplace_back(at, stop);
         at = brk;
-        while (at < end && (*at == ' ' || *at == '\n')) ++at;
+        while (at < end && *at == ' ') ++at;
     }
-    return y - top;
+    return lines;
+}
+
+// Text across [x0, x1] from `top`, wrapped at the width, a line every
+// `advance`; each line centred (as the game's dialogs set their help) or
+// from x0.
+void text_lines(ImDrawList* dl, ImFont* f, float size, float x0, float x1, float top, float advance, ImU32 col, const std::string& text,
+                bool centred) {
+    float y = top;
+    for (const auto& [a, b] : wrap_lines(f, size, text, x1 - x0)) {
+        const float w = centred ? f->CalcTextSizeA(size, FLT_MAX, 0.0f, a, b).x : 0.0f;
+        dl->AddText(f, size, ImVec2(centred ? (x0 + x1 - w) * 0.5f : x0, y), col, a, b);
+        y += advance;
+    }
 }
 
 // The controller's guide with the game's key guide icons for the buttons it
@@ -692,24 +725,25 @@ void plugin_panel_draw(float scale, bool pad) {
     const ImVec2 frame_pad(8.0f * s, 3.0f * s);
     const float frame_h = text_size + 2.0f * frame_pad.y;
     const float row_h = frame_h + 6.0f * s;
-    int most_rows = 0;
-    float help_h = 0.0f;
+    // The help and the guide in the font at the small size: their lines a
+    // line's height and the game's leading apart.
+    ImFont* const font = ImGui::GetFont();
+    const float leading = kLeading * s, advance = small_size + leading;
+    const auto lines_of = [&](const std::string& t) { return t.empty() ? 0 : static_cast<int>(wrap_lines(font, small_size, t, inner).size()); };
+    int most_rows = 0, help_lines = 0;
     {
         std::map<std::string, int> rows;
         for (const PluginOptionDesc& o : p.entry->options) {
             if (o.page.empty()) continue;
-            if (o.type == BB_OPT_HEADING) {
-                help_h = std::max(help_h, wrapped_height(o.help, small_size, inner));
-                continue;
-            }
-            most_rows = std::max(most_rows, ++rows[o.page]);
-            help_h = std::max(help_h, wrapped_height(o.help, small_size, inner));
+            help_lines = std::max(help_lines, lines_of(o.help));
+            if (o.type != BB_OPT_HEADING) most_rows = std::max(most_rows, ++rows[o.page]);
         }
     }
-    const float line_h = small_size * 1.25f;
-    help_h = std::clamp(help_h, 2.0f * line_h, 4.0f * line_h);
-    const float guide_h = std::max(wrapped_height(p.guide, small_size, inner), wrapped_height(p.guide_keys, small_size, inner)) +
-                          (art.atlas ? small_size * 0.3f : 0.0f);
+    // Room for two to five lines, and under the last for its descenders.
+    help_lines = std::clamp(help_lines, 2, 5);
+    const float help_h = static_cast<float>(help_lines) * advance - leading + descender_overhang(font, small_size);
+    const int guide_lines = std::max(lines_of(p.guide), lines_of(p.guide_keys));
+    const float guide_h = (guide_lines ? static_cast<float>(guide_lines) * advance - leading : 0.0f) + (art.atlas ? small_size * 0.3f : 0.0f);
     const float rule_gap = 12.0f * s;
     // The game's top and foot are its ornament over its band; the rules about
     // the title and the help carry the filigree, which wants more room.
@@ -842,13 +876,14 @@ void plugin_panel_draw(float scale, bool pad) {
         // Its rows, the one with the cursor lit; the glow and the lines go
         // under the row's widget (the draw list's first channel).
         std::string help = page_help;
-        dl->ChannelsSplit(2);
-        dl->ChannelsSetCurrent(1);
+        dl->ChannelsSplit(3);
+        dl->ChannelsSetCurrent(kWidgetLayer);
         const bool glow_art = art.has(game_menu_art::kGlow);
         // `strength` 1 for the cursor's row; less for the one under the
-        // pointer (the art's glow only).
-        const auto light = [&](float top, bool label_side, float strength) {
-            dl->ChannelsSetCurrent(0);
+        // pointer (the art's glow only). `value_x` the value's centre (a
+        // slider's track); < 0 the value column's.
+        const auto light = [&](float top, bool label_side, float strength, float value_x) {
+            dl->ChannelsSetCurrent(kGlowLayer);
             if (glow_art) {
                 // The game's glow: brightest at the column rule, fading to the
                 // left behind the label; on the value, brightest at its middle.
@@ -857,7 +892,8 @@ void plugin_panel_draw(float scale, bool pad) {
                 const ImU32 value_tint = IM_COL32(255, 255, 255, static_cast<int>(170.0f * strength));
                 if (label_side)
                     art.image(dl, game_menu_art::kGlow, ImVec2(x0 - pad_x * 0.6f, cy - gh * 0.5f), ImVec2(mid, cy + gh * 0.5f), label_tint);
-                const float vx = (mid + 14.0f * s + x1) * 0.5f, hw = (x1 - mid - 14.0f * s) * 0.45f, vh = row_h * 2.0f;
+                const float vx = value_x >= 0.0f ? value_x : (mid + 14.0f * s + x1) * 0.5f, hw = (x1 - mid - 14.0f * s) * 0.45f,
+                            vh = row_h * 2.0f;
                 art.image(dl, game_menu_art::kGlow, ImVec2(vx - hw, cy - vh * 0.5f), ImVec2(vx, cy + vh * 0.5f), value_tint);
                 art.image(dl, game_menu_art::kGlow, ImVec2(vx, cy - vh * 0.5f), ImVec2(vx + hw, cy + vh * 0.5f), value_tint, true);
             } else if (strength >= 1.0f) {
@@ -867,7 +903,7 @@ void plugin_panel_draw(float scale, bool pad) {
                 dl->AddRectFilledMultiColor(ImVec2(cx, top), ImVec2(x1 + pad_x * 0.5f, top + row_h), look::kGlow, IM_COL32(0, 0, 0, 0),
                                             IM_COL32(0, 0, 0, 0), look::kGlow);
             }
-            dl->ChannelsSetCurrent(1);
+            dl->ChannelsSetCurrent(kWidgetLayer);
         };
         bool first = true;
         int i = 0, focus = -1;
@@ -876,10 +912,10 @@ void plugin_panel_draw(float scale, bool pad) {
             const float top = y + static_cast<float>(i) * row_h;
             const RowOut r = row(*p.entry, opt, ImVec2(x0, top), ImVec2(x1, top + row_h), mid, s, first && refocus, art);
             if (r.focused) {
-                light(top, opt.type != BB_OPT_ACTION, 1.0f);
+                light(top, opt.type != BB_OPT_ACTION, 1.0f, r.glow_x);
                 focus = i;
             } else if (r.hot) {
-                light(top, opt.type != BB_OPT_ACTION, 0.4f);
+                light(top, opt.type != BB_OPT_ACTION, 0.4f, r.glow_x);
             }
             if (r.hot) help = opt.help;
             if (!art.has(game_menu_art::kLabelLine))
@@ -895,20 +931,20 @@ void plugin_panel_draw(float scale, bool pad) {
             const bool pressed = value_button("defaults", "Defaults", ImVec2(x1 - mid - 14.0f * s, frame_h), false);
             const bool focused = ImGui::IsItemFocused(), hovered = ImGui::IsItemHovered();
             if (focused) {
-                light(top, false, 1.0f);
+                light(top, false, 1.0f, -1.0f);
                 focus = most_rows;
             } else if (hovered) {
-                light(top, false, 0.4f);
+                light(top, false, 0.4f, -1.0f);
             }
             if (focused || hovered) help = "Every row on this page back to its default.";
             if (art.has(game_menu_art::kValueEnd) && art.has(game_menu_art::kRule)) {
                 const float ly = top + row_h - 4.0f * s, ew = art.w(game_menu_art::kValueEnd), eh = art.h(game_menu_art::kValueEnd);
                 const float vx0 = mid + 16.0f * s, vx1 = x1 - 2.0f * s;
-                dl->ChannelsSetCurrent(0);
+                dl->ChannelsSetCurrent(kLineLayer);
                 art.image(dl, game_menu_art::kValueEnd, ImVec2(vx0, ly - 1.0f), ImVec2(vx0 + ew, ly - 1.0f + eh), art_tint, false, true);
                 art.image(dl, game_menu_art::kValueEnd, ImVec2(vx1 - ew, ly - 1.0f), ImVec2(vx1, ly - 1.0f + eh), art_tint, true, true);
                 art.rule(dl, vx0 + ew - 1.0f, vx1 - ew + 1.0f, ly, art_tint);
-                dl->ChannelsSetCurrent(1);
+                dl->ChannelsSetCurrent(kWidgetLayer);
             }
             if (pressed) {
                 for (const PluginOptionDesc& opt : p.entry->options) {
@@ -946,21 +982,16 @@ void plugin_panel_draw(float scale, bool pad) {
         {
             ImGui::PushFont(nullptr, kSmallSize);
             ImFont* f = ImGui::GetFont();
-            ImGui::PushClipRect(ImVec2(x0, y), ImVec2(x1, y + help_h), true);
-            if (art.atlas)
-                centred_text(dl, f, small_size, x0, x1, y, look::kHelp, help);
-            else
-                dl->AddText(f, small_size, ImVec2(x0, y), look::kHelp, help.c_str(), nullptr, inner);
+            // Its area holds its last line's descenders; the clip lets an
+            // accented capital of its first line rise as far.
+            ImGui::PushClipRect(ImVec2(x0, y - (help_h - static_cast<float>(help_lines) * advance + leading)), ImVec2(x1, y + help_h), true);
+            text_lines(dl, f, small_size, x0, x1, y, advance, look::kHelp, help, art.atlas != nullptr);
             ImGui::PopClipRect();
             y += help_h + 10.0f * s;
             const std::string& guide = pad ? p.guide : p.guide_keys;
             if (!guide.empty()) {
-                if (!(art.atlas && pad && guide_with_icons(dl, f, small_size, x0, x1, y, look::kGuide, guide, art))) {
-                    if (art.atlas)
-                        centred_text(dl, f, small_size, x0, x1, y, look::kGuide, guide);
-                    else
-                        dl->AddText(f, small_size, ImVec2(x0, y), look::kGuide, guide.c_str(), nullptr, inner);
-                }
+                if (!(art.atlas && pad && guide_with_icons(dl, f, small_size, x0, x1, y, look::kGuide, guide, art)))
+                    text_lines(dl, f, small_size, x0, x1, y, advance, look::kGuide, guide, art.atlas != nullptr);
             }
             ImGui::PopFont();
         }
