@@ -22,11 +22,14 @@
 //   eye_height = 1.55        # metres above the feet, in first person (head_bob off)
 //   first_person_field_of_view = 0  # % wider, in first person (0: field_of_view's)
 //   look_limit = 80          # degrees up or down in first person (the game's aim: 35 up, 40 down)
+//   first_person_lock_on = false  # the lock-on in first person: the view follows the target
 //   stick_speed = 1.0        # the right stick's turning, times the game's
 //   mouse_sensitivity = 50   # the mouse in the aim (first person, facing the camera), F10's scale
 //   mouse_invert_y = false   # and its up and down reversed
 //   face_camera = false      # always face where the camera looks
 //   crosshair = true         # the monocular's sight while facing the camera
+//   tank_controls = false    # the left stick's left and right turn the hunter, the view behind them
+//   tank_turn_speed = 120    # degrees a second at a full stick
 //   dodge = 1                # 0 the roll, 1 a sidestep in the stick's direction
 //
 // The camera. The game keeps its own follow camera (ChrFollowCam, the camera
@@ -108,6 +111,38 @@
 // again, rolls the hunter the stick's way as unaimed; the view is held still
 // meanwhile and the aim given back its angles.
 //
+// The lock-on in first person. The player's update drops the lock each frame
+// the hunter aims: with the precision-shooting bit set (0x1cf58a4, test ah, 4
+// on ChrIns +0x1e1's dword) or the monocular's stateInfo 15 on, it sets
+// LOCK_TGT_MAN's reset request (the manager at 0x593e860, +0x2822), which
+// clears the lock mode (+0x2820) and the button's request (+0x2821) before the
+// lock-on handler (0x1c8e900) looks for a target - so in first person, whose
+// facing is that bit, the lock-on button did nothing. With Lock-on in first
+// person on, the bit's test passes while the bit is the plugin's (the
+// monocular's own check stands), and once the handler has a target - it sets
+// the player's ChrIns +0xf8 and puts the point locked onto at +0x100 each
+// frame - the plugin takes its bit away for the lock's length: the hunter is
+// the game's locked-on hunter (they face the target, strafe about it and
+// sidestep; the right stick and the mouse switch targets and turn nothing),
+// and the view, still at the eyes, is turned by the plugin to look at that
+// point, eased onto it. When the lock ends the bit comes back and the aim
+// camera is given the angles the view had, as after a roll.
+//
+// Tank controls. The left stick's (or A and D's) left and right turn the
+// hunter instead of stepping them sideways, forward and back walk and back
+// away, and the view stays behind them - Resident Evil 4's. The hunter faces
+// the camera for it (the precision-shooting bit, as Always face the camera),
+// and the stick's sideways axis is taken from the game where it reads the pad:
+// the pad device's update (0x2a90090; 0x2a91870 the other device class's)
+// calls scePadReadState into the device (+0x110, the sticks' bytes from +4)
+// and makes floats of them (+0x94 from there: left x, left y, right x, right
+// y, -1 to 1). A hook on its entry runs the update itself, then keeps the left
+// stick's x for the plugin and leaves the game a centred one; each frame it
+// turns the aim camera's yaw by the Turn speed. Only while the aim is the
+// plugin's and the player is playing: in a menu, through a roll (which goes
+// the stick's way) and locked on in first person (where the stick strafes
+// about the target) the stick is the game's.
+//
 // Cutscenes and other cameras. A cutscene (plugin API 29's cutscene()) places
 // the hunter and the camera itself, and while another camera has the picture
 // (world_state's BB_WORLD_VIEW: another plugin's free camera) or another plugin
@@ -132,7 +167,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_LIVE_SWITCH,
     "hunter_cam",
     "Hunter Cam",
-    "1.3.4",
+    "1.4.0",
     "Kyo",
     "The hunter from closer in: an over-the-shoulder camera (right or left, swapped with a key, zoomed with the wheel) "
     "or first person with only the arms and weapons drawn; the hunter can always face where the camera looks, the right "
@@ -178,6 +213,11 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
      0, 100, nullptr},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "look_limit", "Look up/down limit",
      "Degrees the view turns up or down from level in first person.", "80", 45, 89, nullptr},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "first_person_lock_on", "Lock-on in first person",
+     "The lock-on button works in first person: locked on, the view follows the target, the hunter faces it, and the "
+     "mouse and the right stick no longer turn the view (they switch targets, as the game has it). Off: no lock-on in "
+     "first person.",
+     "false", 0, 0, nullptr},
     {BB_OPT_HEADING, "h_controls", "Turning", nullptr, nullptr, 0, 0, nullptr},
     {BB_OPT_FLOAT | BB_OPT_LIVE, "stick_speed", "Right stick speed",
      "How fast the right stick turns the camera, times the game's own (its Camera speed option still applies).", "1.0",
@@ -196,6 +236,13 @@ extern "C" BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
     {BB_OPT_BOOL | BB_OPT_LIVE, "crosshair", "Crosshair",
      "The monocular's sight at the middle of the screen while the hunter faces the camera (and in first person).", "true",
      0, 0, nullptr},
+    {BB_OPT_BOOL | BB_OPT_LIVE, "tank_controls", "Tank controls",
+     "The left stick's left and right (or A and D) turn the hunter instead of stepping sideways, forward and back walk "
+     "and back away, and the view stays behind them, as in Resident Evil 4. The hunter always faces the camera with it; "
+     "dodges go forward or back.",
+     "false", 0, 0, nullptr},
+    {BB_OPT_FLOAT | BB_OPT_LIVE, "tank_turn_speed", "Tank turn speed", "Degrees a second the hunter turns at a full stick.",
+     "120", 30, 360, nullptr},
     {BB_OPT_INT | BB_OPT_LIVE, "dodge", "Dodge (0 Roll, 1 Sidestep)",
      "0: always the roll, locked on too. 1: a quick sidestep in the stick's direction, as when locked on, without a "
      "lock. The Modern Movement Lite patch keeps working beside it.",
@@ -230,11 +277,14 @@ struct Settings {
     int fov = 0;  // +% wider
     bool first_person = false, head_bob = false;
     float eye_height = 1.55f, look_limit = 80.0f;
+    bool first_lock = false;  // the lock-on in first person
     int first_fov = 0;  // +% wider
     float stick_speed = 1.0f;
     int mouse_sensitivity = 50;
     bool mouse_invert_y = false;
     bool face_camera = false, crosshair = true;
+    bool tank = false;
+    float tank_turn = 120.0f;  // degrees a second
     int dodge = 1;
 } s;
 
@@ -299,11 +349,14 @@ void read_options() {
     s.head_bob = flag("hunter_cam.head_bob", false);
     s.first_fov = static_cast<int>(number("hunter_cam.first_person_field_of_view", 0.0f, 0.0f, 100.0f) + 0.5f);
     s.look_limit = number("hunter_cam.look_limit", 80.0f, 45.0f, 89.0f);
+    s.first_lock = flag("hunter_cam.first_person_lock_on", false);
     s.stick_speed = number("hunter_cam.stick_speed", 1.0f, 0.25f, 4.0f);
     s.mouse_sensitivity = static_cast<int>(number("hunter_cam.mouse_sensitivity", 50.0f, 0.0f, 100.0f) + 0.5f);
     s.mouse_invert_y = flag("hunter_cam.mouse_invert_y", false);
     s.face_camera = flag("hunter_cam.face_camera", false);
     s.crosshair = flag("hunter_cam.crosshair", true);
+    s.tank = flag("hunter_cam.tank_controls", false);
+    s.tank_turn = number("hunter_cam.tank_turn_speed", 120.0f, 30.0f, 360.0f);
     s.dodge = static_cast<int>(number("hunter_cam.dodge", 1.0f, 0.0f, 1.0f) + 0.5f);
 }
 
@@ -506,6 +559,11 @@ const CodeSite kSight[] = {{0x1ffe4e1, {0xf6, 0xc5, 0x04}}};
 // Vial is drunk, a paper rubbed on, a tool raised, and nothing heals, buffs or
 // is spent. Its mask made 0, items work as they do unaimed.
 const CodeSite kItems[] = {{0x197f9b6, {0xe1, 0x00, 0x04}}};
+// The lock-on: the player's update asks LOCK_TGT_MAN to drop the lock (its
+// +0x2822) each frame the bit is set - or the monocular's stateInfo 15 is on,
+// the check after it, which stands. Its test passed, the lock-on button locks
+// on while the hunter aims.
+const CodeSite kLock[] = {{0x1cf58a4, {0xf6, 0xc4, 0x04}}};
 
 struct SiteSet {
     const CodeSite* sites;
@@ -517,6 +575,7 @@ struct SiteSet {
 SiteSet g_interact{kInteract, sizeof(kInteract) / sizeof(kInteract[0]), "X's action button and talk"};
 SiteSet g_sight{kSight, sizeof(kSight) / sizeof(kSight[0]), "the crosshair"};
 SiteSet g_items{kItems, sizeof(kItems) / sizeof(kItems[0]), "items"};
+SiteSet g_lock{kLock, sizeof(kLock) / sizeof(kLock[0]), "the lock-on in first person"};
 // Until when (steady clock, ns) a roll runs unaimed. Aiming, the game holds
 // the hunter facing where the camera looks - it reads that before the script
 // runs - so a roll would only ever go straight ahead. The script's roll is
@@ -560,6 +619,18 @@ std::atomic<bool> g_force_roll{false};         // the env hook makes the dodge a
 std::atomic<bool> g_monocular{false};          // SpEffect 2000 on: the monocular in use
 bool g_first = false;                          // in first person now (the key or the option)
 
+// The lock-on, as the lock-on handler (0x1c8e900) leaves it on the player's
+// ChrIns each frame: +0xf8 set while a target is held, +0x100 the point
+// locked onto (the target's lock point, where the game draws its cursor).
+constexpr std::size_t kLockedOn = 0xf8, kLockPoint = 0x100;
+bool g_locked = false;  // first person, locked on: the hunter is the game's, the view follows the target
+
+// Tank controls: the left stick's sideways axis, taken where the game reads
+// the pad (pad_hook) while g_tank_take is set.
+std::atomic<bool> g_tank_take{false};
+std::atomic<float> g_tank_x{0.0f};  // -1 left .. 1 right
+bool g_playing = true;              // the player is playing: no menu has the input (read_keys)
+
 // Plugin API 29: one of the game's cutscenes asked for or playing. It places
 // the camera and the hunter itself: the camera, the facing (the aim bit) and
 // the body go back to the game for its length, as at a load.
@@ -581,19 +652,23 @@ bool world_elsewhere() {
     if (!api || api->world_state(&w) != 0) return false;
     return (w.flags & (BB_WORLD_PAUSED | BB_WORLD_VIEW)) != 0;
 }
-bool aim_wanted() { return s.on && (s.face_camera || g_first) && !in_cutscene() && !g_elsewhere.load(); }
+bool aim_wanted() { return s.on && (s.face_camera || s.tank || g_first) && !in_cutscene() && !g_elsewhere.load(); }
 bool rolling() { return now_ns() < g_roll_until.load(); }
 
 // Once a frame, on the main thread: the bit set while it should be, cleared
 // once it should not (only when we set it).
 void face_camera_frame() {
     const bool loading = api->loading_screen && api->loading_screen();
-    const bool want = aim_wanted() && !loading && !rolling();
     std::uint8_t* chr = player();
     if (chr != g_aim_chr) g_aim_ours = false;  // a load: the character it was on is gone
     g_aim_chr = chr;
     g_player.store(loading ? nullptr : chr);
     g_monocular.store(chr && api->sp_effect_has(nullptr, kMonocular) != 0);
+    // The lock-on in first person: while the game holds a target the hunter
+    // is its locked-on hunter - no aim of ours - and the view follows (on_camera).
+    const bool lock_wanted = aim_wanted() && g_first && s.first_lock && !loading;
+    g_locked = lock_wanted && chr && chr[kLockedOn] != 0 && !g_monocular.load();
+    const bool want = aim_wanted() && !loading && !rolling() && !g_locked;
     if (chr) {
         if (want) {
             chr[kAimFlags] |= kAimBit;
@@ -611,6 +686,13 @@ void face_camera_frame() {
     set_sites(g_interact, ours);
     set_sites(g_items, ours);
     set_sites(g_sight, ours && !s.crosshair);
+    // The lock-on button locks on while the aim is first person's.
+    set_sites(g_lock, ours && lock_wanted);
+    // Tank controls: the stick's sideways axis is ours while the aim is, and
+    // the player is playing (a menu keeps its stick).
+    const bool take = ours && s.tank && g_playing;
+    g_tank_take.store(take);
+    if (!take) g_tank_x.store(0.0f);
 }
 
 // The aim is ours and the monocular is not in use: our camera keeps the view.
@@ -680,6 +762,44 @@ int env_hook(BbHookCtx* c, void*) {
         return 1;
     }
     return 0;
+}
+
+// ---- tank controls: the left stick's sideways axis ---------------------------
+//
+// The pad device's update (this) reads the pad into the device and makes
+// floats of its sticks; the game's input layers read them from there. The
+// hook runs the update itself (the call back in passes straight through),
+// then takes the left stick's x and leaves the game a centred one.
+
+constexpr std::uint64_t kPadUpdate[2] = {0x2a90090, 0x2a91870};  // one for each device class
+constexpr std::size_t kPadData[2] = {0x110, 0x150};              // the device's ScePadData; its handle 8 bytes before
+constexpr std::size_t kPadLeftX = 0x4, kPadAxes = 0x94;          // from the data: the stick's byte, the four floats
+constexpr std::uint8_t kPadPrologue[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+                                           0x53, 0x48, 0x83, 0xec, 0x28, 0x48, 0x89, 0xfb};
+std::atomic<bool> g_pad_inside{false};
+bool g_pad_hooked = false;
+
+int pad_hook(BbHookCtx* c, void* user) {
+    if (!g_tank_take.load(std::memory_order_relaxed)) return 0;
+    if (g_pad_inside.exchange(true)) return 0;  // our own call of it (or another thread's meanwhile, left alone)
+    const std::size_t which = static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(user));
+    BbCallRegs r{};
+    std::memcpy(r.arg, c->arg, sizeof r.arg);
+    std::memcpy(r.xmm, c->xmm, sizeof r.xmm);
+    const bool ran = api->call_guest(kPadUpdate[which], &r) == 0;
+    g_pad_inside.store(false);
+    if (!ran) return 0;  // not run: the game runs it, with its stick
+    auto* dev = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(c->arg[0]));
+    if (dev && get<std::int32_t>(dev, kPadData[which] - 8) >= 0) {  // a pad is open on it
+        std::uint8_t* data = dev + kPadData[which];
+        const float x = get<float>(data, kPadAxes);
+        if (std::isfinite(x)) g_tank_x.store(x < -1.0f ? -1.0f : x > 1.0f ? 1.0f : x);
+        const float none = 0.0f;
+        std::memcpy(data + kPadAxes, &none, 4);
+        data[kPadLeftX] = 0x80;
+    }
+    c->ret = r.ret;
+    return 1;
 }
 
 // ---- first person: the body's parts hidden, the weapons kept -----------------
@@ -856,6 +976,10 @@ struct View {
     bool have_basis = false, roll_hold = false;
     float held_angles[2] = {};  // the aim's pitch and yaw as the roll began
     int restore = 0;            // frames left putting them back
+    float look[2] = {};         // locked on in first person: the view's pitch and yaw, eased onto the target
+    bool have_look = false;
+    bool lock_was = false;      // the last frame's view was a lock's
+    bool lock_exit = false;     // a lock ended: the view held until the aim is back to take its angles
     std::chrono::steady_clock::time_point last;
     bool started = false;
 } view;
@@ -868,6 +992,7 @@ constexpr float kMinReach = 0.15f;    // metres it keeps behind the shoulder
 constexpr float kChase = 0.06f;       // seconds the point from the hunter takes to catch up
 constexpr float kEyeForward = 0.12f;  // the eyes, metres ahead of the feet's middle
 constexpr float kHeadForward = 0.04f; // with Head bob: metres ahead of the eyes' dummy poly, past the face
+constexpr float kLockEase = 0.09f;    // seconds the first-person view takes to turn onto a lock's target
 constexpr float kZoomStep = 1.15f, kZoomNear = 0.6f, kZoomFar = 6.0f;             // the shoulder camera's
 constexpr float kGameZoomStep = 1.2f, kGameZoomNear = 0.5f, kGameZoomFar = 6.0f;  // the host's own
 
@@ -887,6 +1012,33 @@ float lock_cam_fov(const std::uint8_t*) {
     return last;
 }
 
+// The cameras' angles (the follow camera's +0x140, the aim camera's +0x148):
+// the pitch is positive looking down, the yaw atan2 of x over z.
+float pitch_of(V3 d) { return -std::atan2(d.y, std::sqrt(d.x * d.x + d.z * d.z)); }
+float yaw_of(V3 d) { return std::atan2(d.x, d.z); }
+V3 direction(float pitch, float yaw) {
+    return {std::sin(yaw) * std::cos(pitch), -std::sin(pitch), std::cos(yaw) * std::cos(pitch)};
+}
+float wrap_pi(float a) {
+    for (int i = 0; i < 64 && a > kPi; ++i) a -= 2 * kPi;
+    for (int i = 0; i < 64 && a < -kPi; ++i) a += 2 * kPi;
+    return a;
+}
+V3 cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+
+// The camera turned to look along `fwd`, level (no roll), keeping the hand
+// of the basis the game gave it.
+void look_along(BbCamera* c, V3 fwd) {
+    const float hand = dot(cross(v3(c->up), v3(c->forward)), v3(c->right)) < 0 ? -1.0f : 1.0f;
+    V3 right = cross(V3{0, 1, 0}, fwd) * hand;
+    if (length(right) < 1e-4f) return;  // straight up or down: as it is
+    right = unit(right);
+    const V3 up = cross(fwd, right) * hand;
+    put(c->right, right);
+    put(c->up, up);
+    put(c->forward, fwd);
+}
+
 std::uint8_t* follow_cam(BbCamera* c) {
     auto* manager = reinterpret_cast<std::uint8_t*>(c) - 0x10;
     return get<std::uint8_t*>(manager, 0x60);
@@ -902,7 +1054,9 @@ void swap_to(float side) {
 // The keys' presses, once per press while playing (one read of the input a frame).
 void read_keys() {
     BbInput in;
-    const bool ok = api->input(&in) == 0 && in.playing;
+    const bool read = api->input(&in) == 0;
+    const bool ok = read && in.playing;
+    g_playing = ok || !read;  // without a window (a headless run) nothing says: playing
     view.mouse_dx = ok ? in.dx : 0.0f;
     view.mouse_dy = ok ? in.dy : 0.0f;
     const Key keys[2] = {s.swap_key, s.first_key};
@@ -1056,8 +1210,25 @@ void mouse_turn(std::uint8_t* aim) {
     std::memcpy(aim + kAimYaw, &yaw, 4);
 }
 
-// Once a frame while the plugin is on: the speeds, the limits and the mouse.
-void turning(std::uint8_t* follow, std::uint8_t* aim) {
+// Tank controls: the left stick's sideways axis turns the aim - and with it
+// the hunter, who faces where it looks.
+constexpr float kTankDead = 0.12f;  // of the stick, on top of the game's own dead zone
+
+void tank_turn(std::uint8_t* aim, float dt) {
+    if (!aim || !g_tank_take.load()) return;
+    float x = g_tank_x.load();
+    const float mag = std::fabs(x);
+    if (mag <= kTankDead) return;
+    x = (x < 0 ? -1.0f : 1.0f) * (mag - kTankDead) / (1.0f - kTankDead);
+    float yaw = get<float>(aim, kAimYaw) + x * s.tank_turn * kPi / 180.0f * dt;
+    for (int i = 0; i < 64 && yaw > kPi; ++i) yaw -= kTwoPi;
+    for (int i = 0; i < 64 && yaw < -kPi; ++i) yaw += kTwoPi;
+    std::memcpy(aim + kAimYaw, &yaw, 4);
+}
+
+// Once a frame while the plugin is on: the speeds, the limits, the mouse and
+// the tank controls' turn.
+void turning(std::uint8_t* follow, std::uint8_t* aim, float dt) {
     const float k = s.stick_speed;
     if (k != 1.0f) {
         const auto scale = [k](float game, int) { return game * k; };
@@ -1075,7 +1246,10 @@ void turning(std::uint8_t* follow, std::uint8_t* aim) {
     } else {
         release(g_aim_limits, aim);
     }
-    if (aim_is_ours()) mouse_turn(aim);
+    if (aim_is_ours()) {
+        mouse_turn(aim);
+        tank_turn(aim, dt);
+    }
 }
 
 void turning_off(std::uint8_t* follow, std::uint8_t* aim) {
@@ -1106,6 +1280,13 @@ void trace(const BbCamera* c, V3 pos) {
              static_cast<double>(c->near_z), static_cast<double>(view_yaw), static_cast<double>(off),
              (g_aim_chr ? (g_aim_chr[kAimFlags] & kAimBit) : 0) | (g_monocular.load() ? 16 : 0), static_cast<double>(feet[0]),
              static_cast<double>(feet[1]), static_cast<double>(feet[2]));
+    if (const std::uint8_t* chr = (s.first_lock || s.tank) ? player() : nullptr) {
+        const V3 point = v3(reinterpret_cast<const float*>(chr + kLockPoint));
+        api->log("hunter_cam: lock %d (the game's %d, its point %.2f %.2f %.2f) look %.3f %.3f hold %d tank %d stick %.2f",
+                 g_locked ? 1 : 0, chr[kLockedOn], static_cast<double>(point.x), static_cast<double>(point.y),
+                 static_cast<double>(point.z), static_cast<double>(view.look[0]), static_cast<double>(view.look[1]),
+                 view.lock_exit ? 1 : 0, g_tank_take.load() ? 1 : 0, static_cast<double>(g_tank_x.load()));
+    }
     const std::uint8_t* aim = get<std::uint8_t*>(reinterpret_cast<const std::uint8_t*>(c) - 0x10, kAimCam);
     if (aim)
         api->log("hunter_cam: aim pitch %.3f yaw %.3f limits %.4f %.4f speeds %.3f %.3f %.3f %.3f fwd %.3f %.3f %.3f",
@@ -1173,7 +1354,7 @@ void on_camera(BbCamera* c, void*) {
                  static_cast<double>(s.distance), static_cast<double>(s.offset), static_cast<double>(s.height));
     }
     read_keys();
-    turning(follow, aim_cam);
+    turning(follow, aim_cam, dt);
     const bool first = g_first;
     if (!first && !s.camera) {  // the game's camera (first person off, the shoulder camera off)
         view.reach = -1.0f;
@@ -1190,8 +1371,29 @@ void on_camera(BbCamera* c, void*) {
     const auto* own = reinterpret_cast<const BbCamera*>(f + 0x10);
     // (Through a roll the aim is down and the game blends to its follow
     // camera, which takes the aim's angles: still ours, so the view stays put.)
-    const bool aim = aim_is_ours() || (aim_wanted() && rolling() && !g_monocular.load());
-    if (aim && !aim_is_ours()) {
+    // Locked on in first person the hunter is the game's locked-on hunter (no
+    // aim of ours) and the view, still ours, looks at the target; as the lock
+    // ends the view is held until the aim is back, which then takes its angles.
+    const bool lock = first && g_locked && !g_monocular.load();
+    if (view.lock_was && !lock && view.have_look && view.have_basis) {
+        view.lock_exit = true;
+        std::memcpy(view.held, view.basis, sizeof view.held);
+        std::memcpy(view.held_angles, view.look, sizeof view.held_angles);
+    }
+    view.lock_was = lock;
+    if (lock || !first || !aim_wanted() || g_monocular.load()) view.lock_exit = false;
+    if (!lock) view.have_look = false;
+    const bool lock_hold = view.lock_exit && !aim_is_ours();
+    const bool aim = aim_is_ours() || lock || lock_hold || (aim_wanted() && rolling() && !g_monocular.load());
+    if (lock) {
+        view.roll_hold = false;
+        view.restore = 0;
+    } else if (lock_hold) {
+        std::memcpy(c->right, view.held[0], 16);
+        std::memcpy(c->up, view.held[1], 16);
+        std::memcpy(c->forward, view.held[2], 16);
+        std::memcpy(follow + 0x140, view.held_angles, 8);
+    } else if (aim && !aim_is_ours()) {
         // The view held as it was, and the follow camera kept on the aim's
         // angles, which the aim takes back from it after the roll.
         if (!view.roll_hold && view.have_basis) {
@@ -1208,12 +1410,13 @@ void on_camera(BbCamera* c, void*) {
             std::memcpy(follow + 0x140, aim_cam + kAimPitch, 4);
             std::memcpy(follow + 0x144, aim_cam + kAimYaw, 4);
         }
-    } else if (view.roll_hold || view.restore > 0) {
+    } else if (view.roll_hold || view.lock_exit || view.restore > 0) {
         // The aim back: it takes its angles from the follow camera, which
         // drifted (a reset to +0x154/+0x158 that its next update applies) -
         // the ones it had instead, and the view as held until it has them.
-        if (view.roll_hold) view.restore = 3;
+        if (view.roll_hold || view.lock_exit) view.restore = 3;
         view.roll_hold = false;
+        view.lock_exit = false;
         --view.restore;
         if (aim_cam && aim_is_ours()) {
             std::memcpy(aim_cam + kAimPitch, view.held_angles, 8);
@@ -1240,11 +1443,22 @@ void on_camera(BbCamera* c, void*) {
         return;
     }
 
-    const V3 fwd = unit(v3(c->forward));
+    V3 fwd = unit(v3(c->forward));
     V3 right = v3(c->right);
     right.y = 0;  // the shoulder is beside the hunter, whatever the pitch
     right = unit(right);
     if (length(fwd) < 0.5f || length(right) < 0.5f) return;
+    if (lock) {
+        // The view's own way, from where it looked as the lock began (the
+        // game's camera is its lock-on camera's now, behind the hunter).
+        if (!view.have_look) {
+            const V3 from = view.have_basis ? unit(v3(view.basis[2])) : fwd;
+            view.look[0] = pitch_of(length(from) > 0.5f ? from : fwd);
+            view.look[1] = yaw_of(length(from) > 0.5f ? from : fwd);
+            view.have_look = true;
+        }
+        fwd = direction(view.look[0], view.look[1]);
+    }
 
     // The hunter's feet, and the point from them: the look-at point in the aim
     // (whose camera sits in the hunter's head) and the eyes in first person.
@@ -1280,6 +1494,25 @@ void on_camera(BbCamera* c, void*) {
     if (first) {
         pos = focus;
         if (c->near_z > 0.05f) c->near_z = 0.05f;  // the weapons in hand stay in view
+        if (lock) {
+            // Locked on: the view turns onto the point locked onto, and
+            // stays on it - nothing else turns it.
+            float want[2] = {view.look[0], view.look[1]};
+            if (const std::uint8_t* chr = player()) {
+                const V3 to = v3(reinterpret_cast<const float*>(chr + kLockPoint)) - pos;
+                const float far = length(to);
+                if (std::isfinite(far) && far > 0.05f && far < 500.0f) {
+                    want[0] = pitch_of(to);
+                    want[1] = yaw_of(to);
+                }
+            }
+            const float limit = s.look_limit * kPi / 180.0f;
+            want[0] = want[0] < -limit ? -limit : want[0] > limit ? limit : want[0];
+            const float k = 1.0f - std::exp(-dt / kLockEase);
+            view.look[0] += (want[0] - view.look[0]) * k;
+            view.look[1] = wrap_pi(view.look[1] + wrap_pi(want[1] - view.look[1]) * k);
+            look_along(c, direction(view.look[0], view.look[1]));
+        }
     } else {
         // The shoulder, eased across on a swap.
         if (view.swap_t < 1.0f) {
@@ -1317,7 +1550,11 @@ void on_camera(BbCamera* c, void*) {
     // keeps the follow camera's), widened as F10's widens it.
     float base = c->fov_y;
     const float row = lock_cam_fov(f);
-    if (aim) {
+    if (lock) {
+        // Locked on, the follow camera has the view and its field of view is current.
+        if (own->fov_y > 0.1f && own->fov_y < 2.5f) base = own->fov_y;
+        if (row > 0) view.row_fov = row;
+    } else if (aim) {
         // The follow camera eases to its LockCamParam row's camFovY (which
         // F10's Field of view scales) only in its own update, which does not
         // run while the aim camera has the view: its last, scaled as the row
@@ -1415,11 +1652,20 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
     if (!g_env_hooked)
         host->log("hunter_cam: the script's env queries are not where they should be: facing the camera walks, Roll "
                   "stays the game's");
+    g_pad_hooked = true;
+    for (std::size_t i = 0; i < 2; ++i)
+        if (host->hook2(kPadUpdate[i], kPadPrologue, sizeof(kPadPrologue), &pad_hook, reinterpret_cast<void*>(i)) != 0)
+            g_pad_hooked = false;
+    if (!g_pad_hooked)
+        host->log("hunter_cam: the pad's update is not where it should be: Tank controls face the camera, and the "
+                  "stick still steps sideways");
     g_imaging = true;
     apply();
     g_imaging = false;
-    host->log("hunter_cam: Hunter Cam %s (%s, %s shoulder, face the camera %s, dodge %s)", s.on ? "on" : "off",
-              g_first ? "first person" : s.camera ? "over the shoulder" : "game camera", s.shoulder > 0 ? "right" : "left",
-              s.face_camera ? "on" : "off", s.dodge ? "sidestep" : "roll");
+    host->log("hunter_cam: Hunter Cam %s (%s, %s shoulder, face the camera %s, tank controls %s, lock-on in first "
+              "person %s, dodge %s)",
+              s.on ? "on" : "off", g_first ? "first person" : s.camera ? "over the shoulder" : "game camera",
+              s.shoulder > 0 ? "right" : "left", s.face_camera ? "on" : "off", s.tank ? "on" : "off",
+              s.first_lock ? "on" : "off", s.dodge ? "sidestep" : "roll");
     return 0;
 }
