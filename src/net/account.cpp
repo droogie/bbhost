@@ -27,6 +27,8 @@ bool g_refused = false;  // the server refused this sign-in (account_refused)
 AccountCheck g_check;
 unsigned g_check_serial = 0;
 unsigned g_signin = 0;
+// The relay switch's change (account_relay_change_start), under g_mu.
+RelayChange g_relay_change;
 
 // What the player is told over the game when the server refuses the sign-in
 // while it runs: a token it no longer knows needs a new sign-in; a refusal for
@@ -113,6 +115,7 @@ void account_set(const std::string& name, const std::string& token) {
     g_refused = false;
     ++g_signin;
     g_check = AccountCheck{};
+    g_relay_change = RelayChange{};
 }
 
 void account_clear() {
@@ -122,6 +125,7 @@ void account_clear() {
     g_refused = false;
     ++g_signin;
     g_check = AccountCheck{};
+    g_relay_change = RelayChange{};
 }
 
 bool account_refused() {
@@ -153,7 +157,7 @@ void account_check_start(int timeout_ms) {
         name = g_name;
         signin = g_signin;
         mine = ++g_check_serial;
-        g_check = AccountCheck{AccountCheckState::Checking, name, "", 0, {}};
+        g_check = AccountCheck{AccountCheckState::Checking, name, "", 0, {}, {}};
     }
     // The server the caller has chosen now (the setup window's dropdown).
     const std::string url = auth_server_base() + "/auth/whoami";
@@ -171,6 +175,7 @@ void account_check_start(int timeout_ms) {
             if (v.verdict == SignInVerdict::Valid) {
                 g_check.state = AccountCheckState::Valid;
                 g_check.nat_test = v.nat_test;
+                g_check.relay = v.relay;
                 g_refused = false;
             } else if (v.verdict == SignInVerdict::Refused) {
                 g_check.state = AccountCheckState::Refused;
@@ -206,6 +211,45 @@ void account_check_start(int timeout_ms) {
 AccountCheck account_check() {
     std::lock_guard<std::mutex> lk(g_mu);
     return g_check;
+}
+
+void account_relay_change_start(bool direct, int timeout_ms) {
+    std::string token;
+    unsigned signin = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_token.empty() || g_name.empty() || g_relay_change.state == RelayChangeState::Saving) return;
+        token = g_token;
+        signin = g_signin;
+        g_relay_change = RelayChange{RelayChangeState::Saving, direct, "", 0};
+    }
+    const std::string url = auth_server_base() + "/auth/profile";
+    std::thread([url, token, signin, direct, timeout_ms] {
+        json::Value body = json::Value::make_object();
+        body.set("Token", token);
+        body.set("RelayDirect", direct);
+        const HttpResult r = http_post_json(url, body, timeout_ms);
+        const ProfileReply v = read_profile_reply(r.status, r.body, r.error);
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            if (signin != g_signin) return;  // signed in or out since
+            g_relay_change.state = v.ok ? RelayChangeState::Saved : RelayChangeState::Failed;
+            g_relay_change.why = v.ok ? std::string() : v.why;
+            g_relay_change.status = v.status;
+        }
+        if (v.ok) {
+            host_log("account: the relay is %s for this account now (%s)", v.relay.direct ? "off" : "on", url.c_str());
+            account_check_start();  // what the window shows comes from whoami
+        } else {
+            host_log("account: the relay switch was not changed at %s: %s", url.c_str(), v.why.c_str());
+            if (v.refused) account_mark_refused(v.why);
+        }
+    }).detach();
+}
+
+RelayChange account_relay_change() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_relay_change;
 }
 
 std::string account_device_name() {

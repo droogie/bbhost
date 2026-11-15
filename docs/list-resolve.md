@@ -10,10 +10,10 @@ at a place where it limits the frame rate, which parts of a draw could be
 resolved per list and which must stay in the command processor's order, how
 its token stream falls into the runs a list's resolution would cover, and the
 order to build it in. `BBHOST_LIST_RESOLVE=runs` counts the runs
-(`src/host/list_resolve.cpp`), and `BBHOST_RUN_BATCH=1` has a run's draws
-share their targets' lookups on the command processor (+3% where it limits);
-nothing that resolves or commits a draw off the command processor is built
-yet.
+(`src/host/list_resolve.cpp`), and the run batching (`BBHOST_RUN_BATCH`, on
+by default) has a run's draws share their targets' lookups on the command
+processor (+3% where it limits); nothing that resolves or commits a draw off
+the command processor is built yet.
 
 ## Where it was measured
 
@@ -359,7 +359,7 @@ sampled images' clears and layouts, the copy-version straddles). The lite
 shadow drains GX's notices at each vertex record, reading a line GX's threads
 write at every Map.
 
-`BBHOST_RUN_BATCH=1` shares two of those:
+`BBHOST_RUN_BATCH=1` shares these:
 
 - **The targets.** A GX-native draw whose target inputs - the colour targets'
   registers, extents and generations with the masks, the depth target's
@@ -374,12 +374,42 @@ write at every Map.
   the census's counts. Tessellated and geometry-shader draws look up as
   before.
 - **The drain.** Once a draw, at its first vertex record.
+- **The constant buffers' copies** (since 2026-11-11). A constant buffer the
+  game writes on the CPU is copied as its draw records, after four lookups:
+  whether a copy-back's version lies over it, a device-local twin holds it, a
+  GPU write is still to land on it, and whether it is mapped; the same buffer
+  bound again in the recording binds the first copy (the snapshots' memo); in
+  GX's upload heap and ring the lookups' answers are known and not asked. A
+  binding whose range an earlier draw of the run copied - and that copy is
+  still the memo's (this recording, this lap of the ring) - binds the copy
+  again without the lookups and the choice after them: inside a run no
+  copy-back's version can be made (copy tokens end the run), no YEBIS window
+  opened (YEBIS draws end it), and no other thread took the GPU mutex; the GPU
+  writes and the mapping are asked again, and the twins are watched by their
+  map's shape. The homes, GX's upload heap bound in place, the dedupe's
+  checks and the draw context keep it off. With no homes, 64-69% of the
+  command processor's 9,100-14,900 constant-buffer bindings a flip at Old
+  Yharnam, Central Yharnam, the Nightmare of Mensis and Cainhurst's courtyard
+  had an earlier one in their run (2-3% more elsewhere in the recording); the
+  copies' memo binds 39% of them on an RTX 4070 and on a Steam Deck (the rest
+  are bound where they are, or their first copy is of another run). Compared
+  (below) 45.2 million bindings on the RTX, 26.3 million on the Deck (pushed
+  at the copy), 29.7 million on an RTX 3070 Ti Laptop GPU with the run commit
+  forking three draws in four, 15.8 million on a Radeon 680M: none differed.
+  Where the command processor limits - the RTX held to 2,950 MiB, uncapped,
+  alternating runs, against the targets' sharing alone - Old Yharnam ran 97.5
+  -> 101.4 fps (+4.0%), Cainhurst's courtyard +1.7%, the Nightmare of Mensis
+  +1.0%, Central Yharnam (the main loop's) +0.6%; where the GPU limits (the
+  Deck uncapped and at 60, a 680M at 60) nothing moved beyond the runs'
+  spread.
 
 `BBHOST_RUN_BATCH=compare` draws as before - every target looked up, the
-notices drained at each vertex record - and checks every answer a run would
-have shared against the lookup: the targets, their layers and masks, the
-scissor, the depth target and the blends. The exit report counts the draws
-that shared, why the rest did not, and the disagreements.
+notices drained at each vertex record, every constant buffer through its
+lookups - and checks every answer a run would have shared against the
+lookup: the targets, their layers and masks, the scissor, the depth target
+and the blends, and each constant buffer's binding against the run's copy.
+The exit report counts the draws and bindings that shared, why the rest did
+not, and the disagreements.
 
 At the 18:11 save, 640x360 headless:
 
@@ -392,6 +422,21 @@ At the 18:11 save, 640x360 headless:
   runs as 81cc83bb (173.8 against 173.4, 170.0 against 170.3).
 - The batched run's frames at 60 and 80 s show what the compare run's do.
 
+**On by default everywhere (2026-11-11).** The batching came on with the run
+commit (Windows' default) and with the constant buffers' homes; on Linux
+without the homes - a Steam Deck, an integrated GPU, a card with under 5,000
+MiB free - every draw still looked its targets up. Now it is on wherever
+`BBHOST_RUN_BATCH` is unset. On an RTX 4070 held to a 4 GB card's 2,950 MiB
+(`BBHOST_TEST_VRAM_MB`: no homes, no pool - the command processor draws every
+draw in order and limits the frame rate; Linux, 1080p uncapped, alternating
+runs, two series): Old Yharnam 89.8 -> 92.4 fps (+2.9%) and 94.8 -> 97.7
+(+3.0%), Cainhurst's courtyard +2.2% and +1.5%, the Nightmare of Mensis 94.0
+-> 97.8 (+4.0%) where its GPU time held still (the small card's memory moved
+it in the other series), Central Yharnam, held by the main loop, -0.1% and
++1.1%. 73-76% of the draws took the draw before's targets. The static title's
+frames are identical with it and without, and a timeline of the Nightmare of
+Mensis (eight frames a run, four runs) shows the same scene, light and colour.
+
 Tried and dropped: handing the draw packets to `bb-record` sixteen at a time
 instead of one, to save most of the hand-over (1.1% of `bb-cp0`, a store
 fence among it, at every draw). Alternating runs with it were 2.2% slower
@@ -403,6 +448,45 @@ The GPU mutex is left as it is. Holding it for a run would not save its
 hand-offs - every time another thread takes it while the command processor
 works costs one wake either way - and the vblank's flip waiter, which takes
 it some 2,000 times a second, would wait a run each time.
+
+## The run's lookups (`BBHOST_RUN_LOOKUPS`)
+
+Two lookups the command processor repeats for the in-order draws of a run give
+the same answer through the run (`src/host/run_lookups.h`):
+
+- **The run's publication.** With the pool's segments on, every batched
+  in-order draw asks `publish_run_targets_locked` to publish its run's targets
+  for the pool's draws: `names_of` builds a zeroed `GpuDrawInputs` from the
+  run's lookups, the names are hashed and the set's ways searched - and the way
+  already holds them. The run's answers (`RunTargets`) carry a version that
+  `run_targets` moves whenever it refills or drops them. While it stays, the
+  way the last call took keeps its sequence (only the command processor writes
+  a way, each write moving it, and one way of a set holds a run's names at
+  most), the erase generation is the one it was published or found at, and the
+  publication is no older than `kRtPubAge / 2` flips, the call returns at once:
+  the condition the full call checks, on the same values.
+- **The GX buffer's extent.** Each vertex record whose extent decides something
+  (the buffer shadow, staging, the race census) asks `gx_buffer_end` for the
+  end of the GX buffer it starts in: the registry's lock, which every GX Map
+  takes, and its map walk. The answer is a function of the registry's shape -
+  its memory index, its holders, and each entry's memory, size, type and
+  liveness - and is the same over an interval of addresses. Each thread keeps
+  its last answer with that interval and the shape's generation, which the
+  registry moves under its lock right after each change of the shape, before
+  anything in the change that could release a lock or free memory (an erased
+  node is freed after the move). A thread that has synchronised with a change
+  reads the moved generation and looks up under the lock.
+
+`BBHOST_RUN_LOOKUPS=0` looks both up every time; `=compare` looks every memo
+answer up as before, returns that, and counts and logs the differences (the
+exit report's `run-lookups:` lines). On an RTX 4070 (the 16 places uncapped,
+and Old Yharnam, the Nightmare of Mensis, Central Yharnam and Cainhurst's
+courtyard held to a 4 GB card's 2,950 MiB) the memo answered 50% of 40.9
+million publications and 94% of 60.6 million extents. Compared there, on an
+RTX 3070 Ti Laptop GPU under Windows (the homes on; then the run commit on,
+its workers resolving 73% of the draws) and under lavapipe at the 12 places
+(the homes off and on), none of 123 million memo answers differed. A Steam
+Deck asks neither lookup (no pool, no buffer shadow, no staging).
 
 ## The draw's own context (`BBHOST_DRAW_CONTEXT`)
 
@@ -686,8 +770,11 @@ on the live save), 182.4 and 177.4 off against 182.0 and 184.5, and 200.9 on.
   command processor takes one more predictable branch a packet.
 - `BBHOST_RUN_BATCH=1|compare`: the batching above, on the census's run
   tracking (`list_resolve::run_serial`, which the per-run commit will start
-  from). On with the run commit (so by default on Windows, and kept on where
-  that default gives way to the constant buffers' homes); `=0` off.
+  from). On by default (since 2026-11-11; before, only with the run commit -
+  Windows' default - and the constant buffers' homes); `=0` off.
+- `BBHOST_RUN_LOOKUPS=0|compare`: the run's lookups above - the publication and
+  the GX buffer's extent answered from the lookup before. On by default; `=0`
+  looks both up every time.
 - `BBHOST_DRAW_CONTEXT=chunks|compare`: the draw's own context above, with its
   census and checks. Off by default.
 - `BBHOST_RUN_COMMIT=fork|on|compare` (`BBHOST_RUN_COMMIT_THREADS`,

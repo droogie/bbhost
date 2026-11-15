@@ -45,6 +45,8 @@ Started without a configuration, bbhost opens its setup window: pick the game
 folder and the eboot (both are checked as you go), choose the online server
 and account if you want to play online, and press Play. The window writes the
 per-user `bbhost.toml` and starts the game. `bbhost --setup` opens it again.
+Over Play, on every page, **Discord** opens the community's Discord invite and
+**Website** opens thehuntersdream.com, each in your browser.
 
 The game turns its shaders into HLSL and compiles them on your PC in the
 background, so you can play straight away; the first session uses the
@@ -110,8 +112,15 @@ that cannot move it uses the old folder as it is.
 ## Saves
 
 Saves are in `<data>/saves/SPRJ0005`, where `<data>` defaults to
-`%LOCALAPPDATA%\bbhost\data` or `~/.local/share/bbhost/data`. Each time the
-game writes a save (at most every five minutes) a copy goes to
+`%LOCALAPPDATA%\bbhost\data` or `~/.local/share/bbhost/data`. The game writes
+a save into a copy beside it, `.SPRJ0005.stage`, and bbhost then moves the
+copy's files into `SPRJ0005` one by one, under a list in `.SPRJ0005.commit`
+(on Linux, where the file system can swap two folders in one step, it swaps
+them instead). If bbhost ends in the middle, its next start finishes the save
+or drops it, so `SPRJ0005` always holds a whole save, the new one or the one
+before; leave the copy and the list alone. On Windows the `SPRJ0005` folder
+itself never moves, so a File Explorer window open in it stays open. Each time
+the game writes a save (at most every five minutes) a copy goes to
 `<data>/save-backups/`, and the newest eight are kept. To restore one, quit and
 copy its files over `<data>/saves/SPRJ0005`.
 
@@ -251,9 +260,11 @@ without it: its title screen would otherwise be a flat green picture.
 
 **The graphics card stops responding.** When the GPU hangs and the system
 resets it, nothing can be drawn again in that session; bbhost stops the sound,
-says so in a box and exits. The next three starts run with the GPU's progress
-markers enabled, so the log of a second hang names the draw that hung - send
-that log. Overlays that hook Vulkan are a common cause: OBS's game capture is
+says so in a box and exits. Loading screens run with the GPU's progress
+markers, so the log of a hang in one names the draw that hung and how far past
+it the GPU had got - send that log. `set BBHOST_GPU_CHECKPOINTS=amd` in
+run-bbhost.bat (`BBHOST_GPU_CHECKPOINTS=amd` before the command on Linux)
+marks the whole game, at some cost to the frame rate. Overlays that hook Vulkan are a common cause: OBS's game capture is
 kept out automatically on AMD cards (`[video] obs_capture` changes that), and
 OBS's Window Capture records bbhost without any hook.
 
@@ -731,7 +742,15 @@ GPU for minutes.
 
 Graphics > Upscaling (F10, the setup window's Graphics page, or System > PC
 Upscaling in the game) runs one of these in place of the game's own
-anti-aliasing:
+anti-aliasing. Whatever the choice, Off included, a Resolution below the
+window's draws only the 3D at it: the game, its post effects, the HUD and the
+menus stay at the window's size (with Off the game's own copy of the 3D into
+its post chain stretches it up). With Off that costs some GPU time on a large
+window - the post effects and the HUD are drawn at its size: about 6% uncapped
+on a 2560x1600 laptop screen at a 1920x1080 Resolution.
+`set BBHOST_RENDER_SCALE=0` in run-bbhost.bat (`BBHOST_RENDER_SCALE=0` before
+the command on Linux) goes back to the way before v0.2.35: with Off, the whole
+picture drawn at the Resolution and stretched to the window.
 
 | Choice | Where it runs |
 |---|---|

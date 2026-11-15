@@ -4,6 +4,8 @@
 
 #include "bbhost_plugin.h"
 #include "core/config.h"
+#include "host/options.h"
+#include "host/plugin_panel.h"
 #include "host/updater.h"
 
 #include "imgui.h"
@@ -313,6 +315,12 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
 #endif
             ImGui::PopTextWrapPos();
         }
+        // A plugin it does not work with, both on (host/plugins.h plugins_clash).
+        if (const std::string clash = plugins_clash(ui.plugins, p.name); !clash.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), "%s", clash.c_str());
+            ImGui::PopTextWrapPos();
+        }
         ImGui::Spacing();
         ImGui::BeginDisabled(p.bad_signature);
         bool on = p.enabled;
@@ -328,11 +336,29 @@ void plugin_ui_draw(PluginUi& ui, float scale, float height) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.30f, 1.0f), p.enabled ? "starts with the next launch" : "stops at the next launch");
         }
-        if (!p.options.empty()) {
+        // A panel's pages (BB_OPT_PANEL) are the plugin's to show over the game.
+        const bool any = std::any_of(p.options.begin(), p.options.end(), [](const PluginOptionDesc& o) { return o.page.empty(); });
+        if (any) {
             ImGui::Spacing();
-            for (const PluginOptionDesc& o : p.options) option_row(ui, p, o, scale);
+            for (const PluginOptionDesc& o : p.options) {
+                if (o.page.empty()) option_row(ui, p, o, scale);
+            }
         } else {
-            ImGui::TextDisabled("No settings.");
+            ImGui::TextDisabled(p.options.empty() ? "No settings." : "Its settings are in its own panel, over the game.");
+        }
+        // The menus its table names (BB_OPT_MENU): each opened from here, in
+        // game, over the game as the game's own menus look.
+        if (ui.in_game && p.loaded && p.enabled) {
+            for (const PluginMenuEntry& m : plugin_panel_menus(p.name)) {
+                ImGui::Spacing();
+                if (ImGui::Button(("Open " + m.name + "##menu-" + m.page).c_str())) {
+                    PluginPanelShow how;
+                    how.page = m.page;
+                    if (plugin_panel_show(p.name, how)) host_options_close();
+                }
+                ImGui::SetItemTooltip("Closes this menu and shows %s's %s menu over the game. Circle or Escape closes it.", p.title.c_str(),
+                                      m.name.c_str());
+            }
         }
     }
     ImGui::EndChild();
@@ -342,7 +368,11 @@ bool plugin_ui_wants_attention() {
     if (config_value("plugins.show_settings") == "true") return true;
     const std::vector<std::string> seen = seen_list();
     for (const PluginEntry& p : plugins_scan()) {
-        if (!p.enabled || p.options.empty()) continue;
+        // Only a plugin the player turned on: one on by default never opens
+        // the window - its settings wait on the Plugins tab and in game for
+        // whoever looks.
+        const std::string sw = config_value(("plugins." + p.name).c_str());
+        if (!p.enabled || p.options.empty() || (sw != "true" && sw != "1")) continue;
         if (std::find(seen.begin(), seen.end(), seen_key(p)) == seen.end()) return true;
     }
     return false;

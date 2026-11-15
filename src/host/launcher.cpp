@@ -9,9 +9,11 @@
 #include "engine/patch_manifest.h"
 #include "host/controls_page.h"
 #include "host/launcher_ui.h"
+#include "host/links.h"
 #include "host/options.h"
 #include "net/account.h"
 #include "net/http.h"
+#include "net/nat_examples.h"
 #include "net/nat_job.h"
 #include "host/plugin_ui.h"
 #include "host/shader_compile.h"
@@ -317,7 +319,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     bool stay_borderless = host_opt_get("stay_borderless");  // Windows' switch under the Window row, for Borderless
     bool skip_logos = host_opt_get("skip_logos");
     bool performance_mode = host_opt_get("performance_mode");
-    bool debug_camera = host_opt_get("debug_camera");
     int frame_cap = host_opt_frame_cap();
     // The Native frame clock (experimental, off): F10's DISPLAY row, read as the
     // game starts (engine/frame_rate.cpp; BBHOST_FRAME_CLOCK=0|1 wins).
@@ -355,6 +356,16 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     double nat_wait_until = 0.0;  // ImGui time
     std::string nat_server;       // the server the last test ran against (server_key)
     bool nat_scroll = false;      // bring the card into view (the test hook)
+    bool nat_details = false;     // the card's Details open
+    // The P2P port setting (online.p2p_port): the next test runs from it at
+    // once, Save or Play keep it, and the game opens it as it starts. A port
+    // typed that will not do is refused, with why.
+    int p2p_port = cfg.p2p_port >= 1024 && cfg.p2p_port <= 65535 ? cfg.p2p_port : 9307;
+    std::string p2p_port_note;
+    // The relay switch (signed in, net/account.h): turning it off without a
+    // test that showed other hunters can get in asks again first.
+    bool relay_confirm = false;
+    double relay_asked_at = -100.0;  // ImGui time of the last change asked
     std::mutex devices_mu;
     std::vector<std::string> devices;
     std::atomic<bool> devices_ready{false};
@@ -406,7 +417,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // The Patches page: every manifest the loader would read
     // (engine/patch_manifest.h), each with its switch. One that follows a
     // setting (its `option`) shows that setting - the Game page's Skip company
-    // logos, the debug camera - so a patch has one switch; the rest (The Old
+    // logos, Performance mode - so a patch has one switch; the rest (The Old
     // Hunters among them) are [patches] <name> = true or false in bbhost.toml.
     bool quick_reentry = cfg.quick_reentry, all_post_processors = cfg.all_post_processors;
     bool quick_reentry_was = quick_reentry, all_post_processors_was = all_post_processors;
@@ -434,7 +445,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         const std::string& o = r.p.option;
         if (o == "startup.skip_intro") return &skip_logos;
         if (o == "startup.performance_mode") return &performance_mode;
-        if (o == "debug.free_camera") return &debug_camera;
         if (o == "loading.quick_reentry") return &quick_reentry;
         if (o == "streaming.all_post_processors") return &all_post_processors;
         return &r.on;
@@ -475,16 +485,80 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     const std::string test_shot = test && !std::strncmp(test, "shot:", 5) ? test + 5 : "";
     // nattest:DIR runs the connection test as its button does, then saves the
     // window with the Connection card in view as DIR/connection.png once the
-    // result is shown, and closes; natcard:DIR saves the card as it opens
-    // (once the sign-in check has answered), without a test.
+    // result is shown, and again with its Details open as
+    // DIR/connection-details.png, and closes; natcard:DIR saves the card as it
+    // opens (once the sign-in check has answered), without a test.
+    // natfake:DIR:NAME[+off|+on] shows the card for a made-up finished test of
+    // the kind NAME (net/nat_examples.h; nothing is sent) - with the account's
+    // relay switch off or on, when said - as DIR/connection-NAME.png and
+    // DIR/connection-NAME-details.png.
     const bool nat_hook_test = test && !std::strncmp(test, "nattest:", 8);
-    const std::string test_nat = nat_hook_test ? test + 8 : test && !std::strncmp(test, "natcard:", 8) ? test + 8 : "";
+    const bool nat_hook_fake = test && !std::strncmp(test, "natfake:", 8);
+    std::string test_nat = nat_hook_test || nat_hook_fake ? test + 8 : test && !std::strncmp(test, "natcard:", 8) ? test + 8 : "";
+    std::string nat_shot_name = "connection";
+    net::nat::Outcome nat_fake;
+    bool nat_fake_on = false;
+    int nat_fake_relay = 0;  // 1 off, -1 on, 0 as the sign-in check has it
+    if (nat_hook_fake) {
+        const std::size_t colon = test_nat.rfind(':');
+        std::string spec = colon == std::string::npos ? std::string() : test_nat.substr(colon + 1);
+        if (colon != std::string::npos) test_nat.resize(colon);
+        nat_shot_name += "-" + spec;
+        if (const std::size_t plus = spec.find('+'); plus != std::string::npos) {
+            nat_fake_relay = spec.substr(plus + 1) == "off" ? 1 : spec.substr(plus + 1) == "on" ? -1 : 0;
+            spec.resize(plus);
+        }
+        nat_fake_on = net::nat::example_outcome(spec, cfg.p2p_port >= 1024 && cfg.p2p_port <= 65535 ? cfg.p2p_port : 9307,
+                                                static_cast<double>(std::time(nullptr)) - 20, &nat_fake);
+        if (!nat_fake_on) host_log("setup: natfake: no example called %s", spec.c_str());
+    }
     int nat_hook_stage = 0;  // 0 waiting to start, 1 testing, 2 the result shown, 3 saved
     double nat_hook_at = 0.0;
+    // relay:DIR walks the relay switch, signed in: the card as it opens
+    // (DIR/relay-1-start.png), Off pressed - the warning up, when this PC's
+    // last test did not show that others can get in (relay-2-warning.png), and
+    // "Turn it off anyway" pressed - the card once the server has it
+    // (relay-3-off.png), On pressed and the card again (relay-4-on.png).
+    // relayfail:DIR presses Off with the account server out of reach and saves
+    // what the switch says then (relay-fail.png).
+    const bool relay_hook_fail = test && !std::strncmp(test, "relayfail:", 10);
+    const std::string test_relay = relay_hook_fail ? test + 10 : test && !std::strncmp(test, "relay:", 6) ? test + 6 : "";
+    int relay_hook_step = 0;
+    double relay_hook_at = 0.0;
+    int relay_press = 0;  // the hook's press: 1 Off, 2 "Turn it off anyway", 3 On
+    // links:DIR puts the pointer on each of the sidebar's links in turn, saves
+    // the window with its bubble as DIR/link-discord.png and
+    // DIR/link-website.png, and presses it - which in a test's window logs the
+    // address it would open and opens no browser - then closes.
+    const std::string test_links = test && !std::strncmp(test, "links:", 6) ? test + 6 : "";
+    int links_step = 0;
+    double links_at = 0.0;
+    ImVec2 link_mid[2] = {ImVec2(-FLT_MAX, -FLT_MAX), ImVec2(-FLT_MAX, -FLT_MAX)};
+    // portset:DIR:PORT[,PORT...] types each port into the P2P port field as a
+    // player would and saves the card as DIR/port-PORT.png: taken, or refused
+    // with why; then closes.
+    std::vector<int> port_hook;
+    std::string test_port;
+    if (test && !std::strncmp(test, "portset:", 8)) {
+        test_port = test + 8;
+        const std::size_t colon = test_port.rfind(':');
+        std::string list = colon == std::string::npos ? std::string() : test_port.substr(colon + 1);
+        if (colon != std::string::npos) test_port.resize(colon);
+        for (std::size_t at = 0; at < list.size();) {
+            const std::size_t comma = std::min(list.find(',', at), list.size());
+            port_hook.push_back(std::atoi(list.substr(at, comma - at).c_str()));
+            at = comma + 1;
+        }
+    }
+    std::size_t port_hook_next = 0;
+    double port_hook_at = 0.0;
+    // A test hook's picture, saved once the frame is drawn ("" none).
+    std::string hook_shot;
+    double hook_shot_at = 0.0;
     int shot = 0;  // the picture being waited for: a page, then the bubble
     double shot_at = 1.2;
     ImVec2 patch_row_at(-FLT_MAX, -FLT_MAX);  // a row's middle, for the bubble
-    if (!test_shot.empty() || !test_nat.empty()) page = kPageGame;
+    if (!test_shot.empty() || !test_nat.empty() || !test_relay.empty() || !test_port.empty()) page = kPageGame;
 
     // The account section's fields (never saved: the name is the account's,
     // the recovery code is typed once to recover).
@@ -522,7 +596,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         net::nat::JobParams p;
         p.host = net::nat::test_host();
         p.ports = net::nat::parse_ports(config().nat_test_ports);
-        p.p2p_port = cfg.p2p_port > 0 ? cfg.p2p_port : 9307;
+        p.p2p_port = p2p_port;
         if (net::account_logged_in() && !net::account_refused()) p.token = net::account_token();
         p.save_url = net::auth_server_base() + "/auth/nat_test";
         if (nat_job.start(p)) nat_server = server_key();
@@ -581,6 +655,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         e.push_back({"online", "verify_tls", (custom ? verify_tls : kServers[server].verify_tls) ? "true" : "false"});
         e.push_back({"online", "require_account", (custom ? require_account : kServers[server].require_account) ? "true" : "false"});
         if (!custom) e.push_back({"online", "auth_server", toml_string(kServers[server].auth_server)});
+        e.push_back({"online", "p2p_port", std::to_string(p2p_port)});
         e.push_back({"update", "check", check_updates ? "true" : "false"});
         if (!f[kToken].str().empty()) e.push_back({"update", "token_file", toml_string(saved_path(f[kToken].str()))});
         e.push_back({"startup", "setup_window", show_every_start ? "true" : "false"});
@@ -611,7 +686,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("stay_borderless", stay_borderless);
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("performance_mode", performance_mode);
-        host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);  // unticks Custom limit, set again next
         host_opt_set_frame_cap_custom(cap_custom, cap_custom_fps);
         host_opt_set("frame_clock", frame_clock);
@@ -624,6 +698,39 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         saved_ok = true;
         host_log("setup: saved %s", file.c_str());
         return true;
+    };
+
+    // A port typed into the P2P port field: taken - the next test runs from it,
+    // Save or Play keeps it - or refused, with why.
+    auto take_p2p_port = [&](int typed) {
+        if (typed == p2p_port) {
+            p2p_port_note.clear();
+            return;
+        }
+        std::string why = net::nat::p2p_port_problem(typed, net::nat::parse_ports(config().nat_test_ports));
+        if (why.empty()) {
+            if (const std::string t = net::nat::port_taken(static_cast<std::uint16_t>(typed)); !t.empty())
+                why = "Another program has UDP port " + std::to_string(typed) + " (" + t + "): choose another.";
+        }
+        if (why.empty()) {
+            host_log("setup: P2P port %d (was %d)", typed, p2p_port);
+            p2p_port = typed;
+            p2p_port_note.clear();
+        } else {
+            host_log("setup: P2P port %d refused: %s", typed, why.c_str());
+            p2p_port_note = why;
+        }
+    };
+    // A link's button (host/links.h): its address in the browser - in a
+    // test's window, only the log says which it would open.
+    auto open_link = [&](const links::Link& l) {
+        if (!links::known(l.url)) return;
+        if (!links::opens_browser(test)) {
+            host_log("setup: link: %s would open %s (a test's window opens no browser)", l.title, l.url);
+            return;
+        }
+        host_log("setup: link: %s: %s", l.title, l.url);
+        if (!SDL_OpenURL(l.url)) host_log("setup: link: %s did not open: %s", l.url, SDL_GetError());
     };
 
     // The window's pace: 30 frames a second at most. V-Sync alone left the loop
@@ -713,6 +820,19 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         // A test's pictures: the pointer where the test puts it, not where the
         // desk's is.
         if (!test_shot.empty()) io.AddMousePosEvent(shot == kPageCount ? patch_row_at.x : -FLT_MAX, shot == kPageCount ? patch_row_at.y : -FLT_MAX);
+        // links: the pointer on the link the hook is at, pressed and let go.
+        if (!test_links.empty()) {
+            const int k = links_step >= 1 && links_step <= 3 ? 0 : links_step >= 5 && links_step <= 7 ? 1 : -1;
+            io.AddMousePosEvent(k >= 0 ? link_mid[k].x : -FLT_MAX, k >= 0 ? link_mid[k].y : -FLT_MAX);
+            if (links_step == 2 || links_step == 6) {
+                io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+                ++links_step;
+            } else if (links_step == 3 || links_step == 7) {
+                io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+                links_at = ImGui::GetTime() + 0.6;
+                ++links_step;
+            }
+        }
         ImGui::NewFrame();
         const ImGuiViewport* vp = ImGui::GetMainViewport();
         const ImGuiStyle& st = ImGui::GetStyle();
@@ -782,14 +902,52 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         // The card's result is the last test's while the server chosen is the
         // one it ran against; else the account's last test (the sign-in
         // check's), which F10 repeats in the game.
-        const bool nat_ours = nat_view.finished && nat_server == server_key();
+        const bool nat_ours = (nat_view.finished && nat_server == server_key()) || nat_fake_on;
+        const net::nat::Outcome& nat_outcome = nat_fake_on ? nat_fake : nat_view.outcome;
         const net::AccountCheck nat_check = net::account_check();
         const bool nat_record = !nat_view.running && !nat_ours && nat_check.state == net::AccountCheckState::Valid &&
                                 nat_check.nat_test.present;
+        net::nat::Record nat_rec;
         if (nat_record)
-            net::nat::remember(net::nat::Remembered{true, net::nat::verdict_from_word(nat_check.nat_test.verdict),
-                                                    net::nat::inbound_from_word(nat_check.nat_test.inbound),
-                                                    nat_check.nat_test.tested_at, true});
+            nat_rec = net::nat::Record{net::nat::verdict_from_word(nat_check.nat_test.verdict),
+                                       net::nat::inbound_from_word(nat_check.nat_test.inbound), nat_check.nat_test.port,
+                                       nat_check.nat_test.tested_at};
+        // The card's words (net/nat_check.h), every frame whatever the page:
+        // F10 repeats them in the game.
+        net::nat::CardContext nat_cx;
+        nat_cx.now = static_cast<double>(std::time(nullptr));
+        nat_cx.p2p_port = p2p_port;
+        nat_cx.signed_in = net::account_logged_in() && !net::account_refused();
+        if (nat_check.state == net::AccountCheckState::Valid && nat_check.relay.known)
+            nat_cx.relay = nat_check.relay.direct ? net::nat::RelaySetting::Off : net::nat::RelaySetting::On;
+        if (nat_fake_relay) nat_cx.relay = nat_fake_relay > 0 ? net::nat::RelaySetting::Off : net::nat::RelaySetting::On;
+        const net::nat::Card nat_card = nat_ours     ? net::nat::card_of(nat_outcome, nat_cx)
+                                        : nat_record ? net::nat::card_of_record(nat_rec, nat_cx)
+                                                     : net::nat::card_untested(nat_cx, net::account_logged_in());
+        if (nat_ours && !nat_fake_on && nat_card.reading != net::nat::Reading::Cancelled)
+            net::nat::remember(net::nat::Remembered{true, nat_outcome.at, nat_outcome.saved(), nat_card});
+        else if (nat_record)
+            net::nat::remember(net::nat::Remembered{true, nat_rec.at, true, nat_card});
+        // This PC's last test, for the relay switch: what it found, and the
+        // address and router its steps name.
+        bool nat_tested = false, nat_router = true;
+        net::nat::Verdict nat_tested_v = net::nat::Verdict::None;
+        net::nat::Inbound nat_tested_in = net::nat::Inbound::NotTested;
+        std::string nat_lan;
+        if (nat_ours && nat_outcome.probe.error == net::nat::ProbeResult::Error::None && nat_outcome.resolved &&
+            nat_outcome.probe.local_port == p2p_port) {
+            nat_tested = true;
+            nat_tested_v = nat_card.reading == net::nat::Reading::Direct  ? net::nat::Verdict::Direct
+                           : nat_card.reading == net::nat::Reading::Relay ? net::nat::Verdict::Relay
+                                                                          : net::nat::Verdict::Blocked;
+            nat_tested_in = nat_outcome.inbound;
+            nat_router = net::nat::behind_router(nat_outcome.probe);
+            if (nat_outcome.probe.local_addr) nat_lan = net::nat::ipv4_text(nat_outcome.probe.local_addr);
+        } else if (nat_record && nat_rec.port == p2p_port && nat_rec.inbound != net::nat::Inbound::NotTested) {
+            nat_tested = true;
+            nat_tested_v = nat_rec.verdict;
+            nat_tested_in = nat_rec.inbound;
+        }
         const bool can_play = app0_ok && eboot.ok && !compiling && !game && !nat_view.running;
         bool play = false;
         const SignIn si = sign_in_state();
@@ -808,7 +966,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             const float hint_h = std::round(std::round(ImGui::GetFontSize() * 0.78f) + 8 * scale);
             const float hints = 2 * (hint_h + 6 * scale) + 6 * scale + st.ItemSpacing.y;  // the two keys, the gap and the spacing under it
             const float side_h = vp->WorkSize.y - 38 * scale;
-            float foot = play_h + 4 * scale + ImGui::GetFrameHeight() + note_h + 3 * st.ItemSpacing.y;
+            // The links' row over them (host/links.h) counts in the foot.
+            float foot = play_h + 4 * scale + 2 * ImGui::GetFrameHeight() + note_h + 4 * st.ItemSpacing.y;
             // The keys where the name and the pages (last frame's height) leave room.
             static float nav_h = 0.0f;
             const bool keys = side_h - foot - hints - 8 * scale >= nav_h;
@@ -847,6 +1006,18 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ImGui::EndChild();
             ImGui::SetCursorScreenPos(o + ImVec2(16 * scale, 20 * scale + side_h - foot));
             ImGui::BeginChild("##foot", ImVec2(w, foot), 0, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            // The community's Discord and its website, a press away on every
+            // page: each opens in the browser.
+            {
+                const float half = (w - st.ItemSpacing.x) * 0.5f;
+                for (int i = 0; i < 2; ++i) {
+                    const links::Link& l = *links::kAll[i];
+                    if (i) ImGui::SameLine();
+                    if (ui::ghost_button(l.label, i == 0 ? ui::Icon::Chat : ui::Icon::Online, ImVec2(half, 0))) open_link(l);
+                    link_mid[i] = (ImGui::GetItemRectMin() + ImGui::GetItemRectMax()) * 0.5f;
+                    ui::tooltip_for_item(l.title, l.tip, l.url);
+                }
+            }
             if (keys) {
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(st.ItemSpacing.x, 6 * scale));
                 ui::key_hint("F9", "In-game patches");
@@ -922,6 +1093,140 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 nat_hook_at = ImGui::GetTime() + 1.0;
             }
             if (nat_hook_stage == 2) nat_scroll = true;
+        }
+        if (!test_relay.empty() && ++frames > 30) {
+            // The relay switch's walk (relay:, relayfail:), a step at a time.
+            const net::AccountCheck ac = net::account_check();
+            const net::RelayChange rc = net::account_relay_change();
+            const double now = ImGui::GetTime();
+            const bool known = ac.state == net::AccountCheckState::Valid && ac.relay.known;
+            auto snap = [&](const char* name, int next) {
+                hook_shot = test_relay + "/" + name + ".png";
+                hook_shot_at = now;
+                relay_hook_step = next;
+            };
+            nat_scroll = true;
+            switch (relay_hook_step) {
+            case 0:  // the sign-in check's answer, with the switch
+                if (known) {
+                    host_log("setup: relay test: the switch reads %s", ac.relay.direct ? "off" : "on");
+                    relay_hook_step = relay_hook_fail ? 10 : 1;
+                    relay_hook_at = now + 1.0;
+                    if (relay_hook_fail) {
+                        // The account server out of reach (nothing listens on port 9 here).
+                        const HostConfig& c = config();
+                        config_set_online(c.online_host, c.online_scheme, c.online_verify_tls, c.online_require_account, "http://127.0.0.1:9");
+                    }
+                } else if (frames > 600) {
+                    host_log("setup: relay test: no relay switch (the sign-in check: %d)", static_cast<int>(ac.state));
+                    done = true;
+                }
+                break;
+            case 1:
+                if (now >= relay_hook_at) snap("relay-1-start", 2);
+                break;
+            case 2:
+                relay_press = 1;
+                relay_hook_step = 3;
+                relay_hook_at = now + 0.8;
+                break;
+            case 3:
+                if (now < relay_hook_at) break;
+                if (relay_confirm) {
+                    snap("relay-2-warning", 4);
+                    relay_hook_at = now + 0.6;
+                } else {
+                    host_log("setup: relay test: off at once (this PC's last test showed others can get in)");
+                    relay_hook_step = 5;
+                    relay_hook_at = now + 20.0;
+                }
+                break;
+            case 4:
+                if (now >= relay_hook_at) {
+                    relay_press = 2;
+                    relay_hook_step = 5;
+                    relay_hook_at = now + 20.0;
+                }
+                break;
+            case 5:
+            case 8:  // the server's answer and the check after it
+                if ((rc.state == net::RelayChangeState::Saved && known && ac.relay.direct == (relay_hook_step == 5)) ||
+                    rc.state == net::RelayChangeState::Failed || now > relay_hook_at) {
+                    host_log("setup: relay test: %s; the switch reads %s", rc.state == net::RelayChangeState::Saved ? "saved" : rc.why.c_str(),
+                             known ? (ac.relay.direct ? "off" : "on") : "not known");
+                    relay_hook_step = relay_hook_step == 5 ? 6 : 9;
+                    relay_hook_at = now + 0.8;
+                }
+                break;
+            case 6:
+                if (now >= relay_hook_at) snap("relay-3-off", 7);
+                break;
+            case 7:
+                relay_press = 3;
+                relay_hook_step = 8;
+                relay_hook_at = now + 20.0;
+                break;
+            case 9:
+                if (now >= relay_hook_at) snap("relay-4-on", 99);
+                break;
+            case 10:
+                if (now >= relay_hook_at) {
+                    relay_press = 1;
+                    relay_hook_step = 11;
+                }
+                break;
+            case 11:
+                if (relay_confirm) relay_press = 2;
+                relay_hook_step = 12;
+                relay_hook_at = now + 20.0;
+                break;
+            case 12:
+                if (rc.state == net::RelayChangeState::Failed || now > relay_hook_at) {
+                    host_log("setup: relay test: %s", rc.state == net::RelayChangeState::Failed ? ("not changed: " + rc.why).c_str() : "no answer");
+                    relay_hook_step = 13;
+                    relay_hook_at = now + 0.6;
+                }
+                break;
+            case 13:
+                if (now >= relay_hook_at) snap("relay-fail", 99);
+                break;
+            default: break;
+            }
+        }
+        if (!test_port.empty() && ++frames > 30) {
+            // The ports typed one after another, each saved once shown.
+            const double now = ImGui::GetTime();
+            nat_scroll = true;
+            if (port_hook_at == 0.0) {
+                port_hook_at = now + 0.6;
+                if (port_hook_next < port_hook.size()) take_p2p_port(port_hook[port_hook_next]);
+            } else if (now >= port_hook_at && hook_shot.empty()) {
+                if (port_hook_next < port_hook.size()) {
+                    hook_shot = test_port + "/port-" + std::to_string(port_hook[port_hook_next]) + ".png";
+                    hook_shot_at = now;
+                    ++port_hook_next;
+                    port_hook_at = 0.0;
+                } else {
+                    done = true;
+                }
+            }
+        }
+        if (!test_links.empty() && ++frames > 30) {
+            // The links' walk: the pointer on each, its bubble saved, pressed.
+            const double now = ImGui::GetTime();
+            if (links_step == 0) {
+                links_step = 1;
+                links_at = now + 1.2;
+            } else if ((links_step == 1 || links_step == 5) && now >= links_at) {
+                hook_shot = test_links + (links_step == 1 ? "/link-discord.png" : "/link-website.png");
+                hook_shot_at = now;
+                ++links_step;
+            } else if (links_step == 4 && now >= links_at) {
+                links_step = 5;
+                links_at = now + 1.2;
+            } else if (links_step == 8 && now >= links_at) {
+                done = true;
+            }
         }
         if (test_link && ++frames > 30) {
             if (!test_created) {
@@ -1131,9 +1436,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 #else
             const bool stay_borderless_row = false;
 #endif
-            // A warning line or two under Frame rate and Frame generation (frame generation's limit).
+            // The display's rows: Window, Frame rate, Native frame clock, Effect
+            // timing, Resolution, Frame generation (Windows), Skip company logos
+            // and Performance mode, with a warning line or two under Frame rate
+            // and Frame generation (frame generation's limit).
+#if defined(_WIN32)
+            const float display_rows = 8.0f;
+#else
+            const float display_rows = 7.0f;
+#endif
             const float cards_h =
-                card_h(std::max(7.0f + (stay_borderless_row ? 1.0f : 0.0f) +
+                card_h(std::max(display_rows + (stay_borderless_row ? 1.0f : 0.0f) +
                                     1.5f * static_cast<float>(host_frame_rate_warning_count(cap_choice, cap_custom, cap_custom_fps)),
                                 online_rows));
             ui::card_begin("##display", ImVec2(std::round((w - gap) * 0.56f), cards_h), "DISPLAY");
@@ -1183,6 +1496,17 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     if (ui::combo("##effects", &shown, labels, et.index == 3 ? 4 : 3, tips) && shown < 3) effect_timing = shown;
                 }
                 ui::tooltip_for_item("Effect timing", kHostEffectTimingNote);
+                // Resolution: the Graphics page's own setting (host/options.h),
+                // changed and saved at once there and here alike.
+                ui::row_label("Resolution", row_lw);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                {
+                    int n = 0;
+                    const char* const* labels = host_opt_resolution_labels(&n);
+                    int res = host_opt_resolution_index();
+                    if (ui::combo("##resolution", &res, labels, n)) host_opt_set_resolution_index(res);
+                }
+                if (const char* note = host_opt_resolution_note()) ui::tooltip_for_item("Resolution", note);
                 // Frame generation: the same setting as the Graphics page's,
                 // changed and saved at once. AMD's frame generation, Windows' alone:
                 // no row elsewhere (host/options.cpp keeps it off there).
@@ -1347,93 +1671,51 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ui::card_end();
 
             // The connection test (net/nat_check.h): can other hunters reach
-            // this PC directly, or does co-op go through the server's relay -
-            // and does a packet nobody asked for get in. From the game's own
-            // P2P port, while the game is not running. The result in words,
-            // what it means, the port it ran from and when; the account's last
-            // test (the sign-in check's) until one runs here.
+            // this PC directly, or does co-op go through the server's relay,
+            // and does a packet nobody asked for get in. One headline with its
+            // status, what it means, the thing to do and whether others can
+            // get in; the technical lines under Details. Under them the P2P
+            // port setting and, signed in, the account's relay switch.
             ImGui::Dummy(ImVec2(0, gap - st.ItemSpacing.y));
             ui::card_begin("##connection", ImVec2(w, 0), "CONNECTION");
             {
                 namespace nat = net::nat;
-                const int p2p = cfg.p2p_port > 0 ? cfg.p2p_port : 9307;
-                const double now_unix = static_cast<double>(std::time(nullptr));
-                const net::AccountCheck& ac = nat_check;
-                const bool record = nat_record;
-                std::string head = nat::headline(nat::Verdict::None), meaning = nat::meaning(nat::Verdict::None);
-                std::string incoming, detail, note;
+                nat::Card card = nat_card;
                 ImU32 col = ui::kText;
                 ui::Icon icon = ui::Icon::Online;
-                auto look = [&](nat::Verdict v) {
-                    head = nat::headline(v);
-                    meaning = nat::meaning(v);
-                    col = v == nat::Verdict::Direct ? ui::kGood : v == nat::Verdict::Relay ? ui::kIce : ui::kWarn;
-                    icon = v == nat::Verdict::Direct ? ui::Icon::Check : v == nat::Verdict::Relay ? ui::Icon::Info : ui::Icon::Warning;
-                    if (v == nat::Verdict::Blocked) col = ui::kBad;
-                };
                 if (nat_view.running) {
-                    head = "Testing the connection...";
-                    meaning = std::string(nat_view.step) + " From UDP port " + std::to_string(p2p) + "; a few seconds.";
+                    card = nat::Card{};
+                    card.head = "Testing the connection...";
+                    card.sentence = std::string(nat_view.step) + " From UDP port " + std::to_string(p2p_port) + "; a few seconds.";
                     icon = ui::Icon::Refresh;
-                } else if (nat_ours) {
-                    const nat::Outcome& o = nat_view.outcome;
-                    const std::string port = std::to_string(o.probe.local_port);
-                    if (!o.resolved) {
-                        head = "The test server could not be found";
-                        meaning = "Its name did not resolve: check the server chosen above and this PC's network.";
-                        col = ui::kWarn;
-                        icon = ui::Icon::Warning;
-                    } else if (o.probe.error == nat::ProbeResult::Error::PortInUse) {
-                        head = "UDP port " + port + " is in use: close the game to test";
-                        meaning = "Another program has the game's P2P port - most likely bbhost itself, running the game. The "
-                                  "test sends from that port, so it runs while the game is closed.";
-                        col = ui::kWarn;
-                        icon = ui::Icon::Warning;
-                    } else if (o.probe.error != nat::ProbeResult::Error::None) {
-                        head = "The test could not use UDP port " + port;
-                        meaning = o.probe.error_text.empty() ? std::string("The test was stopped.") : o.probe.error_text + ".";
-                        col = ui::kWarn;
-                        icon = ui::Icon::Warning;
-                    } else {
-                        look(o.shown());
-                        if (o.local != nat::Verdict::Blocked) incoming = nat::inbound_line(o.inbound, o.probe.local_port, o.shown());
-                        std::string ports = nat::public_ports(o.probe);
-                        detail = "Tested from UDP port " + port + " (the game's P2P port)" + (ports.empty() ? "" : ": the server saw " + ports) +
-                                 ". " + capitalised(nat::ago(o.at, now_unix)) + "; ";
-                        if (o.saved()) {
-                            detail += "saved to your account for this network (test again on another one).";
-                            if (o.save.verdict != o.local)
-                                note = std::string("This PC's own reading was \"") + nat::verdict_word(o.local) +
-                                       "\": the server compares what reached it from the address this request came from, and a VPN or "
-                                       "proxy for web traffic can make the two differ.";
-                        } else if (!o.signed_in) {
-                            detail += "this PC's own reading, not saved to your account.";
-                            note = o.local == nat::Verdict::Relay
-                                       ? "Sign in (above) and test again: the server then knows to relay you, and other hunters can reach you."
-                                       : "Sign in (above) and test again to keep it for your account; the server goes by the kept result.";
-                        } else {
-                            detail += "not saved to your account: " + nat::unsaved_reason(o) + ".";
-                        }
-                    }
-                } else if (record) {
-                    const nat::Verdict v = nat::verdict_from_word(ac.nat_test.verdict);
-                    look(v);
-                    const nat::Inbound in = nat::inbound_from_word(ac.nat_test.inbound);
-                    if (in != nat::Inbound::NotTested) incoming = nat::inbound_line(in, ac.nat_test.port > 0 ? ac.nat_test.port : p2p, v);
-                    const std::string when = "Your account's last test, " + nat::ago(ac.nat_test.tested_at, now_unix);
-                    detail = ac.nat_test.port == p2p ? when + ", from this PC's P2P port (UDP " + std::to_string(p2p) + ")."
-                             : ac.nat_test.port > 0 ? when + ", from UDP port " + std::to_string(ac.nat_test.port) +
-                                                          "; this PC's P2P port is UDP " + std::to_string(p2p) + ": test again for it."
-                                                    : when + ", on the website or from another PC: test again for this PC's own (UDP " +
-                                                          std::to_string(p2p) + ").";
-                } else {
-                    detail = "Runs from UDP port " + std::to_string(p2p) + " (the game's P2P port, online.p2p_port)" +
-                             (si.in ? std::string(" and is kept for your account.") : std::string("; sign in (above) to keep the result for your account."));
+                } else if (card.tone == nat::Tone::Good) {
+                    col = ui::kGood;
+                    icon = ui::Icon::Check;
+                } else if (card.tone == nat::Tone::Warn) {
+                    col = ui::kWarn;
+                    icon = ui::Icon::Warning;
+                } else if (card.tone == nat::Tone::Bad) {
+                    col = ui::kBad;
+                    icon = ui::Icon::Problem;
                 }
                 const float fh = ImGui::GetFrameHeight();
                 const ImVec2 at = ImGui::GetCursorScreenPos();
                 const float right = at.x + ImGui::GetContentRegionAvail().x;
-                const char* label = nat_view.running ? "Testing..." : (nat_ours || record) ? "Test again" : "Test connection";
+                // Numbered steps, each wrapping under its own words.
+                auto numbered = [&](const std::vector<std::string>& steps, ImU32 num_col) {
+                    const float num_w = ImGui::CalcTextSize("0.").x + 7 * scale;
+                    for (std::size_t i = 0; i < steps.size(); ++i) {
+                        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+                        ImGui::SetCursorScreenPos(ImVec2(p0.x + 6 * scale, p0.y));
+                        ImGui::PushStyleColor(ImGuiCol_Text, num_col);
+                        ImGui::TextUnformatted((std::to_string(i + 1) + ".").c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::SameLine(0, 0);
+                        ImGui::SetCursorScreenPos(ImVec2(p0.x + 6 * scale + num_w, p0.y));
+                        ImGui::TextUnformatted(steps[i].c_str());
+                    }
+                };
+                const char* label = nat_view.running ? "Testing..." : (nat_ours || nat_record) ? "Test again" : "Test connection";
                 const float bw = std::max(ImGui::CalcTextSize("Test connection").x, ImGui::CalcTextSize(label).x) + st.FramePadding.x * 4;
                 ImGui::Dummy(ImVec2(fh * 0.8f, fh));
                 ui::draw_icon(ImGui::GetWindowDrawList(), icon, at + ImVec2(fh * 0.4f, fh * 0.5f), fh * 0.62f, col);
@@ -1443,30 +1725,41 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::AlignTextToFramePadding();
                 ImGui::PushFont(ui::font_strong(), 0.0f);
                 ImGui::PushStyleColor(ImGuiCol_Text, col);
-                ImGui::TextUnformatted(head.c_str());
+                ImGui::TextUnformatted(card.head.c_str());
                 ImGui::PopStyleColor();
                 ImGui::PopFont();
                 ImGui::PushFont(nullptr, 14.0f);
                 ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextDim);
-                ImGui::TextUnformatted(meaning.c_str());
+                ImGui::TextUnformatted(card.sentence.c_str());
                 ImGui::PopStyleColor();
-                if (!incoming.empty()) {
-                    ImGui::Dummy(ImVec2(0, 1 * scale));
-                    ImGui::TextUnformatted(incoming.c_str());
-                }
-                if (!detail.empty()) {
-                    ImGui::Dummy(ImVec2(0, 1 * scale));
-                    ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextFaint);
-                    ImGui::TextUnformatted(detail.c_str());
-                    ImGui::PopStyleColor();
-                }
-                if (!note.empty()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ui::kWarn);
-                    ImGui::TextUnformatted(note.c_str());
-                    ImGui::PopStyleColor();
-                }
-                ImGui::PopFont();
                 ImGui::PopTextWrapPos();
+                // The rest as wide as the card: the button is above.
+                ImGui::PushTextWrapPos(right - ImGui::GetWindowPos().x);
+                if (!card.incoming.empty()) {
+                    ImGui::Dummy(ImVec2(0, 1 * scale));
+                    ImGui::TextUnformatted(card.incoming.c_str());
+                }
+                if (!card.action.empty()) {
+                    ImGui::Dummy(ImVec2(0, 1 * scale));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ui::kIce);
+                    ImGui::TextUnformatted(card.action.c_str());
+                    ImGui::PopStyleColor();
+                }
+                numbered(card.steps, ui::kIce);
+                if (!nat_view.running && !card.details.empty()) {
+                    ImGui::Dummy(ImVec2(0, 1 * scale));
+                    ui::disclosure("Details", &nat_details);
+                    ui::tooltip_for_item(nullptr, nat_details ? "Hide the technical lines." : "The ports, what the server saw, and whether the result was kept.");
+                    if (nat_details) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextFaint);
+                        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(st.ItemSpacing.x, 3 * scale));
+                        for (const std::string& d : card.details) ImGui::TextUnformatted(d.c_str());
+                        ImGui::PopStyleVar();
+                        ImGui::PopStyleColor();
+                    }
+                }
+                ImGui::PopTextWrapPos();
+                ImGui::PopFont();
                 ImGui::EndGroup();
                 const float bottom = ImGui::GetItemRectMax().y;
                 ImGui::SetCursorScreenPos(ImVec2(right - bw, at.y));
@@ -1474,7 +1767,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 const bool can_test = !nat_view.running && !game && wait <= 0;
                 if (ui::primary_button(label, ImVec2(bw, 0), can_test)) start_nat_test();
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled)) {
-                    const std::string what = "Sends a few UDP packets from the game's P2P port (UDP " + std::to_string(p2p) +
+                    const std::string what = "Sends a few UDP packets from the game's P2P port (UDP " + std::to_string(p2p_port) +
                                              ") to the server's two test ports, and one the server answers from a third port, "
                                              "then asks the server what it saw. A few seconds; the game must be closed.";
                     const std::string why = game ? std::string("The game is running: the test needs its port. Test from here while the game is closed.")
@@ -1487,7 +1780,151 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                     ui::tooltip("Connection test", what, why);
                 }
                 ImGui::SetCursorScreenPos(ImVec2(at.x, std::max(bottom, at.y + fh)));
-                ImGui::Dummy(ImVec2(0, 0));
+                ImGui::Dummy(ImVec2(0, 4 * scale));
+
+                // The settings under it, each on a row: the P2P port, and
+                // (signed in, on a server with the switch) the relay.
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                // A rule a pixel high on the pixel grid: a thin line's anti-aliased
+                // sliver left gaps under SDL's software renderer.
+                const ImVec2 rule = ImGui::GetCursorScreenPos();
+                const float rule_y = std::round(rule.y);
+                dl->AddRectFilled(ImVec2(std::round(rule.x), rule_y), ImVec2(std::round(right), rule_y + 1.0f), ui::alpha(ui::kViolet, 58));
+                ImGui::Dummy(ImVec2(0, 6 * scale));
+                const float rl = std::min(92 * scale, (right - at.x) * 0.22f);
+                const float field_w = std::round(std::max(ImGui::CalcTextSize("65535").x + st.FramePadding.x * 2, 84 * scale));
+                const float seg_w = std::round(std::max(150 * scale, ImGui::CalcTextSize("OnOff").x + 80 * scale));
+                static const char* const kPortTip =
+                    "The UDP port other hunters reach this PC on. Forward this port on your router. Two copies of bbhost on "
+                    "one PC need different ports.";
+                const std::string port_note = "1024 to 65535; 9307 unless changed. The test runs from it at once; Save or Play keeps "
+                                              "it, and the game opens it as it starts, so a change made while the game runs "
+                                              "applies from its next start.";
+                ui::row_label("P2P port", rl);
+                ui::tooltip_for_item("P2P port", kPortTip, port_note);
+                {
+                    // What is being typed lives in the window's storage until it is
+                    // taken (Enter, or a click elsewhere), as Frame rate's Custom limit's.
+                    ImGuiStorage* store = ImGui::GetStateStorage();
+                    const ImGuiID key = ImGui::GetID("##p2p_typing");
+                    int typing = store->GetInt(key, p2p_port);
+                    ImGui::SetNextItemWidth(field_w);
+                    ImGui::InputInt("##p2p_port", &typing, 0, 0);
+                    ui::tooltip_for_item("P2P port", kPortTip, port_note);
+                    if (ImGui::IsItemDeactivatedAfterEdit()) take_p2p_port(typing);
+                    store->SetInt(key, ImGui::IsItemActive() ? typing : p2p_port);
+                }
+                ImGui::SameLine(0, 12 * scale);
+                ImGui::PushFont(nullptr, 14.0f);
+                ImGui::AlignTextToFramePadding();
+                ImGui::PushStyleColor(ImGuiCol_Text, p2p_port_note.empty() ? ui::kTextDim : ui::kBad);
+                ImGui::TextUnformatted(ui::fit_text(!p2p_port_note.empty() ? p2p_port_note
+                                                    : p2p_port != cfg.p2p_port
+                                                        ? std::string("Saved with Save or Play; the game opens it as it starts.")
+                                                        : std::string("The port other hunters reach this PC on."),
+                                                    right - ImGui::GetCursorScreenPos().x)
+                                           .c_str());
+                ImGui::PopStyleColor();
+                ImGui::PopFont();
+                if (!p2p_port_note.empty()) ui::tooltip_for_item("P2P port", p2p_port_note);
+
+                // The relay switch: the account's, as the website's account page
+                // has it (net/account.h). Its state is the sign-in check's; a
+                // change goes to the server, and the check runs again.
+                const net::RelayChange rc = net::account_relay_change();
+                const bool relay_known = nat_check.state == net::AccountCheckState::Valid && nat_check.relay.known;
+                if (!si.in || !(relay_known || rc.state != net::RelayChangeState::None)) relay_confirm = false;
+                if (si.in && (relay_known || rc.state != net::RelayChangeState::None)) {
+                    const bool saving = rc.state == net::RelayChangeState::Saving;
+                    const bool reading = nat_check.state == net::AccountCheckState::Checking;
+                    const bool off_now = nat_fake_relay ? nat_fake_relay > 0
+                                         : (saving || (rc.state == net::RelayChangeState::Saved && !relay_known)) ? rc.direct
+                                                                                                                 : nat_check.relay.direct;
+                    ImGui::Dummy(ImVec2(0, 2 * scale));
+                    ui::row_label("Relay", rl);
+                    static const char* const kRelayWebsite =
+                        "Co-op and PvP go through the server's relay, which works on every network. If the test says direct "
+                        "connections work, you can turn the relay off and connect to other hunters directly. Hunters who keep "
+                        "the relay still reach you through it. Everyone who plays from your connection (your home network) "
+                        "needs it off for it to apply.";
+                    ui::tooltip_for_item("Relay", kRelayWebsite, "Your account's setting, the same as the website's account page has.");
+                    static const char* const kRelayLabels[] = {"On", "Off"};
+                    static const char* const kRelayTips[] = {
+                        "Works on every network: co-op and PvP go through the server's relay.",
+                        "Direct connections only: your router must let other hunters in (the test's Incoming says whether it does)."};
+                    int choice = off_now ? 1 : 0;
+                    bool want_off = false, want_on = false;
+                    ImGui::BeginDisabled(saving || reading || relay_confirm);
+                    if (ui::segmented("##relay", &choice, kRelayLabels, 2, seg_w, kRelayTips,
+                                      "Your account's setting, the same as the website's account page has.")) {
+                        want_off = choice == 1;
+                        want_on = choice == 0;
+                    }
+                    ImGui::EndDisabled();
+                    if (relay_press == 1) want_off = true;
+                    if (relay_press == 3) want_on = true;
+                    ImGui::SameLine(0, 12 * scale);
+                    std::string relay_line = off_now ? "Off: direct connections only; your router must let other hunters in."
+                                                     : "On: works on every network.";
+                    ImU32 relay_col = ui::kTextDim;
+                    if (saving) {
+                        relay_line = "Saving...";
+                    } else if (rc.state == net::RelayChangeState::Failed) {
+                        relay_line = rc.status == 0 ? "Not changed: the server didn't answer (" + rc.why + ")."
+                                                    : "Not changed: " + rc.why + ".";
+                        relay_col = ui::kBad;
+                    } else if (rc.state == net::RelayChangeState::Saved && (reading || !relay_known)) {
+                        relay_line = "Saved; reading it back...";
+                    } else if (rc.state == net::RelayChangeState::Saved && ImGui::GetTime() - relay_asked_at < 8.0) {
+                        relay_line = off_now ? "Saved: the relay is off for your account." : "Saved: the relay is on for your account.";
+                        relay_col = ui::kGood;
+                    }
+                    ImGui::PushFont(nullptr, 14.0f);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::PushStyleColor(ImGuiCol_Text, relay_col);
+                    ImGui::TextUnformatted(ui::fit_text(relay_line, right - ImGui::GetCursorScreenPos().x).c_str());
+                    ImGui::PopStyleColor();
+                    ImGui::PopFont();
+                    ui::tooltip_for_item("Relay", relay_line == "Saving..." ? kRelayWebsite : relay_line, kRelayWebsite);
+                    auto ask = [&](bool direct) {
+                        relay_confirm = false;
+                        relay_asked_at = ImGui::GetTime();
+                        host_log("setup: relay switch: asking the server to turn it %s", direct ? "off" : "on");
+                        net::account_relay_change_start(direct);
+                    };
+                    if (want_on && off_now) ask(false);
+                    if (want_off && !off_now) {
+                        // Off with a test that showed others get in: at once; else the
+                        // warning first, and a second press.
+                        if (nat::relay_off_safe(nat_tested_v, nat_tested_in) && nat_tested) ask(true);
+                        else relay_confirm = true;
+                    }
+                    if (relay_confirm) {
+                        const nat::RelayOffWarning wn = nat::relay_off_warning(nat_tested, nat_tested_v, nat_tested_in, nat_cx, nat_lan, nat_router);
+                        ImGui::Dummy(ImVec2(0, 2 * scale));
+                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + rl);
+                        ImGui::BeginGroup();
+                        ImGui::PushTextWrapPos(right - ImGui::GetWindowPos().x);
+                        ImGui::PushFont(nullptr, 14.0f);
+                        ImGui::PushStyleColor(ImGuiCol_Text, ui::kWarn);
+                        ImGui::TextUnformatted(wn.why.c_str());
+                        ImGui::PopStyleColor();
+                        numbered(wn.steps, ui::kWarn);
+                        ImGui::PopFont();
+                        ImGui::PopTextWrapPos();
+                        ImGui::Dummy(ImVec2(0, 2 * scale));
+                        if (ui::primary_button("Keep the relay", ImVec2(ImGui::CalcTextSize("Keep the relay").x + st.FramePadding.x * 4, 0))) {
+                            relay_confirm = false;
+                            host_log("setup: relay switch: kept on");
+                        }
+                        ui::tooltip_for_item(nullptr, "Leaves the relay on: co-op and PvP keep working on every network.");
+                        ImGui::SameLine();
+                        if (ui::ghost_button("Turn it off anyway") || relay_press == 2) ask(true);
+                        ui::tooltip_for_item(nullptr, "Turns the relay off for your account now. You can turn it back on here at any time.");
+                        ImGui::EndGroup();
+                    }
+                }
+                relay_press = 0;
             }
             ui::card_end();
             if (nat_scroll) {
@@ -1975,14 +2412,32 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         SDL_RenderClear(ren);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
         if (nat_hook_stage == 2 && ImGui::GetTime() >= nat_hook_at) {
-            const std::string file = test_nat + "/connection.png";
+            const std::string file = test_nat + "/" + nat_shot_name + (nat_details ? "-details" : "") + ".png";
             if (SDL_Surface* s = SDL_RenderReadPixels(ren, nullptr)) {
                 if (!SDL_SavePNG(s, file.c_str())) host_log("setup: shot: %s: %s", file.c_str(), SDL_GetError());
                 SDL_DestroySurface(s);
             }
             host_log("setup: shot %s", file.c_str());
-            nat_hook_stage = 3;
-            done = true;
+            if (!nat_details) {
+                // What the card says (the headline and the action; never an address), then the same with Details open.
+                static const char* const kTones[] = {"none", "good", "warning", "problem"};
+                host_log("setup: connection card: [%s] %s%s%s (%zu steps)", kTones[static_cast<int>(nat_card.tone)], nat_card.head.c_str(),
+                         nat_card.action.empty() ? "" : " - ", nat_card.action.c_str(), nat_card.steps.size());
+                nat_details = true;
+                nat_hook_at = ImGui::GetTime() + 0.8;
+            } else {
+                nat_hook_stage = 3;
+                done = true;
+            }
+        }
+        if (!hook_shot.empty() && ImGui::GetTime() >= hook_shot_at) {
+            if (SDL_Surface* s = SDL_RenderReadPixels(ren, nullptr)) {
+                if (!SDL_SavePNG(s, hook_shot.c_str())) host_log("setup: shot: %s: %s", hook_shot.c_str(), SDL_GetError());
+                SDL_DestroySurface(s);
+            }
+            host_log("setup: shot %s", hook_shot.c_str());
+            hook_shot.clear();
+            if (relay_hook_step == 99) done = true;
         }
         if (!test_shot.empty() && ImGui::GetTime() >= shot_at) {
             const std::string name = shot < kPageCount ? kPages[shot].slug : "patches-bubble";

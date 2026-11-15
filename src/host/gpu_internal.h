@@ -68,6 +68,10 @@ bool bb_memory_test_limited(std::uint64_t* limit, std::uint64_t* used);
 
 #include "host/heap_compact.h"  // the compaction's blocks and items (global namespace)
 
+namespace gpu_markers {
+struct Reach;  // host/gpu_markers.h
+}  // namespace gpu_markers
+
 namespace gpu {
 
 // BBHOST_RUN_COMMIT (render.cpp run_commit): a run worker's counters, kept
@@ -1257,6 +1261,8 @@ void twins_want_locked(std::uint64_t va);
 void twins_arm_wanted_locked();
 bool twin_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& out, VkDeviceAddress* address = nullptr);
 bool twin_covers_locked(std::uint64_t va, std::uint64_t bytes);
+// The live twins' shape: moves whenever one is made or let go (twin_covers_locked's answers can change only then).
+std::uint64_t twins_shape_locked();
 bool twin_candidate_holds(std::uint64_t va, std::uint64_t bytes);  // a twin holds it, or will at its first binding
 bool twin_holds_live_locked(std::uint64_t va, std::uint64_t bytes);  // inside a live twin: its stores leave guest memory as it was
 // Stage 4b.3a(i): the live twin holding [va, +bytes) whole, its place in `out` - none made, none let go.
@@ -1475,6 +1481,9 @@ struct ListNotes {
     std::uint32_t nsegs = 0;
     std::uint32_t seg[4] = {};        // the list arena's segments its constant-buffer copies went into
     std::uint64_t seg_lap[4] = {};
+    std::uint32_t ngx = 0;
+    std::uint32_t gx_seg[2] = {};     // the GX tables ring's pool-arena segments its tables went into (host/gx_tables_ring.h)
+    std::uint64_t gx_lap[2] = {};
     std::uint64_t packet_index = 0;  // its token slot's list packet (recorder_list_packet)
     std::uint64_t call_flip = 0;     // its GX call's flip (the list arena's copies are shared within one)
     std::uint64_t set_key[2] = {};
@@ -1499,8 +1508,19 @@ struct ListNotes {
         view_target = 0;
         set_key[0] = set_key[1] = 0;
         set[0] = set[1] = VK_NULL_HANDLE;
-        nhomes = nsegs = 0;
+        nhomes = nsegs = ngx = 0;
         full = false;
+    }
+    void note_gx(std::uint32_t s, std::uint64_t lap) {
+        for (std::uint32_t k = 0; k < ngx; ++k) {
+            if (gx_seg[k] == s && gx_lap[k] == lap) return;
+        }
+        if (ngx < 2) {
+            gx_seg[ngx] = s;
+            gx_lap[ngx++] = lap;
+        } else {
+            full = true;
+        }
     }
     void note_home(std::uint32_t handle) {
         for (std::uint32_t k = 0; k < nhomes; ++k) {
@@ -2007,6 +2027,18 @@ void upscale_pass_hudless_locked(RtImage& display);
 // HUD's target then goes to (the frame's prepare done with).
 bool upscale_pass_hudless_copied_locked();
 void upscale_pass_hudless_bind_locked(std::uint64_t display_va, std::uint32_t display_w, std::uint32_t display_h);
+// Plugin API 29's hud_hide (host/scene_look.h scene_look_hud_hidden): the
+// picture in the game's 2D's target kept before its first 2D draw, then put
+// back before the display buffer's pass reads that target.
+void hud_hide_save_locked(RtImage& target);
+bool hud_hide_saved_locked();
+void hud_hide_restore_locked(RtImage& target);
+// The copy is held (made and not yet given back), or this frame's picture kept.
+bool hud_hide_held_locked();
+// The HUD shown again (no plugin hides it) and nothing kept to put back: the
+// copy's video memory given back at the display buffer's pass, so a hidden HUD
+// costs it only while hidden.
+void hud_hide_release_locked();
 // Under render scale: the upscaler's picture, at the output size, for YEBIS's
 // copy to sample in place of a scene of scene_w x scene_h; null when there is
 // none (no upscale of that size has run, or the picture went back into the
@@ -2391,6 +2423,11 @@ VkSampler sampler_with_lod_bias(VkSampler base, float bias);
 // depth comparison, one already nearest or one not made here. Null in a run
 // part's draw that stopped for it to be made in order.
 VkSampler sampler_nearest(VkSampler base);
+// `base` filtering its texels linearly (YEBIS's copy stretching a 3D drawn
+// smaller with no upscaler, render.cpp stretch_samplers), made once and kept;
+// `base` itself for a depth comparison, one already linear or one not made
+// here. Null in a run part's draw that stopped for it to be made in order.
+VkSampler sampler_linear(VkSampler base);
 // `base` with anisotropic filtering of at least `level` (2-16, the device's
 // limit at most), made once and kept; `base` itself for a depth comparison,
 // a nearest or unmipmapped sampler, one already that sharp or one not made
@@ -2681,12 +2718,43 @@ std::string depth_layouts_report();  // "" when off
 constexpr unsigned kGpuMarkSubmission = 3;
 void gpu_checkpoint(unsigned kind, std::uint64_t index);
 void gpu_checkpoint_cmd(VkCommandBuffer cmd, unsigned kind, std::uint64_t index);
+// AMD's markers are written in what the command processor records now: their
+// window is open (host/gpu_markers.h Window - a loading screen's by default).
+// It changes only where a recording begins (gpu.cpp markers_window_locked,
+// under g.mu), so a draw, a dispatch or a run is wholly in it or out of it,
+// and a run's parts read it as the run's.
+extern std::atomic<bool> g_markers_live;
+inline bool markers_live() { return g_markers_live.load(std::memory_order_relaxed); }
+// The draws are recorded in the recent-draw ring for the markers: NVIDIA's
+// checkpoints, or AMD's markers in their window (their draw numbers are the
+// ring's places).
+inline bool markers_record_draws() { return (g.has_checkpoints && !g.cmd_buffer_marker) || markers_live(); }
 // AMD's buffer markers: the 32-bit value for a kind and index, and the two
 // writes (the top of the pipe, then the bottom) into g.marker_buf.
 std::uint32_t gpu_marker_value(unsigned kind, std::uint64_t index);
 void gpu_write_markers(VkCommandBuffer cmd, std::uint32_t value);
+// The word between the draws (host/gpu_markers.h): the top-of-pipe marker
+// before an op the recorder replays between draws - one where the front end
+// stops or the pass changes, or any with BBHOST_GPU_MARKER_OPS=all - with its
+// sequence number. The recorder's replay writes it while the markers are on.
+void gpu_write_op_marker(VkCommandBuffer cmd, std::uint32_t seq);
+// The recorder's note of op `seq` (host/gpu_markers.h), as one line: its
+// kind, its words and the draw or dispatch replayed before it; "" when the
+// ring has moved past it.
+std::string recorder_op_note_text(std::uint32_t seq);
+// The last op number given to an op with the front end's word, 0 before any.
+std::uint32_t recorder_last_op_note();
+// What the GPU's front end had reached after the draw or dispatch `started`
+// (its marker value), the op word being `reached` (host/gpu_markers.h
+// reach_after), with the ops from the first after it to `reached` as lines
+// (at most `max`).
+gpu_markers::Reach recorder_reach_after(std::uint32_t started, std::uint32_t reached, std::vector<std::string>& lines, std::size_t max);
+// A note of an op another thread recorded (the presenter's command buffer), its number for the markers.
+std::uint32_t recorder_note_op(std::uint16_t kind, std::uint64_t a, std::uint64_t b = 0, std::uint64_t c = 0);
 // Logs one recorded draw by index, if it is still in the ring.
 void describe_draw_record(std::uint64_t index);
+// Its pipeline's name, or null once the ring has moved past it.
+const char* draw_record_name(std::uint64_t index);
 // A device fault's address against the tessellation LDS ring (render.cpp):
 // inside it (which region) or how far past or before it, and the recent
 // tessellated draw whose LDS holds it or ends just before it. "" before the
@@ -2862,6 +2930,10 @@ std::string recorder_report();
 // them and hands their submissions to bb-submit, and rec() appends ops
 // (BBHOST_STREAM_SUBMIT, on unless 0, and the recorder on).
 bool stream_on();
+// An open draw's packet that an op or an in-place command must follow is split
+// (DrawCmds::split): the draw goes on in a fresh packet. BBHOST_STREAM_SPLIT=0:
+// the rest of the draw is recorded in place, as before.
+bool stream_split_on();
 // Until submission `serial` has gone to the queue (or failed): a fence the
 // command processor waits for must have been submitted. Under g.mu.
 void stream_wait_submitted(std::uint64_t serial);
@@ -2969,6 +3041,9 @@ public:
     void dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z);
     void dispatch_indirect(VkBuffer buffer, VkDeviceSize offset);
     void marker(std::uint32_t value);  // gpu_write_markers
+    // The markers' window begins or ends here (host/gpu_markers.h Window;
+    // `value` its window_value): recorder.cpp record_marker_window.
+    void marker_window(std::uint32_t value);
     void clear_depth_stencil_image(VkImage image, VkImageLayout layout, const VkClearDepthStencilValue& value, std::uint32_t n,
                                    const VkImageSubresourceRange* ranges);
     void copy_image(VkImage src, VkImageLayout src_layout, VkImage dst, VkImageLayout dst_layout, std::uint32_t n, const VkImageCopy* regions);
@@ -3033,6 +3108,9 @@ public:
     bool deferred() const { return packet_ != nullptr; }
     std::uint64_t number() const;  // its packet's number (0: none)
     void publish();
+    // Published now, an op or an in-place command to follow what it holds, and
+    // the draw goes on in a fresh packet (BBHOST_STREAM_SPLIT=0: in place).
+    void split();
     void update_sets(const VkWriteDescriptorSet* writes, std::size_t n);
     // The draw's own writes, taken rather than copied: `writes` and `images`
     // are swapped with the packet's spent vectors (their buffers, which the
@@ -3092,7 +3170,8 @@ public:
 
 private:
     void* packet_ = nullptr;
-    bool part_ = false;  // a run part's packet (start_reserved)
+    bool part_ = false;   // a run part's packet (start_reserved)
+    bool fresh_ = false;  // its packet taken by start(), numbered in stream order: split() may take another
 };
 // BBHOST_RUN_COMMIT (recorder.cpp): whether draws are recorded on the
 // recorder's thread (the forks need it); `n` packet numbers reserved for a

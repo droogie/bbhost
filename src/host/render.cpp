@@ -9,6 +9,7 @@
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "engine/loading.h"
+#include "engine/plugin_dialog.h"
 #include "engine/render_scale.h"
 #include "engine/texture_origin.h"
 #include "host/clip_control.h"
@@ -32,6 +33,7 @@
 #include "host/lvp_split.h"
 #include "host/masked_blend.h"
 #include "host/rt_extent.h"
+#include "host/run_lookups.h"
 #include "host/shader_bundles.h"
 #include "host/vertex_clamp.h"
 #include "host/shader_overrides.h"
@@ -47,6 +49,7 @@
 #include "host/gxvk_lists_internal.h"
 #include "host/list_cb_memo.h"
 #include "host/gxvk_table.h"
+#include "host/gx_tables_ring.h"
 #include "host/draw_capture.h"
 #include "host/shaders/particleargs.spv.h"
 #include "host/shaders/gbuffer_flat_frag.spv.h"
@@ -92,6 +95,8 @@ namespace {
 // tessellated draws below).
 bool hs_constant_factors(const gcn::Program& p, float out[6]);
 }  // namespace
+
+void publish_memo_report();  // BBHOST_RUN_LOOKUPS: the run's publications (below, beside publish_run_targets_locked)
 
 namespace gpu {
 // What a draw resolved, as its digest (RunDigest) keeps it: the run commit's
@@ -742,13 +747,19 @@ const bool g_vs_invariant = [] {
 // Rendering from GX: the tables a draw's user data points at
 // (the fetch shader's vertex table, resource tables, extended blocks) live in
 // a host-owned ring the GPU page table reaches, instead of the command
-// stream's memory.
+// stream's memory (host/gx_tables_ring.h): the command processor's part, round
+// which its placements go under the ring's lock with its serial guard, and
+// stage 4b.1b's pool's arena at its end (g_list_gx).
 struct GxRing {
     std::mutex mu;
-    std::uint64_t base = 0, size = 0, cursor = 0;
+    std::uint64_t base = 0, size = 0;
     bool failed = false;
+    gx_ring::Guard guard;  // (under mu)
 };
 GxRing g_gx_ring;
+gx_ring::Arena g_list_gx;
+std::atomic<std::uint64_t> g_list_gx_base{0};  // the arena's address, once the ring is made with the pool committing draws
+thread_local gx_ring::Arena::Cursor t_list_gx;
 // Whether [base, +bytes) lies in the ring: a table a draw's user data placed there (gx_ring_place), whose bytes that
 // draw's commit wrote. (The base is set once, under the ring's lock, before any placement is handed out.)
 bool gx_ring_holds(std::uint64_t base, std::uint64_t bytes) {
@@ -14591,6 +14602,7 @@ std::atomic<std::uint64_t> g_onepass_faced{0}, g_onepass_unfaced{0};
 
 void render_report() {
     cross_vendor_report();
+    ::publish_memo_report();
     if (const std::uint64_t n = g_onepass_faced.load() + g_onepass_unfaced.load())
         host_log("render: OnePass cube shadows: %llu caster draws given their six faces, %llu without a light block found (of %llu)",
                  static_cast<unsigned long long>(g_onepass_faced.load()), static_cast<unsigned long long>(g_onepass_unfaced.load()),
@@ -14820,9 +14832,19 @@ void render_report() {
         }
     }
     if (g_vertex_tables.load() || g_gx_user_stages.load() || g_gx_user_fallbacks.load()) {
-        host_log("render: GX vertex tables from the call %llu; stage user data built %llu, left to the command stream %llu (ring at 0x%llx)",
+        std::uint64_t laps = 0, waits = 0, base = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_gx_ring.mu);
+            laps = g_gx_ring.guard.laps;
+            waits = g_gx_ring.guard.waits;
+            base = g_gx_ring.base;
+        }
+        host_log("render: GX vertex tables from the call %llu; stage user data built %llu, left to the command stream %llu (ring at 0x%llx: "
+                 "%llu laps, %llu waits for the GPU at a segment's reuse; the pool's arena: %llu segments taken, none free %llu)",
                  static_cast<unsigned long long>(g_vertex_tables.load()), static_cast<unsigned long long>(g_gx_user_stages.load()),
-                 static_cast<unsigned long long>(g_gx_user_fallbacks.load()), static_cast<unsigned long long>(g_gx_ring.base));
+                 static_cast<unsigned long long>(g_gx_user_fallbacks.load()), static_cast<unsigned long long>(base),
+                 static_cast<unsigned long long>(laps), static_cast<unsigned long long>(waits),
+                 static_cast<unsigned long long>(g_list_gx.takes.load()), static_cast<unsigned long long>(g_list_gx.full.load()));
     }
     if (g_render_cost_enabled) {
         const auto per = [](int k) {
@@ -17168,6 +17190,70 @@ const bool g_cb_prefetch = [] {
     const char* e = std::getenv("BBHOST_CB_PREFETCH");
     return !(e && e[0] == '0');
 }();
+// BBHOST_CB_SNAPSHOT_DEDUPE (resolve_stage_buffers): 0 off, 1 on (unset), 2 check, 3 compare.
+enum { kDedupeOff, kDedupeOn, kDedupeCheck, kDedupeCompare };
+int cb_dedupe_mode() {
+    static const int mode = [] {
+        const char* e = std::getenv("BBHOST_CB_SNAPSHOT_DEDUPE");
+        if (!e || !*e) return int{kDedupeOn};
+        if (std::strcmp(e, "check") == 0) return int{kDedupeCheck};
+        if (std::strcmp(e, "compare") == 0) return int{kDedupeCompare};
+        return e[0] == '0' ? int{kDedupeOff} : int{kDedupeOn};
+    }();
+    return mode;
+}
+// The run batching's constant buffers (BBHOST_RUN_BATCH, host/list_resolve.h).
+// A buffer an earlier draw of the run copied as it recorded - its lookups said
+// a snapshot: no copy-back's version over it, no twin, no GPU write still to
+// land, mapped (or, in GX's upload heap or ring, those answers known) - binds
+// that copy again without the lookups and the choice after them, as the
+// snapshots' memo would bind it once they had said the same. Within a run
+// nothing is done in order - a copy-back's version is made only at a copy
+// token and a draw's windows open only for YEBIS's draws, and both end the run
+// (list_resolve::split) - and nobody else takes the GPU mutex (its count of
+// takes, as the targets' sharing has it). What a draw of the run can still
+// change is asked again at the binding - a GPU write noted over the range, the
+// memory unmapped - or watched: a twin made or let go moves the twins' shape.
+// The copy is the snapshots' memo's, which must still hold it: this
+// recording's, this lap of the ring. At Old Yharnam with no homes (a 4 GB
+// card's state on an RTX 4070) 67% of the command processor's ~12,900
+// constant-buffer bindings a flip had an earlier one in their run.
+struct CbRunEntry {
+    std::uint64_t base = 0, bytes = 0, epoch = 0, twins = 0;
+};
+CbRunEntry g_cb_run[1024];
+std::uint64_t g_cb_run_epoch = 1;                  // moved by cb_run_draw: another run, or another's take of the GPU mutex
+std::uint64_t g_cb_run_serial = 0, g_cb_run_mu = 0;  // the last draw's run and count of the mutex's takes
+thread_local bool t_cb_run = false;                // the draw t_cb_run_draw names shares its run's copies (cb_run_draw)
+thread_local std::uint64_t t_cb_run_draw = 0;      // that draw's number (g.draw_calls when it asked)
+inline CbRunEntry& cb_run_for(std::uint64_t base) { return g_cb_run[((base >> 4) ^ (base >> 14)) & 1023]; }
+VkBuffer g_cb_ring = VK_NULL_HANDLE;               // the copies' ring (resolve_stage_buffers' scratch, made at the first copy)
+constexpr VkDeviceSize kCbRingBytes = 64ull << 20;
+
+// A draw of the command processor's own, in order and batched, with its GPU
+// mutex's count of takes (run_targets, from draw_impl's targets, before any of
+// its bindings): whether its constant buffers take its run's copies (CbRunEntry)
+// - none of what the copies' lookups answer otherwise: the homes made, GX's
+// upload heap bound in place, the dedupe's checks, the draw context, the
+// checks' and censuses' own paths. The run's epoch moves where this draw is of
+// another run than the draw before, or another took the mutex in between. (Kept
+// out of draw_impl: a change of its code drops its part of the Windows build's
+// PGO profile.)
+void cb_run_draw(std::uint64_t mu_taken) {
+    const std::uint64_t serial = list_resolve::run_serial();
+    if (serial != g_cb_run_serial || mu_taken != g_cb_run_mu + 1) ++g_cb_run_epoch;
+    g_cb_run_serial = serial;
+    g_cb_run_mu = mu_taken;
+    t_cb_run = !gxvk_homes::made_on() && !gxvk::arena_wanted() && cb_dedupe_mode() == kDedupeOn && !cb_proof::g_on && !gxvk::census() &&
+               !list_resolve::g_draw_ctx && !run_digest_on();
+    t_cb_run_draw = g.draw_calls.load(std::memory_order_relaxed);
+}
+// Whether this stage's bindings take their run's copies: a GX-native draw's (its
+// records: not a dispatch's, YEBIS's or Scaleform's) of the command processor's
+// own (not a run part's, not the pool's), the very draw cb_run_draw was told of.
+bool cb_run_stage(const GxStageRecords* gx) {
+    return t_cb_run && gx && !t_run_draw && t_cb_run_draw == g.draw_calls.load(std::memory_order_relaxed);
+}
 }  // namespace
 
 // TranslateOptions::cb_ssbo: bind each constant buffer the shader reads
@@ -17369,7 +17455,26 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
     enum { kBound, kNoBase, kUnaligned, kUnmapped, kTooLong, kOutcomes };
     static std::uint64_t outcomes[kOutcomes] = {};
     static std::uint64_t resolves = 0;
+    const auto log_outcomes = [] {
+        host_log("render: storage-buffer constants: %llu bound; page-table path: %llu no base, %llu unaligned, %llu not imported, %llu too long",
+                 static_cast<unsigned long long>(outcomes[kBound]), static_cast<unsigned long long>(outcomes[kNoBase]),
+                 static_cast<unsigned long long>(outcomes[kUnaligned]), static_cast<unsigned long long>(outcomes[kUnmapped]),
+                 static_cast<unsigned long long>(outcomes[kTooLong]));
+        host_log("render:   YEBIS windows written by the CPU %llu, bound from their draw's copy %llu, read past their window %llu",
+                 static_cast<unsigned long long>(g_windows_given.load()), static_cast<unsigned long long>(g_windows_bound.load()),
+                 static_cast<unsigned long long>(g_windows_past.load()));
+        host_log("render:   %llu of them copied to an aligned scratch (%llu MiB): a base that is not on a vec4 is read wrongly "
+                 "through the binding, which is the menu flash; %llu of those a Scaleform draw's, copied as recorded "
+                 "(BBHOST_SF_SNAPSHOT); %llu memory the game writes, copied as recorded (BBHOST_CB_SNAPSHOT)",
+                 static_cast<unsigned long long>(g_cb_realigned.load()), static_cast<unsigned long long>(g_cb_realigned_bytes.load() >> 20),
+                 static_cast<unsigned long long>(g_sf_cb_snapshots.load()), static_cast<unsigned long long>(g_cb_snapshots.load()));
+        host_log("render:   %llu of those snapshots bound the copy an earlier binding of the same recording made (BBHOST_CB_SNAPSHOT_DEDUPE); "
+                 "compared with the guest's bytes %llu, changed since the copy %llu",
+                 static_cast<unsigned long long>(g_cb_snapshots_shared.load()), static_cast<unsigned long long>(g_cb_snapshots_compared.load()),
+                 static_cast<unsigned long long>(g_cb_snapshots_changed.load()));
+    };
     const GxStagePlan* plan = gx && g_binding_plans ? &stage_plan(meta, *gx) : nullptr;
+    const bool run_share = cb_run_stage(gx);  // the run batching's copies (CbRunEntry)
     for (std::size_t i = 0; i < meta.buffers.size(); ++i) {
         const gcn::BufferBinding& b = meta.buffers[i];
         VkDescriptorBufferInfo info{g.dummy_ssbo, 0, VK_WHOLE_SIZE};
@@ -17417,6 +17522,37 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         const std::uint64_t hi = b.pointer ? words[1] : (words[1] & 0xff);
         const std::uint64_t base = resolved ? static_cast<std::uint64_t>(words[0]) | (hi << 32) : 0;
         if (bases) bases[i] = base;
+        // The run batching: the copy an earlier draw of this run took of the buffer (CbRunEntry). Its compare mode
+        // resolves the binding as before and checks it against that copy (`run_at`).
+        std::uint64_t run_at = ~0ull;
+        if (run_share && !b.pointer && !b.written && base && !(base & 3) && shape && bytes && bytes <= (1u << 20) &&
+            (exact || g.ssbo_max_range >= kCbRingBytes) && !t_snapshot_cbs && t_draw_windows.empty() && !glitch_watching_draw()) {
+            const CbRunEntry& e = cb_run_for(base);
+            const SnapMemo& m = snap_memo_for(base);
+            if (e.base == base && e.epoch == g_cb_run_epoch && e.bytes >= bytes && e.twins == twins_shape_locked() && m.base == base &&
+                m.serial == g.record_serial && m.lap == g_scratch_lap && m.bytes >= bytes && hle_kernel_va_mapped(base, bytes) &&
+                !gpu_writes_pending_locked(base, bytes)) {
+                if (list_resolve::batch_compare()) {
+                    run_at = m.at;
+                } else {
+                    // As the snapshots' memo binds it (below): the whole ring at the copy's dword bias, or pushed at the copy.
+                    const bool whole = !exact;
+                    info = whole ? VkDescriptorBufferInfo{g_cb_ring, 0, kCbRingBytes} : VkDescriptorBufferInfo{g_cb_ring, m.at, bytes};
+                    params.cb_valid |= 1u << i;
+                    params.cb_bias_dw[i] = whole ? static_cast<std::uint32_t>(m.at / 4) : 0;
+                    if (!whole) note_copy_binding_locked(info, base);
+                    if (host_tooling()) {
+                        bump(g_cb_snapshots);
+                        bump(g_cb_snapshots_shared);
+                    }
+                    list_resolve::count(list_resolve::kBatchCbShared);
+                    ++outcomes[kBound];
+                    infos.push_back(info);
+                    if (host_tooling() && ++resolves % 200000 == 0) log_outcomes();
+                    continue;
+                }
+            }
+        }
         // A buffer the game writes on the CPU is copied as the draw records
         // (BBHOST_CB_SNAPSHOT, below), from memory a game thread has just
         // written - its lines in that core's cache. Asked for here, ahead of
@@ -17774,6 +17910,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 if (!scratch.buffer) {
                     MemOwner own_mem("constant-buffer copies ring");
                     create_upload_buffer(scratch, kScratch, "the constant-buffer copies' ring");
+                    static_assert(kScratch == kCbRingBytes, "the run batching binds the ring by its size");
+                    g_cb_ring = scratch.buffer;
                     g_cb_ring_made = scratch.map != nullptr;  // (stage 1d.1 takes the heap's answers only once there is a ring to copy into)
                     if (g_cb_ring_made) gxvk::heap_copy_ring_made();  // (and 1d.2a's versions from the heap need it for their homes' bindings)
                     if (g_cb_ring_made && gxvk_lists::splice()) {  // stage 4b.1b/4b.2: the pool's copies in its last 16 MiB
@@ -17801,14 +17939,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 // since (the report's "changed"); =compare: shares only a copy
                 // whose bytes still match, and copies again otherwise. Both
                 // read the write-combined ring back: slow, for checks.
-                enum { kDedupeOff, kDedupeOn, kDedupeCheck, kDedupeCompare };
-                static const int dedupe = [] {
-                    const char* e = std::getenv("BBHOST_CB_SNAPSHOT_DEDUPE");
-                    if (!e || !*e) return int{kDedupeOn};
-                    if (std::strcmp(e, "check") == 0) return int{kDedupeCheck};
-                    if (std::strcmp(e, "compare") == 0) return int{kDedupeCompare};
-                    return e[0] == '0' ? int{kDedupeOff} : int{kDedupeOn};
-                }();
+                const int dedupe = cb_dedupe_mode();
                 SnapMemo* memo = nullptr;
                 // Pushed (`exact`), each draw's ranges go into the command
                 // buffer anyway: the snapshot is bound where it is.
@@ -18021,6 +18152,11 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                         bump(g_cb_realigned_bytes, bytes);
                     }
                 }
+                // The run batching: a later binding in this draw's run takes this copy without the lookups (CbRunEntry) -
+                // GX's upload heap's and ring's too, whose answers were known (their later bindings ask the GPU writes
+                // and the mapping again all the same).
+                if (run_share && memo && outcome == kBound && copy_from == base && !draw_ctx())
+                    cb_run_for(base) = CbRunEntry{base, bytes, g_cb_run_epoch, twins_shape_locked()};
             }
             if (outcome == kBound) {
                 // already handled by the realign path
@@ -18112,27 +18248,28 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             if (t_run_digest.nbuffers < 6) std::memcpy(t_run_digest.first[t_run_digest.nbuffers], what, sizeof(what));
             ++t_run_digest.nbuffers;
         }
-        infos.push_back(info);
-        if (host_tooling() && !run_part() && ++resolves % 200000 == 0) {
-            host_log("render: storage-buffer constants: %llu bound; page-table path: %llu no base, %llu unaligned, %llu not imported, %llu too long",
-                     static_cast<unsigned long long>(outcomes[kBound]), static_cast<unsigned long long>(outcomes[kNoBase]),
-                     static_cast<unsigned long long>(outcomes[kUnaligned]), static_cast<unsigned long long>(outcomes[kUnmapped]),
-                     static_cast<unsigned long long>(outcomes[kTooLong]));
-            host_log("render:   YEBIS windows written by the CPU %llu, bound from their draw's copy %llu, read past their window %llu",
-                     static_cast<unsigned long long>(g_windows_given.load()), static_cast<unsigned long long>(g_windows_bound.load()),
-                     static_cast<unsigned long long>(g_windows_past.load()));
-            host_log("render:   %llu of them copied to an aligned scratch (%llu MiB): a base that is not on a vec4 is read wrongly "
-                     "through the binding, which is the menu flash; %llu of those a Scaleform draw's, copied as recorded "
-                     "(BBHOST_SF_SNAPSHOT); %llu memory the game writes, copied as recorded (BBHOST_CB_SNAPSHOT)",
-                     static_cast<unsigned long long>(g_cb_realigned.load()),
-                     static_cast<unsigned long long>(g_cb_realigned_bytes.load() >> 20),
-                     static_cast<unsigned long long>(g_sf_cb_snapshots.load()), static_cast<unsigned long long>(g_cb_snapshots.load()));
-            host_log("render:   %llu of those snapshots bound the copy an earlier binding of the same recording made (BBHOST_CB_SNAPSHOT_DEDUPE); "
-                     "compared with the guest's bytes %llu, changed since the copy %llu",
-                     static_cast<unsigned long long>(g_cb_snapshots_shared.load()),
-                     static_cast<unsigned long long>(g_cb_snapshots_compared.load()),
-                     static_cast<unsigned long long>(g_cb_snapshots_changed.load()));
+        if (run_at != ~0ull) {
+            // BBHOST_RUN_BATCH=compare: what the run's copy would have bound against what was.
+            list_resolve::count(list_resolve::kBatchCbCompared);
+            const bool whole = !exact;
+            const bool same = ((params.cb_valid >> i) & 1) && info.buffer == g_cb_ring &&
+                              (whole ? info.offset == 0 && info.range == kCbRingBytes && params.cb_bias_dw[i] == run_at / 4
+                                     : info.offset == run_at && info.range == bytes && params.cb_bias_dw[i] == 0);
+            if (!same) {
+                list_resolve::count(list_resolve::kBatchCbDiffered);
+                static int logs = 0;  // under g.mu
+                if (logs++ < 8) {
+                    host_log("list-resolve: run batching: a constant buffer at 0x%llx (%llu bytes) bound %p +0x%llx (%llu bytes, bias %u dwords), "
+                             "its run's copy at 0x%llx in %p (flip %llu)",
+                             static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<void*>(info.buffer),
+                             static_cast<unsigned long long>(info.offset), static_cast<unsigned long long>(info.range), params.cb_bias_dw[i],
+                             static_cast<unsigned long long>(run_at), static_cast<void*>(g_cb_ring),
+                             static_cast<unsigned long long>(hle_video_flip_count()));
+                }
+            }
         }
+        infos.push_back(info);
+        if (host_tooling() && !run_part() && ++resolves % 200000 == 0) log_outcomes();
     }
 }
 
@@ -18412,45 +18549,84 @@ void compare_gx_fetch(std::uint64_t user_fetch, const GxDrawObjects& o) {
 }
 
 // Reserves bytes in the ring (8-byte aligned), copies them there and returns
-// their address; 0 when no ring could be mapped. Tables come to a few MiB a
-// frame at most, so the 128 MiB ring does not reuse a copy before the queued
-// work reading it has run.
+// their address; 0 when no ring could be mapped, or for a run part's or a
+// pool thread's draw that stopped instead (the guard, host/gx_tables_ring.h).
 // BBHOST_DRAW_CONTEXT: a draw context's placements come from a chunk of the
 // ring it owns, taken as a placement of the chunk's size would be.
 constexpr std::uint64_t kGxCtxChunk = 64u << 10;
+std::uint64_t gx_list_place(const std::uint8_t* data, std::uint64_t bytes, std::uint64_t align);
 std::uint64_t gx_ring_place(const std::uint8_t* data, std::uint64_t bytes, std::uint64_t align = 8) {
+    if (list_draw()) return gx_list_place(data, bytes, align);
     GxRing& ring = g_gx_ring;
     std::uint64_t va = 0;
     DrawCtx* const ctx = draw_ctx();
     if (ctx) {
         if (!bytes) return 0;
-        ctx->take_recording(list_draw() ? 1 : g.flushes);  // (a pool thread's chunk is its own: no recording to follow)
+        ctx->take_recording(g.flushes);
         va = (ctx->gx_next + align - 1) & ~(align - 1);
     }
     if (!ctx || !ctx->gx_end || va + bytes > ctx->gx_end) {
         const std::uint64_t take = ctx ? std::max<std::uint64_t>(kGxCtxChunk, bytes + align) : bytes;
         std::lock_guard<std::mutex> lk(ring.mu);
         if (!ring.base && !ring.failed) {
-            ring.size = 128ull << 20;
+            ring.size = gx_ring::kRingBytes;
             ring.base = hle_kernel_map_host(ring.size);
             ring.failed = ring.base == 0;
             if (ring.failed) host_log("render: no host mapping for GX tables; they stay on the command stream");
+            // Stage 4b.1b's pool places its draws' tables in the ring's last 16 MiB (its arena), the command processor
+            // in the rest.
+            if (ring.base && gxvk_lists::splice()) {
+                ring.guard.end = ring.size - gx_ring::Arena::kBytes;
+                g_list_gx_base.store(ring.base + ring.guard.end, std::memory_order_release);
+            }
         }
-        if (!ring.base || !bytes || take > ring.size) return 0;
-        ring.cursor = (ring.cursor + align - 1) & ~(align - 1);
-        if (ring.cursor + take > ring.size) ring.cursor = 0;
-        va = ring.base + ring.cursor;
-        ring.cursor += take;
+        if (!ring.base || !bytes) return 0;
+        // A segment entered in a new lap: the recording that last placed there has run, or is waited for (a run
+        // part's draw stops instead).
+        const bool part = run_part();
+        const std::uint64_t at = ring.guard.take(
+            take, align, g.flushes, part, [](std::uint64_t serial) { return g.completed_submits > serial; },
+            [](std::uint64_t serial) { wait_submission_locked(serial); });
+        if (at == gx_ring::Guard::kNone) {
+            if (part) run_part_stop(kRunStopRing);
+            return 0;
+        }
+        va = ring.base + at;
         if (ctx) {
             ctx->gx_end = va + take;
             list_resolve::count(list_resolve::kCtxGxChunks);
-            if (list_resolve::draw_ctx_compare()) list_resolve::check_chunk(0, g.flushes, va, va + take, ring.base, ring.base + ring.size);
+            if (list_resolve::draw_ctx_compare()) list_resolve::check_chunk(0, g.flushes, va, va + take, ring.base, ring.base + ring.guard.end);
         }
     }
     if (ctx) {
         ctx->gx_next = va + bytes;
         list_resolve::count(list_resolve::kCtxGxBytes, bytes);
     }
+    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(va)), data, static_cast<std::size_t>(bytes));
+    return va;
+}
+
+// Stage 4b.1b: a pool thread's list-mode draw places its tables in the pool's
+// arena of the ring (host/gx_tables_ring.h Arena), in the segment the thread
+// owns, the segment and its lap noted for the splice; 0 and the draw stopped
+// when the ring is not made yet (the command processor's draws make it) or no
+// segment is free.
+std::uint64_t gx_list_place(const std::uint8_t* data, std::uint64_t bytes, std::uint64_t align) {
+    const std::uint64_t base = g_list_gx_base.load(std::memory_order_acquire);
+    ListNotes* const notes = t_run_draw ? t_run_draw->list : nullptr;
+    if (!base || !bytes || !notes || align > 256) {
+        run_part_stop(kRunStopRing);
+        return 0;
+    }
+    gx_ring::Arena::Cursor& c = t_list_gx;
+    const std::uint64_t at = g_list_gx.place(c, bytes, align, hle_video_flip_count(), g_completed_submits_seen.load(std::memory_order_acquire),
+                                             kListMaxAge);
+    if (at == gx_ring::Arena::kNone) {
+        run_part_stop(kRunStopRing);
+        return 0;
+    }
+    notes->note_gx(c.seg, c.lap);  // (more segments than its notes hold: not committed)
+    const std::uint64_t va = base + at;
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(va)), data, static_cast<std::size_t>(bytes));
     return va;
 }
@@ -22959,6 +23135,9 @@ void take_target_inputs(const GpuDrawInputs& in, TargetInputs& k) {
 // The draw before's answers on this command-processor thread.
 struct RunTargets {
     bool valid = false;
+    // Moved by run_targets whenever it refills or drops the answers (not when a
+    // draw takes them): publish_run_targets_locked's memo holds while it stays.
+    std::uint64_t version = 0;
     std::uint64_t serial = 0, acquires = 0, rt_gen = 0, htile_gen = 0;
     std::uint64_t pending_gen = 0;  // g_pending_gen at its lookups (BBHOST_RUN_COMMIT's fork checks it)
     TargetInputs in{};
@@ -23316,6 +23495,7 @@ void run_targets_written_locked() {
 // before and counts where the taken answers would have differed.
 void run_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, std::uint64_t mu_taken) {
     using namespace list_resolve;
+    cb_run_draw(mu_taken);  // its constant buffers' run (resolve_stage_buffers, CbRunEntry)
     RunTargets& m = t_run_targets;
     count(kBatchTargetsAsked);
     const std::uint64_t serial = run_serial();
@@ -23402,8 +23582,10 @@ void run_targets(const GpuDraw& d, const GpuDrawInputs& in, DrawState& s, std::u
     }
     if (why == kBatchMissKind) {
         m.valid = false;
+        ++m.version;
         return;
     }
+    ++m.version;
     m.valid = true;
     m.serial = serial;
     m.acquires = mu_taken;
@@ -23586,6 +23768,43 @@ bool look_samplers(const DrawState& s, const GfxPipeline& pl, StageImages& si) {
             host_log("render: the colour grading's table sampled nearest (pipeline %s), for a plugin's look", pl.name.c_str());
         if (copy && !told_copy.exchange(true) && s.color[0])
             host_log("render: YEBIS's copy brings the 3D up nearest, to %ux%u, for a plugin's look", s.color[0]->width, s.color[0]->height);
+    }
+    return true;
+}
+
+// Render scale with no upscaler (Upscaling Off, or one this machine cannot
+// run, at a Resolution below the window's: engine/render_scale.cpp): YEBIS's
+// copy - the post chain's first pass, at the output size - stretches the 3D
+// itself, and its own sampler is nearest (at the game's one size it never
+// mattered), which made the 3D blocky. The render-sized targets it samples
+// are filtered linearly instead. A plugin's look keeps its nearest
+// (look_samplers). False in a run part's draw that stopped for a sampler to
+// be made in order.
+bool stretch_samplers(const DrawState& s, const GfxPipeline& pl, StageImages& si) {
+    // Every draw asks: the render scale's flag first (one load, false at the
+    // Resolution of the window), the pipeline's name only under it.
+    if (!s.color[0] || !render_scale_on() || pl.name != "0b0acf50+ccbf44a6" || upscaler_method() || scene_look_scale()) return true;
+    RenderScale rs;
+    if (!render_scale_on(&rs) || s.color[0]->width != rs.output_w || s.color[0]->height != rs.output_h) return true;
+    const std::vector<std::uint32_t>& pairs = pl.ps_sampler_images;
+    for (std::size_t k = 0; k < si.samplers.size(); ++k) {
+        if (!si.samplers[k]) continue;  // unresolved: the dummy is bound
+        const std::uint32_t images = k < pairs.size() ? pairs[k] : 0;
+        bool small = false;
+        for (std::uint32_t b = images; b; b &= b - 1) {
+            const std::size_t i = static_cast<std::size_t>(__builtin_ctz(b));
+            if (i >= si.images.size() || !si.images[i].resolved) continue;
+            const RtImage* rt = find_render_target(image_base(si.images[i]));
+            if (rt && !rt->depth && rt->width == rs.render_w && rt->height == rs.render_h) small = true;
+        }
+        if (!small) continue;
+        const VkSampler l = sampler_linear(si.samplers[k]);
+        if (!l) return false;  // a run part's draw: made in order
+        si.samplers[k] = l;
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            host_log("render: YEBIS's copy brings the 3D up linearly, %ux%u to %ux%u (no upscaler running)", rs.render_w, rs.render_h,
+                     rs.output_w, rs.output_h);
     }
     return true;
 }
@@ -23961,7 +24180,8 @@ static bool draw_impl(const GpuDraw& d) {
         }
     }
     // The game's occlusion culling under a smaller 3D (render scale: FSR 3, FSR
-    // 4 and DLSS below Native AA; a plugin's look at its own size): its proxies
+    // 4 and DLSS below Native AA, TAA or Upscaling Off at a Resolution below
+    // the window's; a plugin's look at its own size): its proxies
     // - boxes drawn depth-tested with no colour and no depth write, between
     // ZPASS_DONE dumps (host/occlusion.cpp) - are drawn against
     // DefDepthStencil at the output size, which the scene no longer draws into
@@ -24742,6 +24962,8 @@ static bool draw_impl(const GpuDraw& d) {
     // A plugin's look's samplers (look_samplers): the 3D's textures nearest,
     // the colour grading's tables as its rule says, the 3D brought up nearest.
     if (!look_samplers(s, pl, stage_images[1])) return false;  // a run part's draw: made in order
+    // With no upscaler, the 3D drawn smaller brought up linearly (stretch_samplers).
+    if (!stretch_samplers(s, pl, stage_images[1])) return false;  // a run part's draw: made in order
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.
     const GfxPipeline* const capture_lean = lean_of(pl);
@@ -26924,16 +27146,24 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
     }
-    // A plugin's look with no upscaler or frame generation (host/scene_look.h):
-    // the scene and its depth learned the same way, for look_camera_draw.
-    else if (scene_look_camera()) {
+    // A plugin's look with no upscaler or frame generation (host/scene_look.h),
+    // or the 3D drawn smaller with none running (Upscaling Off at a Resolution
+    // below the window's, engine/render_scale.cpp): the scene and its depth
+    // learned the same way - for look_camera_draw, and for the occlusion
+    // culling's proxies, which take the scene's depth when it is smaller than
+    // theirs (above). Without it, Upscaling Off's proxies were tested against
+    // the output-size depth the 3D never draws into: every box passed, the
+    // game culled nothing, and Central Yharnam's frame drew ~1240 draws where
+    // TAA at the same sizes draws ~940.
+    else if (scene_look_camera() || render_scale_on()) {
         UpscaleFrame& u = g_upscale;
         if (pl.name == "0b0acf50+ccbf44a6") {
             for (const StageImages::Image& im : stage_images[1].images) {
                 if (!im.resolved) continue;
                 const std::uint64_t b = image_base(im);
                 if (b != u.scene) {
-                    host_log("render: the scene is 0x%llx (YEBIS's copy samples it), for a plugin's look", static_cast<unsigned long long>(b));
+                    host_log("render: the scene is 0x%llx (YEBIS's copy samples it), for %s", static_cast<unsigned long long>(b),
+                             scene_look_camera() ? "a plugin's look" : "the occlusion culling's depth (no upscaler running)");
                     u.scene = b;
                     u.depth = 0;
                 }
@@ -26953,8 +27183,14 @@ static bool draw_impl(const GpuDraw& d) {
     // is in it, and the copy handed over with the display buffer the pass then
     // writes. A plugin's dither (scene_dither) goes over the target at the
     // same point, before the copy.
+    // A plugin's hidden HUD (hud_hide) the same way: the picture kept at the
+    // HUD's first draw, and put back into the target before the display
+    // buffer's pass reads it.
     const std::uint32_t dither = scene_look_dither();
-    if ((upscale_pass_hudless_due_locked() || dither) && s.color[0]) {
+    // (Not while a plugin's page is up in the game's dialog, itself the
+    // game's 2D: plugins_frame holds the game's HUD option off instead.)
+    const bool hud_hidden = scene_look_hud_hidden() && !plugin_dialog::up();
+    if ((upscale_pass_hudless_due_locked() || dither || hud_hidden || hud_hide_held_locked()) && s.color[0]) {
         static std::uint64_t hud_target = 0;
         // The target's last write (RtImage::last_write) as the display
         // buffer's pass read it: a write since is the next frame's.
@@ -26963,16 +27199,49 @@ static bool draw_impl(const GpuDraw& d) {
         const std::uint64_t dst = s.color[0]->base;
         if (hle_video_is_display_buffer(dst)) {
             if (s.rect) {
+                RtImage* shown = nullptr;
                 for (const StageImages::Image& im : stage_images[1].images) {
                     if (!im.resolved) continue;
-                    const RtImage* t = find_render_target(image_base(im));
+                    RtImage* t = find_render_target(image_base(im));
                     if (t && t->width == s.color[0]->width && t->height == s.color[0]->height) {
-                        if (hud_target != t->base) host_log("framegen: the HUD's target is 0x%llx", static_cast<unsigned long long>(t->base));
-                        hud_target = t->base;
-                        shown_write = t->last_write;
+                        shown = t;
                         break;
                     }
                 }
+                // A frame whose HUD drew nothing - the HUD hidden: no triangle
+                // list came into the target, so no copy was taken below, and
+                // with no HUD-less picture frame generation switched off until
+                // the HUD was back (Kyo's log, 2026-11-12: off at flip 894 and
+                // every frame after it "shown before"). The target as this pass
+                // reads it, written since the last display buffer's pass, is
+                // that frame's HUD-less picture: copied here, before the bind.
+                if (shown && upscale_pass_hudless_due_locked() && !upscale_pass_hudless_copied_locked() && !hud_begun &&
+                    (target_written || shown->last_write != shown_write)) {
+                    if (part) {
+                        run_part_stop(kRunStopOrder);
+                        return false;
+                    }
+                    upscale_pass_hudless_locked(*shown);
+                    static bool told = false;
+                    if (!told)
+                        host_log("framegen: a frame with no HUD drawn (flip %llu): the HUD's target 0x%llx as the display buffer's pass reads it "
+                                 "is its HUD-less picture",
+                                 static_cast<unsigned long long>(hle_video_flip_count()), static_cast<unsigned long long>(shown->base));
+                    told = true;
+                }
+                if (shown) {
+                    if (hud_target != shown->base) host_log("framegen: the HUD's target is 0x%llx", static_cast<unsigned long long>(shown->base));
+                    hud_target = shown->base;
+                    shown_write = shown->last_write;
+                }
+                if (hud_hide_saved_locked()) {
+                    if (part) {
+                        run_part_stop(kRunStopOrder);
+                        return false;
+                    }
+                    if (RtImage* t = hud_target ? find_render_target(hud_target) : nullptr) hud_hide_restore_locked(*t);
+                }
+                if (!hud_hidden) hud_hide_release_locked();  // shown again: the copy given back
                 if (upscale_pass_hudless_due_locked()) upscale_pass_hudless_bind_locked(dst, s.color[0]->width, s.color[0]->height);
             }
             target_written = false;
@@ -26996,6 +27265,7 @@ static bool draw_impl(const GpuDraw& d) {
                 hud_begun = true;
                 if (dither) scene_dither_locked(*s.color[0], dither);
                 if (upscale_pass_hudless_due_locked() && !upscale_pass_hudless_copied_locked()) upscale_pass_hudless_locked(*s.color[0]);
+                if (hud_hidden) hud_hide_save_locked(*s.color[0]);
             }
         }
     }
@@ -27483,8 +27753,11 @@ static bool draw_impl(const GpuDraw& d) {
     }
     draw_stamp.to(kRenderCostGeometry);
     if (g.cmd_buffer_marker) {
-        cmds.marker(gpu_marker_value(1, part ? run->record : g_draw_rec_next));
-    } else if (!(run && run->list)) {  // (stage 4b.1b: refused with checkpoints - lists_commit)
+        // In the markers' window (a loading screen's by default: host/gpu_markers.h). A list-mode draw has none of its
+        // own - no number in the recent-draw ring, committed beside the command processor: its splice is an op the
+        // recorder notes, and the report names the draws marked around it.
+        if (markers_live() && !(run && run->list)) cmds.marker(gpu_marker_value(1, part ? run->record : g_draw_rec_next));
+    } else if (!(run && run->list)) {  // (stage 4b.1b: refused with NVIDIA's checkpoints - lists_commit)
         gpu_checkpoint(1, g_draw_rec_next);  // (a run is not forked with checkpoints recorded in place)
     }
     if (bind_pl->profile_name.empty()) {
@@ -27899,7 +28172,7 @@ static bool draw_impl(const GpuDraw& d) {
     }
     // The recent-draw ring (gpu_internal.h): tooling, the glitch hunt's, and
     // the GPU's progress markers, whose draw numbers are its places.
-    if ((host_tooling() || glitch_on() || g.has_checkpoints) && !(run && run->list)) {  // (a list-mode draw keeps none)
+    if ((host_tooling() || glitch_on() || markers_record_draws()) && !(run && run->list)) {  // (a list-mode draw keeps none)
         DrawRec& r = g_draw_recs[(part ? run->record : g_draw_rec_next++) % kDrawRecs];  // a run part's: its reserved number
         const std::size_t name_len = std::min<std::size_t>(pl.name.size(), sizeof(r.name) - 1);  // no snprintf: every draw
         std::memcpy(r.name, pl.name.data(), name_len);
@@ -28324,7 +28597,7 @@ int host_gpu_run_commit(const GpuDraw* draws, const std::uint64_t* ids, std::uin
     const std::uint32_t params = g.queued;
     g.queued += kRunParamsEach * n;
     const std::uint64_t packets = recorder_reserve_packets(n);
-    const bool records = host_tooling() || glitch_on() || g.has_checkpoints;
+    const bool records = host_tooling() || glitch_on() || markers_record_draws();
     const std::uint64_t record = g_draw_rec_next;
     if (records) g_draw_rec_next += n;
     for (std::uint32_t i = 0; i < n; ++i) {
@@ -28654,11 +28927,46 @@ void pass_restart_locked(VkRenderingFlags flags);
 
 }  // namespace
 
+namespace {
+// publish_run_targets_locked's memo (BBHOST_RUN_LOOKUPS, host/run_lookups.h):
+// the call before on this thread - its run's version, the way that holds the
+// run's names, and that way's sequence, erase generation and flip after it.
+thread_local run_lookups::PubMemo t_pub_memo;
+// Calls and memo answers; compare mode's checks, differences, and checks whose
+// two looks at the flip count fell on either side of a flip (the publication's
+// age, judged at two moments: not comparable). The command processor's, under
+// g.mu.
+struct PubMemoCounts {
+    std::atomic<std::uint64_t> calls{0}, hits{0}, checked{0}, differed{0}, flipped{0};
+};
+PubMemoCounts g_pub_memo;
+void pub_memo_bump(std::atomic<std::uint64_t>& a) { a.store(a.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+}  // namespace
+
 // The command processor, under g.mu: a run's first draw just looked its
 // targets up (t_run_targets): published for the pool's draws with the same
-// names, unless the slot already holds them.
+// names, unless the slot already holds them. The run's later draws ask again
+// for the same: while the run's answers (their version), the way's sequence,
+// the erase generation and the publication's age say the slot still holds
+// them, the memo returns before the names are worked out (run_lookups::pub_hit
+// says why that is the call's own answer).
 void publish_run_targets_locked(const RunTargets& m) {
     if (!m.valid) return;
+    const int mode = run_lookups::g_mode;
+    run_lookups::PubMemo& memo = t_pub_memo;
+    const std::uint64_t erase_gen = g_rt_erase_gen.load(std::memory_order_acquire);
+    bool hit = false;
+    std::uint64_t memo_flip = 0;
+    if (mode) {
+        pub_memo_bump(g_pub_memo.calls);
+        memo_flip = hle_video_flip_count();
+        const std::uint64_t seq_now = memo.slot ? static_cast<const PubTargets*>(memo.slot)->seq.load(std::memory_order_relaxed) : 0;
+        hit = run_lookups::pub_hit(memo, &m, m.version, seq_now, erase_gen, memo_flip, kRtPubAge);
+        if (hit) {
+            pub_memo_bump(g_pub_memo.hits);
+            if (mode == 1) return;
+        }
+    }
     std::uint32_t n[kTargetNames];
     names_of(m, n);
     // The way that holds these names, else the one published longer ago (an empty one first). (The command
@@ -28677,20 +28985,61 @@ void publish_run_targets_locked(const RunTargets& m) {
         }
     }
     PubTargets& p = *way;
-    const std::uint64_t erase_gen = g_rt_erase_gen.load(std::memory_order_acquire);
-    if (p.seq.load(std::memory_order_relaxed) && p.erase_gen == erase_gen && p.flip + kRtPubAge / 2 >= hle_video_flip_count() &&
-        std::memcmp(p.names, n, sizeof(n)) == 0 &&
-        std::memcmp(p.m.out.looked, m.out.looked, sizeof(m.out.looked)) == 0 && p.m.out.reached == m.out.reached)
-        return;
-    const std::uint64_t s = p.seq.load(std::memory_order_relaxed);
-    p.seq.store(s + 1, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
-    std::memcpy(p.names, n, sizeof(n));
-    p.m = m;
-    p.erase_gen = erase_gen;
-    p.flip = hle_video_flip_count();
-    p.seq.store(s + 2, std::memory_order_release);
-    g_pub_writes.fetch_add(1, std::memory_order_relaxed);
+    // The way holds these names and lookups, published at this erase generation at most kRtPubAge / 2 flips ago.
+    const auto holds = [&](std::uint64_t flip_now) {
+        return p.seq.load(std::memory_order_relaxed) && p.erase_gen == erase_gen && p.flip + kRtPubAge / 2 >= flip_now &&
+               std::memcmp(p.names, n, sizeof(n)) == 0 && std::memcmp(p.m.out.looked, m.out.looked, sizeof(m.out.looked)) == 0 &&
+               p.m.out.reached == m.out.reached;
+    };
+    const bool kept = holds(hle_video_flip_count());
+    if (hit) {  // compare: the memo returned; the call must have
+        pub_memo_bump(g_pub_memo.checked);
+        if (!kept && holds(memo_flip)) {
+            pub_memo_bump(g_pub_memo.flipped);
+        } else if (!kept) {
+            pub_memo_bump(g_pub_memo.differed);
+            static int logs = 0;  // under g.mu
+            if (logs++ < 8) {
+                host_log("run-lookups: compare: the run's publication at flip %llu: the memo returned, the call publishes - the way %s the "
+                         "memo's (sequence %llu, memo %llu), names %s, lookups %s, erase generation %llu (the way's %llu, memo %llu), the "
+                         "way's flip %llu (memo %llu), the run's version %llu (memo %llu)",
+                         static_cast<unsigned long long>(memo_flip), &p == memo.slot ? "is" : "is not",
+                         static_cast<unsigned long long>(p.seq.load(std::memory_order_relaxed)), static_cast<unsigned long long>(memo.seq),
+                         std::memcmp(p.names, n, sizeof(n)) == 0 ? "the same" : "differ",
+                         std::memcmp(p.m.out.looked, m.out.looked, sizeof(m.out.looked)) == 0 && p.m.out.reached == m.out.reached ? "the same"
+                                                                                                                                 : "differ",
+                         static_cast<unsigned long long>(erase_gen), static_cast<unsigned long long>(p.erase_gen),
+                         static_cast<unsigned long long>(memo.erase_gen), static_cast<unsigned long long>(p.flip),
+                         static_cast<unsigned long long>(memo.flip), static_cast<unsigned long long>(m.version),
+                         static_cast<unsigned long long>(memo.version));
+            }
+        }
+    }
+    if (!kept) {
+        const std::uint64_t s = p.seq.load(std::memory_order_relaxed);
+        p.seq.store(s + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        std::memcpy(p.names, n, sizeof(n));
+        p.m = m;
+        p.erase_gen = erase_gen;
+        p.flip = hle_video_flip_count();
+        p.seq.store(s + 2, std::memory_order_release);
+        g_pub_writes.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (mode) memo = run_lookups::PubMemo{&m, m.version, &p, p.seq.load(std::memory_order_relaxed), p.erase_gen, p.flip};
+}
+
+// The exit report's line (render_report).
+void publish_memo_report() {
+    const unsigned long long calls = g_pub_memo.calls.load(), hits = g_pub_memo.hits.load();
+    if (!calls && !run_lookups::compare()) return;
+    std::string compared;
+    if (run_lookups::compare())
+        compared = "; compare: memo answers checked " + std::to_string(g_pub_memo.checked.load()) + ", differed " +
+                   std::to_string(g_pub_memo.differed.load()) + ", a flip between the two looks " + std::to_string(g_pub_memo.flipped.load());
+    host_log("run-lookups: run target publications (%s): %llu calls, %llu answered by the memo (%.1f%%)%s",
+             run_lookups::compare() ? "compare" : "on", calls, hits, calls ? 100.0 * static_cast<double>(hits) / static_cast<double>(calls) : 0.0,
+             compared.c_str());
 }
 
 namespace {
@@ -28764,7 +29113,7 @@ const std::uint32_t* run_names_of(const RunTargets& m) {
 // Whether the list-mode commit takes draws in this configuration at all (as
 // host_gpu_run_commit's refusals): read under g.mu.
 bool list_config_ok_locked() {
-    if (!g.ok || !recorder_threaded() || g.profile || g.profile_passes || g.has_checkpoints || g.cmd_buffer_marker || !set_cache_on() || !cb_push_on() ||
+    if (!g.ok || !recorder_threaded() || g.profile || g.profile_passes || (g.has_checkpoints && !g.cmd_buffer_marker) || !set_cache_on() || !cb_push_on() ||
         capture_wanted() || g_trace || glitch_on() || g_render_cost_enabled || run_diagnostics_on())
         return false;
     if (g.bindless || (gxvk::buffers_on() && !gxvk_buffers_bind_mode()) || gxvk::arena_wanted() || shadow_in_place_on()) return false;
@@ -29125,6 +29474,9 @@ bool host_gpu_splice(std::uint64_t id) {
     for (std::uint32_t k = 0; k < n.nsegs; ++k) {
         if (g_list_arena.lap[n.seg[k]].load(std::memory_order_acquire) != n.seg_lap[k]) return fall(kSwArena);
     }
+    for (std::uint32_t k = 0; k < n.ngx; ++k) {
+        if (!g_list_gx.lap_is(n.gx_seg[k], n.gx_lap[k])) return fall(kSwArena);  // (its tables' segment taken again)
+    }
     if (!occlusion_draw_plain()) return fall(kSwOcclusion);
     if (g.queued + 2 >= kMaxQueued * kStageSlots) return fall(kSwOther);  // (a mid-frame submit: in order)
     if (gxvk_lists::splice_compare()) {  // drawn in order, and compared with this commit after (host_gpu_splice_compare)
@@ -29136,6 +29488,11 @@ bool host_gpu_splice(std::uint64_t id) {
     if (std::uint64_t want = cw_now; !c.word.compare_exchange_strong(want, lc_word(id, kLcTaken), std::memory_order_acq_rel)) return fall(kSwSegment);
     if (!occlusion_draw_entry()) return fall(kSwOcclusion);  // (issued: plain, so no predicate skips it)
     begin_recording_locked();
+    // Its tables' segments in the GX ring's pool arena stamped with this recording, then their laps asked again: a take
+    // claims a lap before it reads the stamp (host/gx_tables_ring.h).
+    for (std::uint32_t k = 0; k < n.ngx; ++k) {
+        if (!g_list_gx.splice(n.gx_seg[k], n.gx_lap[k], g.flushes)) return fall(kSwArena);
+    }
     // (Stage 4b.2 without maintenance7: a pass begun for segments holds no inline draw - begun again for it.)
     if ((g_pass.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) && !(g_pass.flags & VK_RENDERING_CONTENTS_INLINE_BIT_KHR))
         pass_restart_locked(0);
@@ -29523,6 +29880,7 @@ struct Segment {
     std::vector<Set> sets;
     std::vector<std::uint32_t> homes;
     std::vector<std::pair<std::uint32_t, std::uint64_t>> cb_segs, pr_segs;  // the list arena's and the params region's segments, laps
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> gx_segs;           // the GX ring's pool arena's (host/gx_tables_ring.h)
     struct Pipe {
         GfxPipeline* p;
         std::uint32_t draws, gx;
@@ -29861,6 +30219,7 @@ void build_segment(const gxvk_lists::detail::ListRec& r, const std::uint64_t* wo
     sg.sets.clear();
     sg.homes.clear();
     sg.cb_segs.clear();
+    sg.gx_segs.clear();
     sg.pipes.clear();
     sg.vs_other.clear();
     const ListCommit& head = all[r.id[m0] & (kListCommits - 1)];
@@ -29896,6 +30255,11 @@ void build_segment(const gxvk_lists::detail::ListRec& r, const std::uint64_t* wo
             bool noted = false;
             for (const auto& [s2, l2] : sg.cb_segs) noted |= s2 == ln.seg[i] && l2 == ln.seg_lap[i];
             if (!noted) sg.cb_segs.emplace_back(ln.seg[i], ln.seg_lap[i]);
+        }
+        for (std::uint32_t i = 0; i < ln.ngx; ++i) {
+            bool noted = false;
+            for (const auto& [s2, l2] : sg.gx_segs) noted |= s2 == ln.gx_seg[i] && l2 == ln.gx_lap[i];
+            if (!noted) sg.gx_segs.emplace_back(ln.gx_seg[i], ln.gx_lap[i]);
         }
         if (GfxPipeline* const p = static_cast<GfxPipeline*>(c.drew)) {
             std::uint32_t pat = static_cast<std::uint32_t>(sg.pipes.size());
@@ -30194,6 +30558,9 @@ bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word) {
     for (const auto& [s2, lap] : sg.pr_segs) {
         if (g_list_params.lap[s2].load(std::memory_order_acquire) != lap) return fall(kSfArena);
     }
+    for (const auto& [s2, lap] : sg.gx_segs) {
+        if (!g_list_gx.lap_is(s2, lap)) return fall(kSfArena);
+    }
     if (!occlusion_draw_plain()) return fall(kSfOcclusion);
     if (gxvk_lists::segments_compare()) {  // drawn in order, each member compared with its commit (host_gpu_splice_compare)
         std::memcpy(t_seg_would, sg.ids, sizeof(std::uint64_t) * sg.count);
@@ -30202,6 +30569,9 @@ bool host_gpu_splice_segment(std::uint64_t id, std::uint64_t word) {
         return fall(kSfCompare);
     }
     begin_recording_locked();
+    for (const auto& [s2, lap] : sg.gx_segs) {  // (stamped, then asked again: as host_gpu_splice)
+        if (!g_list_gx.splice(s2, lap, g.flushes)) return fall(kSfArena);
+    }
     if (g_seg_inline) {
         // Replayed by the recorder into the command buffer itself, chained (a pass begun for secondaries ends first).
         if ((g_pass.flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) && !(g_pass.flags & VK_RENDERING_CONTENTS_INLINE_BIT_KHR))
@@ -30431,6 +30801,11 @@ void describe_draw_record(std::uint64_t index) {
              static_cast<unsigned long long>(r.tex[0]), static_cast<unsigned long long>(r.tex[1]),
              static_cast<unsigned long long>(r.tex[2]), static_cast<unsigned long long>(r.tex[3]), r.indexed ? " idx" : "");
 }
+// The pipeline name of recorded draw `index`, or null once the ring has moved past it (BBHOST_MARKER_TRACE).
+const char* draw_record_name(std::uint64_t index) {
+    if (index >= g_draw_rec_next || (g_draw_rec_next - index) > kDrawRecs) return nullptr;
+    return g_draw_recs[index % kDrawRecs].name;
+}
 }  // namespace gpu
 
 void host_gpu_hang_report() {
@@ -30449,9 +30824,13 @@ void host_gpu_hang_report() {
     }
     const std::uint64_t next = g_draw_rec_next;
     const std::uint64_t first = next > 6 ? next - 6 : 0;
-    host_log("hang: %llu draws recorded, %llu dispatches, %llu queued, pass %s",
+    // The recent-draw ring is kept for the progress markers only in their window (host/gpu_markers.h - a loading
+    // screen's by default): out of it, the draws it lists are that window's last, not the ones at this hang.
+    const bool kept = host_tooling() || glitch_on() || markers_record_draws();
+    host_log("hang: %llu draws recorded, %llu dispatches, %llu queued, pass %s%s",
              static_cast<unsigned long long>(g.draws.load()), static_cast<unsigned long long>(g.dispatches.load()),
-             static_cast<unsigned long long>(g.queued), g_pass.active ? "open" : "closed");
+             static_cast<unsigned long long>(g.queued), g_pass.active ? "open" : "closed",
+             next && !kept ? "; the draws below are the progress markers' last window's (a loading screen's), not this hang's" : "");
     for (std::uint64_t i = first; i < next; ++i) {
         const DrawRec& r = g_draw_recs[i % kDrawRecs];
         host_log("  hang draw[%llu] %s n=%u prim=%u vp=(%.0f,%.0f %.0fx%.0f) rt0=0x%llx tex=0x%llx,0x%llx",

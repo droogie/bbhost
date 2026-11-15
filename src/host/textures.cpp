@@ -4510,7 +4510,11 @@ VkSampler sampler_anisotropic(VkSampler base, int level) {
     return out;
 }
 
-VkSampler sampler_nearest(VkSampler base) {
+namespace {
+// sampler_nearest and sampler_linear: `base` with its texel filter changed,
+// each its own memo and map (a template's statics are per instance).
+template <bool kLinear>
+VkSampler sampler_filtered(VkSampler base) {
     if (!base) return base;
     // The answer for this thread's last few, in front of the map (samplers
     // are never destroyed, so an entry never goes stale).
@@ -4534,13 +4538,19 @@ VkSampler sampler_nearest(VkSampler base) {
         // would take the hardware's four-sample blend away.
         if (rec != g_sampler_records.end() && !rec->second.compareEnable) {
             const VkSamplerCreateInfo& was = rec->second;
-            if (was.magFilter != VK_FILTER_NEAREST || was.minFilter != VK_FILTER_NEAREST || was.mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST ||
-                was.anisotropyEnable) {
+            const bool change = kLinear ? was.magFilter != VK_FILTER_LINEAR || was.minFilter != VK_FILTER_LINEAR
+                                        : was.magFilter != VK_FILTER_NEAREST || was.minFilter != VK_FILTER_NEAREST ||
+                                              was.mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST || was.anisotropyEnable;
+            if (change) {
                 VkSamplerCreateInfo sci = was;
-                sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
-                sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-                sci.anisotropyEnable = VK_FALSE;
-                sci.maxAnisotropy = 1.0f;
+                if (kLinear) {
+                    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;  // the mip mode and anisotropy as they were
+                } else {
+                    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+                    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                    sci.anisotropyEnable = VK_FALSE;
+                    sci.maxAnisotropy = 1.0f;
+                }
                 if (vkCreateSampler(g.device, &sci, nullptr, &out) == VK_SUCCESS)
                     g_sampler_records[out] = sci;
                 else
@@ -4554,6 +4564,10 @@ VkSampler sampler_nearest(VkSampler base) {
     m.out = out;
     return out;
 }
+}  // namespace
+
+VkSampler sampler_nearest(VkSampler base) { return sampler_filtered<false>(base); }
+VkSampler sampler_linear(VkSampler base) { return sampler_filtered<true>(base); }
 
 // Stage 4b.1a's reader path (under cache_rw's shared lock): the sampler made
 // for these words, null when it is not made yet.
@@ -5202,10 +5216,17 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     // Depth layouts (render.cpp): a depth target is copied in GENERAL, as every image here.
     if (src.rt) rt_set_layout_locked(*src.rt, VK_IMAGE_LAYOUT_GENERAL);
     if (dst.rt) rt_set_layout_locked(*dst.rt, VK_IMAGE_LAYOUT_GENERAL);
+    // The barriers and the copy as the stream's ops (host/recorder.cpp): recorded in place, each copy token drained
+    // the recorder - 13 a flip at Old Yharnam and Central Yharnam. BBHOST_STREAM_COPY_TOKEN=0: in place, as before.
+    static const bool as_ops = [] {
+        const char* e = std::getenv("BBHOST_STREAM_COPY_TOKEN");
+        return !(e && e[0] == '0');
+    }();
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (as_ops) rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    else vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     const VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     VkImageCopy r{};
     r.srcSubresource = {aspect, c.src_mip - src.drop, c.src_layer, 1};
@@ -5219,11 +5240,13 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
         std::snprintf(key, sizeof(key), "img-copy-%ux%u-f%d", c.w, c.h, static_cast<int>(dst.format));
         profile_begin_locked(&profile_names.emplace(key, key).first->second);
     }
-    vkCmdCopyImage(g_cmd(), src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    if (as_ops) rec().copy_image(src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    else vkCmdCopyImage(g_cmd(), src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     if (g.profile) profile_end_locked();
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (as_ops) rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    else vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     if (dst.surface) {
         surface_written(*dst.surface);
         static_changed(*dst.surface);

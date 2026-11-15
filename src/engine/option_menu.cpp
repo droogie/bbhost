@@ -1,5 +1,7 @@
 #include "engine/option_menu.h"
 #include "engine/graphics_patch.h"
+#include "engine/option_rows.h"
+#include "engine/plugin_dialog.h"
 #include "host/window.h"
 
 #include "core/elf.h"
@@ -593,8 +595,9 @@ std::uint64_t g_gfx_vtable = 0;
 std::uint64_t g_gfx_base_depth = 0;  // its popup stack with nothing open on it
 
 
-// PC Effects: motion blur and depth of field (shader patches,
-// host/shader_patch.h), chromatic aberration and vignette, and two sliders -
+// PC Effects: motion blur (a shader patch, host/shader_patch.h), depth of
+// field (YEBIS's own switch, engine/graphics_patch.cpp), chromatic aberration
+// and vignette, and two sliders -
 // bloom (10 the area's own glare, 0 none) and saturation (5 the area's own,
 // 0 black and white).
 Toggle g_effects[] = {
@@ -1911,6 +1914,9 @@ GUEST_ABI void* pc_system_finalize(void* out, void* builder, void* arg3) {
         GuestFunction f(kRowFunctorVTable, r[1]);
         hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow), builder, c.buf, f.buf, &flag);
     }
+    // Plugins: the plugins' named menus in the game's own dialog
+    // (engine/plugin_dialog.h), while any plugin has one.
+    plugin_dialog_system_row(builder);
     if (move_exit) {
         // Three arguments and no flag: Exit Game is not a section opener, it
         // is a command, and sub_1f4c9a0 is what builds one.
@@ -2178,6 +2184,7 @@ void option_menu_poll() {
 }
 
 bool option_menu_click_decides(void* list, int index) {
+    if (plugin_dialog::click_decides(list, index)) return true;  // a plugin's button, text or menu row
     return g_installed && g_keys.dialog && list == g_keys.rows && index >= 1 && index < kKeysRows &&
            (keys_row_bound(index) || keys_row_reset(index)) && keys_alive();
 }
@@ -2187,6 +2194,7 @@ void option_menu_list_update(void* comp, bool focused) {
         return;
     }
     g_list_updates.fetch_add(1, std::memory_order_relaxed);  // a menu is up (option_menu_poll)
+    plugin_dialog::list_update(comp, focused);  // a plugin's menu page (engine/plugin_dialog.h)
     confirm_update();
     auto* c = static_cast<std::uint8_t*>(comp);
     defaults_view_update(c, focused);
@@ -2236,6 +2244,7 @@ void option_menu_install(ElfImage* image) {
     g_installed = true;
     host_log("pc-options: System gains %sPC Enhancements, PC Settings, PC Graphics, PC Upscaling, PC Effects, PC Controls, PC Camera and Key Bindings",
              host_steam_deck() ? "Steam Deck (a Steam Deck), " : "");
+    plugin_dialog_install();  // the plugins' menu pages, in the same movie
 }
 
 bool option_menu_confirm_possible() { return g_installed && gfx_alive(); }
@@ -2255,3 +2264,207 @@ void option_menu_confirm_close() {
     g_confirm_timed_out.store(true);
     hle_pad_tap(menu_confirm_button(), 0, 120);
 }
+
+// ---- The rows for the plugins' menu pages (engine/option_rows.h) ------------------
+
+namespace option_rows {
+
+namespace {
+constexpr std::uint64_t kSetCursor = 0x1ecf6b0;  // a list's cursor moved (engine/menu_pointer.cpp)
+constexpr std::size_t kListCursor = 0x74;
+constexpr std::uint32_t kMsgDialog = 0xcc;
+
+// A row's captions with the host's label and help in place of the message's.
+struct HostCaptions : Captions {
+    HostCaptions(std::uint32_t id, const char16_t* label, const char16_t* help) : Captions(id) {
+        if (label) std::memcpy(&buf[0x00], &label, sizeof(label));
+        if (help) std::memcpy(&buf[0x40], &help, sizeof(help));
+    }
+};
+}  // namespace
+
+bool ready() { return g_installed; }
+void* fn(std::uint64_t bn) { return guest_fn(bn); }
+std::uint64_t addr(std::uint64_t bn) { return guest(bn); }
+
+void opener_functor(Functor& f, void* host_fn) {
+    GuestFunction g(kOpenerFunctorVTable, host_fn);
+    std::memcpy(f.buf, g.buf, sizeof(f.buf));
+    void* self = &f.buf[0];
+    std::memcpy(&f.buf[0x20], &self, sizeof(self));
+}
+void row_functor(Functor& f, void* host_fn) {
+    GuestFunction g(kRowFunctorVTable, host_fn);
+    std::memcpy(f.buf, g.buf, sizeof(f.buf));
+    void* self = &f.buf[0];
+    std::memcpy(&f.buf[0x20], &self, sizeof(self));
+}
+
+std::int64_t open_section(void* root, void* params, const char* name, void* handler) {
+    std::snprintf(g_open_name, sizeof(g_open_name), "%s", name);
+    g_defaults_view = DefaultsView{};
+    const std::int64_t dialog = hle_call_guest<std::int64_t>(guest_fn(kOpenSection), root, params, g_open_name, handler, 0, 0);
+    if (dialog) drop_defaults_row(reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(dialog)));
+    return dialog;
+}
+
+void handler_begin() {
+    alignas(16) std::uint8_t scratch[0x100]{};
+    hle_call_guest<std::int64_t>(guest_fn(kScratchInit), &scratch);
+}
+
+void add_text_row(void* dialog, std::uint8_t* value, std::uint32_t id, const char16_t* label, const char16_t* help,
+                  const char16_t* text) {
+    ::add_text_row(dialog, value, id, label, help, text);
+}
+
+void add_toggle_row(void* dialog, std::uint8_t* value, std::uint32_t id, std::uint8_t def, const char16_t* label,
+                    const char16_t* help) {
+    HostCaptions c(id, label, help);
+    alignas(16) std::uint8_t list[0x100]{};
+    hle_call_guest<std::int64_t>(guest_fn(kBuildOnOff), &list);
+    hle_call_guest<std::int64_t>(guest_fn(kAddChoiceRow), dialog, &c.buf[0], value, &list, &def);
+    std::uint64_t n = 0;
+    std::memcpy(&n, &list[0x98], sizeof(n));
+    free_entries(list, n);
+}
+
+void add_pair_row(void* dialog, std::uint8_t* value, std::uint32_t id, const char16_t* first, const char16_t* second,
+                  std::uint8_t def, const char16_t* label, const char16_t* help) {
+    HostCaptions c(id, label, help);
+    alignas(16) std::uint8_t list[0x100]{};
+    const char16_t* texts[2] = {first, second};
+    for (int i = 0; i < 2; ++i) {
+        alignas(16) std::uint8_t entry[0x48];
+        make_entry(entry, i, texts[i]);
+        hle_call_guest<std::int64_t>(guest_fn(kChoiceAppend), &list, &entry);
+        free_entries(entry, 1);
+    }
+    hle_call_guest<std::int64_t>(guest_fn(kAddChoiceRow), dialog, &c.buf[0], value, &list, &def);
+    std::uint64_t n = 0;
+    std::memcpy(&n, &list[0x98], sizeof(n));
+    free_entries(list, n);
+}
+
+void add_slider_row(void* dialog, std::uint8_t* value, std::uint32_t id, std::uint8_t def, const char16_t* label,
+                    const char16_t* help) {
+    HostCaptions c(id, label, help);
+    hle_call_guest<std::int64_t>(guest_fn(kAddSliderRow), dialog, &c.buf[0], value, &def);
+}
+
+int row_count(void* dialog) { return dialog_row_count(dialog); }
+std::uint8_t* row_widget(void* dialog, int row) { return dialog_widget(dialog, row); }
+std::uint8_t* rows_list(void* dialog) { return static_cast<std::uint8_t*>(dialog) + kDialogRows; }
+std::uint8_t* value_list(std::uint8_t* widget) { return widget + kChoiceList; }
+std::uint64_t value_target(std::uint8_t* widget) {
+    std::uint64_t v = 0;
+    std::memcpy(&v, widget + kChoiceValue, sizeof(v));
+    return v;
+}
+void redraw(std::uint8_t* list) { ::redraw(list); }
+void layout(void* dialog) { hle_call_guest<std::int64_t>(guest_fn(kLayoutRows), dialog, 0); }
+void set_cursor(std::uint8_t* list, int index) { hle_call_guest<std::int64_t>(guest_fn(kSetCursor), list, index); }
+int cursor_of(std::uint8_t* list) {
+    std::int32_t c = -1;
+    std::memcpy(&c, list + kListCursor, sizeof(c));
+    return c;
+}
+
+namespace {
+// A record's copy of one of its captions (0x40 bytes: the raw text pointer,
+// then the wstring the row builder copied the text into - its buffer or heap
+// pointer at +0x10, its length at +0x20, its capacity at +0x28, its DL
+// allocator at +0x30, as sub_1f20900 frees its own captions): the heap
+// buffer given back, the string left empty.
+void free_caption_copy(std::uint8_t* c) {
+    std::uint64_t cap = 0, ptr = 0, alloc = 0;
+    std::memcpy(&cap, c + 0x28, sizeof(cap));
+    std::memcpy(&ptr, c + 0x10, sizeof(ptr));
+    std::memcpy(&alloc, c + 0x30, sizeof(alloc));
+    if (cap >= 8 && ptr && alloc) {
+        const std::uint64_t vt = *reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(alloc));
+        const std::uint64_t fn = *reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(vt + 0x70));
+        hle_call_guest<std::int64_t>(reinterpret_cast<void*>(static_cast<std::uintptr_t>(fn)), alloc, ptr);
+    }
+    const std::uint64_t seven = 7, zero = 0;
+    std::memcpy(c + 0x28, &seven, sizeof(seven));
+    std::memcpy(c + 0x20, &zero, sizeof(zero));
+    std::memset(c + 0x10, 0, 2);
+}
+}  // namespace
+
+void clear_rows(void* dialog) {
+    auto* d = static_cast<std::uint8_t*>(dialog);
+    std::uint64_t begin = 0, end = 0;
+    std::memcpy(&begin, d + kItemsBegin, sizeof(begin));
+    std::memcpy(&end, d + kItemsEnd, sizeof(end));
+    if (!begin || end < begin || (end - begin) % kItemStride != 0) return;
+    for (std::uint64_t r = end; r > begin; r -= kItemStride) {
+        auto* rec = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(r - kItemStride));
+        free_caption_copy(rec);
+        free_caption_copy(rec + 0x40);
+        std::uint64_t widget = 0;
+        std::memcpy(&widget, rec + kItemWidget, sizeof(widget));
+        static const bool trace = [] {
+            const char* e = std::getenv("BBHOST_PLUGIN_DIALOG_LOG");
+            return e && e[0] == '1';
+        }();
+        if (trace && widget)
+            host_log("plugin-dialog: row %llu's widget %llx refs %d", static_cast<unsigned long long>((r - kItemStride - begin) / kItemStride),
+                     static_cast<unsigned long long>(widget), *reinterpret_cast<std::int32_t*>(static_cast<std::uintptr_t>(widget + 8)));
+        release_ref(widget);
+    }
+    std::memcpy(d + kItemsEnd, &begin, sizeof(begin));
+}
+
+const char16_t* message(std::uint32_t id) { return message_text(id); }
+const char16_t* dialog_message(std::uint32_t id) {
+    alignas(16) std::uint8_t caption[0x40]{};
+    hle_call_guest<std::int64_t>(guest_fn(kMsgRepository), &caption[0], kMsgDialog, id);
+    const char16_t* t = nullptr;
+    std::memcpy(&t, &caption[0], sizeof(t));
+    Captions::free_wstring(&caption[0x08]);
+    return t;
+}
+
+std::uint64_t ask(std::uint8_t* dialog, std::uint32_t msg, void* yes) {
+    std::uint64_t depth = 0;
+    std::memcpy(&depth, dialog + 0x40, sizeof(depth));
+    if (depth + 1 >= 5) return 0;  // the stack is full
+    alignas(16) std::uint8_t caption[0x40]{};
+    hle_call_guest<std::int64_t>(guest_fn(kMsgRepository), &caption[0], kMsgDialogText, msg);
+    std::uint64_t box = 0, command = 0, popup = 0;
+    hle_call_guest<std::int64_t>(guest_fn(kBoxFromCaption), &box, dialog + 0x48, &caption[0]);
+    GuestFunction action(kOpenerFunctorVTable, yes);
+    hle_call_guest<std::int64_t>(guest_fn(kCommandFromAction), &command, &action.buf[0], 2);
+    hle_call_guest<std::int64_t>(guest_fn(kPopupFromBox), &popup, &box, &command);
+    if (popup) {
+        const std::uint64_t slot = popup_slot(dialog, depth);
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(slot)), &popup, sizeof(popup));  // the stack's reference
+        ++*reinterpret_cast<std::int32_t*>(static_cast<std::uintptr_t>(popup + 8));                      // and the caller's
+        depth += 1;
+        std::memcpy(dialog + 0x40, &depth, sizeof(depth));
+    }
+    release_ref(command);
+    release_ref(box);
+    Captions::free_wstring(&caption[0x08]);
+    return popup;
+}
+std::uint64_t popup_depth(std::uint8_t* dialog) {
+    std::uint64_t depth = 0;
+    std::memcpy(&depth, dialog + 0x40, sizeof(depth));
+    return depth;
+}
+void release(std::uint64_t obj) { release_ref(obj); }
+std::int32_t refs(std::uint64_t obj) { return obj ? *reinterpret_cast<std::int32_t*>(static_cast<std::uintptr_t>(obj + 8)) : 0; }
+
+void add_command_row(void* builder, std::uint32_t id, void* open) {
+    Captions c(id);
+    GuestFunction f(kRowFunctorVTable, open);
+    std::int64_t flag = 0;
+    hle_call_guest<std::int64_t>(guest_fn(kAddCommandRow), builder, c.buf, f.buf, &flag);
+}
+
+void* section_screen(void* out, void* ctx, void* opener) { return row_open(out, ctx, opener); }
+
+}  // namespace option_rows

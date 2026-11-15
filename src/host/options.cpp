@@ -157,7 +157,6 @@ enum SettingId {
     kSkipLogos,
     kPerformanceMode,
     kDebugMenu,
-    kDebugCamera,
     kChangeAppearance,
     kRebirth,
     kFivePlayers,
@@ -167,6 +166,7 @@ enum SettingId {
     kMenuTextSize,
     kMenuHue,
     kMenuVibrance,
+    kTextScale,
     kSettingCount,
 };
 
@@ -367,8 +367,12 @@ Setting g_set[kSettingCount] = {
      "The game's own anti-aliasing pass, over the finished picture. Off while TAA, FSR, DLSS or a plugin's own anti-aliasing "
      "takes its place: they do the anti-aliasing, and this pass after them would only soften the picture again.",
      false},
+    // Off is YEBIS's own switch, cleared each view (engine/graphics_patch.cpp):
+    // none of the blur's passes run.
     {"depth_of_field", "Depth of field", {"Off", "On"}, 1,
-     "Blurs distant scenery; indoors there is rarely anything far enough to blur.", false},
+     "Blurs distant scenery, and what is out of focus in cutscenes; indoors there is rarely anything far enough to "
+     "blur. Off leaves it out everywhere, and its passes are not drawn.",
+     false},
     {"chromatic_aberration", "Chromatic aberration", {"Off", "On"}, 1,
      "The colour fringing at the edges of the frame.", false},
     // Two of the area's draw parameters (param/drawparam), scaled or cleared
@@ -604,8 +608,9 @@ Setting g_set[kSettingCount] = {
     // engine/live_resolution.cpp's: the cameras widened (or the height kept for
     // a taller one), the HUD at 16:9 in the middle, the plates and the lock-on
     // where the camera puts them. 960x600 and 1024x640 are the Deck's screen at
-    // 75% and 80%: it holds 60 fps there (pixel-bound at 1280x800, ~45), and
-    // the presenter upscales by FSR 1. The largest want a GPU to match - or
+    // 75% and 80%: it holds 60 fps there (pixel-bound at 1280x800, ~45), the
+    // 3D at that size and the HUD at the screen's (a Resolution below the
+    // window's, engine/render_scale.cpp). The largest want a GPU to match - or
     // Upscaling below Native AA, which draws the 3D at a fraction of them.
     {"resolution", "Resolution", {"640x360", "960x540", "1280x720", "1366x768", "1440x810", "1600x900", "1920x1080", "2560x1440",
                                   "2880x1620", "3200x1800", "3840x2160", "5120x2880", "7680x4320", "960x600", "1024x640",
@@ -616,7 +621,8 @@ Setting g_set[kSettingCount] = {
                                   "4800x1200", "5760x1200", "7680x1600", "5400x1080", "3840x720", "4800x900", "5760x1080",
                                   "7680x1440", "11520x2160", "7680x1080", "10320x1440"}, 6,
      "What the game renders at. 1920x1080 is what it shipped with; ultrawide, super-ultrawide, multi-screen, 16:10, 4:3 and "
-     "square screens are filled, the HUD kept 16:9 in the middle. The largest sizes can need a restart: the memory for them "
+     "square screens are filled, the HUD kept 16:9 in the middle. Below the window's size only the 3D is drawn smaller: the "
+     "menus, the HUD and the post effects stay at the window's, with any Upscaling choice, Off included. The largest sizes can need a restart: the memory for them "
      "is set aside when the game starts, and past about 11.5 million pixels (5120x2880, 7680x2160 and up) only Upscaling below "
      "Native AA, which draws the 3D smaller, fits in it.",
      true},
@@ -642,11 +648,6 @@ Setting g_set[kSettingCount] = {
     // plugin replaced (engine/debug_menu.h): no row shows it, and an "On" an
     // older bbhost saved turns the plugin on once (main.cpp).
     {"debug_menu", "Debug menu", {"Off", "On"}, 0, "Replaced by the Debug Menu plugin.", true},
-    // Lance McDonald's "Restore Debug Camera" (patches/debug-camera.toml). Its
-    // code takes the place of a debug-only load-test step, so the debug menu's
-    // LOAD TEST and DUNGEON MOVEMAP TEST crash while it is on.
-    {"debug_camera", "Debug camera", {"Off", "On"}, 0,
-     "Requires a restart. Hold Interact (E) and press L3 (Left Ctrl) to cycle the free camera's modes.", true},
     // The PC enhancements: additions to the game itself, each read once at
     // start (main.cpp hands them to config_set_enhancements), all on unless
     // bbhost.toml's [world] says otherwise. Off, all of them, is the game as it
@@ -681,6 +682,15 @@ Setting g_set[kSettingCount] = {
      "is their own blue and violet.",
      false},
     {"menu_vibrance", "Menu vibrance", signed_steps(-100, 100, "%"), 100, "How much colour bbhost's own menus have: -100% is black and white, 0% their own, +100% the most.", false},
+    // The game's own text: the scale MenuFont_01 is mapped with, kept in the
+    // font map and rewritten there when it changes (engine/graphics_patch.cpp,
+    // map_font_hook) - what Kyo's "50% Text scale" patch set to 0.5. A movie
+    // reads it as it makes its font handles: a menu window when it is made
+    // again, the HUD at a loading screen or the title (tried 2026-11-13).
+    {"text_scale", "Text scale", signed_steps(50, 100, "%", false), 50,
+     "The size of the game's own text. 100% is the game's own; smaller looks better at high resolutions. A menu "
+     "takes the new size when it is opened again; the HUD after the next loading screen or a return to the title.",
+     false},
 };
 
 // The in-game menu's pages, one a header, in the setup window's order: Game
@@ -739,6 +749,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kTextureQuality},
     {Row::Option, nullptr, kSfxTextureQuality},
     {Row::Option, nullptr, kModelDetail},
+    {Row::Option, nullptr, kTextScale},
     {Row::Option, nullptr, kAnisotropicFiltering},
     {Row::Option, nullptr, kHdMotionBlur},
     {Row::Option, nullptr, kHdMotionBlurRes},
@@ -1336,8 +1347,8 @@ void apply(int id) {
             // A change the player made asks to be kept (g_res_prev set by
             // set_index); going back, and the start, ask nothing.
             if (output_of(&w, &h)) {
-                // The game's size (the window's, with an upscaler and a
-                // smaller Resolution); the 3D's at it is the rebuild's.
+                // The game's size (the window's, with a smaller
+                // Resolution); the 3D's at it is the rebuild's.
                 unsigned cw = 0, ch = 0;
                 live_resolution_current(&cw, &ch);
                 if (cw == w && ch == h) {
@@ -1391,7 +1402,6 @@ void apply(int id) {
         }
         case kSkipLogos:
         case kDebugMenu:
-        case kDebugCamera:
         case kChangeAppearance:
         case kRebirth:
         case kFivePlayers:
@@ -1403,6 +1413,8 @@ void apply(int id) {
         case kMenuHue:
         case kMenuVibrance:
             break;  // the menus read them every frame (host_opt_menu_text_scale, host_opt_menu_colour)
+        case kTextScale:
+            break;  // the settings object carries it (engine/graphics_patch.cpp)
         default: break;
     }
 }
@@ -1564,10 +1576,10 @@ void rebuild_settings() {
         h.motion_vectors = std::clamp(index_of(kMotionVectors), 0, 3);
         h.char_motion = index_of(kCharMotion) != 1;  // Precise, Off (the game's velocity map alone)
     }
+    h.text_scale = static_cast<float>(50 + std::clamp(index_of(kTextScale), 0, 50)) / 100.0f;
     h.skip_logos = on_of(kSkipLogos);
     h.performance_mode = on_of(kPerformanceMode);
     h.debug_menu = on_of(kDebugMenu);
-    h.debug_camera = on_of(kDebugCamera);
     h.change_appearance = on_of(kChangeAppearance);
     h.rebirth = on_of(kRebirth);
     h.five_players = on_of(kFivePlayers);
@@ -1709,6 +1721,7 @@ void host_options_load() {
                          static_cast<int>(kSkillIssue), static_cast<int>(kFullPhantomHp), static_cast<int>(kAutoReplenish)})
         g_default_index[static_cast<std::size_t>(id)] = g_set[id].index;
     const std::string path = options_path();
+    bool text_scale_saved = false;  // the file has a text_scale (below)
     FILE* f = std::fopen(path.c_str(), "r");
     if (f) {
         char line[512];
@@ -1763,8 +1776,16 @@ void host_options_load() {
                 continue;
             }
             if (key == "old_hunters") continue;  // v0.2.9's PC enhancement: The Old Hunters is always on now
+            // The Debug camera: it switched a patch manifest no package carries
+            // (patches/debug-camera.toml), so it never worked in a release. A
+            // saved one is set aside; the next save drops it.
+            if (key == "debug_camera") {
+                if (val == "On") host_log("options: the Debug camera is gone (it never worked in a release); the saved On is set aside");
+                continue;
+            }
             // Looked at again once the file's version is known (below).
             if (key == "frame_cap") frame_cap_val = val;
+            if (key == "text_scale") text_scale_saved = true;
             if (key == "window_mode") window_mode_val = val;
             // HD motion blur quality's were Quarter, Half and Full until 2026-11-05.
             if (key == "hd_motion_blur_res") val = val == "Quarter" ? "Low" : val == "Half" ? "Medium" : val == "Full" ? "High" : val;
@@ -1865,6 +1886,14 @@ void host_options_load() {
             save();  // as version 2, so a later Off is the player's and stays
         }
         host_log("options: read %s", path.c_str());
+    }
+    // Text scale was the patch text-scale-50 until 2026-11-13: a player who
+    // had it on keeps 50% (once: the save writes text_scale, which wins from then on).
+    if (!text_scale_saved && config_value("patches.text-scale-50") == "true") {
+        g_set[kTextScale].index = 0;
+        g_dirty = true;
+        save();
+        host_log("options: the patch text-scale-50 was on; Text scale reads as %s", "50%");
     }
     // BBHOST_ACCOUNT=name:token, for a scripted run that must not touch the file.
     if (const char* e = std::getenv("BBHOST_ACCOUNT"); e && e[0]) {
@@ -2210,6 +2239,30 @@ bool frame_rate_control(int* cap, bool* custom, int* custom_fps, float width) {
     return changed;
 }
 
+// The Resolution list as the setup window and F10 show it: each size after
+// its aspect ratio, "(16:9) 1280x720" - the list is grouped by ratio already,
+// smallest to largest in each. The values stay plain WxH (saved by name and
+// read with %ux%u); kResolutionAspects runs parallel to them, and a list of
+// another length shows the bare sizes. The game's own list says the same
+// (tools/pc_option_messages.tsv, 117010-117077).
+const char* const kResolutionAspects[] = {
+    "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:9", "16:10",
+    "16:10", "16:10", "16:10", "16:10", "16:10", "16:10", "16:10", "16:10", "4:3", "4:3", "4:3", "4:3", "4:3", "4:3",
+    "5:4", "1:1", "1:1", "1:1", "21:9", "21:9", "21:9", "21:9", "21:9", "16:5", "32:9", "32:9", "32:9", "18:5",
+    "4:1", "4:1", "24:5", "24:5", "5:1", "16:3", "16:3", "16:3", "16:3", "16:3", "64:9", "43:6",
+};
+const std::vector<const char*>& resolution_labels(const Setting& s) {
+    static std::vector<std::string> text;
+    static std::vector<const char*> labels;
+    if (labels.empty()) {
+        constexpr std::size_t kAspects = sizeof(kResolutionAspects) / sizeof(kResolutionAspects[0]);
+        for (std::size_t v = 0; v < s.values.size(); ++v)
+            text.push_back(s.values.size() == kAspects ? std::string("(") + kResolutionAspects[v] + ") " + s.values[v] : s.values[v]);
+        for (const std::string& t : text) labels.push_back(t.c_str());
+    }
+    return labels;
+}
+
 void setting_row(int id, const char* label = nullptr, const char* note = nullptr, const char* const* names = nullptr) {
     const Setting& s = g_set[id];
     if (!label) label = s.label;
@@ -2285,9 +2338,9 @@ void setting_row(int id, const char* label = nullptr, const char* note = nullptr
         }
         ImGui::PopID();
         return;
-    } else if (id == kResolution || id == kMenuTextSize) {
+    } else if (id == kResolution || id == kMenuTextSize || id == kTextScale) {
         ImGui::SetNextItemWidth(cw);
-        ui::combo("##v", &want, s.values.data(), n);
+        ui::combo("##v", &want, id == kResolution ? resolution_labels(s).data() : s.values.data(), n);
     } else if (n <= 4 || id == kShadowResolution || id == kUpscaler || id == kAnisotropicFiltering) {
         // Shadow resolution's six sizes and Upscaling's five (Off, TAA, FSR 3,
         // FSR 4, DLSS - a slider once TAA made five) as buttons too, as wide as
@@ -2402,22 +2455,28 @@ void account_page() {
         ImGui::PopFont();
         ImGui::PushStyleColor(ImGuiCol_Text, ui::kTextDim);
         ImGui::TextUnformatted(hle_np_online_status().c_str());
-        // The connection test's verdict as the setup window had it before
-        // the game started (its own test, or the account's last one): the
-        // test itself runs only there, from the game's port while the game
-        // is closed. Nothing when the setup window did not open.
+        // The connection test's result as the setup window's card said it
+        // before the game started (its own test, or the account's last one),
+        // in the card's words and colour: the test itself runs only there,
+        // from the game's port while the game is closed. Nothing when the
+        // setup window did not open.
         if (const net::nat::Remembered c = net::nat::remembered(); c.known) {
             const double now = static_cast<double>(std::time(nullptr));
-            ImGui::TextUnformatted(("Connection test (" + net::nat::ago(c.at, now) + (c.saved ? "" : ", not saved") +
-                                    "): " + net::nat::headline(c.verdict))
-                                       .c_str());
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-                ui::tooltip("Connection test",
-                            std::string(net::nat::meaning(c.verdict)) +
-                                (c.inbound != net::nat::Inbound::NotTested
-                                     ? " " + net::nat::inbound_line(c.inbound, config().p2p_port > 0 ? config().p2p_port : 9307, c.verdict)
-                                     : std::string()),
-                            "The setup window's Game page runs it again (bbhost --setup, while the game is closed).");
+            const net::nat::Tone t = c.card.tone;
+            ImGui::PushStyleColor(ImGuiCol_Text, t == net::nat::Tone::Good ? ui::kGood
+                                                 : t == net::nat::Tone::Warn ? ui::kWarn
+                                                 : t == net::nat::Tone::Bad  ? ui::kBad
+                                                                             : ui::kTextDim);
+            ImGui::TextUnformatted(("Connection test (" + net::nat::ago(c.at, now) + (c.saved ? "" : ", not saved") + "): " + c.card.head).c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
+                std::string text = c.card.sentence;
+                for (const std::string* line : {&c.card.incoming, &c.card.action}) {
+                    if (!line->empty()) text += " " + *line;
+                }
+                for (std::size_t i = 0; i < c.card.steps.size(); ++i) text += "\n" + std::to_string(i + 1) + ". " + c.card.steps[i];
+                ui::tooltip("Connection test", text, "The setup window's Game page runs it again (bbhost --setup, while the game is closed).");
+            }
         }
         ImGui::PopStyleColor();
         ImGui::EndGroup();
@@ -2828,9 +2887,23 @@ bool host_opt_output_size(int* w, int* h) {
 }
 
 namespace {
+// Whether the 3D can be drawn at a size of its own (engine/render_scale.cpp
+// render_scale_plan): off with BBHOST_RENDER_SCALE=0 or BBHOST_LIVE_RESOLUTION=0.
+bool render_scale_possible() {
+    static const bool on = [] {
+        for (const char* name : {"BBHOST_RENDER_SCALE", "BBHOST_LIVE_RESOLUTION"})
+            if (const char* e = std::getenv(name); e && e[0] == '0') return false;
+        return true;
+    }();
+    return on;
+}
+
 void output_for(int* w, int* h) {
     const bool look = scene_look_scale();
-    if (!host_opt_upscaler_chosen() && !look) return;
+    // Upscaling Off too: a Resolution below the window draws the 3D at it and
+    // keeps the game and its HUD at the window's size, as TAA, FSR and DLSS
+    // do - the 3D brought up by YEBIS's copy (engine/render_scale.cpp).
+    if (!host_opt_upscaler_chosen() && !look && !render_scale_possible()) return;
     int ww = 0, wh = 0;
     if (g_set[kWindowMode].index == 0) {
         ww = config().width;
@@ -2857,6 +2930,14 @@ void output_for(int* w, int* h) {
 }  // namespace
 
 int host_opt_resolution_index() { return g_set[kResolution].index; }
+
+const char* const* host_opt_resolution_labels(int* n) {
+    const std::vector<const char*>& labels = resolution_labels(g_set[kResolution]);
+    *n = static_cast<int>(labels.size());
+    return labels.data();
+}
+
+const char* host_opt_resolution_note() { return g_set[kResolution].note; }
 
 void host_opt_set_resolution_index(int i) {
     if (i < 0 || static_cast<std::size_t>(i) >= g_set[kResolution].values.size()) {
@@ -2997,14 +3078,15 @@ void host_options_save_now() {
 
 int host_options_selftest(const std::string& dir) {
     // An options file as v0.2.31 wrote it, Character motion at Off (then
-    // called Velocity map) and one other setting away from its default.
+    // called Velocity map) and one other setting away from its default - and
+    // the Debug camera on, a setting that is gone.
     const std::string path = dir + "/bbhost-options.toml";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     {
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
         f << "# bbhost PC port options. Written by the options screen (F10).\n[options]\nversion = \"8\"\n"
-             "char_motion = \"Velocity map\"\nssr_quality = \"Half\"\n";
+             "char_motion = \"Velocity map\"\ndebug_camera = \"On\"\nssr_quality = \"Half\"\n";
         if (!f) {
             std::printf("options selftest: cannot write %s\n", path.c_str());
             return 1;
@@ -3034,6 +3116,7 @@ int host_options_selftest(const std::string& dir) {
     check(text.find("\nchar_motion = \"Off\"\n") != std::string::npos, "written back as char_motion = \"Off\"");
     check(text.find("Velocity map") == std::string::npos, "with no Velocity map left in the file");
     check(text.find("\nssr_quality = \"Half\"\n") != std::string::npos, "and ssr_quality = \"Half\" kept");
+    check(text.find("debug_camera") == std::string::npos, "and the Debug camera's line, a setting that is gone, left out");
     std::printf("options selftest: %s (%s)\n", failed ? "FAILED" : "passed", path.c_str());
     return failed ? 1 : 0;
 }

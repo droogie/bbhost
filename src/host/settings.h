@@ -89,6 +89,9 @@ struct HostSettings {
     // 2, 4, 8 or 16 at least (host/render.cpp anisotropy_samplers). Live.
     int anisotropy = 0;
     float shadow_scale = 1.0f;  // the cascades stretched: 1.0 to 3.0
+    // The game's text, 0.5 to 1.0: MenuFont_01's scale in the game's font
+    // map (engine/graphics_patch.cpp, map_font_hook).
+    float text_scale = 1.0f;
     bool dynamic_shadows = true;  // the dynamic lights' shadows (graphics_patch.cpp, +0x296e)
     // Shadow resolution (engine/patch_manifest.cpp's shadow-resolution, read once as
     // the game starts): 0 Lowest, 1 Low, 2 Default (the game's sizes), 3 High,
@@ -136,7 +139,6 @@ struct HostSettings {
     bool skip_logos = false;
     bool performance_mode = false;  // the post-effects and YEBIS passes off (engine/patch_manifest.cpp)
     bool debug_menu = false;
-    bool debug_camera = false;  // patches/debug-camera.toml (Lance McDonald's free camera)
     // The PC enhancements (also read once, through config_set_enhancements)
     bool change_appearance = true;
     bool rebirth = true;

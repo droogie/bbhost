@@ -23,7 +23,8 @@
 // walks), lets the GPU run one more of the submissions it was handed - its
 // labels land, the oldest blocks come free - and runs the rename again, a
 // submission at a time; then, if that is not enough, it lets the GPU catch up
-// on everything recorded, and then the command processor walk what it still
+// on everything recorded (outside the renderer's lock: block_reclaim.cpp),
+// and then the command processor walk what it still
 // holds first, running the rename after each. Waiting for everything at once
 // (a flush) at every one drained the GPU and left it idle: at 3840x2160
 // uncapped, where the base lost ~100,000 discard Maps in two places' run,
@@ -72,6 +73,9 @@ constexpr auto kCpBudget = std::chrono::milliseconds(100);
 // The step-at-a-time catch-up's bounds (block_reclaim.cpp's): steps, and time before the flush.
 constexpr int kMaxSteps = 64;
 constexpr auto kStepBudget = std::chrono::milliseconds(200);
+// How long a catch-up of everything recorded waits outside the renderer's
+// lock before it waits under it, as the flush did (block_reclaim.cpp's).
+constexpr std::uint64_t kCatchUpNs = 200'000'000ull;
 
 const bool g_wait = [] {
     const char* e = std::getenv("BBHOST_GX_RENAME_WAIT");
@@ -113,7 +117,7 @@ GUEST_ABI std::uint64_t discard_rename(std::uint64_t table, std::uint64_t ctx, s
     if (r == kNoRoom) {
         // 1. What is recorded: submitted and run, its labels written; the rename again.
         stage = 1;
-        host_gpu_flush();
+        host_gpu_catch_up(kCatchUpNs);
         r = run_game(table, ctx, out, resource);
     }
     if (r == kNoRoom) {
@@ -121,7 +125,7 @@ GUEST_ABI std::uint64_t discard_rename(std::uint64_t table, std::uint64_t ctx, s
         stage = 2;
         const std::uint64_t target = hle_gnm_submitted_total();
         while (hle_gnm_retired_total() < target && std::chrono::steady_clock::now() - t0 < kCpBudget) host_sleep_us(200);
-        host_gpu_flush();
+        host_gpu_catch_up(kCatchUpNs);
         r = run_game(table, ctx, out, resource);
     }
     (r == kNoRoom ? g_still : stage == 0 ? g_by_step : stage == 1 ? g_by_gpu : g_by_cp).fetch_add(1, std::memory_order_relaxed);

@@ -57,3 +57,13 @@ std::uint64_t menu_pointer_tick();
 // CSMouseMan switches the same way - a pointer while UI owns the input,
 // mouse-look otherwise - and the camera and the pointer both key off this.
 bool menu_pointer_in_menu();
+
+// The game's menu sounds for a menu the host draws (a plugin's panel): the
+// request its own widgets post ({id, priority} at 0x597fc60, which
+// sub_1ee9bc0 plays once a frame and clears) - 0 the cursor's move, 100
+// decide, 200 cancel, 1000 a menu opening - kept unless a louder one is
+// pending, as theirs are. From the game's thread (plugins_frame); nothing
+// before menu_pointer_install. The first one's fate is logged: taken (played)
+// or still pending a second later.
+constexpr int kMenuSoundMove = 0, kMenuSoundDecide = 100, kMenuSoundCancel = 200, kMenuSoundOpen = 1000;
+void menu_sound_post(int id, int priority);

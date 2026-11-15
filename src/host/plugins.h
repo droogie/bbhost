@@ -27,10 +27,12 @@ void plugins_event_flag(unsigned id, bool value);
 // One setting a plugin declares (bbhost_plugin.h BbOption), copied.
 struct PluginOptionDesc {
     std::uint32_t type = 0;  // BB_OPT_*, without BB_OPT_LIVE
+    std::uint32_t flags = 0; // the type's flags: BB_OPT_LIVE, _WHEN, _PANEL, _MENU, _SUBPAGE, _OPEN, _CONFIRM
     bool live = false;       // takes effect at once in game
     std::string key, label, help, def, choices;
     std::string when;        // BB_OPT_WHEN: "key=a|b", greyed out unless that option is one of them
     double min = 0, max = 0;
+    std::string page;        // BB_OPT_PANEL: the key of the panel page's heading it is on (or is); empty in the menus
 };
 // A plugin file the manager shows: its info, settings and state.
 struct PluginEntry {
@@ -62,6 +64,9 @@ std::string plugins_option_value(const PluginEntry& p, const PluginOptionDesc& o
 void plugins_set_option(const std::string& name, const std::string& key, const std::string& value);
 // An action button: queued for the plugin's on_action on the main thread.
 void plugins_run_action(const std::string& name, const std::string& action);
+// A menu's run-time row changed (plugin API 29's panel_rows): queued for the
+// plugin's on_option with its "page/key", the config left alone.
+void plugins_menu_option(const std::string& name, const std::string& key, const std::string& value);
 // The rules this session plays by, for the server (the X-BBHost-Ruleset
 // header on every request the game makes): "vanilla", or each loaded plugin
 // flagged BB_PLUGIN_GAMEPLAY, sorted, comma separated, with ";seed=<seed>"
@@ -72,6 +77,12 @@ std::string plugins_ruleset();
 // The plugin of that name is loaded and on for this run (not a visitor):
 // what host features a plugin turns on ask (engine/debug_menu.h).
 bool plugins_active(const std::string& name);
+// Plugins that do not work together (Quake, Isometric and Hunter Cam: each owns the
+// camera): the warnings `name`'s page shows - one a line - while it and a plugin it clashes
+// with are both turned on with their main switch on, among `list` (the
+// launcher's scan or the in-game catalog); "" otherwise. In game the same
+// warning is a banner, once, when the two first meet (plugins_frame).
+std::string plugins_clash(const std::vector<PluginEntry>& list, const std::string& name);
 // Plugin API 27's anti-aliasing claim (bbhost_plugin.h aa_claim): the
 // strongest claim of the plugins that are on - kAaTake before kAaLeave - in
 // one relaxed load (host/upscaler.cpp reads it at every draw).

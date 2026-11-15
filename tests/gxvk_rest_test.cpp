@@ -6,7 +6,11 @@
 // with the game held back by the command processor 20% or more (the median of
 // six windows) - not a wait under 8% alone; a rest that ended within 30 s
 // makes the next wait (5 s, doubling to 160 s; a long rest, or one a loading
-// screen came into, sets it back). With no cap holding the frame the frame
+// screen came into, sets it back). A frame under 85% of its cap is held by no
+// cap, however the limiter waits: such a window counts toward no rest at it,
+// and the median of the three windows' frame rates under 85% of the cap ends a
+// rest at it - unless the GPU is busy 90% over the last three windows (their
+// mean). With no cap holding the frame the frame
 // rate decides, both ways at the place: a probe 10 s after the pool began to
 // work (rest three windows of the switch's and eight counted, then work as long)
 // rests it when the rest's frame rate is under 0.5% slower than the median of
@@ -16,7 +20,10 @@
 // anew (work, then rest again) after the interval, twice as far each time (20
 // s to 240 s), and at once with the game held back 20% and the frame 5%
 // slower than it found it resting. GPU-bound (90%, two windows): a rest until
-// the GPU's median of six windows is under 80%. A loading screen drops an
+// the GPU's median of six windows is under 80% - and with no cap holding the
+// frame, one that ran 8% slower than the GPU-bound windows that began it ends
+// judged: the pool works, and no GPU-bound rest and no probe come for 40 s, then
+// 160, then 240. A loading screen drops an
 // experiment, ends any rest but one at a cap, and starts the place's
 // experiments again 10 s after it.
 #include "host/gxvk_rest.h"
@@ -727,6 +734,61 @@ int main() {
         check(step(s, openf(0.6, 90.0, 0.95), t += kWin) == kStay && step(s, openf(0.6, 90.0, 0.95), t += kWin) == kRest, "no rest GPU-bound again", 12);
         check(step(s, loading_window(), t += kWin) == kWake && !s.resting, "a GPU-bound rest kept across a loading screen", 13);
     }
+    // A GPU-bound rest judged by the frame, no cap holding it. The Hunter's Dream on an RTX 4070: 206 fps working, the GPU
+    // 93% busy; resting, the command processor the wall at ~170 fps, the GPU 75%, the game held back 70%. The rest ends
+    // after six windows judged - 8% slower: the pool works, and neither a GPU-bound rest nor a probe comes for 40 s (the
+    // first interval four times over), then 160 s, then 240; a rest that ran as fast (an APU's frame, the GPU's either
+    // way) wakes as before and may rest again at once; at a cap nothing waits; a loading screen starts the place over.
+    {
+        using gxvk_rest::kEvGpuCost;
+        using gxvk_rest::kProbeFirstNs;
+        using gxvk_rest::kWhyGpu;
+        State s;
+        check(step(s, openf(0.0, 206.0, 0.93), t += kWin) == kStay && step(s, openf(0.0, 206.0, 0.93), t += kWin) == kRest &&
+                  s.why == kWhyGpu && s.gpu_ref == 206.0,
+              "no GPU-bound rest at the Dream", 0);
+        for (int k = 0; k < 5; ++k) check(step(s, openf(0.70, 170.0, 0.75), t += kWin) == kStay && s.resting, "woken before six windows", k);
+        check(step(s, openf(0.70, 170.0, 0.75), t += kWin) == kWake && !s.resting && s.event == kEvGpuCost, "a GPU-bound rest 17% slower not judged", 1);
+        check(s.interval_ns == 4 * kProbeFirstNs && s.next_at == t + s.interval_ns && s.gpu_allowed_at == s.next_at && s.phase == gxvk_rest::kNoPhase,
+              "the judged rest's waits", 2);
+        const auto works_until = [&](std::uint64_t until, const char* what) {
+            for (int k = 0; t + kWin < until && k < 4000; ++k) check(step(s, openf(0.0, 206.0, 0.93), t += kWin) == kStay && !s.resting, what, k);
+        };
+        works_until(s.gpu_allowed_at, "a rest within the first 40 s");
+        check(step(s, openf(0.0, 206.0, 0.93), t += kWin) == kRest && s.why == kWhyGpu, "no GPU-bound rest once its time came", 3);
+        for (int k = 0; k < 6; ++k) step(s, openf(0.70, 170.0, 0.75), t += kWin);
+        check(!s.resting && s.event == kEvGpuCost && s.interval_ns == 16 * kProbeFirstNs && s.gpu_allowed_at == s.next_at,
+              "the second judged rest's waits (160 s)", 4);
+        works_until(s.gpu_allowed_at, "a rest within 160 s");
+        check(step(s, openf(0.0, 206.0, 0.93), t += kWin) == kRest, "no GPU-bound rest after 160 s", 5);
+        for (int k = 0; k < 6; ++k) step(s, openf(0.70, 170.0, 0.75), t += kWin);
+        check(!s.resting && s.event == kEvGpuCost && s.interval_ns == gxvk_rest::kProbeMostNs, "the third judged rest's waits (240 s)", 6);
+        // At a cap (the limiter waiting 10%, the GPU 95%) a GPU-bound rest begins at once, whatever the wait set uncapped.
+        check(s.gpu_allowed_at > t + kWin, "no wait to test the cap against", 7);
+        check(step(s, win(0.10, 60.0f, 0.9, 0.0, 0.95), t += kWin) == kStay && step(s, win(0.10, 60.0f, 0.9, 0.0, 0.95), t += kWin) == kRest &&
+                  s.why == kWhyGpu && s.gpu_ref == 0.0,
+              "a GPU-bound rest at a cap held back by the uncapped wait", 8);
+        // A loading screen ends it and starts the place over: GPU-bound again uncapped, it rests at once.
+        check(step(s, loading_window(), t += kWin) == kWake && s.gpu_allowed_at == 0, "the wait kept across a loading screen", 9);
+        check(step(s, openf(0.0, 206.0, 0.93), t += kWin) == kStay && step(s, openf(0.0, 206.0, 0.93), t += kWin) == kRest,
+              "no GPU-bound rest after the loading screen", 10);
+        // A rest that ran as fast as it began (7.9% slower, 100 fps against 108.6 is not 8%): as before - the GPU's wake, the
+        // interval as it was, and a rest again at once.
+        State a;
+        check(step(a, openf(0.0, 108.6, 0.95), t += kWin) == kStay && step(a, openf(0.0, 108.6, 0.95), t += kWin) == kRest, "no rest (APU)", 11);
+        for (int k = 0; k < 6; ++k) step(a, openf(0.0, 100.0, 0.7), t += kWin);
+        check(!a.resting && a.event == gxvk_rest::kEvCapWake && a.interval_ns == kProbeFirstNs && a.gpu_allowed_at == 0, "an APU's rest judged", 12);
+        check(step(a, openf(0.0, 108.6, 0.95), t += kWin) == kStay && step(a, openf(0.0, 108.6, 0.95), t += kWin) == kRest, "no rest again (APU)", 13);
+        // A probe's rest that became the GPU's has nothing to be judged by: it wakes as before.
+        Sim pr;
+        const Place busy{105.0, 104.0};
+        for (int k = 0; k < 200 && !pr.s.resting; ++k) pr.one(busy);
+        check(pr.s.resting && pr.s.why == gxvk_rest::kWhyProbe, "no probe at the place", 14);
+        for (int k = 0; k < 4; ++k) step(pr.s, openf(0.0, 104.0, 0.95), pr.t += kWin);
+        check(pr.s.resting && pr.s.why == kWhyGpu && pr.s.gpu_ref == 0.0, "a probe's rest not the GPU's", 15);
+        for (int k = 0; k < 6; ++k) step(pr.s, openf(0.0, 80.0, 0.6), pr.t += kWin);
+        check(!pr.s.resting && pr.s.event == gxvk_rest::kEvCapWake, "a probe's rest turned GPU-bound judged", 16);
+    }
     // Uncapped the game held back alone wakes nothing and rests nothing: the frame rate decides (the sewer pit: the command
     // processor 92% busy with the homes alone, the game held back 1.4%; the laptop: 84% either way).
     {
@@ -751,6 +813,129 @@ int main() {
             // Each experiment after the first two minutes is at most two switches out and, at most, one back - with the
             // interval at 240 s, five experiments in 18 minutes.
             check(changes_late <= 3 * 6, "more than one experiment's changes a four minutes after the first two", changes_late);
+        }
+    }
+    // A frame well under its cap is held by no cap, however the limiter waits (uneven frames: the fast ones still meet
+    // it). Cainhurst's roof at a 120 cap: the place's event takes the frame to 80-97 fps with the limiter waiting 15-24%
+    // and the command processor 88-94% busy - the median of the cap windows' frame rates under 85% of the cap wakes a
+    // rest at the cap within those windows. At the cap with room (120 fps, the limiter 30%), or narrowly with uneven
+    // frames (117-119 fps, the limiter 15-16%, busy 84-88%), it rests on; a window under 85% of its cap counts toward no
+    // rest at it; and with the GPU the limit (busy 90% over the last windows, steady or 88-97% from one to the next) a
+    // frame under the cap wakes nothing - the Steam Deck at 60.
+    {
+        auto at = [](float cap, double slack, double fps, double cp, double gpu) {
+            gxvk_rest::Window w = win(slack, cap, cp, 0.0, gpu);
+            w.fps = fps;
+            return w;
+        };
+        // The roof's dip, from a steady rest at the cap.
+        State s;
+        check(step(s, at(120.0f, 0.30, 120.0, 0.60, 0.55), t += kWin) == kStay &&
+                  step(s, at(120.0f, 0.30, 120.0, 0.60, 0.55), t += kWin) == kRest && s.why == gxvk_rest::kWhyCap,
+              "no rest at the 120 cap", 0);
+        for (int k = 0; k < 200; ++k)
+            check(step(s, at(120.0f, k % 2 ? 0.28 : 0.32, k % 3 ? 120.0 : 119.6, 0.60, 0.55), t += kWin) == kStay && s.resting,
+                  "woken resting at the cap with room", k);
+        const double dip_fps[] = {87.5, 86.8, 85.5, 82.8, 83.1, 86.6};
+        const double dip_slack[] = {0.17, 0.19, 0.18, 0.15, 0.24, 0.17};
+        const double dip_cp[] = {0.90, 0.94, 0.91, 0.88, 0.91, 0.89};
+        int woke = -1;
+        for (int k = 0; k < 6 && woke < 0; ++k)
+            if (step(s, at(120.0f, dip_slack[k], dip_fps[k], dip_cp[k], 0.43), t += kWin) == kWake) woke = k;
+        check(woke >= 1 && woke < gxvk_rest::kCapWindows && !s.resting && s.event == gxvk_rest::kEvCapWake,
+              "the roof's dip at the 120 cap not woken within the cap windows (or by one window)", woke);
+        // A frame fallen far from its cap with the command processor idle is the place's own hitch, no flapping: after
+        // such a wake the next rest at the cap may begin 5 s on, and the backoff starts over - though short rests woken
+        // by a busy command processor had doubled it to 20 s (Cathedral Ward at 120: an arrival's second at 50-100 fps,
+        // the command processor 63-64% busy over the cap windows, and a 40-s backoff kept the pool working). One the
+        // command processor holds (busy 88-94%, the roof's) is the rest's own cost: it doubles the backoff as any short
+        // rest, to 40 s.
+        const double hitch_cp[] = {0.31, 0.64, 0.45, 0.52, 0.38, 0.60};
+        for (const bool idle : {true, false}) {
+            State b;
+            auto busy_wake = [&](int most) {
+                for (int k = 0; k < most; ++k)
+                    if (step(b, at(120.0f, 0.30, 120.0, 0.97, 0.5), t += kWin) == kWake) return true;
+                return false;
+            };
+            auto rest_within = [&](int most) {
+                for (int k = 0; k < most; ++k)
+                    if (step(b, at(120.0f, 0.30, 120.0, 0.6, 0.5), t += kWin) == kRest) return k;
+                return -1;
+            };
+            check(rest_within(4) >= 0, "no rest at the cap (backoff)", 0);
+            check(busy_wake(6), "no wake from a saturated command processor", 1);   // a short rest: the backoff 10 s
+            check(rest_within(30) >= 0, "no rest after the first backoff", 2);
+            check(busy_wake(6), "no second wake", 3);                                // the backoff 20 s
+            check(rest_within(50) >= 19, "the backoff not doubled by the short rests", 4);
+            for (int k = 0; k < 4; ++k) step(b, at(120.0f, 0.30, 120.0, 0.6, 0.5), t += kWin);
+            int far_woke = -1;
+            for (int k = 0; k < 6 && far_woke < 0; ++k)
+                if (step(b, at(120.0f, dip_slack[k], dip_fps[k], idle ? hitch_cp[k] : dip_cp[k], 0.43), t += kWin) == kWake) far_woke = k;
+            if (idle) {
+                check(far_woke >= 0 && b.backoff_ns == gxvk_rest::kBackoffFirstNs, "a far wake with the command processor idle doubled the backoff",
+                      far_woke);
+                const int again = rest_within(40);
+                check(again >= 9 && again <= 12, "the next rest at the cap not 5 s after a far wake (command processor idle)", again);
+            } else {
+                check(far_woke >= 0 && b.backoff_ns == 8 * gxvk_rest::kBackoffFirstNs, "a far wake with the command processor busy not doubling the backoff",
+                      far_woke);
+                const int again = rest_within(120);
+                check(again >= 79 && again <= 82, "the next rest at the cap not 40 s after a far wake (command processor busy)", again);
+            }
+        }
+        // At the roof the rest is what takes the frame down: each rest at the cap brings the dip back within a second.
+        // Woken by it each time, the command processor busy, the rests back off - five minutes there see a handful of
+        // them (5, 10, 20, 40, 80 s apart), not one every 6.5 s.
+        {
+            State r;
+            int rests = 0, in_rest = 0;
+            for (int k = 0; k < 600; ++k) {
+                const bool resting = r.resting;
+                in_rest = resting ? in_rest + 1 : 0;
+                const gxvk_rest::Window w = !resting      ? at(120.0f, 0.30, 120.0, 0.60, 0.5)
+                                            : in_rest < 2 ? at(120.0f, 0.25, 120.0, 0.84, 0.5)
+                                                          : at(120.0f, dip_slack[k % 6], dip_fps[k % 6], dip_cp[k % 6], 0.43);
+                step(r, w, t += kWin);
+                if (r.event == gxvk_rest::kEvCapRest) ++rests;
+            }
+            check(rests >= 3 && rests <= 7, "the roof's rests at the cap not backed off (5 minutes)", rests);
+        }
+        // ... and a rest at the cap does not begin inside the dip: windows under 85% of the cap count for nothing (the
+        // place's experiments decide there - a probe's rest may come, never the cap's).
+        State d;
+        for (int k = 0; k < 40; ++k) {
+            step(d, at(120.0f, dip_slack[k % 6], dip_fps[k % 6], dip_cp[k % 6], 0.43), t += kWin);
+            check(!(d.resting && d.why == gxvk_rest::kWhyCap) && d.event != gxvk_rest::kEvCapRest, "a rest at the cap begun inside the dip", k);
+        }
+        // One window at the cap between windows under it does not make two in a row.
+        State e;
+        for (int k = 0; k < 40; ++k) {
+            step(e, k % 2 ? at(120.0f, 0.30, 120.0, 0.6, 0.5) : at(120.0f, 0.20, 90.0, 0.6, 0.5), t += kWin);
+            check(e.event != gxvk_rest::kEvCapRest && !(e.resting && e.why == gxvk_rest::kWhyCap), "a rest at the cap from one window at it in two", k);
+        }
+        // Narrowly at the cap with uneven frames: rests on.
+        State n;
+        check(step(n, at(120.0f, 0.30, 120.0, 0.60, 0.55), t += kWin) == kStay &&
+                  step(n, at(120.0f, 0.30, 120.0, 0.60, 0.55), t += kWin) == kRest,
+              "no rest at the 120 cap (narrow)", 1);
+        for (int k = 0; k < 200; ++k)
+            check(step(n, at(120.0f, k % 2 ? 0.16 : 0.15, k % 3 ? 118.0 : (k % 2 ? 117.0 : 119.0), k % 2 ? 0.84 : 0.88, 0.6), t += kWin) ==
+                          kStay &&
+                      n.resting,
+                  "woken narrowly at the cap with uneven frames", k);
+        // GPU-bound at 60 (the Steam Deck): a dip to 48 fps with the limiter waiting on its fast frames wakes nothing,
+        // the GPU 95% throughout, or 88-97% from one window to the next.
+        for (const bool jitter : {false, true}) {
+            State g;
+            check(step(g, at(60.0f, 0.30, 60.0, 0.6, 0.75), t += kWin) == kStay && step(g, at(60.0f, 0.30, 60.0, 0.6, 0.75), t += kWin) == kRest &&
+                      g.why == gxvk_rest::kWhyCap,
+                  "no rest at the 60 cap (GPU)", 2);
+            for (int k = 0; k < 200; ++k) {
+                const double gpu = jitter ? (k % 2 ? 0.97 : 0.88) : 0.95;
+                check(step(g, at(60.0f, k % 2 ? 0.18 : 0.15, 48.0, 0.90, gpu), t += kWin) != kWake && g.resting,
+                      jitter ? "woken GPU-bound (88-97%) under the 60 cap" : "woken GPU-bound (95%) under the 60 cap", k);
+            }
         }
     }
     if (g_failures) {

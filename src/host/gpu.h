@@ -964,6 +964,10 @@ GpuBusy host_gpu_busy();
 void host_gpu_busy_present_begin(void* cmd);
 void host_gpu_busy_present_end(void* cmd);
 void host_gpu_busy_present_done();
+// The same command buffer's front-end word, at its start (`end` false) and at
+// its end, while the device-loss markers are on (host/gpu_markers.h): the
+// stream submits it in its order, so a loss can name it among the ops.
+void host_gpu_present_markers(void* cmd, bool end);
 // The 300-flip report's line: busy over the window since the last call.
 std::string host_gpu_busy_report();
 // The presenter's, before its blit: submits the renderer's recording only when
@@ -1047,6 +1051,13 @@ std::uint32_t host_gpu_vendor_id();
 // `timeout_ns` passed: true when they have. False at once without a timeline
 // (the caller polls host_gpu_submissions_completed as before).
 bool host_gpu_wait_completed(std::uint64_t need, std::uint64_t timeout_ns);
+// The GX layer's catch-up (host/gpu_catch_up.h), for the block reclaim and the
+// discard rename: what host_gpu_flush gives them - the recording under way
+// submitted, every submission through it run, its labels in memory, its slot
+// retired - with the GPU's time waited for outside the renderer's lock. A wait
+// that runs out (`timeout_ns`) waits for the same submissions under the lock,
+// as the flush does. No timeline, or BBHOST_GX_CATCH_UP=0: host_gpu_flush.
+void host_gpu_catch_up(std::uint64_t timeout_ns);
 const char* host_present_step(double& seconds);  // window.cpp: what the presenting thread is doing  // BBHOST_STALL_TEST: hold the renderer, as a frame dump does
 // Last few recorded draws, read without the renderer lock: for the watchdog,
 // which runs precisely when some thread is stuck holding it.

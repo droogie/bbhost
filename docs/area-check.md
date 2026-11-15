@@ -149,8 +149,8 @@ a player has it: the swapchain, the window's size and the present's scaling.
 `bbhost-options.toml`, as the in-game PC menus write it). Together they act out
 a player's setup - for the render below the display that many players run, an
 Xvfb at 2560x1440 with `resolution = "1920x1080"` and `window_mode =
-"Borderless"`: the scene in a target of its own, FSR 1 bringing it up at the
-present (with Upscaling TAA, the render-scale path). A private Xvfb has no
+"Borderless"`: the game at the screen's size and its 3D at the Resolution (the
+render-scale path, with Upscaling Off as with TAA). A private Xvfb has no
 window manager to size a borderless or fullscreen window to the screen, so with
 `--display` and such a `window_mode` the harness does it with `xdotool` the
 moment the window is up (xdotool must be installed).

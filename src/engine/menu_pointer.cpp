@@ -4,6 +4,7 @@
 
 #include "engine/debug_menu.h"
 #include "engine/option_menu.h"
+#include "engine/plugin_dialog.h"
 
 #include "core/elf.h"
 #include "core/memory.h"
@@ -120,6 +121,9 @@ constexpr std::uint64_t kInputBlockB = 0x5962878;  // ptr; blocked if *(u32*)(+0
 constexpr std::uint64_t kMenuSe = 0x597fc60;
 constexpr std::uint64_t kMenuSeLabel = 0x597fc68;
 constexpr std::uint64_t kCursorMoveLabel = 0x4d344e4;  // "カーソル移動"
+constexpr std::uint64_t kDecideLabel = 0x4d3451b;      // "決定"
+constexpr std::uint64_t kCancelLabel = 0x4d3450b;      // "キャンセル"
+constexpr std::uint64_t kOpenLabel = 0x4d33d56;        // "メニュー開く"
 
 constexpr std::size_t kListener = 0x30;
 constexpr std::size_t kCount = 0x70;
@@ -841,6 +845,14 @@ void pointer_step(std::uint8_t* c, const std::uint8_t* input) {
 }
 
 GUEST_ABI void pc_list_update(std::uint8_t* comp, std::uint8_t* input) {
+    // A list of a menu of the game's under a plugin's page the host opened
+    // over it (engine/plugin_dialog.h): updated without the input (its first
+    // byte, all the list reads of it) and out of the pointer's reach.
+    if (plugin_dialog::holds(comp)) {
+        std::uint8_t none = 0;
+        hle_call_guest(guest_fn(kListUpdate), comp, &none);
+        return;
+    }
     // Before the pad, as DS3 does it: a direction the pad reads this frame
     // then moves on from wherever the pointer put the cursor.
     pointer_step(comp, input);
@@ -973,4 +985,24 @@ bool menu_pointer_in_menu() {
     // own; a list updates every frame it has focus, so a gap longer than a
     // few frames means none has.
     return menu_open() || now_ms() - g_focus_ms.load(std::memory_order_relaxed) < 400;
+}
+
+void menu_sound_post(int id, int priority) {
+    static int said = 0;          // 0: none posted yet; 1: the first posted, its fate not yet logged; 2: logged
+    static std::int64_t first_ms = 0;
+    if (!g_slide) return;
+    auto* se = static_cast<std::int32_t*>(guest_fn(kMenuSe));
+    if (said == 1 && (se[0] < 0 || now_ms() - first_ms > 1000)) {
+        host_log("menu: a plugin's panel's first menu sound %s", se[0] < 0 ? "taken by the game's sound request" : "still pending a second on");
+        said = 2;
+    }
+    if (id < 0 || se[1] > priority) return;
+    se[0] = id;
+    se[1] = priority;
+    *static_cast<std::uint64_t*>(guest_fn(kMenuSeLabel)) =
+        guest(id == kMenuSoundDecide ? kDecideLabel : id == kMenuSoundCancel ? kCancelLabel : id == kMenuSoundOpen ? kOpenLabel : kCursorMoveLabel);
+    if (said == 0) {
+        said = 1;
+        first_ms = now_ms();
+    }
 }

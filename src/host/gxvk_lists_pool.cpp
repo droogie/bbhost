@@ -173,6 +173,7 @@ struct DutyCounts {
     // and the rests a loading screen ended.
     std::atomic<u64> by[gxvk_rest::kWhys] = {};
     std::atomic<u64> probes{0}, asks{0}, held_asks{0}, decided_rest{0}, decided_work{0}, load_wakes{0}, quiet_asks{0}, trials_rested{0};
+    std::atomic<u64> gpu_costs{0};  // GPU-bound rests that ran clearly slower than the frame that began them (gxvk_rest.h)
 };
 DutyCounts g_pool_duty, g_run_duty;
 // BBHOST_GXVK_LISTS_REST_LOG=1: every window of the duty's rule logged, with the state it left the pool in.
@@ -477,16 +478,17 @@ static_assert(sizeof(Snap) % sizeof(u64) == 0, "a snapshot of counters");
 std::string duty_text(const DutyCounts& c, const char* who, bool resting_now) {
     const auto by = [&c](int k) { return static_cast<ull>(c.by[k].load(std::memory_order_relaxed)); };
     const auto n = [](const std::atomic<u64>& a) { return static_cast<ull>(a.load(std::memory_order_relaxed)); };
-    char buf[768];
+    char buf[832];
     std::snprintf(buf, sizeof(buf),
                   "%s rested %llu times (at a frame cap %llu, GPU-bound %llu, an experiment's %llu, decided %llu, "
                   "a trial near the cap %llu of which %llu rested on), "
                   "%.1f s in the ended ones%s; experiments: %llu probes, %llu asks (%llu at a heavier place; %llu not made, the rest "
-                  "holding the game back under 10%%), %llu decided it rests, %llu that it works; %llu rests ended at a loading screen",
+                  "holding the game back under 10%%), %llu decided it rests, %llu that it works; %llu rests ended at a loading screen; "
+                  "%llu GPU-bound rests ran 8%% slower than the frame that began them",
                   who, n(c.rests), by(gxvk_rest::kWhyCap), by(gxvk_rest::kWhyGpu), by(gxvk_rest::kWhyProbe), by(gxvk_rest::kWhyJudged),
                   by(gxvk_rest::kWhyNear), n(c.trials_rested), static_cast<double>(c.rested_ns.load(std::memory_order_relaxed)) / 1e9,
                   resting_now ? "; resting now" : "", n(c.probes), n(c.asks), n(c.held_asks), n(c.quiet_asks), n(c.decided_rest),
-                  n(c.decided_work), n(c.load_wakes));
+                  n(c.decided_work), n(c.load_wakes), n(c.gpu_costs));
     return buf;
 }
 
@@ -850,6 +852,15 @@ void frame_paced(std::uint64_t wait_ns, float cap_fps, bool loading) {
                      tag, who, 100.0 * gxvk_rest::detail::median(state.trial_slack, state.trial_n), fps, static_cast<double>(cap_fps),
                      100.0 * gxvk_rest::detail::median(state.trial_cp, state.trial_n),
                      static_cast<int>(state.backoff_ns / 1'000'000'000ull));
+        break;
+    case gxvk_rest::kEvGpuCost:
+        c.gpu_costs.fetch_add(1, std::memory_order_relaxed);
+        if (log)
+            host_log("%s: %s works again after %.1f s - resting ran %.1f fps against %.1f working before it (the command processor "
+                     "busy %.0f%%, the game held back by it %.0f%%, the GPU busy %.0f%%): its work is what kept the frame the GPU's; no "
+                     "GPU-bound rest here and the next probe in %.0f s",
+                     tag, who, rested_s, state.gpu_cost_rest, state.gpu_cost_work, 100.0 * w.cp, 100.0 * w.held, 100.0 * w.gpu,
+                     static_cast<double>(state.interval_ns) / 1e9);
         break;
     case gxvk_rest::kEvLoadWake:
         c.load_wakes.fetch_add(1, std::memory_order_relaxed);

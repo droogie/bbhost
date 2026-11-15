@@ -16,7 +16,9 @@
 //   plasma = "A Call Beyond"   # or Blacksky Eye: what the plasma gun fires
 //
 // Every setting is live: the launcher's Plugins page and F9's change it while
-// playing.
+// playing. While another plugin holds the world still (a photo mode's Frozen,
+// plugin API 29) or another camera has the picture (a free camera over the
+// running world: world_state's BB_WORLD_VIEW), Quake holds with it.
 //
 // Where it sits. The game's state update runs the camera manager's blend
 // (the follow camera's update, then the blend into the manager's own camera)
@@ -70,8 +72,10 @@
 
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -85,7 +89,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.22",
+    "0.3.24",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -322,6 +326,13 @@ const bool g_sounds = [] {
     return e && e[0] == '1';
 }();
 
+// The world held still by another plugin - a photo mode's (plugin API 29's
+// world_pause) - or another camera's picture (BB_WORLD_VIEW: a free camera
+// that flies over the running world by the same keys and mouse), as
+// world_state read it on the main thread this frame; the camera reads it on
+// the game's.
+std::atomic<bool> g_world_held{false};
+
 // ---- the game ------------------------------------------------------------------
 
 constexpr std::uint64_t kWorldChrMan = 0x593e878;  // WorldChrMan*: +0x60 the main player's ChrIns
@@ -440,10 +451,24 @@ constexpr std::uint8_t kDashOwn[5] = {0xc5, 0xfa, 0x11, 0x45, 0x84};
 constexpr std::uint8_t kDashHook[5] = {0xe9, 0xce, 0xe1, 0x07, 0x03};
 bool g_dash_lifted = false;
 
+// Plugin API 29: one of the game's cutscenes asked for or playing.
+bool in_cutscene() {
+    return g.api->version >= 29 && g.api->size >= offsetof(BbHostApi, cutscene) + sizeof(void*) && g.api->cutscene &&
+           g.api->cutscene() != 0;
+}
+
 void lift_dash(bool lift) {
     if (lift == g_dash_lifted) return;
     if (lift) {
-        if (g.api->patch(kDashSite, kDashHook, kDashOwn, sizeof kDashOwn) != 0) return;  // no dash patch
+        // Only where the dash patch's jump is there to set aside. The host's
+        // patch answers 0 for bytes that are already the new ones, so without
+        // the patch (it is off by default) this used to count as lifted, and
+        // the hook's return then wrote the jump into the error strings the
+        // patch's code would have replaced: the next movement step ran text
+        // (a crash at 0x4d3b8e4 at every release - a load, a cutscene, a death).
+        std::uint8_t now[sizeof kDashHook] = {};
+        if (g.api->read(kDashSite, now, sizeof now) != 0 || std::memcmp(now, kDashHook, sizeof now) != 0) return;
+        if (g.api->patch(kDashSite, kDashHook, kDashOwn, sizeof kDashOwn) != 0) return;
         g.log("quake: the debug dash's hook set aside while Quake has the player (it clears the no-gravity bit)");
     } else if (g.api->patch(kDashSite, kDashOwn, kDashHook, sizeof kDashHook) != 0) {
         g.log("quake: the debug dash's hook could not be put back");
@@ -2879,9 +2904,17 @@ void take_input(bool on, bool moving = true) {
 void release() {
     g_on_ladder = false;
     g_ladder_exit_ms = -1.0;
-    if (g_held) hold_body(g_held, false, false);
+    // The held character's switches and parts go back only while it is still
+    // the player (Quake turned off, a cutscene, a loading screen coming up with
+    // the hunter still there). A load builds a new player and frees the old
+    // one, its switches and parts with it: writing those switches was a write
+    // into freed memory, and reading its parts crashed (in vm_show, at a lamp
+    // travel's arrival in Central Yharnam). A character that is gone is left
+    // alone; the dash hook is code, put back either way.
+    std::uint8_t* const held = g_held && g_held == player() ? g_held : nullptr;
+    if (held) hold_body(held, false, false);
     lift_dash(false);
-    vm_release(g_held ? g_held : player());
+    vm_release(held ? held : g_held ? nullptr : player());
     g_held = nullptr;
     if (g_active) take_input(false);
     g_active = false;
@@ -3182,6 +3215,12 @@ void camera(BbCamera& cam) {
     g_last = now;
     g_have_last = true;
     dt = std::min(dt, kMaxFrame);
+    // A world another plugin holds still (a photo mode's), or another camera's
+    // picture, holds Quake's time too: the player stays where the world was
+    // held and the view as it was, and what the keys and the mouse do
+    // meanwhile is that plugin's camera's.
+    const bool held = g_world_held.load(std::memory_order_relaxed);
+    if (held) dt = 0.0;
     g_now += dt;
     view.ms = g_now * 1000.0;
 
@@ -3241,7 +3280,17 @@ void camera(BbCamera& cam) {
             g.log("quake: QUAKE_SOUNDS: %d", g.api->hook2(0x2bd3a80, prologue, sizeof prologue, &probe_sound, nullptr));
         }
     }
-    if (!s.enabled || !chr || !phys || !world || g.loading_screen() || max_hp <= 0) {
+    // A cutscene places the hunter and the camera itself (plugin API 29): the
+    // hunter goes back to the game for its length - gravity, the body, the
+    // controls and the left hand - and Quake takes them up again from
+    // wherever it leaves them, as after a load.
+    const bool cutscene = in_cutscene();
+    static bool cutscene_was = false;
+    if (cutscene != cutscene_was) {
+        g.log("quake: %s", cutscene ? "a cutscene: the hunter is the game's until it ends" : "the cutscene is over");
+        cutscene_was = cutscene;
+    }
+    if (!s.enabled || !chr || !phys || !world || g.loading_screen() || cutscene || max_hp <= 0) {
         if (g_active || g_held) release();
         // A Quake gun left in the hunter's hand by a session that ended early.
         static bool checked = false;
@@ -3310,7 +3359,8 @@ void camera(BbCamera& cam) {
         g_off_dump = g_now + 2.0;
         return;
     }
-    const Frame in = read_input();
+    Frame in = read_input();
+    if (held) in = Frame{};
     weapons_frame(in, view.ms);
     static const bool dmg_log = std::getenv("QUAKE_DMG") != nullptr;
     if (dmg_log) damage_log();
@@ -3495,7 +3545,13 @@ int probe_emit(BbHookCtx* c, void* which) {
 }  // namespace
 
 extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
-    if (!g.attach(api, 13)) return 1;
+    // Version 29 with its last call, cutscene() (in_cutscene): a cutscene's
+    // hunter is the game's.
+    if (api->version < 29 || api->size < offsetof(BbHostApi, cutscene) + sizeof(void*)) {
+        api->log("quake: needs plugin API 29 (cutscene()); this host has %u", api->version);
+        return 1;
+    }
+    if (!g.attach(api, 29)) return 1;
     if (!api->eboot_is_109()) return 1;
     read_options();
     parse_test();
@@ -3511,6 +3567,16 @@ extern "C" BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* api) {
         g.log("quake: %s changed to %s (%s physics)", key, value ? value : "?", physics_name());
     }, nullptr);
     g.on_world_load([](std::uint32_t) { g_written_valid = false; });
+    // A world another plugin holds still (plugin API 29: a photo mode's), or
+    // another camera's picture (a free camera over the running world too).
+    if (api->version >= 29 && api->size >= offsetof(BbHostApi, world_state) + sizeof(void*)) {
+        g.every_frame([] {
+            BbWorldState w{};
+            w.size = sizeof(w);
+            g_world_held.store(g.api->world_state(&w) == 0 && (w.flags & (BB_WORLD_PAUSED | BB_WORLD_VIEW)) != 0,
+                               std::memory_order_relaxed);
+        });
+    }
     // The guns' rows, once the tables are there and whenever the switch moves.
     g.every_frame([] {
         static std::uint64_t frame = 0;
