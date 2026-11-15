@@ -68,9 +68,9 @@ shadow and the GPU layer) can be inlined: about 3-5% more frame rate where the
 command processor is the limit (Kyo's Central Yharnam save on a Radeon 8060S,
 ~137 to ~143-145 fps; on an RTX 4070 with two Xeon Gold 6230 at 1080p, Old
 Yharnam ~100 to ~104 fps and the Cainhurst courtyard ~107 to ~110). Off by
-default; the release packages (Windows, Linux and the Steam Deck kit) are
-built with it. It applies to the first configure of a build directory, as the
-other `-D` options do.
+default; the release packages (Windows, Linux, the AppImage and the Steam
+Deck kit) are built with it. It applies to the first configure of a build
+directory, as the other `-D` options do.
 
 `-DBBHOST_PGO=generate` builds an instrumented bbhost (Clang's IR profiles;
 MSYS2 needs `mingw-w64-ucrt-x86_64-compiler-rt`, the version of its clang).
@@ -174,6 +174,7 @@ written back as `Off`.
 | `cmake --build build-win --target package-win` | `build/win/bbhost-win-<rev>.zip`, and the unstripped `.debug.exe` for symbolising crash reports |
 | `tools/package_linux.sh <bbhost> <outdir>` | a Linux tarball (built with `tools/linux_portable_build.sh` for a portable binary) |
 | `tools/package_steamdeck.sh` | the Linux package with the Steam Deck's settings |
+| `tools/package_appimage.sh <tarball> <outdir>` | the Linux package as one AppImage file (needs `mksquashfs`, from squashfs-tools) |
 | `tools/package_plugins.sh` | the official plugins with their signatures |
 | `tools/package_playtest.sh` | tester kits for a playtest on a dev server, built by hand |
 | `tools/package_hlsl_sweep.sh` | a kit that runs the HLSL path's driver-acceptance sweep (`gcn2hlsl --sweep`) on another machine's GPU, built by hand ([rendering.md](rendering.md)) |
@@ -212,7 +213,8 @@ made, from the same SDK tag as the Windows DLLs (so both run FSR 3.1.6), with
 AMD's licence and bbhost's in `licenses/fidelityfx`. None of NVIDIA's or
 AMD's files is in the repository, and bbhost itself links none of their code.
 `tools/check_release_bundle.sh` fails a release whose Windows or Linux
-package or Steam Deck kit lacks its files, or whose Steam Deck kit has DLSS's.
+package, AppImage or Steam Deck kit lacks its files, or whose Steam Deck kit
+has DLSS's.
 
 The Windows and Linux packages (and so the Steam Deck kit) carry the pipeline
 list beside the executable, `pipeline-list.bin`: every pipeline a tour of the

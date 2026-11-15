@@ -6,7 +6,8 @@
 # https. Each bundle carries the pinned DXC library beside its executable
 # with DXC's licences, and no DXIL validator (tools/fetch_dxc.sh), and
 # bbhost's licence's additional permission (LICENSE-EXCEPTION). The publish
-# job runs it on what it is about to sign.
+# job runs it on what it is about to sign. The AppImage's files are checked
+# as the Linux tarball's.
 #   tools/check_release_bundle.sh DIR     (dist/release)
 set -eu
 d=${1:?usage: tools/check_release_bundle.sh DIR}
@@ -16,6 +17,21 @@ work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 n=0
 for z in "$d"/bbhost-win-*.zip; do [ -f "$z" ] || continue; mkdir -p "$work/w$n"; unzip -q "$z" -d "$work/w$n"; n=$((n + 1)); done
 for t in "$d"/bbhost-linux-*.tar.gz "$d"/bbhost-steamdeck-*.tar.gz; do [ -f "$t" ] || continue; mkdir -p "$work/l$n"; tar xzf "$t" -C "$work/l$n"; n=$((n + 1)); done
+# The AppImage's files (tools/package_appimage.sh), checked as a Linux bundle.
+for a in "$d"/bbhost-linux-*.AppImage; do
+    [ -f "$a" ] || continue
+    mkdir -p "$work/a$n"
+    ap=$(realpath "$a")  # before the cd: DIR is relative in the publish job
+    (cd "$work/a$n" && "$ap" --appimage-extract > /dev/null) || fail "$(basename "$a"): does not extract"
+    [ -x "$work/a$n/squashfs-root/AppRun" ] || fail "$(basename "$a"): no AppRun"
+    mv "$work/a$n/squashfs-root/bbhost" "$work/a$n/bbhost-linux-appimage" || fail "$(basename "$a"): no bbhost/ in the image"
+    for l in LICENSE-runtime.txt LICENSE-libfuse-LGPL-2.1.txt NOTICE.txt; do
+        cmp -s "$work/a$n/bbhost-linux-appimage/licenses/appimage-runtime/$l" "$(dirname "$0")/../third_party/appimage-runtime/$l" ||
+            fail "$(basename "$a"): licenses/appimage-runtime/$l is not third_party/appimage-runtime's"
+    done
+    rm -rf "$work/a$n/squashfs-root"
+    n=$((n + 1))
+done
 [ "$n" -gt 0 ] || fail "no bundles in $d"
 # Every bundle carries the pinned pipeline list (tools/fetch_pipeline_list.sh),
 # once one is published (an empty pin: none yet, and none in any bundle).
@@ -140,4 +156,4 @@ for b in "$d"/bbhost "$d"/bbhost.exe; do
     done
 done
 if [ -n "$list_sha" ]; then listmsg="and the pinned pipeline list (${list_sha:0:12}) beside each executable"; else listmsg="beside each executable (no pipeline list pinned yet)"; fi
-echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg; the Windows ones in UTF-8 with FidelityFX, DLSS and the upscaler bridge; the Linux ones with FSR 3 (bbhost's FidelityFX library), DLSS and the NGX bridge, the Steam Deck's with FSR 3 and without DLSS"
+echo "release bundles: $n checked, the live server over https by default, no playtest kit, DXC $(cat "$(dirname "$0")/../third_party/dxc/VERSION") $listmsg; the Windows ones in UTF-8 with FidelityFX, DLSS and the upscaler bridge; the Linux ones (the AppImage's with its runtime's licences) with FSR 3 (bbhost's FidelityFX library), DLSS and the NGX bridge, the Steam Deck's with FSR 3 and without DLSS"
