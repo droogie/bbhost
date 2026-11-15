@@ -205,6 +205,15 @@ gives the Binary Ninja address.
   gives them back for its length and takes them up again from wherever the
   cutscene leaves the hunter (Quake, Hunter Cam and Isometric do). `on_view` is
   not called during one; `on_camera` still is.
+- `screen_shapes(name, tris, n)` (v30): a plugin's 2D over the picture -
+  triangles (`BbScreenTri`: corners 0 to 1 across and down the game's picture,
+  a colour with alpha) that the host draws with its own overlay, the FPS
+  counter's, over every frame it presents: after the game's HUD, under the
+  host's boxes, menus and pointer. Never in the 3D, so frame generation, the
+  upscalers and the TAA take them for UI, as they take the HUD (Quake's
+  crosshair). A call replaces the plugin's last ones, `n = 0` takes them away,
+  and they go by themselves a quarter of a second after the last call: call it
+  each frame to keep them up. At most 2048; main thread.
 
 **The world held still, the controller, who else is in the world, the HUD, the look and a panel** (v29)
 

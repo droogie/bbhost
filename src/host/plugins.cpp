@@ -49,6 +49,7 @@
 #include "host/scene_look.h"
 #include "host/updater.h"
 #include "host/window.h"
+#include "host/overlay.h"
 #include "log.h"
 
 #include <algorithm>
@@ -1235,6 +1236,36 @@ int api_on_view(void (*fn)(BbCamera*, void*), void* user) {
 // Version 29: a cutscene asked for or playing (engine/loading.h).
 int api_cutscene() { return loading_cutscene() ? 1 : 0; }
 
+// Version 30: the plugins' 2D over the picture (screen_shapes), drawn by the
+// window's pump into the host overlay (plugins_draw_screen_shapes), which the
+// presenter puts over the frame after the HUD: frame generation takes it for
+// UI. Each plugin's list goes a quarter of a second after it was last given.
+struct ScreenShapes {
+    std::vector<BbScreenTri> tris;
+    std::chrono::steady_clock::time_point at;
+};
+std::mutex g_screen_mu;
+std::map<std::string, ScreenShapes> g_screen;
+constexpr std::size_t kMaxScreenTris = 2048;
+constexpr auto kScreenHold = std::chrono::milliseconds(250);
+
+int api_screen_shapes(const char* name, const BbScreenTri* tris, std::size_t n) {
+    if (!name || !*name || (n && !tris) || n > kMaxScreenTris) return 1;
+    if (n) {
+        const auto it = std::find_if(g_plugins.begin(), g_plugins.end(), [&](const Plugin& p) { return p.name == name; });
+        if (it == g_plugins.end() || it->dormant) return 1;
+    }
+    std::lock_guard<std::mutex> lk(g_screen_mu);
+    if (!n) {
+        g_screen.erase(name);
+        return 0;
+    }
+    ScreenShapes& s = g_screen[name];
+    s.tris.assign(tris, tris + n);
+    s.at = std::chrono::steady_clock::now();
+    return 0;
+}
+
 int api_key_bound(std::uint16_t scancode) {
     if (scancode == 0) return 0;
     // A plugin's own keys work in play, where a menu's actions press nothing
@@ -1846,6 +1877,7 @@ const BbHostApi g_api = {
     &api_panel_show, &api_panel_state, &api_option_set, &api_input_take_as, &api_input_as,
     &api_panel_rows, &api_panel_value, &api_panel_open,
     &api_cutscene,
+    &api_screen_shapes,
 };
 
 std::string read_file(const std::string& path) {
@@ -2617,5 +2649,20 @@ void plugins_enter_world(const std::string& host_rules) {
             at = end + 1;
         }
         c.fn(entry.c_str(), c.user);  // "" when the host plays without this plugin
+    }
+}
+
+void plugins_draw_screen_shapes(float display_w, float display_h) {
+    std::lock_guard<std::mutex> lk(g_screen_mu);
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = g_screen.begin(); it != g_screen.end();) {
+        if (now - it->second.at > kScreenHold) {
+            it = g_screen.erase(it);
+            continue;
+        }
+        for (const BbScreenTri& t : it->second.tris)
+            host_overlay_tri(t.x[0] * display_w, t.y[0] * display_h, t.x[1] * display_w, t.y[1] * display_h,
+                             t.x[2] * display_w, t.y[2] * display_h, t.rgba);
+        ++it;
     }
 }
