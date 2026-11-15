@@ -118,7 +118,20 @@
 //    command processor's share ends it only with the GPU under 80% in its
 //    window: on a Steam Deck at Old Yharnam, 88-97% from one window to the
 //    next, the pool rested and woke four times in 20 s uncapped and five at 60
-//    with a line at 90%.
+//    with a line at 90%. With no cap holding the frame (the limiter waiting
+//    under 8% as it began), the rest is judged by the frame when the GPU has
+//    room: resting 8% slower than the GPU-bound windows that began it, the
+//    frame was the GPU's only because the pool worked - resting, the command
+//    processor in order holds it back - and that is an experiment's clear
+//    answer: the next experiment four times as far, and no GPU-bound rest
+//    before it (a loading screen starts the place over). On an RTX 4070 with
+//    two Xeon Gold 6230, uncapped, the Hunter's Dream ran 204-208 fps working
+//    (the GPU 91-95% busy) and ~170 resting (the command processor 100%, the
+//    game held back 70%), Cainhurst's courtyard 166-170 and 106-113: the rest
+//    began after two windows, ended after six, and began again two windows
+//    later, ten times in every 20 s, and the places ran 180-184 and 121-124
+//    fps against 216 and 167 with the pool never resting. A rest that ran as
+//    fast (an APU's, the frame the GPU's either way) is the GPU's as before.
 //  - A loading screen: its windows are not the place's and count for nothing;
 //    an experiment under way is dropped. The next place is one no experiment
 //    has judged, so a rest an experiment decided or the GPU began ends with it
@@ -177,6 +190,7 @@ enum Event : int {
     kEvNearTrial, // near the cap: a trial rest began
     kEvNearRests, // the trial: the cap holds the frame without the pool - a cap's rest goes on
     kEvNearWorks, // the trial: without the pool the frame does not keep its cap - the pool works again
+    kEvGpuCost,   // a GPU-bound rest ended 8% slower than the frame that began it: the pool works, judged clearly (no cap)
 };
 
 struct State {
@@ -218,6 +232,15 @@ struct State {
     // Whether the frame rate's experiments decide (the pool's duty). Without them (the run commit's, list_resolve.h)
     // only a cap holding the frame or a GPU-bound frame rests it, and it works anywhere else, as it did before a duty.
     bool experiments = true;
+    // A GPU-bound rest judged by the frame (no cap holding it): the GPU-bound windows' frame rates working, the last
+    // kQuietWindows; the frame rate working the rest under way began from (0: none to judge it by - one begun at a cap,
+    // or a rest that became the GPU's); and no GPU-bound rest begins before gpu_allowed_at where no cap holds the frame
+    // (one that cost the frame puts it at the next experiment's time). For the lines: the last costly rest's frame rates.
+    double gpu_work[kQuietWindows] = {};
+    int gpu_work_n = 0;
+    double gpu_ref = 0;
+    std::uint64_t gpu_allowed_at = 0;
+    double gpu_cost_rest = 0, gpu_cost_work = 0;
 };
 
 // A window: the limiter's wait, the command processor's busy time, the main
@@ -297,6 +320,7 @@ inline Step rest(State& s, Why why, std::uint64_t now) {
     s.why = why;
     s.rest_at = now;
     s.travelled = false;
+    s.gpu_ref = 0;
     own_again(s);
     return kRest;
 }
@@ -398,6 +422,8 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
         s.rest_ref = 0;
         s.interval_ns = kProbeFirstNs;
         s.next_at = 0;
+        s.gpu_allowed_at = 0;
+        s.gpu_work_n = 0;
         no_experiment(s);
         if (!s.resting) return kStay;
         s.travelled = true;
@@ -418,15 +444,21 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
     if (!s.resting) {
         s.quiet = capped ? s.quiet + 1 : 0;
         s.near = at_cap ? s.near + 1 : 0;
+        if (s.gpu_bound) keep(s.gpu_work, s.gpu_work_n, kQuietWindows, w.fps);
+        else s.gpu_work_n = 0;
         if (s.quiet >= kQuietWindows && now >= s.allowed_at) {
             no_experiment(s);
             s.event = kEvCapRest;
             return rest(s, kWhyCap, now);
         }
-        if (gpu_bound) {
+        // GPU-bound: a rest - where no cap holds the frame, not before the time a costly one set (the place's experiments
+        // run meanwhile); at a cap as ever.
+        if (gpu_bound && (limited || now >= s.gpu_allowed_at)) {
             no_experiment(s);
             s.event = kEvGpuRest;
-            return rest(s, kWhyGpu, now);
+            const Step r = rest(s, kWhyGpu, now);
+            if (!limited) s.gpu_ref = median(s.gpu_work, s.gpu_work_n);
+            return r;
         }
         if (at_cap) {  // the cap's rule decides there: no experiment, and its windows are not the place's uncapped ones
             no_experiment(s);
@@ -622,7 +654,22 @@ inline Step step(State& s, const Window& w, std::uint64_t now) {
     // A GPU-bound rest ends once the GPU has room - under 80% over the last six windows (on a Steam Deck at Old Yharnam,
     // busy 88-97% from one window to the next, the pool rested and woke four times in 20 s at 90%): the place's
     // experiments decide from there.
-    if (s.why == kWhyGpu) return median(s.rest_gpu, s.held_n) < kGpuFree ? cap_wake(s, now) : kStay;
+    if (s.why == kWhyGpu) {
+        if (median(s.rest_gpu, s.held_n) >= kGpuFree) return kStay;
+        // Judged by the frame (a rest begun with no cap holding the frame): resting kClear slower than the GPU-bound
+        // windows that began it, the pool's work was what kept the frame the GPU's - an experiment's clear answer: the
+        // pool works, the next experiment four times as far, and no GPU-bound rest before it. Else as ever.
+        const double ref = s.gpu_ref, rested = median(s.rest_fps, s.held_n);
+        if (ref > 0 && rested > 0 && rested < ref * (1.0 - kClear)) {
+            judged(s, now, true);
+            s.gpu_allowed_at = s.next_at;
+            s.gpu_cost_rest = rested;
+            s.gpu_cost_work = ref;
+            s.event = kEvGpuCost;
+            return work(s);
+        }
+        return cap_wake(s, now);
+    }
     // A rest at a cap the frame no longer comes near - under 85% of it over the last six windows (the median): the cap
     // holds nothing there, and the place's experiments decide from there (uncapped play after the title's menus had met
     // the 960 cap: v0.2.30 rested through the first places on that rest, as their game was not held back 20%).

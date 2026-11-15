@@ -8,6 +8,7 @@
 #include "hle/modules.h"
 #include "host/gpu.h"
 #include "host/gxvk_lists.h"
+#include "host/run_lookups.h"
 #include "log.h"
 
 #include <algorithm>
@@ -92,6 +93,19 @@ std::atomic<int> g_batch = [] {
     if (std::strcmp(e, "compare") == 0) return 2;
     return std::atoi(e) ? 1 : 0;
 }();
+
+}  // namespace list_resolve
+
+// BBHOST_RUN_LOOKUPS (host/run_lookups.h): 1 on (unset), 0 or off, 2 compare.
+const int run_lookups::g_mode = [] {
+    const char* e = std::getenv("BBHOST_RUN_LOOKUPS");
+    if (!e || !*e) return 1;
+    if (std::strcmp(e, "compare") == 0) return 2;
+    if (std::strcmp(e, "off") == 0) return 0;
+    return std::atoi(e) ? 1 : 0;
+}();
+
+namespace list_resolve {
 
 const int g_draw_ctx = [] {
     const char* e = std::getenv("BBHOST_DRAW_CONTEXT");

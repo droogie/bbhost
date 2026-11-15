@@ -1,5 +1,6 @@
 // The sign-in check's reading of the server's answer to POST /auth/whoami
-// (net/sign_in_check.h): a token the account service knows, one it does not
+// (net/sign_in_check.h), and of POST /auth/profile's to the relay switch: a
+// token the account service knows, one it does not
 // (its refusal comes as HTTP 200 with ResKind 1, or as the NP surfaces' 401),
 // and everything that is no verdict on the token - no answer, a busy server
 // (429, 5xx, even in the service's own words), a server without the account
@@ -105,6 +106,46 @@ void nat_test() {
           "a refusal carries none");
 }
 
+// whoami's RelayDirect: the account's relay switch (true: the player turned
+// the relay off), the setup window's Relay row - and a server without it.
+void relay_direct() {
+    const net::SignInReply off = read(200, R"({"ResKind":0,"OnlineId":"Hunter","ModdedSummons":true,"RelayDirect":true,"NatTest":null})");
+    check(off.relay.known && off.relay.direct, "RelayDirect true: the relay is off");
+    const net::SignInReply on = read(200, R"({"ResKind":0,"OnlineId":"Hunter","RelayDirect":false})");
+    check(on.relay.known && !on.relay.direct, "RelayDirect false: the relay is on");
+    check(!read(200, R"({"ResKind":0,"OnlineId":"Hunter"})").relay.known, "a server without the switch: not known");
+    check(!read(200, R"({"ResKind":0,"OnlineId":"Hunter","RelayDirect":1})").relay.known, "not a bool: not known");
+    check(!read(200, R"({"ResKind":0,"OnlineId":"Hunter","RelayDirect":"true"})").relay.known, "a string: not known");
+    check(!read(200, R"({"ResKind":1,"Message":"no such token","RelayDirect":true})").relay.known, "a refusal carries none");
+}
+
+// POST /auth/profile {Token, RelayDirect}'s answer: what the account holds
+// now, or why not.
+void profile_reply() {
+    const net::ProfileReply ok = net::read_profile_reply(
+        200, R"({"ResKind":0,"OnlineId":"Hunter","ProfilePublic":true,"ShowDiscord":false,"ModdedSummons":true,"RelayDirect":true})", "");
+    check(ok.ok && ok.relay.known && ok.relay.direct && ok.why.empty() && ok.status == 200, "taken: the relay is off now");
+    const net::ProfileReply back = net::read_profile_reply(200, R"({"ResKind":0,"OnlineId":"Hunter","RelayDirect":false})", "");
+    check(back.ok && back.relay.known && !back.relay.direct, "taken: the relay is on now");
+    const net::ProfileReply gone = net::read_profile_reply(200, R"({"ResKind":1,"Message":"no such token"})", "");
+    check(!gone.ok && gone.refused && gone.why == "no such token", "a token the server no longer knows: refused, a new sign-in needed");
+    const net::ProfileReply other = net::read_profile_reply(200, R"({"ResKind":1,"Message":"slow down"})", "");
+    check(!other.ok && !other.refused && other.why == "slow down", "another refusal: its words, the sign-in still good");
+    const net::ProfileReply none = net::read_profile_reply(0, "", "Couldn't connect to server");
+    check(!none.ok && !none.refused && none.why == "Couldn't connect to server" && none.status == 0, "no answer: the transport's words");
+    check(net::read_profile_reply(0, "", "").why == "no answer", "no status and no error: no answer");
+    const net::ProfileReply old = net::read_profile_reply(404, R"({"detail":"Not Found"})", "");
+    check(!old.ok && old.why == "this server has no account settings (HTTP 404)", "a server without /auth/profile");
+    check(!net::read_profile_reply(200, "<html>", "").ok, "not JSON");
+    const net::ProfileReply busy = net::read_profile_reply(503, R"({"ResKind":0,"RelayDirect":true})", "");
+    check(!busy.ok && busy.why == "HTTP 503", "ResKind 0 on a 503 is no answer");
+    const net::ProfileReply nosw = net::read_profile_reply(200, R"({"ResKind":0,"OnlineId":"Hunter","ShowDiscord":false})", "");
+    check(!nosw.ok && nosw.why == "this server has no relay switch", "taken, but no relay switch to set");
+    check(!net::read_profile_reply(200, R"({"ResKind":0,"RelayDirect":"yes"})", "").ok, "RelayDirect not a bool");
+    check(!net::read_profile_reply(200, R"({"ResKind":1,"Message":"no such token"})", "Recv failure").refused,
+          "a transport error wins over a body");
+}
+
 }  // namespace
 
 int main() {
@@ -112,6 +153,8 @@ int main() {
     refused();
     unchecked();
     nat_test();
+    relay_direct();
+    profile_reply();
     if (g_fail) {
         std::printf("%d failed\n", g_fail);
         return 1;

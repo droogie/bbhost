@@ -440,11 +440,30 @@ path at all:
 
 - YEBIS, the post-processing library (bloom, glare, depth of field, tone
   mapping): every stage's resources and constants are built by bbhost.
+  Its depth of field blends each blurred level in by the circle of
+  confusion in pixels, which grows with the picture, against an offset that
+  does not. A blur drawn with several levels keeps its look by itself, as a
+  growing circle moves on to the next, larger level (the cutscenes, a
+  plugin's lens), but the areas' own faint far blur has one level, so it
+  faded out below 1080 lines and grew above them. On a side drawn with one
+  level the offset now scales with the picture's height over 1080, which
+  keeps the 1080-line look at every Resolution; with an upscaler the height
+  is the picture's, the one YEBIS works at.
 - Scaleform, the menu renderer: its draws are taken from its hardware
   abstraction layer.
 - Depth snapshots, the on-screen overlay and FSR 1 upscaling are bbhost's
   own. The depth snapshot's compute pass goes into the recorder's stream
   (`BBHOST_STREAM_DEPTH_COPY=0` records it in place, draining the recorder).
+  The scene's own depth copy is one: after the G-buffer the game copies its
+  depth into DepthRenderTarget (and its first G-buffer target, the normals,
+  into GBuffer0), which SSAO, the sun's screen-space shadows, motion blur's
+  and screen space reflections' smaller depths, the decals, the forward
+  passes and depth of field read. The world's view makes them with
+  CopyResource; the renderer's two other modes make them with three calls of
+  their own (`0x26a10c0`, `0x26a2829`, `0x26a283f`), which the built-in
+  Performance patch turned into NOPs until v0.2.35 - calls the world's view
+  never makes, so leaving them out changed nothing there; only a view drawn in
+  those modes read targets nothing had written that frame.
 
 ## Native or emulated
 
@@ -870,6 +889,14 @@ pool's constant-buffer copies take the last 16 MiB of the command processor's
 ring, which keeps the rest while the pool runs, so on a card with a small
 window of video memory the CPU writes both stay in video memory (in host
 memory the GPU read them across the bus: +11% GPU time on an RTX 4070).
+Their tables - the vertex and resource tables a draw's user data points at -
+take the last 16 MiB of GX's tables ring in the same way, in 1 MiB segments a
+pool thread owns while it places there, each taken again only once no commit
+placed in it can still be spliced and the recordings its commits went into
+have run; the command processor's part of that ring waits, at a lap, for the
+recording that last placed in a segment to have run. (Until 2026-11-13 a pool
+thread kept a chunk of the shared ring until it was full - across a rest at a
+frame cap too - and could write over tables the ring had handed out since.)
 Unset, the switch follows the constant buffers' homes: segments where the
 homes bind by handle, off elsewhere (small video memory, an integrated GPU)
 with the reason in the log; the pool needs 8 hardware threads or more.
@@ -973,7 +1000,19 @@ waiting 8-15%), where it used to work on for good, it tries a rest - the
 switch's 1.5 s, then 1-1.5 s counted - and keeps it where the cap holds the
 frame without it, else it works again and the next trial waits the cap's
 backoff), while the frame is the GPU's (busy 90% of two windows, until it is
-under 80% over six), and wherever resting costs the frame nothing. That last is
+under 80% over six), and wherever resting costs the frame nothing. With no cap
+holding the frame, a rest the GPU began is judged by the frame when it ends:
+resting 8% slower than the GPU-bound windows that began it, the pool's work was
+what kept the frame the GPU's, and that is an experiment's clear answer - the
+pool works, and no GPU-bound rest and no probe come for 40 s, then 160, then 240
+(a loading screen starts the place over; at a cap nothing changes). On the RTX
+4070 below, uncapped, the Hunter's Dream ran 204-208 fps working with the GPU
+91-95% busy and ~170 resting (the command processor the wall, the game held
+back 70%), and Cainhurst's courtyard 166-170 and 106-113: the GPU's rest began
+after two windows, ended after six and began again two later, ten times in
+every 20 s, and the places ran 180-184 and 121-124 fps against 216 and 167 with
+the pool never resting. A rest that runs as fast - an APU's frame, the GPU's
+either way - is the GPU's as before. That last is
 measured at each place, both ways: 10 s after the pool began to work there, an
 experiment rests it for 5.5 s and lets it work for 5.5 s more, and compares the
 frame rate resting with the windows on either side of it; under 0.5% slower
@@ -1242,7 +1281,11 @@ memory at its first use, unless that use is a copy-back over all of it.
 What reads a home without a handle - a dispatch, a copy, a device address -
 finds it by address; a CPU copy of its stale guest bytes is refused; a
 page-table walk that reads it gets it copied back to its memory first, and
-it stays the home. A home ends with its buffer, and a buffer made past the
+it stays the home. The command processor's index of the homes by address
+changes in place, so the draw pool's threads read a copy published for them
+instead - the homes touching each 4 KiB page as an immutable list swapped by
+pointer, freed once no reader can hold it, a run of changes seen whole or not
+at all - and change nothing. A home ends with its buffer, and a buffer made past the
 pool's budget (128 MiB, `BBHOST_GXVK_HOMES_BUDGET_MB`) takes today's path for
 its life. Off on an integrated GPU, and with small video memory under 5,000
 MiB free at the start unless a budget is given (on a 4 GB card the pool's ~80
@@ -1273,5 +1316,8 @@ another thread before the capture read it.
 | `BBHOST_VK_VALIDATE=1` | runs with the Vulkan validation layer |
 | `BBHOST_VA_TRACE=1` | logs every guest-memory import made, put in place, retired and freed, every window whose page-table entries move, every device buffer made through `create_dev_buffer` with its owner and every staging or scratch chunk freed (`va:` lines, the wall clock in seconds and microseconds, to match `journalctl -k -o short-unix`); a device fault report then looks its addresses up in them. `=2` adds the driver's own binds and unbinds where it reports them (VK_EXT_device_address_binding_report) |
 | `BBHOST_GPU_PROFILE=1` | per-pass GPU timings |
+| `BBHOST_GPU_CHECKPOINTS=amd` | the GPU's progress markers (VK_AMD_buffer_marker, which NVIDIA's drivers have too) everywhere, not only while a loading screen is up, as they are by default: two words before each draw and dispatch, and the front end's word before the ops between them where it stops or the pass changes - barriers, pass ends and begins - with every op noted. A lost device then names the draw or dispatch the GPU had started, the op its front end had reached, the ops between the two, and whether a barrier among them says the draw had finished (barriers hold the front end on NVIDIA's and AMD's GPUs; the specification does not promise it); a loss after a loading screen's markers ended says so, and that they were off there. The default's window opens at the first submission recorded once a loading screen is up and closes at the first one 200 ms after it has gone, and nothing of them is written or done in between - in the world they cost frames. `=0` keeps them off in loading screens too; `=after-loss` also marks everything for the three starts after a loss; `=amd-dry` and `=loading-dry` record them, everywhere or in loading screens, on a device without the extension (lavapipe) |
+| `BBHOST_GPU_MARKER_OPS=all` | with the markers on, the front end's word before every op between draws: where the front end was held between two barriers shows too, at a cost on NVIDIA's GPUs, where a word between two copies holds them apart |
+| `BBHOST_MARKER_TRACE=<prefix or *>[:n]` | with the markers on, the ops noted after the first n (4) draws of the pipelines whose name starts with the prefix, and every 300 flips what a lost device would say from the words as they stand |
 | `BBHOST_UPSCALE_CHECK=4` + `tools/upscale_check.py` | the upscalers' reprojection check, with an upscaler on and `BBHOST_UPSCALE_JITTER=0`: in place of the upscaler's picture, green where the motion explains how the scene changed since the last frame, red where it does not, blue where a surface came from off the screen; every 30 frames the log has red's share of what changed, over the picture and in sixteen bands of its width, and the tool sums it over the windows where the picture moved |
 | `bbhost --stream-selftest[=N]` | checks the command stream headless against a CPU model, N rounds (16 by default), and exits with 0 when it matched; run it with `BBHOST_VK_VALIDATE=1` too |

@@ -464,7 +464,7 @@ void device_lost_exit(bool windowed) {
         } else if (const std::string hooks = host_foreign_hooks(); !hooks.empty()) {
             text += "Hooked into bbhost: " + hooks + ". Overlays like these can cause this; try again without them.\n\n";
         }
-        text += "The next starts record where the GPU was, so if it happens again the log says more. Please send the log "
+        text += "Loading screens record where the GPU was, so if it happens again in one, the log says more. Please send the log "
                 "(run-bbhost.bat writes it to the logs folder).";
         // The box on a thread of its own: the exit goes on after a while even
         // if nobody closes it.
@@ -1218,6 +1218,11 @@ int main(int argc, char** argv) {
             }
         }
         if (rounds) {
+            // Its lines written: what differed, the cost table, the validation
+            // layer's messages. The log's decision otherwise waits for the
+            // configuration, which a self-test never reads, and the lines held
+            // until then went with its exit.
+            decide_log(true);
             const int rc = host_gpu_stream_selftest(rounds);
             std::fflush(nullptr);
             std::_Exit(rc);  // the recorder and submission threads run on: no static destructors under them
@@ -1228,6 +1233,7 @@ int main(int argc, char** argv) {
     // the exit code says.
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--options-selftest") == 0) {
+            decide_log(true);  // its lines written (the stream self-test's note)
             const int rc = host_options_selftest(argv[i + 1]);
             std::fflush(nullptr);
             std::_Exit(rc);
@@ -1368,9 +1374,6 @@ int main(int argc, char** argv) {
     }
 #endif
     plugins_load();  // before the HLE table is bound: a plugin may replace an import
-    if (host_settings().debug_camera && plugins_active("debug_menu"))
-        host_log("debug camera: on with the debug menu - its LOAD TEST and DUNGEON MOVEMAP TEST crash the game "
-                 "(the camera's code takes their step's place)");
     register_hle();
 
     ElfImage image{};

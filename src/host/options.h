@@ -62,11 +62,13 @@ bool host_opt_saved(const char* key);
 // neither parses. Read once by the loader - it is a patch on the image.
 bool host_opt_resolution(int* w, int* h);
 // The game's own size - its post chain, the HUD and the menus, and the
-// upscaler's output: the Resolution, or with an upscaler chosen and a
-// Resolution smaller than the window, the window's size (Borderless and
-// Fullscreen: the screen's; Windowed: [video] width x height). The 3D is
-// then drawn at the Resolution (engine/render_scale.cpp) and upscaled, so a
-// low Resolution keeps the UI sharp. A plugin's 3D at a size of its own
+// upscaler's output: the Resolution, or with a Resolution smaller than the
+// window, the window's size (Borderless and Fullscreen: the screen's;
+// Windowed: [video] width x height). The 3D is then drawn at the Resolution
+// (engine/render_scale.cpp) and upscaled - by the upscaler, or with Upscaling
+// Off by YEBIS's copy - so a low Resolution keeps the UI sharp. Only with
+// render scale off (BBHOST_RENDER_SCALE=0, BBHOST_LIVE_RESOLUTION=0) and no
+// upscaler is the game the Resolution's size. A plugin's 3D at a size of its own
 // (plugin API 18 scene_scale, host/scene_look.h: the Bloodborne PS1's) is the same
 // with no upscaler, the 3D brought up nearest - and with a height of its own
 // the game is the window's size whatever the Resolution. False as
@@ -89,6 +91,11 @@ bool host_opt_motion_wanted();
 int host_opt_motion_rebuilt_bits();
 int host_opt_resolution_index();
 void host_opt_set_resolution_index(int i);
+// The Resolution list as its row shows it - "(16:9) 1920x1080", each size
+// after its aspect ratio - its length in *n, and the row's help text: for
+// the setup window's Display card, the same setting as the Graphics page's.
+const char* const* host_opt_resolution_labels(int* n);
+const char* host_opt_resolution_note();
 // The game's frame rate (engine/frame_rate.h): 30, 60, 90, 120, 150, 180,
 // 240, 360, 480, 960, or 0 for Uncapped (the display's refresh rate); the
 // file's key is still frame_cap. Same setting, same file.

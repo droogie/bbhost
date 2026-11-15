@@ -93,6 +93,8 @@ int main() {
     // colour space lives on as bbhost's own scene-rgba8 (plugin API 18).
     CHECK(seen.count("rgba8f-color-space") == 0);
     CHECK(seen.count("lower-specific-renders") == 0);
+    // 50% Text scale is the Text scale setting (2026-11-13): no file of its own.
+    CHECK(seen.count("text-scale-50") == 0);
 
     // The guard catches a dropped line: Smaller Hunter's own file without its
     // `enabled = false` reads as on.
@@ -118,6 +120,32 @@ int main() {
         std::string err;
         CHECK(patch_file::parse((dir / "without-enabled.toml").string(), &m, &err));
         CHECK(m.name == "smaller-hunter" && m.enabled);
+    }
+
+    // The built-in Performance patch (engine/performance_v3_sites.inc, always
+    // on) leaves the scene's depth and G-buffer copies to the game: none of its
+    // sites writes the three calls of the copy recorder (0x268f180) in the
+    // scene's render, which the list turned into NOPs. Without them SSAO,
+    // depth of field and the passes after the G-buffer read a target nothing
+    // wrote that frame.
+    {
+        const std::vector<patch_file::Site> perf = {
+#include "engine/performance_v3_sites.inc"
+        };
+        constexpr std::uint64_t kCopyCalls[] = {0x026a10c0, 0x026a2829, 0x026a283f};  // 5-byte calls each
+        int over = 0;
+        for (const patch_file::Site& s : perf) {
+            CHECK(s.expect.size() == s.bytes.size() && !s.bytes.empty());
+            for (const std::uint64_t call : kCopyCalls) {
+                if (s.address < call + 5 && call < s.address + s.bytes.size()) {
+                    std::printf("  performance site %s (0x%llx) writes the copy call at 0x%llx\n", s.id.c_str(),
+                                static_cast<unsigned long long>(s.address), static_cast<unsigned long long>(call));
+                    ++over;
+                }
+            }
+        }
+        CHECK(over == 0);
+        CHECK(perf.size() == 172);  // the list's 177 less the camera blur's force, Model detail's and the three copies
     }
 
     // What a player starts from turns nothing on.

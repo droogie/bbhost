@@ -4510,7 +4510,11 @@ VkSampler sampler_anisotropic(VkSampler base, int level) {
     return out;
 }
 
-VkSampler sampler_nearest(VkSampler base) {
+namespace {
+// sampler_nearest and sampler_linear: `base` with its texel filter changed,
+// each its own memo and map (a template's statics are per instance).
+template <bool kLinear>
+VkSampler sampler_filtered(VkSampler base) {
     if (!base) return base;
     // The answer for this thread's last few, in front of the map (samplers
     // are never destroyed, so an entry never goes stale).
@@ -4534,13 +4538,19 @@ VkSampler sampler_nearest(VkSampler base) {
         // would take the hardware's four-sample blend away.
         if (rec != g_sampler_records.end() && !rec->second.compareEnable) {
             const VkSamplerCreateInfo& was = rec->second;
-            if (was.magFilter != VK_FILTER_NEAREST || was.minFilter != VK_FILTER_NEAREST || was.mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST ||
-                was.anisotropyEnable) {
+            const bool change = kLinear ? was.magFilter != VK_FILTER_LINEAR || was.minFilter != VK_FILTER_LINEAR
+                                        : was.magFilter != VK_FILTER_NEAREST || was.minFilter != VK_FILTER_NEAREST ||
+                                              was.mipmapMode != VK_SAMPLER_MIPMAP_MODE_NEAREST || was.anisotropyEnable;
+            if (change) {
                 VkSamplerCreateInfo sci = was;
-                sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
-                sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-                sci.anisotropyEnable = VK_FALSE;
-                sci.maxAnisotropy = 1.0f;
+                if (kLinear) {
+                    sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;  // the mip mode and anisotropy as they were
+                } else {
+                    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+                    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                    sci.anisotropyEnable = VK_FALSE;
+                    sci.maxAnisotropy = 1.0f;
+                }
                 if (vkCreateSampler(g.device, &sci, nullptr, &out) == VK_SUCCESS)
                     g_sampler_records[out] = sci;
                 else
@@ -4554,6 +4564,10 @@ VkSampler sampler_nearest(VkSampler base) {
     m.out = out;
     return out;
 }
+}  // namespace
+
+VkSampler sampler_nearest(VkSampler base) { return sampler_filtered<false>(base); }
+VkSampler sampler_linear(VkSampler base) { return sampler_filtered<true>(base); }
 
 // Stage 4b.1a's reader path (under cache_rw's shared lock): the sampler made
 // for these words, null when it is not made yet.

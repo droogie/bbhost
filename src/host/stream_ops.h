@@ -52,6 +52,7 @@ enum class Op : std::uint16_t {
     kExecuteCommands,    // vkCmdExecuteCommands of a segment a pool thread recorded (stage 4b.2)
     kListRun,            // a segment's list packets replayed here one after another (stage 4b.2, inline)
     kUpdateBuffer,       // vkCmdUpdateBuffer, its data copied (at most 64 KiB)
+    kMarkerWindow,       // the markers' window begins or ends here: a loading screen's (host/gpu_markers.h; a Marker)
     kCount
 };
 
@@ -230,7 +231,7 @@ struct DispatchIndirect {
     VkDeviceSize offset;
 };
 struct Marker {
-    std::uint32_t value, pad;  // gpu_marker_value
+    std::uint32_t value, pad;  // gpu_marker_value; kMarkerWindow: gpu_markers::window_value
 };
 struct PushBuffers {
     VkPipelineLayout layout;

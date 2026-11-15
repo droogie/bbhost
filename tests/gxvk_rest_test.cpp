@@ -20,7 +20,10 @@
 // anew (work, then rest again) after the interval, twice as far each time (20
 // s to 240 s), and at once with the game held back 20% and the frame 5%
 // slower than it found it resting. GPU-bound (90%, two windows): a rest until
-// the GPU's median of six windows is under 80%. A loading screen drops an
+// the GPU's median of six windows is under 80% - and with no cap holding the
+// frame, one that ran 8% slower than the GPU-bound windows that began it ends
+// judged: the pool works, and no GPU-bound rest and no probe come for 40 s, then
+// 160, then 240. A loading screen drops an
 // experiment, ends any rest but one at a cap, and starts the place's
 // experiments again 10 s after it.
 #include "host/gxvk_rest.h"
@@ -730,6 +733,61 @@ int main() {
         // A GPU-bound rest ends at a loading screen.
         check(step(s, openf(0.6, 90.0, 0.95), t += kWin) == kStay && step(s, openf(0.6, 90.0, 0.95), t += kWin) == kRest, "no rest GPU-bound again", 12);
         check(step(s, loading_window(), t += kWin) == kWake && !s.resting, "a GPU-bound rest kept across a loading screen", 13);
+    }
+    // A GPU-bound rest judged by the frame, no cap holding it. The Hunter's Dream on an RTX 4070: 206 fps working, the GPU
+    // 93% busy; resting, the command processor the wall at ~170 fps, the GPU 75%, the game held back 70%. The rest ends
+    // after six windows judged - 8% slower: the pool works, and neither a GPU-bound rest nor a probe comes for 40 s (the
+    // first interval four times over), then 160 s, then 240; a rest that ran as fast (an APU's frame, the GPU's either
+    // way) wakes as before and may rest again at once; at a cap nothing waits; a loading screen starts the place over.
+    {
+        using gxvk_rest::kEvGpuCost;
+        using gxvk_rest::kProbeFirstNs;
+        using gxvk_rest::kWhyGpu;
+        State s;
+        check(step(s, openf(0.0, 206.0, 0.93), t += kWin) == kStay && step(s, openf(0.0, 206.0, 0.93), t += kWin) == kRest &&
+                  s.why == kWhyGpu && s.gpu_ref == 206.0,
+              "no GPU-bound rest at the Dream", 0);
+        for (int k = 0; k < 5; ++k) check(step(s, openf(0.70, 170.0, 0.75), t += kWin) == kStay && s.resting, "woken before six windows", k);
+        check(step(s, openf(0.70, 170.0, 0.75), t += kWin) == kWake && !s.resting && s.event == kEvGpuCost, "a GPU-bound rest 17% slower not judged", 1);
+        check(s.interval_ns == 4 * kProbeFirstNs && s.next_at == t + s.interval_ns && s.gpu_allowed_at == s.next_at && s.phase == gxvk_rest::kNoPhase,
+              "the judged rest's waits", 2);
+        const auto works_until = [&](std::uint64_t until, const char* what) {
+            for (int k = 0; t + kWin < until && k < 4000; ++k) check(step(s, openf(0.0, 206.0, 0.93), t += kWin) == kStay && !s.resting, what, k);
+        };
+        works_until(s.gpu_allowed_at, "a rest within the first 40 s");
+        check(step(s, openf(0.0, 206.0, 0.93), t += kWin) == kRest && s.why == kWhyGpu, "no GPU-bound rest once its time came", 3);
+        for (int k = 0; k < 6; ++k) step(s, openf(0.70, 170.0, 0.75), t += kWin);
+        check(!s.resting && s.event == kEvGpuCost && s.interval_ns == 16 * kProbeFirstNs && s.gpu_allowed_at == s.next_at,
+              "the second judged rest's waits (160 s)", 4);
+        works_until(s.gpu_allowed_at, "a rest within 160 s");
+        check(step(s, openf(0.0, 206.0, 0.93), t += kWin) == kRest, "no GPU-bound rest after 160 s", 5);
+        for (int k = 0; k < 6; ++k) step(s, openf(0.70, 170.0, 0.75), t += kWin);
+        check(!s.resting && s.event == kEvGpuCost && s.interval_ns == gxvk_rest::kProbeMostNs, "the third judged rest's waits (240 s)", 6);
+        // At a cap (the limiter waiting 10%, the GPU 95%) a GPU-bound rest begins at once, whatever the wait set uncapped.
+        check(s.gpu_allowed_at > t + kWin, "no wait to test the cap against", 7);
+        check(step(s, win(0.10, 60.0f, 0.9, 0.0, 0.95), t += kWin) == kStay && step(s, win(0.10, 60.0f, 0.9, 0.0, 0.95), t += kWin) == kRest &&
+                  s.why == kWhyGpu && s.gpu_ref == 0.0,
+              "a GPU-bound rest at a cap held back by the uncapped wait", 8);
+        // A loading screen ends it and starts the place over: GPU-bound again uncapped, it rests at once.
+        check(step(s, loading_window(), t += kWin) == kWake && s.gpu_allowed_at == 0, "the wait kept across a loading screen", 9);
+        check(step(s, openf(0.0, 206.0, 0.93), t += kWin) == kStay && step(s, openf(0.0, 206.0, 0.93), t += kWin) == kRest,
+              "no GPU-bound rest after the loading screen", 10);
+        // A rest that ran as fast as it began (7.9% slower, 100 fps against 108.6 is not 8%): as before - the GPU's wake, the
+        // interval as it was, and a rest again at once.
+        State a;
+        check(step(a, openf(0.0, 108.6, 0.95), t += kWin) == kStay && step(a, openf(0.0, 108.6, 0.95), t += kWin) == kRest, "no rest (APU)", 11);
+        for (int k = 0; k < 6; ++k) step(a, openf(0.0, 100.0, 0.7), t += kWin);
+        check(!a.resting && a.event == gxvk_rest::kEvCapWake && a.interval_ns == kProbeFirstNs && a.gpu_allowed_at == 0, "an APU's rest judged", 12);
+        check(step(a, openf(0.0, 108.6, 0.95), t += kWin) == kStay && step(a, openf(0.0, 108.6, 0.95), t += kWin) == kRest, "no rest again (APU)", 13);
+        // A probe's rest that became the GPU's has nothing to be judged by: it wakes as before.
+        Sim pr;
+        const Place busy{105.0, 104.0};
+        for (int k = 0; k < 200 && !pr.s.resting; ++k) pr.one(busy);
+        check(pr.s.resting && pr.s.why == gxvk_rest::kWhyProbe, "no probe at the place", 14);
+        for (int k = 0; k < 4; ++k) step(pr.s, openf(0.0, 104.0, 0.95), pr.t += kWin);
+        check(pr.s.resting && pr.s.why == kWhyGpu && pr.s.gpu_ref == 0.0, "a probe's rest not the GPU's", 15);
+        for (int k = 0; k < 6; ++k) step(pr.s, openf(0.0, 80.0, 0.6), pr.t += kWin);
+        check(!pr.s.resting && pr.s.event == gxvk_rest::kEvCapWake, "a probe's rest turned GPU-bound judged", 16);
     }
     // Uncapped the game held back alone wakes nothing and rests nothing: the frame rate decides (the sewer pit: the command
     // processor 92% busy with the homes alone, the game held back 1.4%; the laptop: 84% either way).

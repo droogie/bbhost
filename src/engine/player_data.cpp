@@ -95,6 +95,37 @@ bool player_origin(int* origin) {
     return true;
 }
 
+// The game's own HUD option: the byte at +9 of GameDataMan's game options
+// (+0x48), 1 shown and 0 hidden, which the in-game HUD's update reads before
+// it draws (sub_1ffb2a0 and its neighbours: cmp byte [options + 9], 0). A
+// plugin's HUD shown (plugin API 29's hud_hide with -1) sets it to 1 while it
+// asks, and the player's own value is put back when it stops.
+void player_hud_option_hold(int want) {
+    static int saved = -1;           // the player's value while it is held
+    static std::uint64_t held_at = 0;
+    const bool held = want == 0 || want == 1;
+    if (!held && saved < 0) return;  // nothing asked, nothing to put back
+    const std::uint64_t man = manager();
+    std::uint64_t options = 0;
+    if (!man || !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(man + 0x48)), &options, 8)) options = 0;
+    const std::uint64_t at = options ? options + 9 : 0;
+    std::uint8_t v = 0;
+    const bool readable = at && host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(at)), &v, 1);
+    if (held && readable) {
+        if (saved < 0 || held_at != at) {
+            saved = v;
+            held_at = at;
+            host_log("player data: the game's HUD option %s for a plugin (the player's is %s)", want ? "shown" : "hidden", v ? "on" : "off");
+        }
+        if (v != want) *reinterpret_cast<volatile std::uint8_t*>(static_cast<std::uintptr_t>(at)) = static_cast<std::uint8_t>(want);
+    } else if (!held && saved >= 0) {
+        if (readable && held_at == at) *reinterpret_cast<volatile std::uint8_t*>(static_cast<std::uintptr_t>(at)) = static_cast<std::uint8_t>(saved);
+        host_log("player data: the game's HUD option back to the player's (%s)", saved ? "on" : "off");
+        saved = -1;
+        held_at = 0;
+    }
+}
+
 void player_data_tick() {
     if (g_said || !g_ok) return;
     std::int64_t level = 0;

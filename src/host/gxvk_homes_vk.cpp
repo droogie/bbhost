@@ -72,16 +72,30 @@ struct Home {
     // also by stage 4b's pool, whose list-mode binding (homes_bind_locked) runs outside g.mu and leaves a home not
     // filled yet to the command processor's draw in order.
     std::atomic<bool> filled{false};
+    // Copies into it still to be put in place: changed under g.mu alone (by the command processor, or a guest thread's
+    // catch-up holding it), read by stage 4b's pool too, whose list-mode binding falls to the draw in order on one
+    // pending - and whose splice asks again on the command processor (homes_splice_ok), so a commit made before a copy
+    // came is drawn in order too.
+    std::atomic<std::uint32_t> pending{0};
     // The command processor's (under g.mu).
     bool indexed = false;      // in the index by address
     bool end_queued = false;   // on its way to being taken back
-    std::uint32_t pending = 0;  // copies into it still to be put in place
     std::uint32_t pend_at = 0;      // ... the newest one's place in the pending list, valid in pend_epoch's batch
     std::uint64_t pend_epoch = 0;
     std::uint8_t* mirror = nullptr;  // compare: what the home holds at this point of the walk
 };
 inline std::uint32_t state_of(std::uint32_t w) { return w & 0xff; }
 inline std::uint32_t gen_of(std::uint32_t w) { return (w >> 8) & 0xff; }
+// A home's pending copies: written under g.mu only (one writer at a time: a load and a store), anyone's to read.
+inline std::uint32_t pending_of(const Home& e) { return e.pending.load(std::memory_order_acquire); }
+inline void pending_add(Home& e, int d) {
+    const std::uint32_t n = e.pending.load(std::memory_order_relaxed);
+    e.pending.store(d > 0 ? n + 1 : n ? n - 1 : 0, std::memory_order_release);
+}
+// A pool thread's list-mode draw (stage 4b.1b's lists_commit), beside the command processor without the renderer's
+// lock: it reads the index's published lists (HomeIndex::read_meets) and changes nothing here. (A run part's draw -
+// BBHOST_RUN_COMMIT - runs while the command processor holds the lock at its fork: it reads the index itself.)
+inline bool pool_draw() { return list_resolve::parts() && t_run_draw && t_run_draw->list; }
 
 constexpr std::uint32_t kChunkBits = 12, kChunks = 1u << (kIndexBits - kChunkBits);
 std::atomic<Home*> g_chunks[kChunks] = {};
@@ -206,15 +220,19 @@ Home* index_meets(std::uint64_t va, std::uint64_t bytes, std::uint32_t* out_inde
 void end_locked(std::uint32_t index, Home& e, int why);
 
 void drain_locked() {
-    // (A run part's draw - BBHOST_RUN_COMMIT - reads the index as the fork left it: homes_settled_locked refused the
-    // fork while events were waiting.)
-    if (g_ev_n.load(std::memory_order_acquire) == g_ev_seen || run_part()) return;
+    // Under g.mu only - the command processor, or a thread holding its lock (the texture-ahead thread's lookups): a
+    // pool thread's list-mode draw changes nothing here (it reads the index's published lists), and a run part's draw
+    // - BBHOST_RUN_COMMIT - reads the index as the fork left it (homes_settled_locked refused the fork while events were
+    // waiting). Asked first, so neither reads g_ev_seen, which the command processor writes.
+    if (run_part() || g_ev_n.load(std::memory_order_acquire) == g_ev_seen) return;
     std::vector<Event> events;
     {
         std::lock_guard<std::mutex> lk(g_mu);
         events.swap(g_events);
         g_ev_seen = g_ev_n.load(std::memory_order_relaxed);
     }
+    // The pool's threads see the index as these events leave it, or as it was (HomeIndex::Batch).
+    const HomeIndex::Batch batch(g_ix);
     // The live homes meeting [va, +bytes) ended for `why` (their buffers' memory is another's now).
     const auto end_over = [](std::uint64_t va, std::uint64_t bytes, int why) {
         std::uint32_t oi = 0;
@@ -266,7 +284,7 @@ void recycle(std::uint32_t index) {
     delete[] e->mirror;
     e->mirror = nullptr;
     e->filled.store(false, std::memory_order_relaxed);  // (made again, it is published by its word's release)
-    e->pending = 0;
+    e->pending.store(0, std::memory_order_relaxed);
     e->end_queued = false;
     e->indexed = false;
     std::lock_guard<std::mutex> lk(g_mu);
@@ -346,7 +364,7 @@ bool ready_for_copy(Home& e, std::uint64_t dst, std::uint64_t bytes) {
 // reads from now on. The home stays the home.
 void sync_one_locked(Home& e) {
     if (!e.filled.load(std::memory_order_acquire)) return;  // guest memory holds what the home would
-    if (e.pending) {
+    if (pending_of(e)) {
         render_end_pass_locked();
         homes_flush_locked();
     }
@@ -611,7 +629,7 @@ void homes_begin_recording_locked() {
         Home* e = home_at(index);
         if (!e) continue;
         // (A copy still pending into it goes into place first: its range is free only after the work that reads it.)
-        if (e->pending) {
+        if (pending_of(*e)) {
             render_end_pass_locked();
             homes_flush_locked();
         }
@@ -625,10 +643,40 @@ void homes_begin_recording_locked() {
         recycle(d.index);
         g_ranges_freed.fetch_add(1, std::memory_order_relaxed);
     }
+    g_ix.reclaim();  // (the published lists the pool's threads have left since the last run of changes)
 }
+
+namespace {
+// A pool thread's list-mode draw asking for the home holding a range (homes_holding_locked), from the index's published
+// lists: a live home, filled, with no copy into it pending, as its entry stands - anything else, or an index it is not
+// sure of, stops the draw (drawn in order, where the fill, the copies and the end are the command processor's).
+bool pool_holding(std::uint64_t va, std::uint64_t bytes, Located* out, VkDeviceAddress* address) {
+    const auto stop = [](int why) {
+        run_part_stop(why);
+        return false;
+    };
+    HomeIndex::Hit h;
+    const int r = g_ix.read_meets(va, bytes, &h);
+    if (r == HomeIndex::kReadUnsure) return stop(kRunStopOrder);
+    if (r == HomeIndex::kReadNone || va < h.memory || va + bytes > h.memory + h.bytes || !bind_on()) return false;
+    Home* const e = home_at(h.index);
+    const std::uint32_t w = e ? e->word.load(std::memory_order_acquire) : 0;
+    if (!e || state_of(w) != kLive || e->memory != h.memory || e->bytes != h.bytes) return stop(kRunStopOrder);
+    if (!e->filled.load(std::memory_order_acquire)) return stop(kRunStopRefresh);
+    if (pending_of(*e)) return stop(kRunStopOrder);
+    const Located loc{e->buffer, e->offset + (va - e->memory), class_bytes(e->cls) - (va - e->memory)};
+    const VkDeviceAddress at = e->address + (va - e->memory);
+    if (e->word.load(std::memory_order_acquire) != w) return stop(kRunStopOrder);  // (ended, or taken back and made again, meanwhile)
+    if (out) *out = loc;
+    if (address) *address = at;
+    g_bound_addr.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+}  // namespace
 
 bool homes_holding_locked(std::uint64_t va, std::uint64_t bytes, Located* out, VkDeviceAddress* address) {
     if (!gxvk_homes::made_on() || !bytes) return false;
+    if (pool_draw()) return pool_holding(va, bytes, out, address);
     drain_locked();
     if (!g_ix.may_meet(va, bytes)) return false;
     std::uint32_t index = 0;
@@ -636,7 +684,7 @@ bool homes_holding_locked(std::uint64_t va, std::uint64_t bytes, Located* out, V
     if (!e || va < e->memory || va + bytes > e->memory + e->bytes) return false;
     if (!bind_on()) return false;  // compare: today's path is bound
     if (!e->filled.load(std::memory_order_acquire) && (run_part_stop(kRunStopRefresh) || !fill_locked(*e))) return false;
-    if (e->pending) bump(g_addr_pending);  // (a copy into it pending: the callers that bind ask the copies first - counted)
+    if (pending_of(*e)) bump(g_addr_pending);  // (a copy into it pending: the callers that bind ask the copies first - counted)
     if (out) *out = {e->buffer, e->offset + (va - e->memory), class_bytes(e->cls) - (va - e->memory)};
     if (address) *address = e->address + (va - e->memory);
     g_bound_addr.fetch_add(1, std::memory_order_relaxed);
@@ -645,19 +693,34 @@ bool homes_holding_locked(std::uint64_t va, std::uint64_t bytes, Located* out, V
 
 bool homes_meet_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_bind.load(std::memory_order_relaxed) || !bytes) return false;
+    if (pool_draw()) {  // (from the published lists; one it is not sure of meets a home, and stops the draw)
+        const int r = g_ix.read_meets(va, bytes, nullptr);
+        if (r == HomeIndex::kReadUnsure) run_part_stop(kRunStopOrder);
+        return r != HomeIndex::kReadNone;
+    }
     drain_locked();
     return ix_meets(va, bytes, nullptr);
 }
 
 bool homes_straddle_locked(std::uint64_t va, std::uint64_t bytes) {
     if (!g_bind.load(std::memory_order_relaxed) || !bytes) return false;
-    drain_locked();
     HomeIndex::Hit h;
+    if (pool_draw()) {  // (as homes_meet_locked)
+        const int r = g_ix.read_meets(va, bytes, &h);
+        if (r == HomeIndex::kReadUnsure) run_part_stop(kRunStopOrder);
+        return r == HomeIndex::kReadUnsure || (r == HomeIndex::kReadMeets && (va < h.memory || va + bytes > h.memory + h.bytes));
+    }
+    drain_locked();
     return ix_meets(va, bytes, &h) && (va < h.memory || va + bytes > h.memory + h.bytes);
 }
 
 void homes_sync_locked(std::uint64_t va, std::uint64_t bytes, int why) {
     if (!g_bind.load(std::memory_order_relaxed) || !bytes) return;
+    // (Its copies are recorded in order: a run part's or a pool thread's draw stops at them.)
+    if (run_part()) {
+        run_part_stop(kRunStopOrder);
+        return;
+    }
     drain_locked();
     if (!g_ix.may_meet(va, bytes)) return;
     std::uint64_t at = va;
@@ -671,9 +734,16 @@ void homes_sync_locked(std::uint64_t va, std::uint64_t bytes, int why) {
 }
 
 void homes_end_meeting_locked(std::uint64_t va, std::uint64_t bytes) {
-    if (!g_bind.load(std::memory_order_relaxed) || !bytes || run_part()) return;
+    if (!g_bind.load(std::memory_order_relaxed) || !bytes) return;
+    // A home met across its edge is copied back and ended in order: a run part's or a pool thread's draw stops there
+    // (until 2026-11-13 it went on and read the guest's bytes as they stood, the home's not copied back).
+    if (run_part()) {
+        run_part_stop(kRunStopOrder);
+        return;
+    }
     drain_locked();
     if (!g_ix.may_meet(va, bytes)) return;
+    const HomeIndex::Batch batch(g_ix);
     std::uint32_t index = 0;
     for (int n = 0; n < 4096; ++n) {
         Home* e = index_meets(va, bytes, &index);
@@ -719,13 +789,13 @@ int homes_bind_locked(std::uint32_t handle, std::uint64_t base, std::uint64_t by
     if (t_run_draw && t_run_draw->list) {
         // Stage 4b.1b's list mode: bound by handle, with no copy pending into
         // it at its splice either (homes_splice_ok); one pending now is in order.
-        if (e->pending) {
+        if (pending_of(*e)) {
             run_part_stop(kRunStopOrder);
             bump(g_fall[kFallPart]);
             return kHomeFall + static_cast<int>(kFallPart);
         }
         t_run_draw->list->note_home(handle);
-    } else if (e->pending) {
+    } else if (pending_of(*e)) {
         // A copy into it pending in this pass: the draw reads what the copy writes, from its source.
         if (pending_lookup(base, bytes, &out) == kCopyVersionInside) {
             bump(g_bound_pending);
@@ -751,7 +821,7 @@ bool homes_splice_ok(std::uint32_t handle) {
     const std::uint32_t w = e->word.load(std::memory_order_acquire);
     const std::uint32_t st = state_of(w);
     return gen_of(w) == gxvk_homes::handle_gen(handle) && (st == kLive || st == kEnded) && e->filled.load(std::memory_order_acquire) &&
-           !e->pending;
+           !pending_of(*e);
 }
 
 int homes_copy_in_locked(std::uint64_t dst, std::uint64_t bytes, VkBuffer src, VkDeviceSize src_off, const void* src_map) {
@@ -777,7 +847,7 @@ int homes_copy_in_locked(std::uint64_t dst, std::uint64_t bytes, VkBuffer src, V
     // A newer copy over the same bytes takes the older one's place, as its batch would leave only it (a copy-back writes
     // its buffer whole: a constant buffer copied back twice between two passes is one copy). A draw that bound the older
     // one's source keeps it.
-    if (e->pending && e->pend_epoch == g_pend_epoch && e->pend_at < g_pending.size()) {
+    if (pending_of(*e) && e->pend_epoch == g_pend_epoch && e->pend_at < g_pending.size()) {
         Pending& p = g_pending[e->pend_at];
         if (p.index == index && p.dst == dst && p.bytes == bytes) {
             p.src = src;
@@ -801,7 +871,7 @@ int homes_copy_in_locked(std::uint64_t dst, std::uint64_t bytes, VkBuffer src, V
     }
     g_pend_lo = std::min(g_pend_lo, dst);
     g_pend_hi = std::max(g_pend_hi, dst + bytes);
-    ++e->pending;
+    pending_add(*e, 1);
     return kHomeCopyTaken;
 }
 
@@ -870,7 +940,7 @@ void homes_flush_locked() {
     if (!overlap) {
         // One pending copy a home (the usual batch): no two share bytes, so they run in any order.
         for (const Pending& p : pending) {
-            if (Home* e = home_at(p.index); e && e->pending) --e->pending;
+            if (Home* e = home_at(p.index); e && pending_of(*e)) pending_add(*e, -1);
             const VkBufferCopy region{p.src_off, p.to_off, p.bytes};
             DrawCmds* c = DrawCmds::open();
             if (!c || !c->copy_buffer(p.src, p.to, region)) rec().copy_buffer(p.src, p.to, 1, &region);
@@ -887,7 +957,7 @@ void homes_flush_locked() {
     covered.clear();
     for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
         const Pending& p = *it;
-        if (Home* e = home_at(p.index); e && e->pending) --e->pending;
+        if (Home* e = home_at(p.index); e && pending_of(*e)) pending_add(*e, -1);
         const std::uint64_t end = p.dst + p.bytes;
         auto copy_piece = [&](std::uint64_t lo, std::uint64_t hi) {
             const VkBufferCopy region{p.src_off + (lo - p.dst), p.to_off + (lo - p.dst), hi - lo};
@@ -954,7 +1024,7 @@ void homes_compare_locked(std::uint32_t handle, std::uint64_t base, std::uint64_
         host_log("gxvk homes compare: the home of 0x%llx (%u bytes) would bind other bytes than today's path at 0x%llx + %llu: first at "
                  "+%zu (home %02x, today %02x)%s",
                  static_cast<ull>(e->memory), e->bytes, static_cast<ull>(base), static_cast<ull>(bytes), at, a[at], b[at],
-                 e->pending ? ", a copy into it pending" : "");
+                 pending_of(*e) ? ", a copy into it pending" : "");
     }
 }
 

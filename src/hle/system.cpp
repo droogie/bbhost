@@ -14,12 +14,14 @@
 #include "engine/camera.h"
 #include "engine/debug_menu.h"
 #include "engine/menu_pointer.h"
+#include "engine/plugin_dialog.h"
 #include "engine/mouse_camera.h"
 #include "host/bindings.h"
 #include "host/ingame_menu.h"
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/window.h"
+#include "host/plugin_panel.h"
 #include "net/account.h"
 #include "net/session.h"
 #include "core/config.h"
@@ -700,7 +702,7 @@ void recover_all_saves() {
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(fs::path(root), ec)) {
         const std::string n = e.path().filename().string();
-        for (const char* tail : {".stage", ".old", ".commit"}) {
+        for (const char* tail : {".stage", ".old", ".commit", ".commit.new"}) {
             const std::size_t t = std::strlen(tail);
             if (n.size() > t + 1 && n[0] == '.' && n.compare(n.size() - t, t, tail) == 0) dirs.push_back(n.substr(1, n.size() - t - 1));
         }
@@ -719,8 +721,10 @@ void recover_all_saves() {
 // no exit, no reports, as a kill or a power cut would - at the N-th time (1)
 // a save reaches STEP: "session" (a writable mount's stage just made, the
 // game about to write it) or one of a commit's steps (save_commit.h: flushed,
-// marker, exchanged, live-moved, stage-moved, marker-removed, old-removed).
-// The next start's recovery must leave the old save or the new one, whole.
+// marker-written, marker; the exchange's exchanged, old-removed,
+// marker-removed; file by file moved (once per file), extras-removed,
+// marker-removed, stage-removed). The next start's recovery must leave the
+// old save or the new one, whole.
 void save_test_kill(const char* step) {
     static const char* const want = std::getenv("BBHOST_TEST_SAVE_KILL");
     static int left = [] {
@@ -765,6 +769,13 @@ GUEST_ABI int hle_save_mount(const SaveMountReq* req, SaveMountResult* result) {
     std::string did;
     const std::string holds = live.empty() ? live : save_commit::recover(live, &did);
     if (!did.empty()) host_log("save %s: %s", dir.c_str(), did.c_str());
+    if (!live.empty() && holds.empty()) {
+        // Neither the save's directory nor its stage holds it whole (a file
+        // held by another process, and the stage not made whole again): it
+        // is not read in pieces; the next mount tries again.
+        host_log("sceSaveDataMount %s: the save cannot be read whole now; busy", dir.c_str());
+        return kSaveErrBusy;
+    }
     const bool exists = save_dir_exists(dir) || holds != live;
     const bool create = (req->mount_mode & (kMountCreate | kMountCreate2)) != 0;
     if (!exists && !create) {
@@ -834,15 +845,19 @@ GUEST_ABI int hle_save_umount(const char* mount_point) {
     hle_fs_umount(mount_point);
     g_save_mounts[slot].used = false;
     host_log("sceSaveDataUmount %s", mount_point);
+    bool committed = true;
     if (g_save_mounts[slot].staged) {
         // The session's writes become the save, whole (save_commit.h); a
         // commit that cannot finish leaves the stage for the next mount.
         std::string why;
-        if (!save_commit::commit(save_dir_host(g_save_mounts[slot].dir_name), &why))
+        committed = save_commit::commit(save_dir_host(g_save_mounts[slot].dir_name), &why);
+        if (!committed)
             host_log("save %s: the commit stopped at %s; the next mount finishes it", g_save_mounts[slot].dir_name.c_str(), why.c_str());
         g_save_mounts[slot].staged = false;
     }
-    if (g_save_mounts[slot].writable) back_up_save(g_save_mounts[slot].dir_name);
+    // A save's directory a commit stopped in may hold some of its files
+    // moved and some not: not a backup.
+    if (g_save_mounts[slot].writable && committed) back_up_save(g_save_mounts[slot].dir_name);
     return 0;
 }
 
@@ -877,7 +892,8 @@ GUEST_ABI int hle_save_delete(const SaveMountReq* req) {
         // What a session or a commit left beside it goes too.
         const save_commit::Paths sp = save_commit::paths_of(h);
         std::error_code ec;
-        for (const std::string& left : {sp.stage, sp.old, sp.marker}) std::filesystem::remove_all(std::filesystem::path(left), ec);
+        for (const std::string& left : {sp.stage, sp.old, sp.marker, sp.marker_new})
+            std::filesystem::remove_all(std::filesystem::path(left), ec);
     }
     host_log("sceSaveDataDelete %s", req->dir_name);
     return 0;
@@ -1749,7 +1765,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         // who wants the pad to own the camera.
         const HostSettings& hs = host_settings_ref();  // the snapshot as published: no copy, no lock
         const bool want = hs.mouse_camera && !host_options_open() && !ingame_menu_open() &&
-                          !menu_pointer_in_menu() && !host_text_entry_open();
+                          !menu_pointer_in_menu() && !host_text_entry_open() && !plugin_panel_shown();
         // What the follow camera turns by, and whether its own turns as the
         // character moves are held: the keyboard and mouse used last, the
         // mouse turning the camera, and Mouse auto-rotation off. A controller
@@ -2006,6 +2022,9 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         return v > 0 ? v : 500;
     }();
 
+    // What the taps and the autopress below add stands for the controller
+    // (plugin API 29: a plugin reads it, and what it takes the game does not).
+    const PadState before_taps = p;
     // Taps the port itself asks for (hle_pad_tap): a press the game reads as
     // the player's, for a few polls - on a pad that is there. With no window
     // and no controller (a headless test run) the record is a disconnected
@@ -2090,6 +2109,25 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         }
         p.timestamp = static_cast<std::uint64_t>(ms) * 1000;
     }
+    {
+        const std::uint32_t tapped = p.buttons & ~before_taps.buttons;
+        const auto moved = [](std::uint8_t now, std::uint8_t was) { return now != was ? now : kStickRest; };
+        // As the controller's own (host/window.cpp): a panel in the game's
+        // dialog has its buttons, whatever a plugin takes, and the plugins not.
+        const std::uint32_t dialog = plugin_panel_dialog_buttons();
+        host_plugin_pad_test(tapped & ~dialog, moved(p.lx, before_taps.lx), moved(p.ly, before_taps.ly), moved(p.rx, before_taps.rx),
+                             moved(p.ry, before_taps.ry));
+        const std::uint32_t take_axes = host_plugin_pad_taken_axes();
+        p.buttons &= ~(tapped & host_plugin_pad_taken_buttons() & ~dialog);
+        if (take_axes & kPadTakeLeftStick) {
+            p.lx = before_taps.lx;
+            p.ly = before_taps.ly;
+        }
+        if (take_axes & kPadTakeRightStick) {
+            p.rx = before_taps.rx;
+            p.ry = before_taps.ry;
+        }
+    }
     // BBHOST_TRACE_PAD=1: every read that sees a button change, with the
     // flip count and the reads-per-flip rate (double-press investigations).
     static const bool trace_pad = [] {
@@ -2150,6 +2188,10 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         p.connected = connected;
         p.timestamp = ts;
     }
+    // A plugin's menu in the game's dialog keeps what is not the dialog's
+    // (engine/plugin_dialog.h): Circle on a page opened on top, Up and Down
+    // at a long page's ends, and a corner page's camera.
+    plugin_dialog::pad_filter(p.buttons, p.lx, p.ly, p.rx, p.ry, p.l2, p.r2);
     {
         const std::uint32_t was = g_pad_delivered.exchange(p.buttons, std::memory_order_relaxed);
         if (p.buttons & ~was & 0x6000u)  // Cross or Circle went down

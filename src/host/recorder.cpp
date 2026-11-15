@@ -45,6 +45,7 @@
 // to bb-submit (R4).
 
 #include "host/gpu_internal.h"
+#include "host/gpu_markers.h"
 #include "host/gxvk_lists.h"
 #include "host/list_resolve.h"
 #include "host/recorder_rest.h"
@@ -60,6 +61,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -81,7 +83,8 @@ const char* stream::op_name(stream::Op op) {
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
                                         "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker",
-                                        "push buffers",   "list draw",    "execute commands", "list run",      "update buffer"};
+                                        "push buffers",   "list draw",    "execute commands", "list run",      "update buffer",
+                                        "marker window"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -413,6 +416,148 @@ const int g_recorder_spin = [] {
 // (RecordedState): the pipeline, and with it unchanged its library and dynamic
 // state, the sets with their offsets, the indices and the vertex buffers.
 std::atomic<std::uint64_t> g_list_binds_skipped{0}, g_list_chained{0};
+// The ops between the draws, for a device-loss report (host/gpu_markers.h):
+// while the markers are on, each op the replay records between two draws gets
+// a note and the top-of-pipe marker with its number. Not inside a pass begun
+// for secondary command buffers alone, where the primary records nothing but
+// their execution.
+gpu_markers::Ring<4096> g_op_notes;  // under g_op_notes_mu
+std::mutex g_op_notes_mu;
+// The markers' window as the replay has met it (host/gpu_markers.h Window):
+// set at a beginning and cleared at an end (record_marker_window), by whichever
+// thread replays them in the stream's order - bb-record, or the command
+// processor where the ops are recorded in place - so the ops between them,
+// and none outside, are noted and get their words.
+std::atomic<bool> g_ops_live{false};
+thread_local std::uint32_t t_after = 0;            // the last draw or dispatch marker replayed on this thread
+thread_local std::uint32_t t_dispatch_marker = 0;  // a dispatch's marker, waiting for its dispatch (the notes' "after")
+thread_local bool t_secondary_pass = false;        // in a pass of secondary command buffers alone
+// BBHOST_MARKER_TRACE=<pipeline prefix>[:<n>] (a check of the marks, with the
+// markers on): after the first n (4) draws of pipelines whose name starts with
+// the prefix ("*": any draw), the ops the replay marks up to the next draw or
+// dispatch, logged; and the first notes another thread makes (the presenter's).
+struct MarkerTrace {
+    std::string prefix;
+    std::atomic<int> left{0};
+};
+MarkerTrace& marker_trace() {
+    static MarkerTrace t;
+    static const bool read = [] {
+        if (const char* e = std::getenv("BBHOST_MARKER_TRACE"); e && *e) {
+            const std::string v = e;
+            const std::size_t colon = v.find(':');
+            t.prefix = v.substr(0, colon);
+            t.left.store(colon == std::string::npos ? 4 : std::max(0, std::atoi(v.c_str() + colon + 1)), std::memory_order_relaxed);
+        }
+        return true;
+    }();
+    (void)read;
+    return t;
+}
+thread_local bool t_tracing = false;
+std::string recorder_op_note_text_locked(const gpu_markers::Note& n);
+void trace_mark(std::uint32_t value) {  // a draw or dispatch with its marker, replayed
+    MarkerTrace& t = marker_trace();
+    if (t.prefix.empty()) return;
+    const std::uint64_t index = value & 0x3fffffffu;
+    const char* name = (value >> 30) == 1 ? draw_record_name(index) : nullptr;
+    if (t_tracing) {
+        host_log("marker trace: then %s %llu %s", (value >> 30) == 1 ? "draw" : "dispatch", static_cast<unsigned long long>(index),
+                 name ? name : "");
+        t_tracing = false;
+    }
+    if (name && (t.prefix == "*" || std::strncmp(name, t.prefix.c_str(), t.prefix.size()) == 0) &&
+        t.left.fetch_sub(1, std::memory_order_relaxed) > 0) {
+        host_log("marker trace: draw %llu %s - replayed; the ops marked before the next draw or dispatch:",
+                 static_cast<unsigned long long>(index), name);
+        t_tracing = true;
+    }
+}
+// Which ops between draws get the front end's word (host/gpu_markers.h): those where the front end stops or the pass
+// changes - barriers, pass ends and begins, the host's own dispatches, secondaries executed, the presenter's command
+// buffer. Every op is noted all the same. The front end runs on past the others until such an op, so the word it
+// leaves at a loss is one of these as a rule, and the loss report lists the ops after it that had none. What that
+// gives up: where the front end itself was held between two of them (a full queue ahead of it), which a word on every
+// op would show. BBHOST_GPU_MARKER_OPS=all writes it before every op, for that, at a cost: on NVIDIA's GPUs a word
+// between two copies or fills held them apart (an RTX 3070 Ti Laptop GPU uncapped: 4.2% slower than the two words a
+// draw alone, against 1.5% for these).
+bool word_on(Op kind) {
+    static const bool every_op = [] {
+        const char* e = std::getenv("BBHOST_GPU_MARKER_OPS");
+        return e && std::strcmp(e, "all") == 0;
+    }();
+    if (every_op) return true;
+    switch (kind) {
+    case Op::kBarrier:
+    case Op::kPassBarrier:
+    case Op::kTransferBarrier:
+    case Op::kCopyOrderBarrier:
+    case Op::kEndRendering:
+    case Op::kBeginRendering:
+    case Op::kDispatch:
+    case Op::kDispatchIndirect:
+    case Op::kExecuteCommands:
+    case Op::kForeignSubmit:
+    case Op::kMarkerWindow: return true;
+    default: return false;
+    }
+}
+void op_marker(VkCommandBuffer cmd, Op kind, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0) {
+    if (!g_ops_live.load(std::memory_order_relaxed) || t_secondary_pass) return;
+    std::uint32_t seq;
+    std::string traced;
+    {
+        std::lock_guard<std::mutex> lk(g_op_notes_mu);
+        seq = g_op_notes.note(static_cast<std::uint16_t>(kind), t_after, a, b, c);
+        if (t_tracing) traced = recorder_op_note_text_locked(*g_op_notes.find(seq));
+    }
+    if (t_tracing) host_log("marker trace:   op %u: %s", seq, traced.c_str());
+    // (The host's own dispatches - the depth copy's - are logged the first times wherever they fall.)
+    static std::atomic<int> host_dispatches{0};
+    if (!t_tracing && (kind == Op::kDispatch || kind == Op::kDispatchIndirect) && !marker_trace().prefix.empty() &&
+        host_dispatches.fetch_add(1, std::memory_order_relaxed) < 4) {
+        std::lock_guard<std::mutex> lk(g_op_notes_mu);
+        host_log("marker trace: op %u: %s", seq, recorder_op_note_text_locked(*g_op_notes.find(seq)).c_str());
+    }
+    if (word_on(kind)) gpu_write_op_marker(cmd, seq);
+}
+// The markers' window begins or ends here (host/gpu_markers.h Window, its
+// mark `value`): noted as an op, and its mark written into all three words -
+// the started and finished words (top and bottom of the pipe: the front end
+// reached it, and everything before it had finished) and the op word - so a
+// loss past it reads as past it, whatever the words said before. From a
+// beginning the ops are noted as after it; at an end nothing more is written
+// until the next beginning.
+void record_marker_window(VkCommandBuffer cmd, std::uint32_t value) {
+    if (!g.cmd_buffer_marker) return;
+    const bool begins = (value & 1) != 0;
+    if (begins) {
+        g_ops_live.store(true, std::memory_order_relaxed);
+        t_after = value;
+    }
+    t_dispatch_marker = 0;
+    std::uint32_t seq;
+    {
+        std::lock_guard<std::mutex> lk(g_op_notes_mu);
+        seq = g_op_notes.note(static_cast<std::uint16_t>(Op::kMarkerWindow), t_after, value >> 1, begins ? 1 : 0, 0);
+    }
+    gpu_write_markers(cmd, value);
+    gpu_write_op_marker(cmd, seq);
+    static std::atomic<int> traced{0};
+    if (!marker_trace().prefix.empty() && traced.fetch_add(1, std::memory_order_relaxed) < 8) {
+        host_log("marker trace: op %u: the markers' window %u %s", seq, value >> 1, begins ? "begins" : "ends");
+    }
+    if (!begins) {
+        g_ops_live.store(false, std::memory_order_relaxed);
+        t_after = 0;
+        t_tracing = false;
+    }
+}
+bool secondary_only(VkRenderingFlags flags) {
+    return (flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT) && !(flags & VK_RENDERING_CONTENTS_INLINE_BIT_KHR);
+}
+std::uint64_t extent_word(const VkRect2D& r) { return static_cast<std::uint64_t>(r.extent.width) << 32 | r.extent.height; }
+
 // Stage 4b.2: a segment's list packets replayed into a pool thread's secondary
 // command buffer - `dyn` and `prev_dyn` the dynamic offsets of this packet and
 // the one before, its params blocks' places in the pool's region (the packets
@@ -434,23 +579,46 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd, const DrawPacket* prev, c
         }
         vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(p.writes.size()), p.writes.data(), 0, nullptr);
     }
-    if (p.end_pass) record_end_rendering(cmd, p.end_pass_barrier);
-    if (p.pass_barrier) record_pass_barrier(cmd);
-    if (p.xfer_begin) record_transfer_barrier(cmd, true);
+    if (p.end_pass) {
+        const bool secondary = t_secondary_pass;
+        t_secondary_pass = false;  // (its end is the primary's again)
+        if (!secondary) op_marker(cmd, Op::kEndRendering, p.end_pass_barrier);
+        record_end_rendering(cmd, p.end_pass_barrier);
+    }
+    if (p.pass_barrier) {
+        op_marker(cmd, Op::kPassBarrier);
+        record_pass_barrier(cmd);
+    }
+    if (p.xfer_begin) {
+        op_marker(cmd, Op::kTransferBarrier, 1);
+        record_transfer_barrier(cmd, true);
+    }
     for (std::uint32_t k = 0; k < p.ncopies; ++k) {
-        if (p.copy_orders >> k & 1) record_copy_order_barrier(cmd);
+        if (p.copy_orders >> k & 1) {
+            op_marker(cmd, Op::kCopyOrderBarrier);
+            record_copy_order_barrier(cmd);
+        }
+        op_marker(cmd, Op::kCopyBuffer, reinterpret_cast<std::uint64_t>(p.copy_src[k]), reinterpret_cast<std::uint64_t>(p.copy_dst[k]),
+                  p.copies[k].size);
         vkCmdCopyBuffer(cmd, p.copy_src[k], p.copy_dst[k], 1, &p.copies[k]);
     }
-    if (p.xfer_end) record_transfer_barrier(cmd, false);
+    if (p.xfer_end) {
+        op_marker(cmd, Op::kTransferBarrier, 0);
+        record_transfer_barrier(cmd, false);
+    }
     for (std::uint32_t k = 0; k < p.nregions; ++k) {
         const DrawPacket::RegionCopy& r = p.regions[k];
+        op_marker(cmd, Op::kCopyImage, reinterpret_cast<std::uint64_t>(r.src), reinterpret_cast<std::uint64_t>(r.dst),
+                  static_cast<std::uint64_t>(r.width) << 32 | r.height);
         record_region_copy(cmd, r.src, r.dst, r.width, r.height, r.dst_initialised);
     }
     if (p.begin_pass) {
         p.rendering.pColorAttachments = p.colors;
         p.rendering.pDepthAttachment = p.has_depth ? &p.depth_att : nullptr;
         p.rendering.pStencilAttachment = p.has_stencil ? &p.stencil_att : nullptr;
+        op_marker(cmd, Op::kBeginRendering, p.rendering.colorAttachmentCount, p.has_depth, extent_word(p.rendering.renderArea));
         vkCmdBeginRendering(cmd, &p.rendering);
+        t_secondary_pass = secondary_only(p.rendering.flags);
     }
     // (A packet with a pass change, copies or a transfer is never chained: its own work comes between.)
     const bool same_pl = prev && p.pipeline && prev->pipeline == p.pipeline && prev->raster_discard == p.raster_discard && !p.end_pass &&
@@ -519,6 +687,10 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd, const DrawPacket* prev, c
     }
     if (p.marker) gpu_write_markers(cmd, p.marker_value);
     if (p.draw) record_draw_call(cmd, p.call);
+    if (p.marker && p.draw && g.cmd_buffer_marker) {  // (host/gpu_markers.h: the ops after it are noted as after it)
+        t_after = p.marker_value;
+        trace_mark(p.marker_value);
+    }
 }
 
 // ---- reading records ----
@@ -600,6 +772,7 @@ void replay_block(const Block& b) {
         }
         case Op::kListDraw: {
             const auto* r = reinterpret_cast<const stream::ListDraw*>(p);
+            op_marker(cmd, Op::kListDraw, r->index, r->id);
             const DrawPacket* const prev = r->chained && t_list_prev ? t_list_prev : nullptr;
             replay_packet(g_list_packets[r->index], cmd, prev);
             g_list_replayed[r->index].store(r->id, std::memory_order_release);
@@ -609,11 +782,13 @@ void replay_block(const Block& b) {
         }
         case Op::kExecuteCommands: {
             const auto* r = reinterpret_cast<const stream::ExecuteCommands*>(p);
+            op_marker(cmd, Op::kExecuteCommands, reinterpret_cast<std::uint64_t>(r->cmd));  // (none in a pass of secondaries alone)
             vkCmdExecuteCommands(cmd, 1, &r->cmd);
             break;
         }
         case Op::kListRun: {
             const auto* r = reinterpret_cast<const stream::ListRun*>(p);
+            op_marker(cmd, Op::kListRun, r->n);
             const std::uint8_t* q = p + round8(sizeof(*r));
             const auto* d = tail<stream::ListRunDraw>(q, r->n);
             const DrawPacket* prev = nullptr;
@@ -633,14 +808,33 @@ void replay_block(const Block& b) {
             const auto* mem = tail<VkMemoryBarrier>(q, r->nmem);
             const auto* buf = tail<VkBufferMemoryBarrier>(q, r->nbuf);
             const auto* img = tail<VkImageMemoryBarrier>(q, r->nimg);
+            op_marker(cmd, Op::kBarrier, r->src, r->dst, static_cast<std::uint64_t>(r->nmem) << 32 | r->nbuf << 16 | r->nimg);
             vkCmdPipelineBarrier(cmd, r->src, r->dst, r->dep, r->nmem, r->nmem ? mem : nullptr, r->nbuf, r->nbuf ? buf : nullptr, r->nimg,
                                  r->nimg ? img : nullptr);
             break;
         }
-        case Op::kTransferBarrier: record_transfer_barrier(cmd, reinterpret_cast<const stream::Flag*>(p)->value != 0); break;
-        case Op::kCopyOrderBarrier: record_copy_order_barrier(cmd); break;
-        case Op::kPassBarrier: record_pass_barrier(cmd); break;
-        case Op::kEndRendering: record_end_rendering(cmd, reinterpret_cast<const stream::Flag*>(p)->value != 0); break;
+        case Op::kTransferBarrier: {
+            const bool begin = reinterpret_cast<const stream::Flag*>(p)->value != 0;
+            op_marker(cmd, Op::kTransferBarrier, begin);
+            record_transfer_barrier(cmd, begin);
+            break;
+        }
+        case Op::kCopyOrderBarrier:
+            op_marker(cmd, Op::kCopyOrderBarrier);
+            record_copy_order_barrier(cmd);
+            break;
+        case Op::kPassBarrier:
+            op_marker(cmd, Op::kPassBarrier);
+            record_pass_barrier(cmd);
+            break;
+        case Op::kEndRendering: {
+            const bool barrier = reinterpret_cast<const stream::Flag*>(p)->value != 0;
+            const bool secondary = t_secondary_pass;
+            t_secondary_pass = false;  // (its end is the primary's again)
+            if (!secondary) op_marker(cmd, Op::kEndRendering, barrier);
+            record_end_rendering(cmd, barrier);
+            break;
+        }
         case Op::kBeginRendering: {
             const auto* r = reinterpret_cast<const stream::BeginRendering*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
@@ -655,65 +849,81 @@ void replay_block(const Block& b) {
             ri.pColorAttachments = r->ncolor ? att : nullptr;
             ri.pDepthAttachment = r->has_depth ? att + r->ncolor : nullptr;
             ri.pStencilAttachment = r->has_stencil ? att + r->ncolor + r->has_depth : nullptr;
+            op_marker(cmd, Op::kBeginRendering, r->ncolor, r->has_depth, extent_word(r->area));
             vkCmdBeginRendering(cmd, &ri);
+            t_secondary_pass = secondary_only(r->flags);
             break;
         }
         case Op::kFill: {
             const auto* r = reinterpret_cast<const stream::Fill*>(p);
+            op_marker(cmd, Op::kFill, reinterpret_cast<std::uint64_t>(r->buffer), r->offset, r->size);
             vkCmdFillBuffer(cmd, r->buffer, r->offset, r->size, r->data);
             break;
         }
         case Op::kCopyBuffer: {
             const auto* r = reinterpret_cast<const stream::CopyBuffer*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
-            vkCmdCopyBuffer(cmd, r->src, r->dst, r->n, tail<VkBufferCopy>(q, r->n));
+            const VkBufferCopy* regions = tail<VkBufferCopy>(q, r->n);
+            op_marker(cmd, Op::kCopyBuffer, reinterpret_cast<std::uint64_t>(r->src), reinterpret_cast<std::uint64_t>(r->dst),
+                      r->n ? regions[0].size : 0);
+            vkCmdCopyBuffer(cmd, r->src, r->dst, r->n, regions);
             break;
         }
         case Op::kCopyBufferToImage: {
             const auto* r = reinterpret_cast<const stream::CopyBufferToImage*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
+            op_marker(cmd, Op::kCopyBufferToImage, reinterpret_cast<std::uint64_t>(r->buffer), reinterpret_cast<std::uint64_t>(r->image), r->n);
             vkCmdCopyBufferToImage(cmd, r->buffer, r->image, r->layout, r->n, tail<VkBufferImageCopy>(q, r->n));
             break;
         }
         case Op::kCopyImageToBuffer: {
             const auto* r = reinterpret_cast<const stream::CopyImageToBuffer*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
+            op_marker(cmd, Op::kCopyImageToBuffer, reinterpret_cast<std::uint64_t>(r->image), reinterpret_cast<std::uint64_t>(r->buffer), r->n);
             vkCmdCopyImageToBuffer(cmd, r->image, r->layout, r->buffer, r->n, tail<VkBufferImageCopy>(q, r->n));
             break;
         }
         case Op::kClearColor: {
             const auto* r = reinterpret_cast<const stream::ClearColor*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
+            op_marker(cmd, Op::kClearColor, reinterpret_cast<std::uint64_t>(r->image), r->n);
             vkCmdClearColorImage(cmd, r->image, r->layout, &r->color, r->n, tail<VkImageSubresourceRange>(q, r->n));
             break;
         }
         case Op::kResetQueries: {
             const auto* r = reinterpret_cast<const stream::Queries*>(p);
+            op_marker(cmd, Op::kResetQueries, reinterpret_cast<std::uint64_t>(r->pool), r->first, r->count);
             vkCmdResetQueryPool(cmd, r->pool, r->first, r->count);
             break;
         }
         case Op::kBeginQuery: {
             const auto* r = reinterpret_cast<const stream::Queries*>(p);
+            op_marker(cmd, Op::kBeginQuery, reinterpret_cast<std::uint64_t>(r->pool), r->first);
             vkCmdBeginQuery(cmd, r->pool, r->first, r->flags);
             break;
         }
         case Op::kEndQuery: {
             const auto* r = reinterpret_cast<const stream::Queries*>(p);
+            op_marker(cmd, Op::kEndQuery, reinterpret_cast<std::uint64_t>(r->pool), r->first);
             vkCmdEndQuery(cmd, r->pool, r->first);
             break;
         }
         case Op::kCopyQueryResults: {
             const auto* r = reinterpret_cast<const stream::CopyQueryResults*>(p);
+            op_marker(cmd, Op::kCopyQueryResults, reinterpret_cast<std::uint64_t>(r->pool), r->first,
+                      reinterpret_cast<std::uint64_t>(r->dst));
             vkCmdCopyQueryPoolResults(cmd, r->pool, r->first, r->count, r->dst, r->offset, r->stride, r->flags);
             break;
         }
         case Op::kTimestamp: {
             const auto* r = reinterpret_cast<const stream::Timestamp*>(p);
+            op_marker(cmd, Op::kTimestamp, reinterpret_cast<std::uint64_t>(r->pool), r->query);
             vkCmdWriteTimestamp(cmd, r->stage, r->pool, r->query);
             break;
         }
         case Op::kBindPipeline: {
             const auto* r = reinterpret_cast<const stream::BindPipeline*>(p);
+            op_marker(cmd, Op::kBindPipeline, reinterpret_cast<std::uint64_t>(r->pipeline), r->bind_point);
             vkCmdBindPipeline(cmd, r->bind_point, r->pipeline);
             break;
         }
@@ -722,11 +932,13 @@ void replay_block(const Block& b) {
             const std::uint8_t* q = p + round8(sizeof(*r));
             const auto* sets = tail<VkDescriptorSet>(q, r->n);
             const auto* dyn = tail<std::uint32_t>(q, r->ndynamic);
+            op_marker(cmd, Op::kBindSets, r->n ? reinterpret_cast<std::uint64_t>(sets[0]) : 0, r->bind_point, static_cast<std::uint64_t>(r->first) << 32 | r->n);
             vkCmdBindDescriptorSets(cmd, r->bind_point, r->layout, r->first, r->n, sets, r->ndynamic, r->ndynamic ? dyn : nullptr);
             break;
         }
         case Op::kPushConstants: {
             const auto* r = reinterpret_cast<const stream::PushConstants*>(p);
+            op_marker(cmd, Op::kPushConstants, r->stages, r->offset, r->size);
             vkCmdPushConstants(cmd, r->layout, r->stages, r->offset, r->size, p + round8(sizeof(*r)));
             break;
         }
@@ -750,33 +962,52 @@ void replay_block(const Block& b) {
                 if (fb[k] >= 0) w[k].pBufferInfo = bufs + fb[k];
                 if (fi[k] >= 0) w[k].pImageInfo = imgs + fi[k];
             }
+            op_marker(cmd, Op::kUpdateSets, r->n, r->nbuffers, r->nimages);  // (on the host, at its place in the stream)
             vkUpdateDescriptorSets(g.device, r->n, w, 0, nullptr);
             break;
         }
         case Op::kDispatch: {
             const auto* r = reinterpret_cast<const stream::Dispatch*>(p);
+            // A dispatch of the host's own (the depth copy's pass) has no marker of its own: its op's.
+            if (!t_dispatch_marker) op_marker(cmd, Op::kDispatch, r->x, r->y, r->z);
             vkCmdDispatch(cmd, r->x, r->y, r->z);
+            if (t_dispatch_marker && g.cmd_buffer_marker) {  // (host/gpu_markers.h: the ops after it are noted as after it)
+                t_after = t_dispatch_marker;
+                trace_mark(t_dispatch_marker);
+            }
+            t_dispatch_marker = 0;
             break;
         }
         case Op::kClearDepth: {
             const auto* r = reinterpret_cast<const stream::ClearDepth*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
+            op_marker(cmd, Op::kClearDepth, reinterpret_cast<std::uint64_t>(r->image), r->n);
             vkCmdClearDepthStencilImage(cmd, r->image, r->layout, &r->value, r->n, tail<VkImageSubresourceRange>(q, r->n));
             break;
         }
         case Op::kMarker: {
-            gpu_write_markers(cmd, reinterpret_cast<const stream::Marker*>(p)->value);
+            const std::uint32_t value = reinterpret_cast<const stream::Marker*>(p)->value;
+            gpu_write_markers(cmd, value);
+            if ((value >> 30) == 2) t_dispatch_marker = value;  // a dispatch's: the ops after its dispatch are noted as after it
             break;
         }
+        case Op::kMarkerWindow: record_marker_window(cmd, reinterpret_cast<const stream::Marker*>(p)->value); break;
         case Op::kCopyImage: {
             const auto* r = reinterpret_cast<const stream::CopyImage*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
+            op_marker(cmd, Op::kCopyImage, reinterpret_cast<std::uint64_t>(r->src), reinterpret_cast<std::uint64_t>(r->dst), r->n);
             vkCmdCopyImage(cmd, r->src, r->src_layout, r->dst, r->dst_layout, r->n, tail<VkImageCopy>(q, r->n));
             break;
         }
         case Op::kDispatchIndirect: {
             const auto* r = reinterpret_cast<const stream::DispatchIndirect*>(p);
+            if (!t_dispatch_marker) op_marker(cmd, Op::kDispatchIndirect, reinterpret_cast<std::uint64_t>(r->buffer), r->offset);
             vkCmdDispatchIndirect(cmd, r->buffer, r->offset);
+            if (t_dispatch_marker && g.cmd_buffer_marker) {  // (host/gpu_markers.h: the ops after it are noted as after it)
+                t_after = t_dispatch_marker;
+                trace_mark(t_dispatch_marker);
+            }
+            t_dispatch_marker = 0;
             break;
         }
         case Op::kPushBuffers: {
@@ -784,11 +1015,13 @@ void replay_block(const Block& b) {
             const std::uint8_t* q = p + round8(sizeof(*r));
             const auto* bindings = tail<std::uint32_t>(q, r->n);
             const auto* infos = tail<VkDescriptorBufferInfo>(q, r->n);
+            op_marker(cmd, Op::kPushBuffers, r->n ? reinterpret_cast<std::uint64_t>(infos[0].buffer) : 0, r->set, r->n);
             push_buffer_writes(cmd, r->bind_point, r->layout, r->set, r->n, bindings, infos);
             break;
         }
         case Op::kUpdateBuffer: {
             const auto* r = reinterpret_cast<const stream::UpdateBuffer*>(p);
+            op_marker(cmd, Op::kUpdateBuffer, reinterpret_cast<std::uint64_t>(r->buffer), r->offset, r->size);
             vkCmdUpdateBuffer(cmd, r->buffer, r->offset, r->size, p + round8(sizeof(*r)));
             break;
         }
@@ -1194,6 +1427,148 @@ void recorder_splice_list_run(const std::uint64_t* indices, const std::uint64_t*
     }
     after_op();
     publish_block(false);
+}
+
+namespace {
+// A note of the ring (host/gpu_markers.h) as one line: its kind, its words, the draw or dispatch before it.
+std::string recorder_op_note_text_locked(const gpu_markers::Note& n) {
+    using ull = unsigned long long;
+    const auto a = static_cast<ull>(n.a), b = static_cast<ull>(n.b), c = static_cast<ull>(n.c);
+    char w[200] = "";
+    switch (static_cast<Op>(n.kind)) {
+    case Op::kFill: std::snprintf(w, sizeof(w), "buffer 0x%llx at %llu, %llu bytes", a, b, c); break;
+    case Op::kCopyBuffer: std::snprintf(w, sizeof(w), "buffer 0x%llx to buffer 0x%llx, %llu bytes", a, b, c); break;
+    case Op::kCopyBufferToImage: std::snprintf(w, sizeof(w), "buffer 0x%llx to image 0x%llx, %llu regions", a, b, c); break;
+    case Op::kCopyImageToBuffer: std::snprintf(w, sizeof(w), "image 0x%llx to buffer 0x%llx, %llu regions", a, b, c); break;
+    case Op::kCopyImage:
+        if (c >> 32) std::snprintf(w, sizeof(w), "image 0x%llx to image 0x%llx, a %llux%llu region", a, b, c >> 32, c & 0xffffffffu);
+        else std::snprintf(w, sizeof(w), "image 0x%llx to image 0x%llx, %llu regions", a, b, c);
+        break;
+    case Op::kClearColor:
+    case Op::kClearDepth: std::snprintf(w, sizeof(w), "image 0x%llx, %llu ranges", a, b); break;
+    case Op::kBarrier:
+        std::snprintf(w, sizeof(w), "stages 0x%llx to 0x%llx; %llu memory, %llu buffer, %llu image barriers", a, b, c >> 32, (c >> 16) & 0xffff,
+                      c & 0xffff);
+        break;
+    case Op::kTransferBarrier: std::snprintf(w, sizeof(w), "%s", a ? "into the transfer stage" : "out of the transfer stage"); break;
+    case Op::kEndRendering: std::snprintf(w, sizeof(w), "%s", a ? "with its barrier" : "its barrier left for later"); break;
+    case Op::kBeginRendering: std::snprintf(w, sizeof(w), "%llu colour attachments%s, %llux%llu", a, b ? " and depth" : "", c >> 32, c & 0xffffffffu); break;
+    case Op::kResetQueries: std::snprintf(w, sizeof(w), "pool 0x%llx, queries %llu..+%llu", a, b, c); break;
+    case Op::kBeginQuery:
+    case Op::kEndQuery:
+    case Op::kTimestamp: std::snprintf(w, sizeof(w), "pool 0x%llx, query %llu", a, b); break;
+    case Op::kCopyQueryResults: std::snprintf(w, sizeof(w), "pool 0x%llx from query %llu into buffer 0x%llx", a, b, c); break;
+    case Op::kUpdateBuffer: std::snprintf(w, sizeof(w), "buffer 0x%llx at %llu, %llu bytes", a, b, c); break;
+    case Op::kListDraw: std::snprintf(w, sizeof(w), "list packet %llu (token %llu)", a, b); break;
+    case Op::kListRun: std::snprintf(w, sizeof(w), "%llu list packets", a); break;
+    case Op::kExecuteCommands: std::snprintf(w, sizeof(w), "secondary 0x%llx", a); break;
+    case Op::kBindPipeline: std::snprintf(w, sizeof(w), "pipeline 0x%llx (%s)", a, b == VK_PIPELINE_BIND_POINT_COMPUTE ? "compute" : "graphics"); break;
+    case Op::kBindSets:
+        std::snprintf(w, sizeof(w), "set 0x%llx and %llu more from %llu (%s)", a, (c & 0xffffffffu) ? (c & 0xffffffffu) - 1 : 0, c >> 32,
+                      b == VK_PIPELINE_BIND_POINT_COMPUTE ? "compute" : "graphics");
+        break;
+    case Op::kPushConstants: std::snprintf(w, sizeof(w), "stages 0x%llx, %llu bytes at %llu", a, c, b); break;
+    case Op::kUpdateSets: std::snprintf(w, sizeof(w), "%llu writes (%llu buffers, %llu images), on the host", a, b, c); break;
+    case Op::kDispatch: std::snprintf(w, sizeof(w), "the host's own, %llux%llux%llu groups", a, b, c); break;
+    case Op::kDispatchIndirect: std::snprintf(w, sizeof(w), "the host's own, arguments in buffer 0x%llx at %llu", a, b); break;
+    case Op::kPushBuffers: std::snprintf(w, sizeof(w), "buffer 0x%llx and %llu more into set %llu", a, c ? c - 1 : 0, b); break;
+    case Op::kForeignSubmit: std::snprintf(w, sizeof(w), "the presenter's command buffer, its %s", a ? "end" : "start"); break;
+    case Op::kMarkerWindow: std::snprintf(w, sizeof(w), "the markers' window %llu %s", a, b ? "begins" : "ends"); break;
+    default: break;
+    }
+    const unsigned kind = n.after >> 30;
+    char after[64] = "";
+    if (kind == 1 || kind == 2) std::snprintf(after, sizeof(after), "; after %s %u", kind == 1 ? "draw" : "dispatch", n.after & 0x3fffffffu);
+    return std::string(stream::op_name(static_cast<Op>(n.kind))) + (w[0] ? " - " : "") + w + after;
+}
+
+}  // namespace
+
+// A note of an op recorded in a command buffer of another thread's (the presenter's, which the stream submits in its
+// order: kForeignSubmit), numbered from the same ring (host/gpu_markers.h).
+std::uint32_t recorder_note_op(std::uint16_t kind, std::uint64_t a, std::uint64_t b, std::uint64_t c) {
+    std::uint32_t seq;
+    std::string traced;
+    static std::atomic<int> traces{0};
+    const bool trace = !marker_trace().prefix.empty() && traces.fetch_add(1, std::memory_order_relaxed) < 4;
+    {
+        std::lock_guard<std::mutex> lk(g_op_notes_mu);
+        seq = g_op_notes.note(kind, 0, a, b, c);
+        if (trace) traced = recorder_op_note_text_locked(*g_op_notes.find(seq));
+    }
+    if (trace) host_log("marker trace: op %u (another thread's): %s", seq, traced.c_str());
+    return seq;
+}
+
+// The recorder's note of op `seq` (host/gpu_markers.h) as one line.
+std::string recorder_op_note_text(std::uint32_t seq) {
+    std::lock_guard<std::mutex> lk(g_op_notes_mu);
+    const gpu_markers::Note* f = g_op_notes.find(seq);
+    return f ? recorder_op_note_text_locked(*f) : std::string();
+}
+
+// The last op number given to an op with the front end's word (host/gpu_markers.h, word_on), 0 before any.
+std::uint32_t recorder_last_op_note() {
+    std::lock_guard<std::mutex> lk(g_op_notes_mu);
+    std::uint32_t seq = g_op_notes.last;
+    for (std::uint32_t steps = 0; seq && steps < 4096; --seq, ++steps) {
+        const gpu_markers::Note* n = g_op_notes.find(seq);
+        if (!n) break;
+        if (word_on(static_cast<Op>(n->kind))) return seq;
+    }
+    return 0;
+}
+
+// What the front end had reached after the draw or dispatch `started` (its
+// marker value), the op word being `reached` (host/gpu_markers.h reach_after),
+// and the ops from the first after it to `reached`, a line each, into `lines`
+// (at most `max`). A barrier holds the front end for the draw when its source
+// stages take in a draw's last ones (the pass end's and the pass barrier's
+// all-graphics, the transfer barrier's all-commands), for a dispatch when they
+// take in the compute stage.
+gpu_markers::Reach recorder_reach_after(std::uint32_t started, std::uint32_t reached, std::vector<std::string>& lines, std::size_t max) {
+    const unsigned kind = started >> 30;
+    const auto classify = [kind](const gpu_markers::Note& n) -> int {
+        constexpr std::uint64_t kDrawEnds = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT |
+                                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        constexpr std::uint64_t kDispatchEnds =
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        switch (static_cast<Op>(n.kind)) {
+        case Op::kForeignSubmit: return gpu_markers::kOtherThread;
+        case Op::kTransferBarrier: return n.a ? gpu_markers::kHolds : gpu_markers::kPlain;  // into the transfer stage: from all commands
+        case Op::kPassBarrier: return kind == 1 ? gpu_markers::kHolds : gpu_markers::kPlain;  // from all graphics stages
+        case Op::kEndRendering: return n.a && kind == 1 ? gpu_markers::kHolds : gpu_markers::kPlain;  // with its pass barrier
+        case Op::kBarrier: return (n.a & (kind == 2 ? kDispatchEnds : kDrawEnds)) ? gpu_markers::kHolds : gpu_markers::kPlain;
+        default: return gpu_markers::kPlain;
+        }
+    };
+    std::lock_guard<std::mutex> lk(g_op_notes_mu);
+    const gpu_markers::Reach r = gpu_markers::reach_after(g_op_notes, started, reached, classify);
+    if (r.ops) {
+        for (std::uint32_t seq = r.first; seq && lines.size() < max; ++seq) {
+            const gpu_markers::Note* n = g_op_notes.find(seq);
+            const int c = n ? classify(*n) : gpu_markers::kOtherThread;
+            if (c != gpu_markers::kOtherThread) {
+                char head[64];
+                std::snprintf(head, sizeof(head), "op %u%s: ", seq, c == gpu_markers::kHolds ? " (a barrier that holds the front end)" : "");
+                lines.push_back(head + recorder_op_note_text_locked(*n));
+            }
+            if (seq == reached) break;
+        }
+        // The ops after it with no word of their own (word_on): the front end may have passed them.
+        for (std::uint32_t seq = reached + 1; seq && lines.size() < max; ++seq) {
+            const gpu_markers::Note* n = g_op_notes.find(seq);
+            if (!n) break;
+            const int c = classify(*n);
+            if (c == gpu_markers::kOtherThread) continue;
+            if (n->after != started || word_on(static_cast<Op>(n->kind))) break;
+            char head[80];
+            std::snprintf(head, sizeof(head), "op %u (no word of its own: it may have been reached): ", seq);
+            lines.push_back(head + recorder_op_note_text_locked(*n));
+        }
+    }
+    return r;
 }
 
 void recorder_drain() {
@@ -1770,9 +2145,18 @@ void Rec::push_buffers(VkPipelineBindPoint bind_point, VkPipelineLayout layout, 
 }
 
 void Rec::marker(std::uint32_t value) {
+    if (!markers_live()) return;  // outside the markers' window (host/gpu_markers.h): nothing
     if (!stream_on()) return gpu_write_markers(in_place(REC_SITE), value);
     before_op(REC_SITE);
     std::uint8_t* at = append_record(Op::kMarker, sizeof(stream::Marker));
+    *put_struct<stream::Marker>(at) = stream::Marker{value, 0};
+    after_op();
+}
+
+void Rec::marker_window(std::uint32_t value) {
+    if (!stream_on()) return record_marker_window(in_place(REC_SITE), value);
+    before_op(REC_SITE);
+    std::uint8_t* at = append_record(Op::kMarkerWindow, sizeof(stream::Marker));
     *put_struct<stream::Marker>(at) = stream::Marker{value, 0};
     after_op();
 }

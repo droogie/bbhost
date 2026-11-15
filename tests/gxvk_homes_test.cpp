@@ -5,6 +5,12 @@
 // answer the command processor asks of it (meets, holding, straddles, and the
 // filter's "no") checked against a plain list of the live ranges. The filter
 // may say "maybe" where nothing is; it may never say "no" where a home is.
+// The pool's threads' view of it (read_meets, the published lists) gives the
+// same answers, single-threaded; beside a writer thread changing it in batches,
+// readers find every home that stays, nothing where nothing ever was, one of
+// the two homes a batch swaps (never neither: a batch's middle), and only homes
+// the writer put where they are (no freed list read back); every list retired
+// is freed once the readers are done (concurrent_test).
 // The handle's packing is checked too (host/gxvk_homes.h), and the default's
 // rule (default_off: on only with a card with room or 5,000 MiB of small video
 // memory free and a frame rate above 60 - at any frame rate where the run
@@ -15,9 +21,12 @@
 #include "host/gxvk_homes_index.h"
 #include "host/list_resolve.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -28,7 +37,7 @@ struct Live {
     std::uint32_t bytes;
 };
 
-int g_failures = 0;
+std::atomic<int> g_failures{0};  // (the concurrent test's threads check too)
 void check(bool ok, const char* what, std::uint64_t va, std::uint64_t bytes) {
     if (ok) return;
     if (++g_failures <= 12) std::printf("FAIL: %s at 0x%llx + %llu\n", what, static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes));
@@ -47,6 +56,128 @@ void model(const std::vector<Live>& live, std::uint64_t va, std::uint64_t bytes,
         }
     }
     *straddles = *meets && !*holding;
+}
+
+// The index a home gets in concurrent_test: from its memory and size, so a reader tells a real entry from bytes that
+// are not one.
+std::uint32_t index_of(std::uint64_t memory, std::uint32_t bytes) {
+    return static_cast<std::uint32_t>(((memory >> 4) * 2654435761ull) ^ (bytes * 40503u)) & gxvk_homes::kIndexMask;
+}
+
+void concurrent_test() {
+    using gxvk_homes::HomeIndex;
+    HomeIndex ix;
+    const std::uint64_t base = 0x300000000ull;
+    // Homes that stay: 64 of 4 KiB, 64 KiB apart.
+    constexpr int kStable = 64;
+    const auto stable_at = [&](int k) { return base + static_cast<std::uint64_t>(k) * 0x10000; };
+    for (int k = 0; k < kStable; ++k) ix.insert(index_of(stable_at(k), 4096), stable_at(k), 4096);
+    // Pairs the writer swaps in one batch: A at the slot, 40 KiB (ten pages); B 256 bytes on, 40 KiB less 512. Both hold
+    // the probe, a page and a half in.
+    constexpr int kPairs = 32;
+    const auto pair_at = [&](int k) { return base + 0x1000000 + static_cast<std::uint64_t>(k) * 0x10000; };
+    const auto a_of = [&](int k) { return Live{index_of(pair_at(k), 40960), pair_at(k), 40960}; };
+    const auto b_of = [&](int k) { return Live{index_of(pair_at(k) + 256, 40448), pair_at(k) + 256, 40448}; };
+    std::vector<int> pair_b(kPairs, 0);
+    for (int k = 0; k < kPairs; ++k) ix.insert(a_of(k).index, a_of(k).memory, a_of(k).bytes);
+    // Homes made and ended at random in 16 MiB; 16 MiB nobody touches.
+    const std::uint64_t churn = base + 0x2000000, empty = base + 0x3000000;
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> batches{0};
+    std::thread writer([&] {
+        std::mt19937_64 r(99);
+        std::vector<Live> live;
+        while (!stop.load(std::memory_order_relaxed)) {
+            {
+                const HomeIndex::Batch b(ix);
+                for (int n = 0; n < 4; ++n) {
+                    const int k = static_cast<int>(r() % kPairs);
+                    const Live from = pair_b[k] ? b_of(k) : a_of(k), to = pair_b[k] ? a_of(k) : b_of(k);
+                    if (!ix.erase(from.index, from.memory)) check(false, "the writer's erase of a pair's home", from.memory, from.bytes);
+                    ix.insert(to.index, to.memory, to.bytes);
+                    pair_b[k] ^= 1;
+                }
+                if (live.size() < 200 || r() % 2) {
+                    const std::uint32_t bytes = static_cast<std::uint32_t>(16 * (1 + r() % 1024));
+                    const std::uint64_t memory = churn + 16 * (r() % (0x1000000 / 16 - 1024));
+                    bool over = false;
+                    for (const Live& l : live) over |= l.memory < memory + bytes && memory < l.memory + l.bytes;
+                    if (!over) {
+                        ix.insert(index_of(memory, bytes), memory, bytes);
+                        live.push_back({index_of(memory, bytes), memory, bytes});
+                    }
+                } else {
+                    const std::size_t k = r() % live.size();
+                    ix.erase(live[k].index, live[k].memory);
+                    live[k] = live.back();
+                    live.pop_back();
+                }
+            }
+            batches.fetch_add(1, std::memory_order_relaxed);
+            // (The command processor drains its events between draws; three batches in four come right after another.)
+            if (r() % 4 == 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+    });
+    std::atomic<std::uint64_t> asked{0}, unsure{0};
+    const auto reader = [&](int seed) {
+        std::mt19937_64 r(seed);
+        std::uint64_t n = 0, u = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            HomeIndex::Hit h;
+            const int what = static_cast<int>(r() % 4);
+            if (what == 0) {
+                const int k = static_cast<int>(r() % kStable);
+                const std::uint64_t va = stable_at(k) + 16 * (r() % 255);
+                const int a = ix.read_meets(va, 16, &h);
+                if (a == HomeIndex::kReadUnsure) ++u;
+                else check(a == HomeIndex::kReadMeets && h.memory == stable_at(k) && h.bytes == 4096 && h.index == index_of(h.memory, h.bytes),
+                           "a home that stays, found", va, 16);
+            } else if (what == 1) {
+                const int k = static_cast<int>(r() % kPairs);
+                const std::uint64_t va = pair_at(k) + 6144;
+                const int a = ix.read_meets(va, 4, &h);
+                if (a == HomeIndex::kReadUnsure) ++u;
+                else check(a == HomeIndex::kReadMeets && ((h.memory == a_of(k).memory && h.bytes == a_of(k).bytes) ||
+                                                          (h.memory == b_of(k).memory && h.bytes == b_of(k).bytes)) &&
+                               h.index == index_of(h.memory, h.bytes),
+                           "one of a swapped pair, never neither", va, 4);
+            } else if (what == 2) {
+                const std::uint64_t va = empty + 16 * (r() % (0x1000000 / 16 - 4096));
+                const int a = ix.read_meets(va, 16 * (1 + r() % 1024), &h);
+                if (a == HomeIndex::kReadUnsure) ++u;
+                else check(a == HomeIndex::kReadNone, "nothing where nothing ever was", va, 16);
+            } else {
+                const std::uint64_t va = churn + 16 * (r() % (0x1000000 / 16 - 4096)), bytes = 16 * (1 + r() % 1024);
+                const int a = ix.read_meets(va, bytes, &h);
+                if (a == HomeIndex::kReadUnsure) ++u;
+                else if (a == HomeIndex::kReadMeets)
+                    check(h.index == index_of(h.memory, h.bytes) && h.memory < va + bytes && va < h.memory + h.bytes,
+                          "a hit is a home the writer put there, meeting the range", va, bytes);
+            }
+            ++n;
+        }
+        asked.fetch_add(n);
+        unsure.fetch_add(u);
+    };
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 3; ++t) readers.emplace_back(reader, 1000 + t);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    stop.store(true);
+    writer.join();
+    for (std::thread& t : readers) t.join();
+    // Done: the lists every reader has left freed, and each pair's home the one the writer left.
+    ix.reclaim();
+    check(ix.retired() == 0, "every retired list freed once the readers are done", ix.retired(), 0);
+    for (int k = 0; k < kPairs; ++k) {
+        HomeIndex::Hit h;
+        const Live want = pair_b[k] ? b_of(k) : a_of(k);
+        check(ix.read_meets(pair_at(k) + 6144, 4, &h) == HomeIndex::kReadMeets && h.memory == want.memory && h.bytes == want.bytes,
+              "the pair's home the writer left", pair_at(k), 0);
+    }
+    // (Unsure: a batch under way through every try - a reader that is always unsure checks nothing.)
+    check(asked.load() > 1000 && unsure.load() * 2 < asked.load(), "readers mostly sure beside the writer", unsure.load(), asked.load());
+    std::printf("gxvk_homes_test: concurrent: %llu batches, %llu reads, %llu unsure\n", static_cast<unsigned long long>(batches.load()),
+                static_cast<unsigned long long>(asked.load()), static_cast<unsigned long long>(unsure.load()));
 }
 
 }  // namespace
@@ -175,6 +306,12 @@ int main() {
             if (overlaps(memory, bytes)) continue;
             ix.insert(next_index, memory, bytes);
             live.push_back({next_index++, memory, bytes});
+        } else if (op == 4 && rng() % 4 == 0) {
+            // A new home at a live one's memory (no larger: nothing else is met) replaces it.
+            const std::size_t k = rng() % live.size();
+            const std::uint32_t bytes = 16 * (1 + static_cast<std::uint32_t>(rng() % (live[k].bytes / 16)));
+            ix.insert(next_index, live[k].memory, bytes);
+            live[k] = {next_index++, live[k].memory, bytes};
         } else if (op < 6) {
             const std::size_t k = rng() % live.size();
             check(ix.erase(live[k].index, live[k].memory), "erase of a live home", live[k].memory, live[k].bytes);
@@ -198,6 +335,19 @@ int main() {
             model(live, va, bytes, &m, &h, &s, &first);
             HomeIndex::Hit hit;
             const bool im = ix.meets(va, bytes, &hit);
+            // The pool's view: the same home, or unsure only for a range of 64 pages or more.
+            {
+                HomeIndex::Hit rh;
+                const int r = ix.read_meets(va, bytes, &rh);
+                const bool long_range = ((va + bytes - 1) >> 12) - (va >> 12) >= HomeIndex::kReadMostPages;
+                if (r == HomeIndex::kReadUnsure) {
+                    check(long_range, "the published lists unsure of a short range", va, bytes);
+                } else {
+                    check(!long_range && (r == HomeIndex::kReadMeets) == m, "the published lists' meets", va, bytes);
+                    if (r == HomeIndex::kReadMeets && im)
+                        check(rh.index == hit.index && rh.memory == hit.memory && rh.bytes == hit.bytes, "the published lists' home", va, bytes);
+                }
+            }
             ++queries;
             if (ix.may_meet(va, bytes)) ++maybes;
             check(im == m, "meets", va, bytes);
@@ -218,9 +368,23 @@ int main() {
     for (const Live& l : live) check(ix.erase(l.index, l.memory), "final erase", l.memory, l.bytes);
     for (int q = 0; q < 2000; ++q) {
         const std::uint64_t va = heaps[q % 2] + 16 * (rng() % (256 * 4096 / 16));
-        check(!ix.meets(va, 64, nullptr) && !ix.may_meet(va, 64), "empty index", va, 64);
+        check(!ix.meets(va, 64, nullptr) && !ix.may_meet(va, 64) && ix.read_meets(va, 64, nullptr) == HomeIndex::kReadNone, "empty index", va, 64);
     }
+    ix.reclaim();
+    check(ix.retired() == 0, "no reader: every retired list freed", ix.retired(), 0);
+    // A reader inside its section: what the writer retires meanwhile stays until it leaves (and only that long).
+    {
+        HomeIndex::Hold* hold = new HomeIndex::Hold(ix);
+        ix.insert(next_index, heaps[0], 64);
+        check(ix.erase(next_index, heaps[0]), "erase beside a held reader", heaps[0], 64);
+        ix.reclaim();
+        check(ix.retired() > 0, "a list retired while a reader is inside kept", ix.retired(), 0);
+        delete hold;
+        ix.reclaim();
+        check(ix.retired() == 0, "freed once the reader left", ix.retired(), 0);
+    }
+    concurrent_test();
     std::printf("gxvk_homes_test: %llu queries, the filter said maybe to %llu; %d failures\n", static_cast<unsigned long long>(queries),
-                static_cast<unsigned long long>(maybes), g_failures);
-    return g_failures ? 1 : 0;
+                static_cast<unsigned long long>(maybes), g_failures.load());
+    return g_failures.load() ? 1 : 0;
 }

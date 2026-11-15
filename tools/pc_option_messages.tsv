@@ -7,8 +7,11 @@
 # The port takes the next free blocks - 116000 PC Settings, 117000 PC
 # Graphics, 118000 PC Controls, 119000 Key Bindings, 120000 PC Effects, 121000
 # PC Camera, 122000 the title menu's Quit Game, 123000 Steam Deck (shown on a
-# Deck only), 124000 PC Enhancements, 125000 PC Upscaling - and 110006..110014 for the System rows
-# that open them. All are unused in the shipped menu.msgbnd. (Motion blur,
+# Deck only), 124000 PC Enhancements, 125000 PC Upscaling, 126000 the plugins'
+# menu pages (rows whose texts the host points at its own, and 126020 the
+# title field's placeholder, engine/plugin_dialog.cpp) - and 110006..110015
+# for the System rows that open them. All are unused in the shipped
+# menu.msgbnd. (Motion blur,
 # depth of field and chromatic aberration moved to PC Effects with their
 # 117000 ids.)
 #
@@ -18,7 +21,9 @@
 # text lives here and nowhere else.
 #
 # Ids 920000..929999 are dialog text instead (group 78, the generic yes/no
-# dialog's - engine/live_resolution.cpp opens one); the help column is unused.
+# dialog's - engine/live_resolution.cpp opens one; group 204 for the options
+# screens' own questions, 920002 a plugin row's, written in memory); the help
+# column is unused.
 # Ids 14000332..14000399 are event text (group 30): the talk menus' entries and
 # the messages their scripts show - the Altar of Despair's rebirth
 # (engine/rebirth_script.h); the help column is unused.
@@ -37,6 +42,7 @@
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Additions to the game, each for the next start: the mirror, rebirth, five players and more.
 110014	PC Upscaling	TAA, FSR, DLSS, frame generation (Windows): quality, sharpness, character motion, reflections.
+110015	Plugins	The menus of the plugins that are turned on.
 116000	Vertical Sync	Wait for the display. Off can tear.
 116001	Fullscreen	Fill the screen: Borderless, or Fullscreen where Window mode (F10) says so.
 116009	Stay Borderless	Borderless never turns into exclusive fullscreen. AMD cards: may lower the frame rate.
@@ -84,60 +90,60 @@
 121030	FPS++ (Kyo)	
 121031	Original	
 117004	Resolution	What the game renders at (it shipped at 1920x1080). Changes at once and asks to be kept.
-117010	1280x720
-117011	1600x900
-117012	1920x1080
-117013	2560x1440
-117014	3200x1800
-117015	3840x2160
-117030	2560x1080 (21:9)
-117031	3440x1440 (21:9)
-117032	5120x2160 (21:9)
-117033	3840x1080 (32:9)
-117034	5120x1440 (32:9)
-117035	1280x800 (16:10)
-117036	960x600 (16:10, upscaled)
-117037	1024x640 (16:10, upscaled)
-117038	640x360
-117039	960x540
-117040	1440x810
-117041	2880x1620
-117042	1920x1200 (16:10)
-117043	2560x1600 (16:10)
-117044	1280x960 (4:3)
-117045	1440x1080 (4:3)
-117046	1366x768
-117047	5120x2880 (5K)
-117048	7680x4320 (8K)
-117049	1440x900 (16:10)
-117050	1680x1050 (16:10)
-117051	2880x1800 (16:10)
-117052	3840x2400 (16:10)
-117053	800x600 (4:3)
-117054	1024x768 (4:3)
-117055	1600x1200 (4:3)
-117056	2048x1536 (4:3)
-117057	1280x1024 (5:4)
-117058	1080x1080 (1:1)
-117059	1440x1440 (1:1)
-117060	1920x1920 (1:1)
-117061	3840x1600 (21:9)
-117062	6880x2880 (21:9)
-117063	3840x1200 (16:5, two 16:10 screens)
-117064	7680x2160 (32:9, 8K ultrawide)
-117065	4320x1200 (18:5)
-117066	3840x960 (4:1, three 4:3 screens)
-117067	4800x1200 (4:1, three 4:3 screens)
-117068	5760x1200 (24:5, three 16:10 screens)
-117069	7680x1600 (24:5, three 16:10 screens)
-117070	5400x1080 (5:1)
-117071	3840x720 (16:3, three 16:9 screens)
-117072	4800x900 (16:3, three 16:9 screens)
-117073	5760x1080 (16:3, three 16:9 screens)
-117074	7680x1440 (16:3, three 16:9 screens)
-117075	11520x2160 (16:3, three 16:9 screens)
-117076	7680x1080 (64:9, three 21:9 screens)
-117077	10320x1440 (43:6, three 21:9 screens)
+117010	(16:9) 1280x720
+117011	(16:9) 1600x900
+117012	(16:9) 1920x1080
+117013	(16:9) 2560x1440
+117014	(16:9) 3200x1800
+117015	(16:9) 3840x2160
+117030	(21:9) 2560x1080
+117031	(21:9) 3440x1440
+117032	(21:9) 5120x2160
+117033	(32:9) 3840x1080
+117034	(32:9) 5120x1440
+117035	(16:10) 1280x800
+117036	(16:10) 960x600 (upscaled)
+117037	(16:10) 1024x640 (upscaled)
+117038	(16:9) 640x360
+117039	(16:9) 960x540
+117040	(16:9) 1440x810
+117041	(16:9) 2880x1620
+117042	(16:10) 1920x1200
+117043	(16:10) 2560x1600
+117044	(4:3) 1280x960
+117045	(4:3) 1440x1080
+117046	(16:9) 1366x768
+117047	(16:9) 5120x2880 (5K)
+117048	(16:9) 7680x4320 (8K)
+117049	(16:10) 1440x900
+117050	(16:10) 1680x1050
+117051	(16:10) 2880x1800
+117052	(16:10) 3840x2400
+117053	(4:3) 800x600
+117054	(4:3) 1024x768
+117055	(4:3) 1600x1200
+117056	(4:3) 2048x1536
+117057	(5:4) 1280x1024
+117058	(1:1) 1080x1080
+117059	(1:1) 1440x1440
+117060	(1:1) 1920x1920
+117061	(21:9) 3840x1600
+117062	(21:9) 6880x2880
+117063	(16:5) 3840x1200 (two 16:10 screens)
+117064	(32:9) 7680x2160 (8K ultrawide)
+117065	(18:5) 4320x1200
+117066	(4:1) 3840x960 (three 4:3 screens)
+117067	(4:1) 4800x1200 (three 4:3 screens)
+117068	(24:5) 5760x1200 (three 16:10 screens)
+117069	(24:5) 7680x1600 (three 16:10 screens)
+117070	(5:1) 5400x1080
+117071	(16:3) 3840x720 (three 16:9 screens)
+117072	(16:3) 4800x900 (three 16:9 screens)
+117073	(16:3) 5760x1080 (three 16:9 screens)
+117074	(16:3) 7680x1440 (three 16:9 screens)
+117075	(16:3) 11520x2160 (three 16:9 screens)
+117076	(64:9) 7680x1080 (three 21:9 screens)
+117077	(43:6) 10320x1440 (three 21:9 screens)
 118000	Mouse Camera	The mouse turns the camera outside menus.
 118004	Field of View	How wide the camera sees. 0 is the game's own; each step widens it 5%.
 118001	Mouse Sensitivity	How far the mouse turns the camera. Each step turns it about half again as far.
@@ -175,6 +181,7 @@
 124006	Auto-Replenish Items	Requires a restart. Molotovs, knives and more refill from storage on a death or in the Dream.
 920000	Keep this resolution?\nIt goes back in 10 seconds unless you choose YES.	
 920001	Quit the game and return to the desktop?	
+920002	Go ahead?	
 14000332	Rebirth in the Nightmare	
 14000333	The altar is silent.\nIt awaits one who bears a sacred heirloom,\na consciousness that is only asleep.	
 14000334	Too many Blood Echoes are held to be reborn.\nSpend some, then return to the altar.	
@@ -201,3 +208,12 @@
 125040	TAA	
 125041	Precise	
 125042	Off	
+126000	Row	
+126001	Row	
+126002	Row	
+126003	Row	
+126004	Row	
+126005	Row	
+126006	Row	
+126007	Row	
+126020	Plugin	

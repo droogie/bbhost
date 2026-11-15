@@ -11,6 +11,7 @@
 #include "engine/addr.h"
 #include "engine/camera.h"
 #include "engine/camera_target.h"
+#include "engine/debug_menu.h"
 #include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
 #include "engine/gx_state.h"
@@ -20,9 +21,12 @@
 #include "gcn/container.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
+#include "engine/plugin_dialog.h"
 #include "engine/world_chr.h"
 #include "engine/lua_events.h"
 #include "engine/loading.h"
+#include "engine/menu_pointer.h"
+#include "engine/world_pause.h"
 #include "engine/paramdef.h"
 #include "engine/params.h"
 #include "engine/patch_manifest.h"
@@ -32,9 +36,11 @@
 #include "guest_abi.h"
 #include "hle/fs.h"
 #include "hle/modules.h"
+#include "hle/np.h"
 #include "host/audio_crush.h"
 #include "host/bindings.h"
 #include "host/options.h"
+#include "host/plugin_panel.h"
 #include "host/ruleset.h"
 #include "host/pixel_cutaway.h"
 #include "host/render_api.h"
@@ -860,6 +866,7 @@ std::vector<ActionCallback> g_action_callbacks;  // under g_frame_mu
 struct MenuRequest {
     bool action;
     std::string name, key, value;
+    bool kept = true;  // a setting the config keeps; false: a menu's run-time row (panel_rows), on_option only
 };
 std::vector<MenuRequest> g_menu_requests;  // under g_frame_mu
 
@@ -1091,10 +1098,9 @@ int api_on_world_rules(const char* name, void (*fn)(const char*, void*), void* u
 }
 
 // Version 13: controls and a view of a plugin's own.
-int api_input(BbInput* out) {
-    if (!out) return 1;
+int input_read(const char* reader, BbInput* out) {
     PluginInput in;
-    const bool ok = host_plugin_input(in);
+    const bool ok = host_plugin_input(reader, in);
     std::memcpy(out->key, in.key, sizeof(out->key));
     out->buttons = in.buttons;
     out->pressed = in.pressed;
@@ -1105,9 +1111,13 @@ int api_input(BbInput* out) {
     return ok ? 0 : 1;
 }
 
+// The read of the plugins that do not name themselves (input_as names one).
+int api_input(BbInput* out) { return out ? input_read("", out) : 1; }
+
+// The take of the plugins that do not name themselves (input_take_as names one).
 int api_input_take(const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, int wheel, int motion) {
     if (n && !scancodes) return 1;
-    host_plugin_input_take(scancodes, n, buttons, wheel != 0, motion != 0);
+    host_plugin_input_take("", scancodes, n, buttons, wheel != 0, motion != 0);
     return 0;
 }
 
@@ -1174,14 +1184,19 @@ int api_on_camera(void (*fn)(BbCamera*, void*), void* user) {
 
 // The scene's camera, after the copy above: the game state's update keeps it
 // in r15, loaded at 0x1d3bb93 from the object the slot at 0x594f880 holds
-// (+0x10). At 0x1d3bec5 the copy is done and a scripted camera's replacing it
-// is still to come (mov rax, [r13+0x110]; cmp dword [rax+0xc4], 0 - the scripted
-// camera's switch). The stub keeps only the argument registers, so the camera is
-// found again through the slot rather than r15.
+// (+0x10). At 0x1d3bec5 the copy is done and the debug free camera's replacing
+// it is still to come (mov rax, [r13+0x110]; cmp dword [rax+0xc4], 0 - its switch;
+// set, its camera at +0xd0 is copied over the scene's). The stub keeps only the
+// argument registers, so the camera is found again through the slot rather than r15.
 std::vector<CameraCallback> g_view_callbacks;  // under g_frame_mu
 bool g_view_hooked = false;
+// world_state's BB_WORLD_VIEW: one more than the flip at which a plugin's
+// on_view last changed the view (0: never) - another camera's picture.
+std::atomic<std::uint64_t> g_view_moved{0};
 
 GUEST_ABI std::int64_t view_hook(std::uint64_t, const std::uint64_t*) {
+    // A cutscene's own camera, left as it places it (plugin API 29).
+    if (loading_cutscene()) return 0;
     const std::uint64_t slot = runtime_of(0x594f880, 8);
     std::uint64_t holder = 0, scene = 0;
     if (!slot || !host_read_safe(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(slot)), &holder, 8) || !holder ||
@@ -1193,7 +1208,10 @@ GUEST_ABI std::int64_t view_hook(std::uint64_t, const std::uint64_t*) {
         now = g_view_callbacks;
     }
     auto* cam = reinterpret_cast<BbCamera*>(static_cast<std::uintptr_t>(scene + 0x10));
+    BbCamera before;
+    std::memcpy(&before, cam, sizeof before);
     for (const CameraCallback& c : now) c.fn(cam, c.user);
+    if (std::memcmp(&before, cam, sizeof before) != 0) g_view_moved.store(hle_video_flip_count() + 1, std::memory_order_relaxed);
     return 0;
 }
 
@@ -1213,6 +1231,9 @@ int api_on_view(void (*fn)(BbCamera*, void*), void* user) {
     }
     return 0;
 }
+
+// Version 29: a cutscene asked for or playing (engine/loading.h).
+int api_cutscene() { return loading_cutscene() ? 1 : 0; }
 
 int api_key_bound(std::uint16_t scancode) {
     if (scancode == 0) return 0;
@@ -1475,6 +1496,321 @@ void api_audio_crush(int rate_hz, int bits, float lowpass_hz) {
                   static_cast<double>(lowpass_hz));
 }
 
+// Version 29: the world held still, the controller, and who else is in the
+// world.
+bool plugin_named(const char* name) {
+    if (!name || !name[0]) return false;
+    for (const Plugin& p : g_plugins) {
+        if (p.name == name && !p.visitor) return true;
+    }
+    return false;
+}
+
+int api_world_pause(const char* name, int paused) {
+    if (!g_image || !api_eboot_is_109() || !plugin_named(name)) return 1;
+    return world_pause_set(name, paused != 0) ? 0 : 1;
+}
+
+int api_world_step(const char* name, std::uint32_t updates) {
+    if (!plugin_named(name)) return 1;
+    return world_pause_step(name, updates) ? 0 : 1;
+}
+
+int api_pad(BbPad* out) {
+    if (!out || out->size < 8) return 1;
+    PluginPad pad;
+    host_plugin_pad(pad);
+    const auto axis = [](std::uint8_t v) {
+        return std::clamp((static_cast<float>(v) - static_cast<float>(kStickRest)) / 127.0f, -1.0f, 1.0f);
+    };
+    BbPad o{};
+    o.buttons = pad.buttons;
+    o.pressed = pad.pressed;
+    o.play = pad.play;
+    o.connected = pad.connected ? 1 : 0;
+    o.lx = axis(pad.lx);
+    o.ly = axis(pad.ly);
+    o.rx = axis(pad.rx);
+    o.ry = axis(pad.ry);
+    o.l2 = static_cast<float>(pad.l2) / 255.0f;
+    o.r2 = static_cast<float>(pad.r2) / 255.0f;
+    o.size = std::min<std::uint32_t>(out->size, sizeof(BbPad));
+    std::memcpy(out, &o, o.size);
+    return 0;
+}
+
+int api_pad_take(const char* name, std::uint32_t buttons, std::uint32_t axes) {
+    static_assert(BB_PAD_LEFT_STICK == kPadTakeLeftStick && BB_PAD_RIGHT_STICK == kPadTakeRightStick &&
+                      BB_PAD_TRIGGERS == kPadTakeTriggers,
+                  "pad_take's axes");
+    if (!plugin_named(name)) return 1;
+    host_plugin_pad_take(name, buttons, axes & (BB_PAD_LEFT_STICK | BB_PAD_RIGHT_STICK | BB_PAD_TRIGGERS));
+    return 0;
+}
+
+int api_input_take_as(const char* name, const std::uint16_t* scancodes, std::size_t n, std::uint32_t buttons, int wheel, int motion) {
+    if ((n && !scancodes) || !plugin_named(name)) return 1;
+    host_plugin_input_take(name, scancodes, n, buttons, wheel != 0, motion != 0);
+    return 0;
+}
+
+int api_input_as(const char* name, BbInput* out) {
+    if (!out || !plugin_named(name)) return 1;
+    return input_read(name, out);
+}
+
+// Other players' characters in this world: the player set's entries after the
+// main player's (WorldChrMan +0x30: the local player, then up to four remote
+// ones, bbhost/engine/sprj/world_chr_man.hpp), each a character still there.
+std::uint32_t other_players() {
+    const std::uint64_t man = world_chr_man();
+    const std::uint64_t main = man ? rp(man + 0x60) : 0;
+    if (!main) return 0;
+    std::uint32_t cap = 0;
+    const std::uint64_t entries = rp(man + 0x38);
+    if (!entries || !rd(man + 0x30, &cap) || cap > 16) return 0;
+    std::uint32_t n = 0;
+    for (std::uint32_t k = 0; k < cap; ++k) {
+        const std::uint64_t ins = rp(entries + k * 0x38);
+        if (ins && ins != main && rp(ins)) ++n;
+    }
+    return n;
+}
+
+// The session's members besides the player: SprjSessionManager's route
+// configurations (+0xf0, one a member, 0x20 bytes each - the in-game update's
+// own "two or more" test at its start reads them) less one.
+std::uint32_t session_members(std::uint64_t sm) {
+    const std::uint64_t begin = rp(sm + 0xf8), end = rp(sm + 0x100);
+    if (!begin || end < begin || (end - begin) % 0x20 || (end - begin) > 0x20 * 16) return 0;
+    const std::uint32_t routes = static_cast<std::uint32_t>((end - begin) / 0x20);
+    return routes > 1 ? routes - 1 : 0;
+}
+
+// The picture's look over the area's own (engine/graphics_patch.h): one for
+// all plugins, the last call's, and its plugin, whose turning off takes it away.
+std::mutex g_look_mu;
+std::string g_look_owner;  // under g_look_mu
+
+float look_value(float v, float lo, float hi, float otherwise) { return std::isfinite(v) ? std::clamp(v, lo, hi) : otherwise; }
+
+int api_post_look(const char* name, const BbLook* look, std::uint32_t* available) {
+    static_assert(BB_LOOK_TONE == kLookTone && BB_LOOK_VIGNETTE == kLookVignette && BB_LOOK_DOF == kLookDof &&
+                      BB_LOOK_ABERRATION == kLookAberration && BB_LOOK_MOTION_BLUR == kLookMotionBlur && BB_LOOK_FOG == kLookFog &&
+                      BB_LOOK_DOF_RANGE == kLookDofRange,
+                  "post_look's groups");
+    if (!plugin_named(name) || (look && look->size < 8)) return 1;
+    GraphicsLook l;
+    if (look && look->set) {
+        BbLook b{};
+        std::memcpy(&b, look, std::min<std::size_t>(look->size, sizeof(BbLook)));
+        // A group the plugin's BbLook does not reach to the end of stays the area's.
+        const std::uint32_t size = look->size;
+        std::uint32_t set = b.set & kLookAll;
+        if (size < offsetof(BbLook, vignette)) set &= ~kLookTone;
+        if (size < offsetof(BbLook, dof)) set &= ~kLookVignette;
+        if (size < offsetof(BbLook, aberration)) set &= ~kLookDof;
+        if (size < offsetof(BbLook, motion_blur)) set &= ~kLookAberration;
+        if (size < offsetof(BbLook, fog_distance)) set &= ~kLookMotionBlur;
+        if (size < offsetof(BbLook, dof_near_end)) set &= ~kLookFog;
+        if (size < sizeof(BbLook)) set &= ~kLookDofRange;
+        l.set = set;
+        // Inside what the post effect's setters take (some assert outside it).
+        l.exposure = look_value(b.exposure, 0.0f, 16.0f, 1.0f);
+        l.gamma = look_value(b.gamma, 0.05f, 16.0f, 1.0f);
+        l.saturation = look_value(b.saturation, 0.0f, 16.0f, 1.0f);
+        l.brightness = look_value(b.brightness, 0.0f, 16.0f, 1.0f);
+        l.contrast = look_value(b.contrast, 0.0f, 16.0f, 1.0f);
+        l.vignette = look_value(b.vignette, 0.0f, 4.0f, 0.0f);
+        l.dof = b.dof != 0;
+        l.dof_focus = look_value(b.dof_focus, 0.01f, 10000.0f, 10.0f);
+        l.dof_aperture = look_value(b.dof_aperture, 0.5f, 64.0f, 5.6f);
+        l.dof_near_levels = std::clamp(b.dof_near_levels, 0, 7);
+        l.dof_far_levels = std::clamp(b.dof_far_levels, 0, 7);
+        l.aberration = b.aberration != 0;
+        for (int i = 0; i < 2; ++i) {
+            l.lateral[i] = look_value(b.lateral[i], -1.0f, 1.0f, 0.0f);
+            l.uniform[i] = look_value(b.uniform[i], -1.0f, 1.0f, 0.0f);
+        }
+        l.motion_blur = b.motion_blur != 0;
+        l.blur_time = look_value(b.blur_time, 0.0f, 100.0f, 0.0f);
+        l.blur_length = look_value(b.blur_length, 0.0f, 100.0f, 0.0f);
+        l.blur_scale = look_value(b.blur_scale, 0.0f, 100.0f, 0.0f);
+        // YEBIS's motion blur is built for 1 to 8 samples and draws with
+        // shaders that are not the blur's past that (engine/graphics_patch.cpp);
+        // 1 is its own 4 or 5. The look's apply keeps it to 7 where the area
+        // interleaves its samples.
+        l.blur_samples = std::clamp(b.blur_samples, 2, 8);
+        l.fog_distance = look_value(b.fog_distance, 0.01f, 100.0f, 1.0f);
+        l.fog_density = look_value(b.fog_density, 0.0f, 16.0f, 1.0f);
+        l.fog_contrast = look_value(b.fog_contrast, 0.0f, 16.0f, 1.0f);
+        l.fog_distance_offset = look_value(b.fog_distance_offset, -10000.0f, 10000.0f, 0.0f);
+        l.fog_height_offset = look_value(b.fog_height_offset, -10000.0f, 10000.0f, 0.0f);
+        l.dof_near_end = look_value(b.dof_near_end, 0.0f, 10000.0f, 0.0f);
+        l.dof_far_start = look_value(b.dof_far_start, 0.0f, 10000.0f, 10000.0f);
+        l.dof_near_fade = look_value(b.dof_near_fade, 0.0f, 10000.0f, 0.0f);
+        l.dof_far_fade = look_value(b.dof_far_fade, 0.0f, 10000.0f, 0.0f);
+    }
+    std::uint32_t was = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        static std::uint32_t groups = 0;
+        was = groups;
+        groups = l.set;
+        g_look_owner = l.set ? name : std::string();
+    }
+    graphics_look_set(l);
+    const std::uint32_t avail = graphics_look_available();
+    if (available) *available = avail;
+    if (was != l.set) host_log("plugin: %s's look over the area's: groups %x (%x can show now)", name, l.set, avail);
+    return 0;
+}
+
+// The plugin's look taken away as it is turned off.
+void drop_look(const std::string& name) {
+    {
+        std::lock_guard<std::mutex> lk(g_look_mu);
+        if (g_look_owner != name) return;
+        g_look_owner.clear();
+    }
+    graphics_look_set(GraphicsLook{});
+    host_log("plugin: %s turned off; its look taken away", name.c_str());
+}
+
+// The plugin's panel (host/plugin_panel.h).
+int api_panel_show(const char* name, const BbPanel* panel) {
+    if (!plugin_named(name)) return 1;
+    if (!panel) {
+        plugin_panel_hide(name);
+        return 0;
+    }
+    if (panel->size < 8) return 1;
+    BbPanel b{};
+    std::memcpy(&b, panel, std::min<std::size_t>(panel->size, sizeof(BbPanel)));
+    PluginPanelShow how;
+    how.page = b.page ? b.page : "";
+    how.guide = b.guide ? b.guide : "";
+    how.guide_keys = b.guide_keys ? b.guide_keys : "";
+    how.defaults = (b.flags & BB_PANEL_DEFAULTS) != 0;
+    how.corner = (b.flags & BB_PANEL_CORNER) != 0;
+    if (b.pages) {
+        for (std::uint32_t i = 0; i < b.page_count; ++i) {
+            if (!b.pages[i]) return 1;
+            how.pages.emplace_back(b.pages[i]);
+        }
+    }
+    return plugin_panel_show(name, how) ? 0 : 1;
+}
+
+PluginOptionDesc option_desc(const BbOption& o);
+
+int api_panel_rows(const char* name, const char* page, const BbOption* rows, size_t n) {
+    if (!plugin_named(name) || !page || (n && !rows)) return 1;
+    std::vector<PluginOptionDesc> out;
+    out.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) out.push_back(option_desc(rows[i]));
+    return plugin_panel_rows(name, page, out) ? 0 : 1;
+}
+
+int api_panel_value(const char* name, const char* page, const char* key, const char* value) {
+    if (!plugin_named(name) || !page || !key) return 1;
+    return plugin_panel_value(name, page, key, value ? value : "") ? 0 : 1;
+}
+
+int api_panel_open(const char* name, const char* page) {
+    if (!plugin_named(name) || !page) return 1;
+    return plugin_panel_open(name, page) ? 0 : 1;
+}
+
+int api_panel_state(const char* name, BbPanelState* out) {
+    if (!out || out->size < 8 || !plugin_named(name)) return 1;
+    PluginPanelState st;
+    plugin_panel_state(name, st);
+    BbPanelState o{};
+    o.shown = st.shown ? 1 : 0;
+    o.closed = st.closed ? 1 : 0;
+    std::snprintf(o.page, sizeof(o.page), "%s", st.page.c_str());
+    o.size = std::min<std::uint32_t>(out->size, sizeof(BbPanelState));
+    std::memcpy(out, &o, o.size);
+    return 0;
+}
+
+int api_option_set(const char* name, const char* key, const char* value) {
+    if (!key || !value || !plugin_named(name)) return 1;
+    for (const Plugin& p : g_plugins) {
+        if (p.name != name || p.visitor) continue;
+        for (const BbOption* o = p.options; o && o->type != BB_OPT_END; ++o) {
+            if (o->key && std::strcmp(o->key, key) == 0 && (o->type & 0xffu) != BB_OPT_HEADING && (o->type & 0xffu) != BB_OPT_ACTION) {
+                plugins_set_option(name, key, value);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+int api_hud_hide(const char* name, int hidden) {
+    if (!plugin_named(name)) return 1;
+    const bool was = scene_look_hud_hidden(), was_shown = scene_look_hud_shown();
+    if (hidden < 0) scene_look_set_hud_shown(name, true);  // shown, whatever the game's HUD option says
+    else scene_look_set_hud_hidden(name, hidden != 0);     // left out, or let go (of either ask)
+    if (hidden == 0) scene_look_set_hud_shown(name, false);
+    if (was != scene_look_hud_hidden() || was_shown != scene_look_hud_shown())
+        host_log("plugin: the game's HUD %s (%s)",
+                 scene_look_hud_hidden() ? "left out of the picture"
+                 : scene_look_hud_shown() ? "shown, its own option held on"
+                                          : "as the game has it",
+                 name);
+    return 0;
+}
+
+// BbWorldState's flags from the game's own state: its world, loads,
+// cutscenes and menus, the plugins' hold and their views (world_state; the
+// in-game menus' interruptions, plugins_frame).
+std::uint32_t world_flags() {
+    std::uint32_t f = 0;
+    if (loading_in_world()) f |= BB_WORLD_IN;
+    if (loading_screen_up()) f |= BB_WORLD_LOADING;
+    if (loading_cutscene()) f |= BB_WORLD_CUTSCENE;
+    // A plugin's own menu in the game's dialog (engine/plugin_dialog.h) is not one of the game's.
+    if ((menu_pointer_in_menu() && !plugin_dialog::alone()) || debug_menu_open()) f |= BB_WORLD_MENU;
+    if (world_pause_held()) f |= BB_WORLD_PAUSED;
+    // A plugin's view drawn this flip or the last (view_hook).
+    if (const std::uint64_t moved = g_view_moved.load(std::memory_order_relaxed); moved && moved + 1 >= hle_video_flip_count())
+        f |= BB_WORLD_VIEW;
+    return f;
+}
+
+int api_world_state(BbWorldState* out) {
+    if (!out || out->size < 8 || !g_image || !api_eboot_is_109()) return 1;
+    BbWorldState w{};
+    w.flags = world_flags();
+    w.others = other_players();
+    // Who is on the way: the matchmaking room's other members - the earliest a
+    // player coming in shows, at the server's member-joined event - or the
+    // game's session's, whichever counts more.
+    std::uint32_t members = hle_np_room_others();
+    if (const std::uint64_t sm = rp(runtime_of(bb::SPRJ_SESSION_MANAGER_SINGLETON_PTR.bn(), 8))) {
+        std::int32_t role = 0;
+        if (rd(sm + 0x124, &role) && role >= BB_SESSION_NONE && role <= BB_SESSION_LEAVING) w.session = role;
+        members = std::max(members, session_members(sm));
+    }
+    if (w.session == BB_SESSION_JOINING || w.session == BB_SESSION_GUEST) w.flags |= BB_WORLD_VISITING;
+    if (w.session == BB_SESSION_HOSTING || w.session == BB_SESSION_HOST || w.others) w.flags |= BB_WORLD_OPEN;
+    w.arriving = members > w.others ? members - w.others : 0;
+    // Logged as who else is in the world changes (the menus, loads and cutscenes
+    // come and go too often to log each).
+    static BbWorldState logged{};
+    if (w.others != logged.others || w.arriving != logged.arriving || w.session != logged.session) {
+        host_log("plugin: world state: session %d, %u other player(s), %u arriving (flags %x)", w.session, w.others, w.arriving,
+                 w.flags);
+        logged = w;
+    }
+    w.size = std::min<std::uint32_t>(out->size, sizeof(BbWorldState));
+    std::memcpy(out, &w, w.size);
+    return 0;
+}
+
 const BbHostApi g_api = {
     BB_PLUGIN_API_VERSION, sizeof(BbHostApi), &api_log, &api_config, &api_data_dir, &api_mods_dir, &api_register_hle,
     &api_eboot_sha256, &api_eboot_is_109, &api_guest_addr, &api_read, &api_write, &api_patch, &api_hook,
@@ -1506,6 +1842,10 @@ const BbHostApi g_api = {
     &api_aa_claim,
     &api_shader_override, &api_shader_folder, &api_shader_state, &api_shader_source, &api_shader_data,
     &api_on_camera_target,
+    &api_world_pause, &api_world_step, &api_pad, &api_pad_take, &api_world_state, &api_hud_hide, &api_post_look,
+    &api_panel_show, &api_panel_state, &api_option_set, &api_input_take_as, &api_input_as,
+    &api_panel_rows, &api_panel_value, &api_panel_open,
+    &api_cutscene,
 };
 
 std::string read_file(const std::string& path) {
@@ -1539,6 +1879,25 @@ std::string toml_value(const std::string& v) {
     return q + "\"";
 }
 
+// One BbOption as the menus keep it (copied, strings too): its type, flags,
+// texts and range; BB_OPT_WHEN's condition from `choices` (anything but a
+// CHOICE).
+PluginOptionDesc option_desc(const BbOption& o) {
+    PluginOptionDesc d;
+    d.type = o.type & 0xffu;
+    d.flags = o.type & ~0xffu;
+    d.live = (o.type & BB_OPT_LIVE) != 0;
+    d.key = o.key ? o.key : "";
+    d.label = o.label ? o.label : d.key;
+    d.help = o.help ? o.help : "";
+    d.def = o.def ? o.def : "";
+    d.choices = o.choices ? o.choices : "";
+    if ((o.type & BB_OPT_WHEN) && d.type != BB_OPT_CHOICE) d.when = d.choices;
+    d.min = o.min;
+    d.max = o.max;
+    return d;
+}
+
 PluginEntry entry_of(const std::string& file_name, const std::string& path, const BbPluginInfo* info, const BbOption* options) {
     PluginEntry e;
     e.file = file_name;
@@ -1554,21 +1913,15 @@ PluginEntry entry_of(const std::string& file_name, const std::string& path, cons
     }
     if (e.title.empty()) e.title = e.name;
     std::string group_when;  // the last heading's BB_OPT_WHEN
+    std::string group_page;  // the last heading's key, when it starts a panel page (BB_OPT_PANEL)
     for (const BbOption* o = options; o && o->type != BB_OPT_END; ++o) {
-        PluginOptionDesc d;
-        d.type = o->type & 0xffu;
-        d.live = (o->type & BB_OPT_LIVE) != 0;
-        d.key = o->key ? o->key : "";
-        d.label = o->label ? o->label : d.key;
-        d.help = o->help ? o->help : "";
-        d.def = o->def ? o->def : "";
-        d.choices = o->choices ? o->choices : "";
-        if ((o->type & BB_OPT_WHEN) && d.type != BB_OPT_CHOICE) d.when = d.choices;
+        PluginOptionDesc d = option_desc(*o);
         // A heading's condition covers the rows under it, up to the next heading.
         if (d.type == BB_OPT_HEADING) group_when = d.when;
         else if (d.when.empty()) d.when = group_when;
-        d.min = o->min;
-        d.max = o->max;
+        // A panel page: its heading and the rows under it, up to the next heading.
+        if (d.type == BB_OPT_HEADING) group_page = (o->type & BB_OPT_PANEL) && !d.key.empty() ? d.key : std::string();
+        d.page = group_page;
         e.options.push_back(std::move(d));
     }
     return e;
@@ -1623,7 +1976,24 @@ void plugins_load() {
     // that does not verify was changed after signing and is not loaded;
     // plugins.signed_only = true loads official plugins alone.
     const bool signed_only = config_value("plugins.signed_only") == "true";
+    // A photo_mode plugin - Nox-'s photo mode, carried on in his own
+    // repository on the plugin API made for his bbphoto - replaces bbphoto:
+    // while one is in the plugins folders and not switched off, bbphoto is not
+    // loaded - nor started, for a renamed copy found by its name - so the two
+    // never both answer L3 and P. [plugins] photo_mode = false loads bbphoto
+    // again.
+    const auto stem = [](const std::string& n) { return n.substr(0, n.rfind('.')); };
+    bool photo_mode_on = false;
+    if (config_switch("photo_mode") != 0) {
+        for (const auto& [name, path] : files) photo_mode_on = photo_mode_on || stem(name) == "photo_mode";
+    }
+    const auto replaced = [&](const std::string& plugin) {
+        if (!photo_mode_on || plugin != "bbphoto") return false;
+        host_log("plugin: bbphoto: not loaded - photo mode replaces it ([plugins] photo_mode = false loads bbphoto instead)");
+        return true;
+    };
     for (const auto& [name, path] : files) {
+        if (replaced(stem(name))) continue;
         bool official = false;
         if (const std::string sig = read_file(path + ".sig"); !sig.empty()) {
             if (!updater::signature_ok(read_file(path), sig, updater::release_key())) {
@@ -1655,6 +2025,10 @@ void plugins_load() {
             continue;
         }
         if (p.info && p.info->name && p.info->name[0]) p.name = p.info->name;
+        if (replaced(p.name)) {
+            close_lib(h);
+            continue;
+        }
         const std::uint32_t flags = p.info ? p.info->flags : 0;
         const int sw = config_switch(p.name);
         const bool off = sw == 0 || (sw < 0 && (flags & BB_PLUGIN_OPT_IN));
@@ -1730,12 +2104,24 @@ void plugins_load() {
         g_plugins.push_back(p);
     }
     aa_update();
+    // A plugin with a panel (BB_OPT_PANEL pages): the game's menu art read now,
+    // on a thread of its own, not on the presenter's at the panel's first frame.
+    for (const Plugin& p : g_plugins) {
+        bool panel = false;
+        for (const BbOption* o = p.options; o && o->type != BB_OPT_END && !panel; ++o)
+            panel = (o->type & 0xffu) == BB_OPT_HEADING && (o->type & BB_OPT_PANEL) != 0;
+        if (panel) {
+            plugin_panel_preload();
+            break;
+        }
+    }
     g_early = false;
 }
 
 void plugins_image(ElfImage* image) {
     g_image = image;
     if (!g_plugins.empty() && api_eboot_is_109()) {
+        world_pause_install(image);  // plugin API 29's world_pause
         static const std::uint8_t prologue[17] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
                                                   0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28};
         if (api_hook2(0x18235e0, prologue, sizeof(prologue), &layout_request_hook, nullptr) != 0)
@@ -1773,9 +2159,43 @@ void plugins_image(ElfImage* image) {
     aa_update();
 }
 
+void clash_check();
 void plugins_frame() {
     speffect_test_tick();  // BBHOST_SPEFFECT_TEST
     chr_watch_tick();      // BBHOST_CHR_WATCH
+    // A plugin's HUD shown (hud_hide with -1): the game's own HUD option held
+    // on, and the player's put back once none asks (before the early return,
+    // so a plugin turned off lets it go). A plugin's HUD left out while a
+    // plugin's page is up in the game's dialog: the option held off instead -
+    // the picture keeps the game's 2D for the page (host/render.cpp), and the
+    // HUD stays out of it.
+    player_hud_option_hold(scene_look_hud_shown()                         ? 1
+                           : scene_look_hud_hidden() && plugin_dialog::up() ? 0
+                                                                            : -1);
+    // A plugin's panel's sounds (the cursor, a change, a page, opening and
+    // closing): the game's own menu sounds, posted as its widgets post them.
+    {
+        int priority = 0;
+        const int id = plugin_panel_take_sound(&priority);
+        menu_sound_post(id, priority);
+    }
+    // A plugin's menu in the game's own dialog: opened, closed and followed
+    // on this thread (engine/plugin_dialog.h).
+    plugin_dialog::frame();
+    // The game's own interruptions close a plugin's centred menu: a loading
+    // screen coming up, a cutscene starting, the player's character dying.
+    if (g_image && api_eboot_is_109()) {
+        std::int64_t hp = -1;
+        if (!player_stat_get("hp", &hp)) hp = -1;
+        plugin_panel_world(world_flags(), hp);
+    }
+    // Plugins that clash (plugins_clash): told once in game, at the first
+    // frame and after a switch or setting changes.
+    static bool clash_first = true;
+    if (clash_first) {
+        clash_first = false;
+        clash_check();
+    }
     std::vector<FrameCallback> now;
     std::vector<WorldLoadCallback> loads;
     std::vector<MenuRequest> requests;
@@ -1808,10 +2228,17 @@ void plugins_frame() {
                 p.dormant = !on;
                 gpu::overrides_owner_on(p.shader_owner, on);  // its shader overrides with it
             }
+            if (!on) {
+                world_pause_drop(r.name);  // and its hold on the world
+                scene_look_drop_hud(r.name.c_str());  // and on the HUD
+                drop_look(r.name);  // and its look
+                plugin_panel_hide(r.name);  // and its panel
+                host_plugin_take_drop(r.name.c_str());  // and the controls it takes
+            }
             host_log("plugin: %s turned %s", r.name.c_str(), on ? "on" : "off");
             if (render_hooks_plugin_on(r.name, on)) republish_settings();
             aa_update();
-        } else {
+        } else if (r.kept) {
             const std::string raw = toml_value(r.value);
             config_value_set(r.name + "." + r.key, raw);
             config_set_values(config_user_file(), {{r.name, r.key, raw}});
@@ -1820,6 +2247,7 @@ void plugins_frame() {
             if (c.name == r.name) c.fn(r.key.c_str(), r.value.c_str(), c.user);
         }
     }
+    if (!requests.empty()) clash_check();
     if (!loads.empty()) {
         // A world load is a new main player (every load builds one) or the
         // player in another block (a warp that keeps it).
@@ -1834,6 +2262,7 @@ void plugins_frame() {
             for (const WorldLoadCallback& c : loads) c.fn(block, c.user);
         }
     }
+    host_plugin_pad_frame();  // the controller's presses since the last frame, the same for every reader (pad)
     for (const FrameCallback& c : now) c.fn(c.user);
 }
 
@@ -1945,6 +2374,11 @@ void plugins_run_action(const std::string& name, const std::string& action) {
     g_menu_requests.push_back({true, name, action, ""});
 }
 
+void plugins_menu_option(const std::string& name, const std::string& key, const std::string& value) {
+    std::lock_guard<std::mutex> lk(g_frame_mu);
+    g_menu_requests.push_back({false, name, key, value, false});
+}
+
 namespace {
 bool has_seed_option(const Plugin& p) {
     for (const BbOption* o = p.options; o && o->type; ++o) {
@@ -2032,6 +2466,65 @@ std::vector<std::string> rules_without(const std::string& rules, const std::vect
     return out;
 }
 }  // namespace
+
+namespace {
+// The pairs, each by its plugins' names and their main switch (a BB_OPT_BOOL
+// key; "" for the plugin's on/off alone).
+struct Clash {
+    const char *a, *a_switch, *b, *b_switch, *text;
+};
+constexpr Clash kClashes[] = {
+    {"quake", "enabled", "iso", "enabled",
+     "Quake and Isometric don't work together: both take over the camera. Turn one of them off."},
+    // Hunter Cam beside either: Quake's first person and Isometric's view both
+    // replace its camera (under Isometric's view it gives the hunter back, as
+    // to any other camera's picture), and its facing fights Quake's movement.
+    {"quake", "enabled", "hunter_cam", "",
+     "Quake and Hunter Cam don't work together: both take over the camera. Turn one of them off."},
+    {"iso", "enabled", "hunter_cam", "",
+     "Isometric and Hunter Cam don't work together: both take over the camera. Turn one of them off."},
+};
+
+bool truthy(const std::string& v) { return v == "true" || v == "1" || v == "on" || v == "yes"; }
+
+// A plugin turned on, with its switch on, as `list` and the config say.
+bool entry_on(const std::vector<PluginEntry>& list, const char* name, const char* key) {
+    for (const PluginEntry& p : list) {
+        if (p.name != name || !p.enabled) continue;
+        if (!*key) return true;
+        for (const PluginOptionDesc& o : p.options)
+            if (o.key == key) return truthy(plugins_option_value(p, o));
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
+std::string plugins_clash(const std::vector<PluginEntry>& list, const std::string& name) {
+    // Every pair it is in that is on - Quake beside both Isometric and Hunter Cam has two - a line each.
+    std::string out;
+    for (const Clash& c : kClashes) {
+        if (name != c.a && name != c.b) continue;
+        if (entry_on(list, c.a, c.a_switch) && entry_on(list, c.b, c.b_switch)) out += (out.empty() ? "" : "\n") + std::string(c.text);
+    }
+    return out;
+}
+
+// In game: a banner the first time a pair is on together, and again only
+// after they have been apart.
+void clash_check() {
+    static std::vector<bool> was(sizeof(kClashes) / sizeof(kClashes[0]), false);
+    const std::vector<PluginEntry> list = plugins_catalog();
+    for (std::size_t i = 0; i < was.size(); ++i) {
+        const Clash& c = kClashes[i];
+        const bool now = entry_on(list, c.a, c.a_switch) && entry_on(list, c.b, c.b_switch);
+        if (now && !was[i]) {
+            host_log("plugin: %s and %s are both on: %s", c.a, c.b, c.text);
+            host_message_show(c.text, 8.0f);
+        }
+        was[i] = now;
+    }
+}
 
 bool plugins_active(const std::string& name) {
     for (const Plugin& p : g_plugins) {

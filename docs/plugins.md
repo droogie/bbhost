@@ -82,7 +82,7 @@ log line. Everything a plugin logs is prefixed with `plugin:`.
 
 The API only ever grows. A plugin checks that `api->version` is at least the
 version whose calls it makes, and `api->size` for fields a newer host
-appended. The current version is 28 (`BB_PLUGIN_API_VERSION`).
+appended. The current version is 29 (`BB_PLUGIN_API_VERSION`).
 
 ## Addresses
 
@@ -162,12 +162,19 @@ gives the Binary Ninja address.
   Space, 224 Left Ctrl), the mouse's buttons held and pressed since the last
   read, its motion in its own counts and the wheel's notches - and `playing`,
   1 while the mouse turns the camera (in the world, no menu up). One reader:
-  the motion, presses and notches are the caller's once read.
+  the motion, presses and notches are the caller's once read - since v29
+  `input_as` gives a plugin reads of its own, and `input` is the read of the
+  plugins that do not name themselves.
 - `input_take(scancodes, n, buttons, wheel, motion)`: while the player is
   playing, those keys and mouse buttons stop pressing what they are bound to,
   the wheel's notches stay out of the game, and the mouse stops turning the
   game's camera - the plugin reads them all through `input`. The menus keep
-  every key. A call replaces the last; nothing taken gives everything back.
+  every key. A call replaces the last; nothing taken gives everything back,
+  but a key held then stays taken until it is let go (since v29), so the
+  game never sees it go down, while a key a call leaves out as it goes on
+  taking others is the game's again at once. Since v29 this is the take of
+  the plugins that do not name themselves: `input_take_as` gives a plugin a
+  take of its own, and the takes add up.
 - `on_camera(fn, user)`: each frame once the game has placed the player's
   camera - the follow camera's update and the camera manager's blend of the
   cameras it owns - and before the scene is drawn from it or a scripted camera
@@ -180,7 +187,9 @@ gives the Binary Ninja address.
   into the scene's, before a scripted camera replaces it: what `fn` writes is
   drawn, while the game's own camera - which the follow camera keeps, the
   controls move by and the aim reads - stays as `on_camera` left it. The
-  Isometric plugin draws its view this way.
+  Isometric plugin draws its view this way. Since v29 it is not called during
+  a cutscene (`cutscene()`), and a view it changes is another camera's picture
+  to the other plugins (`world_state`'s `BB_WORLD_VIEW`).
 - `on_camera_target(fn, user)` (v28): the recompiled follow camera's target.
   Registered once, from `bb_plugin_image`; on the game thread at each of the
   camera's updates `fn` gets the character whose controls the camera uses and
@@ -190,6 +199,155 @@ gives the Binary Ninja address.
   camera this way; where the game's own follow camera runs instead of the
   recompiled one, a plugin still needs its own camera hooks. One plugin owns
   it: 1 outside image setup, for NULL, or once taken; 0 otherwise.
+- `cutscene()` (v29): 1 while one of the game's cutscenes is asked for or
+  playing. The cutscene places the hunter and the camera itself, so a plugin
+  that moves either, hides the body, holds its gravity or takes the controls
+  gives them back for its length and takes them up again from wherever the
+  cutscene leaves the hunter (Quake, Hunter Cam and Isometric do). `on_view` is
+  not called during one; `on_camera` still is.
+
+**The world held still, the controller, who else is in the world, the HUD, the look and a panel** (v29)
+
+What a photo mode needs: the world stopped while its own camera flies, the
+controller read as the plugin's own while the game reads none of what it
+takes, a way to know that nobody else is in the world, the HUD out of the
+picture, a look of its own over the area's, and a panel of its settings
+over the game.
+
+- `world_pause(name, paused)`: holds the world - its characters, physics, AI,
+  events, effects and cloth - while frames go on being drawn and `on_view`
+  goes on being called. It is the game's own pause, the one it holds while it
+  leaves a world, taken at the world's next update. `name` is the plugin's
+  `BbPluginInfo` name; the world is held while any plugin asks. A load lets
+  every hold go, so a world never starts held, and so does turning the plugin
+  off. `set_time_scale` cannot do this: it stops at 0.1, and at frame rates
+  above 30 what the game counts in frames keeps real time.
+- `world_step(name, updates)`: while the plugin holds the world, that many
+  more updates run, one a frame, and then it is held again - a frame advance.
+- `pad(&pad)`: the controller as `BbPad` (set `pad.size` first): its own
+  buttons as `BB_PAD_*` bits, whatever the player's bindings make of them in
+  play, the sticks from -1 to 1 with the player's dead zones applied, the
+  triggers from 0 to 1, and the presses since the last frame, latched so that
+  a press shorter than a frame still counts - the same for every plugin that
+  reads in that frame. `play` is the held buttons as what they press in play
+  under the player's bindings (Key Bindings' controller column), for controls
+  that follow the game's own: photo mode's L3 is whichever button presses the
+  game's L3. From the main thread (`on_frame`). While bbhost's own menus, a
+  binding being chosen or a text box have the controller, nothing reads as
+  held. A test's taps (`BBHOST_AUTOPRESS`, the `tap` request) count as the
+  controller's.
+- `pad_take(name, buttons, axes)`: the game reads those buttons (the
+  controller's own) let go and those axes (`BB_PAD_LEFT_STICK`,
+  `BB_PAD_RIGHT_STICK`, `BB_PAD_TRIGGERS`) at rest - whatever they are bound
+  to in play is not pressed - while `pad` still reads them. Keys are
+  `input_take_as`'s. Each plugin's take is its own and the game loses what any
+  plugin takes; a call replaces the plugin's last. `0, 0` gives its buttons
+  back, but a button held then stays taken until it is let go, so the game
+  never sees it go down; a button a call leaves out as it goes on taking
+  others is the game's again at once. Turning the plugin off gives its take
+  back.
+- `input_take_as(name, scancodes, n, buttons, wheel, motion)`: `input_take`
+  for the plugin named `name`. The plugins' takes add up, each call replacing
+  only that plugin's last, so a plugin giving its keys back leaves another's
+  taken - photo mode ending leaves the Quake plugin's movement keys and mouse
+  its own. `input_take` is the take of every plugin that does not name
+  itself. Nothing taken gives the plugin's back, but a key held then stays
+  taken until it is let go; a key a call leaves out as it goes on taking
+  others is the game's again at once (the Quake plugin's movement keys on a
+  ladder). Turning the plugin off gives its take back.
+- `input_as(name, &in)`: `input` for the plugin named `name`: the presses,
+  motion and wheel since that plugin's own last read, so plugins reading every
+  frame never take them from one another - photo mode looking for P each frame
+  leaves the Quake plugin's mouse look whole. `input`'s are the read of every
+  plugin that does not name itself; a plugin's first read starts its count.
+- `world_state(&state)`: `BbWorldState` (set `state.size` first). `flags`:
+  `BB_WORLD_IN` (a world is loaded and running, or held), `BB_WORLD_LOADING`,
+  `BB_WORLD_CUTSCENE` (one plays or is queued), `BB_WORLD_MENU` (one of the
+  game's menus or dialogs has the controls, its debug menu included),
+  `BB_WORLD_PAUSED` (a plugin holds
+  the world), `BB_WORLD_VISITING` (the player is in another player's world or
+  on the way there), `BB_WORLD_OPEN` (the world's own session is up:
+  players matched to it, or in it - a bell rung alone does not open it; the
+  game makes the session when matchmaking finds a player) and `BB_WORLD_VIEW`
+  (another camera has the picture: a plugin's `on_view` moved the view this
+  frame or the last - a plugin's free camera - so a plugin whose own camera
+  is not the one drawn can give the hunter back to the game meanwhile; a
+  plugin that moves the view itself sees its own). `others`: other
+  players' characters in this world now - co-operators, invaders, the host one
+  visits. `arriving`: players on their way in - members of the world's session
+  or of its matchmaking room who are not in the world yet, counted from the
+  server's word that one joined the room. `session`: the game's own session
+  role (`BB_SESSION_*`).
+- `hud_hide(name, hidden)`: the game's HUD, menus and prompts left out of the
+  picture. The game draws them as always; they are left out where the
+  picture is put together for the screen - the point frame generation takes
+  its picture without the HUD from - so nothing of the game's own state
+  changes, and its HUD option keeps its value. bbhost's overlay and menus are
+  drawn as always, and so is a plugin's menu in the game's dialog: while one
+  is up, the game's HUD option is held off instead, and prompts may show. The HUD is left out while any plugin asks; turning the
+  plugin off lets go. It costs two copies of the picture a frame while on.
+  `hidden` -1 asks for the HUD shown instead, even where the player's own HUD
+  option hides it: the option is held on while any plugin asks so (and none
+  asks for the HUD left out) and is the player's again once none does. A
+  plugin's ask replaces its last.
+- `post_look(name, &look, &available)`: the picture's look over the area's
+  own, as `BbLook` (set `look.size` first): the groups in `set` apply - tone
+  (exposure, gamma, saturation, brightness and contrast, each times the
+  area's; the exposure is the eye adaptation's target while it adapts, the
+  fixed exposure otherwise), the vignette's power, depth of field (off, or on
+  with a focus distance, an aperture and the blur's levels in front of and
+  behind the focus - the lens's blur, in place of the area's own distance
+  ramps while it is on; with `BB_LOOK_DOF_RANGE` as well, the blur placed by
+  distance instead, as the areas' own is: sharp from `dof_near_end` to
+  `dof_far_start` metres, the blur in front full `dof_near_fade` metres
+  nearer and the blur behind full `dof_far_fade` metres further, each as
+  strong as its levels say), chromatic aberration (off, or on with its
+  lateral and uniform dispersions), motion blur (off, or on with its times, scale and
+  samples - 2 to 8, the most the game's motion blur has shaders for, and 7
+  where the area interleaves its samples, which makes 8 a 9) and the fog (its
+  distance, density and contrast times the area's, its distance and height
+  offsets added) - and the rest stay the area's. It is
+  written every view into the numbers the area gives the post-processing and
+  the fog, so nothing of the game's is kept or put back: `NULL` or `set` 0 is
+  the area's own from the next frame. One look for all plugins - the last
+  call's - and turning its plugin off takes it away. Depth of field and motion
+  blur show while the look sets them on whatever the Graphics settings say,
+  and are left out while it sets them off; Performance mode jumps past every
+  depth of field pass and leaves the scene's motion blur off, so `available`
+  (may be `NULL`) leaves those two out then. Values outside what the post
+  effect takes are clamped.
+- `panel_show(name, &panel)`: the plugin's panel up (`BbPanel`) or down
+  (`NULL`). Its pages are the plugin's own options table: a `BB_OPT_HEADING`
+  with `BB_OPT_PANEL` or-ed in starts a page, the rows under it up to the next
+  heading are on it, and neither shows in the menus. It is an in-game menu
+  (see [In-game menus](#in-game-menus-v29)): pages of the game's own options
+  dialog - its rows, cursor, sounds, line help and key guide, read from the
+  player's dump (nothing of it is shipped) - at the dialog's place with the
+  screen dimmed behind it, or smaller at the bottom right with
+  `BB_PANEL_CORNER`. Its rows' changes go to `on_option` as the menus' do (so
+  its rows want `BB_OPT_LIVE`); the line help shows the first sentence of the
+  row's help, then `guide` or `guide_keys` - whichever device the player used
+  last. The controller drives it (the d-pad up and down to a row, left and
+  right to change it, Cross to set a switch or press a button, L1 and R1 the
+  pages, Circle goes back or closes it), as do the keyboard (the arrows,
+  Enter, Page Up and Page Down, Escape or Backspace) and the pointer. While a
+  centred menu is up neither the game's play nor the plugins read the
+  controller, the keyboard or the mouse; while a corner one is, only what the
+  dialog moves by, and everything else is as it was. Where the game cannot
+  open its dialog, the host draws the same pages in a panel of its own.
+  `BB_PANEL_DEFAULTS` ends each page with a Defaults row. One panel at a time;
+  turning the plugin off takes it down.
+- `panel_state(name, &state)`: `BbPanelState` (set `state.size` first) -
+  whether the panel is up, whether the player closed it (Circle, Escape) since
+  the last call, and the page shown or shown last, by its heading's key.
+- `option_set(name, key, value)`: one of the plugin's options set as the menus
+  set it - kept in the player's config, and handed to `on_option` from the
+  next frame - for a row the plugin changes itself (a mode it always starts
+  in).
+- `panel_rows(name, page, rows, n)`, `panel_value(name, page, key, value)`,
+  `panel_open(name, page)`: a menu page's rows set at run time, one of their
+  values, and a page opened on top of the one shown - see
+  [In-game menus](#in-game-menus-v29).
 
 **Settings, UI and files**
 
@@ -421,6 +579,190 @@ only meet others with the same rules. `set_rules` updates the plugin's entry
 (for example when its seed changes); `on_world_rules` and `visitor` let a
 plugin flagged `BB_PLUGIN_ADOPTS_RULES` play by a host's rules when summoned
 into another player's modded world.
+
+## In-game menus (v29)
+
+A plugin can have menus that are the game's own: pages of its options dialog,
+with its rows, cursor, scrolling, sounds, line help and key guide - the
+machinery bbhost's PC Settings pages use, read from the player's dump
+(nothing of the game's is shipped). A menu is pages of the plugin's options
+table, and a page is a `BB_OPT_HEADING` with `BB_OPT_PANEL` or-ed in and the
+rows under it, up to the next heading. Those rows are not in the settings of
+the in-game plugin menu (F10); the menu shows them.
+
+**Declaring menus.** `BB_OPT_MENU` on a page's heading starts a menu, named
+by the heading's `def` (its label when `NULL`); the pages after it, up to the
+next `BB_OPT_MENU` heading, are that menu's, in L1/R1 order. For each named
+menu the plugin's entry in F10 has an *Open* button, and the game's System
+menu has a *Plugins* row (beside PC Settings) that lists every turned-on
+plugin's named menus - so a plugin needs only its table to have a menu: no
+input code. A plugin with no `BB_OPT_MENU` heading has one unnamed menu of
+all its pages and no button; it shows it itself with `panel_show` (photo mode
+does, on L3). `BB_OPT_SUBPAGE` on a page's heading keeps it out of the L1/R1
+order: it is opened on top of another page, by a row or by `panel_open`.
+
+**The rows.** Each row is one of the dialog's own:
+
+- `BB_OPT_BOOL`: the game's On/Off row.
+- `BB_OPT_CHOICE`: of two choices, the game's left/right pair; of more, a row
+  whose value Left and Right step through (wrapping).
+- `BB_OPT_INT`, `BB_OPT_FLOAT`: the game's slider. An INT from 0 to 10 is the
+  game's own slider; any other range has one position a step - 1 for an INT,
+  a hundredth of the range for a FLOAT - its bar at the value's share of the
+  range and its number the host's (a FLOAT to its step's decimals). Left and
+  Right step it, held they repeat.
+- `BB_OPT_INFO`: a label and a value the player cannot change (`def`).
+- `BB_OPT_ACTION`: a button; Cross presses it.
+- `BB_OPT_ACTION | BB_OPT_OPEN`: the button opens the page named by its `def`
+  on top of the one shown and calls `on_action`, which can fill that page;
+  Circle there comes back to the button.
+- `BB_OPT_ACTION | BB_OPT_CONFIRM`: the host asks first, in the game's yes/no
+  dialog ("*label*?", the first sentence of the row's help under it);
+  `on_action` comes only on Yes.
+- `BB_OPT_TEXT`: Cross or Enter opens the host's text box (the one the game's
+  name and glyph dialogs use) with the row's label and value; Enter accepts and
+  Escape cancels. A keyboard types in it; a controller alone can only accept
+  or cancel it, as with the game's own name dialog.
+- A row whose `BB_OPT_WHEN` is not met is shown dimmed and does nothing.
+
+A page of more than eight rows scrolls. The game's fields hold about 24
+characters of a label and 18 of a value; longer ones are set smaller to fit,
+so keep them short. A row in the table is a setting: the config keeps it, and
+its changes come to `on_option` with its key, as the F10 settings' do.
+
+**The help line.** The dialog's line help is one line under the rows: the
+cursor's row's help, **its first sentence** (up to the first `.`, `!` or `?`
+followed by a space), cut at a word with `...` when it does not fit, then the
+menu's guide. The line holds about 68 characters inside the dialog's frame,
+the guide's included, so give each row a short first sentence that says what
+it does, and the details after it: F10 and the host's own panel show the
+whole help.
+
+**Rows set at run time.** `panel_rows(name, page, rows, n)` gives `page` rows
+of the plugin's own from then on - a list (lamps, items, saves), info, or
+anything that is not a setting - copied by the host, strings too; `n` 0
+gives the page its table rows again. The page must be a page of the table,
+which gives its title, help and menu. These rows are never in the config: a
+change comes to `on_option`, and a press to `on_action`, with the key
+`"<page>/<key>"`, so the plugin knows the page it came from.
+`panel_value(name, page, key, value)` sets one of their values while the
+menu is up or not. `panel_open(name, page)` opens a page on top of the one
+shown - from `on_action`, say, after filling the page with one item's
+details.
+
+**Showing a menu.** The System menu's *Plugins* row, F10's *Open* button, or
+`panel_show(name, &panel)` from the plugin's own key or button, at the title
+or in the world. `BbPanel.page` is the page to start at (`NULL`: the one shown
+last); `pages` and `page_count` name the pages of the menu in L1/R1 order when
+they are not the table's; `guide` and `guide_keys` the hint after the help on
+the help line, for the controller and for the keyboard - keep them short
+("L1 R1: page    R3: show"); without them the host puts the menu's page keys
+there when it has more than one page. Without `BB_PANEL_CORNER` the menu is
+the game's dialog at its normal place, the screen dimmed behind it. With it,
+the dialog is smaller at the bottom right and leaves the world in view (photo
+mode's). `BB_PANEL_DEFAULTS` ends each page with a Defaults row. Where the
+game cannot open its dialog - another eboot, a dump the options movie could
+not be made from, a moment its menus stay locked - the host draws the same
+menu in a panel of its own instead (logged once).
+
+**The rules.**
+
+- One menu at a time: a `panel_show` from another plugin replaces it, and a
+  new one starts its pages again.
+- L1 and R1 (Page Up and Page Down, or the player's Menu Previous and Next
+  Page keys) turn the menu's pages; Circle (Backspace, Escape) goes back from
+  a page opened on top, and on a page of the menu closes it, which
+  `panel_state` reports as `closed`.
+- Input: while a centred menu is up neither the game's play nor any plugin
+  reads the controller, the keyboard or the mouse, and what is held as it
+  closes stays out of both until let go. A corner menu takes only what the
+  dialog moves by - the d-pad, Cross, Circle, L1 and R1; the arrows, Enter,
+  Backspace, Escape and the page keys - and gets them even when the plugin
+  takes the controller from the game; the sticks, the triggers and the other
+  buttons and keys stay the plugin's (`pad`, `input`). The pointer works the
+  rows as it does the game's own settings.
+- `world_state` does not count a plugin's menu as one of the game's.
+- A menu shown over the title's holds that one - no input, out of view -
+  until it is gone, as the game does when it opens a menu from another. One
+  shown over a menu of the game's in the world takes that menu's place, as
+  the game's own menus do, and closing it leaves the player in the world.
+  The overlay (F9, F10) opens over a menu and hides it until it closes.
+- The game's own interruptions close a centred menu: a loading screen coming
+  up (lamp travel, the one after a death), a cutscene starting, or the
+  player's character dying. `panel_state` then reads `shown` 0 and `closed`
+  1, as when the player closes it, and a text box or a yes/no open on it goes
+  with it. One already under way when the menu opens (a load, a cutscene, the
+  death's screen) leaves it up. A corner menu stays: the plugin takes it
+  down when it should (photo mode ends itself at a load or a cutscene).
+  When the game closes its menus itself under a corner menu - a load, or
+  frame after frame while the hunter is dying - the host brings the corner
+  menu back as soon as the game lets it; where the game keeps closing them,
+  will not take one back within a second, or takes the menu a third time in
+  ten seconds, it draws the menu itself until it is next shown. The plugin
+  sees it up throughout.
+- The world keeps running while a menu is up, unless the plugin holds it with
+  `world_pause`; the menu works either way.
+- Turning the plugin off takes its menu down.
+
+The example below is `examples/plugins/menu/menu.c`, built with bbhost as
+`build/menu.so` (`menu.dll`); copy it into a `plugins/` folder and open its
+menu from F10:
+
+```c
+/* An in-game menu (plugin API 29): a counter with two buttons, in the game's
+ * own look. Its table names the menu, so the in-game plugin menu (F10) has an
+ * "Open Counter" button for it: the plugin has no input code at all. */
+#include "bbhost_plugin.h"
+
+#include <stdio.h>
+#include <string.h>
+
+static const BbHostApi* api;
+static int count;
+
+/* The page's rows, set at run time: they are not settings, so the host keeps
+ * them for the menu and never writes them to the config. */
+static void fill(void) {
+    char text[16];
+    snprintf(text, sizeof(text), "%d", count);
+    const BbOption rows[] = {
+        {BB_OPT_INFO, "count", "Count", "How many times Add one was pressed.", text},
+        {BB_OPT_ACTION, "add", "Add one", "Adds one to the count."},
+        {BB_OPT_ACTION | BB_OPT_CONFIRM, "reset", "Reset the count", "The count goes back to 0."},
+    };
+    api->panel_rows("menu", "counter", rows, sizeof(rows) / sizeof(rows[0]));
+}
+
+/* A run-time row's button comes back as "<page>/<key>". */
+static void on_action(const char* action, void* user) {
+    char text[16];
+    (void)user;
+    if (strcmp(action, "counter/add") == 0) count += 1;
+    else if (strcmp(action, "counter/reset") == 0) count = 0;
+    else return;
+    if (strcmp(api->config("menu.loud"), "true") == 0) api->log("menu: %s, the count %d", action, count);
+    snprintf(text, sizeof(text), "%d", count);
+    api->panel_value("menu", "counter", "count", text);
+}
+
+BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
+    BB_PLUGIN_API_VERSION, 0, "menu", "Menu example", "1.0.0", "bbhost", "An in-game menu in the game's look."};
+
+/* A setting, kept in the config and shown with the plugin in the overlay; then
+ * the menu: one page, named Counter, its rows filled at run time. */
+BB_PLUGIN_EXPORT const BbOption bb_plugin_options[] = {
+    {BB_OPT_BOOL | BB_OPT_LIVE, "loud", "Log each press", 0, "false"},
+    {BB_OPT_HEADING | BB_OPT_PANEL | BB_OPT_MENU, "counter", "Counter", "Press Add one, or Reset.", "Counter"},
+    {0}};
+
+BB_PLUGIN_EXPORT int bb_plugin_image(const BbHostApi* host) {
+    if (host->version < 29 || host->size < sizeof(BbHostApi)) return 1; /* panel_rows arrived in 29 */
+    api = host;
+    api->on_action("menu", on_action, 0);
+    fill();
+    return 0;
+}
+```
 
 ## Rendering effects (v27)
 
@@ -670,9 +1012,11 @@ setup window can download the latest signed plugins from the newest release.
 | `randomizer` | Shuffles one-time pickups and shop stock from a seed, and optionally enemies: each regular enemy becomes another kind (model, AI and gear together), drawn from its own area or from the whole game, with optional roaming bosses. Writes a spoiler file. |
 | `boss_rush` | Fights the 19 story bosses back to back, optionally with the ten chalice-dungeon bosses, starting each round outside the boss's fog wall. Tracks time and deaths. Practice fights one boss, picked by name, again and again: once, N times, or until stopped, a death trying again from the fog wall and a win waking the boss for the next fight. Each fight that ends in a win or a death is an attempt, so Once and N times end after that many attempts; Restart starts the fight under way over from the fog wall without counting it. With Refill on, every attempt starts with the most blood vials and quicksilver bullets. A practice can start each fight at the boss's phase 2 or 3: once the fight begins, the boss is put just under the HP at which its own event script or AI changes phase, and the game plays the change itself (Ludwig's cutscene and Holy Blade, Gascoigne's beast, Lady Maria's blood and fire). Attempts, wins, deaths, the best and last clear times and, from phase 1, the time to phase 2 are shown after each fight and written to `results.txt`. Boss HP and Your HP are practice's cheats, for learning a fight: Can't die keeps hits taking HP down to 1 and no further (the debug menu's No Dead), and Infinite also puts the HP back after every hit, so the boss stays in the phase its fight began in and the player stays at full health. A boss that cannot die is not defeated, so its fights end in a death, a Restart or Stop. |
 | `mutators` | Switchable rules: gravity, game speed, bullet time at low HP, one-hit deaths, blood drain, enemy HP, echo rate, random effects. |
-| `quake` | Off until turned on. First person with Quake 3's movement and view: strafe jumping, bunny hopping (hold jump to keep hopping), crouching, the walls only characters meet (the invisible ones along ledges) as solid as the rest, creatures as solid as Quake 3's players, and a choice of physics - Quake 3 (VQ3, the default), CPMA, Quake 1 + CPMA, QuakeWorld and DeFRaG's. Five guns made of Bloodborne's (Cannon, Church Cannon, Piercing Rifle, Blunderbuss, Gatling Gun), always +10, firing from the view with each gun's own flash and sound: rockets and grenades at Quake 3's speeds (the grenade bouncing until its fuse), the Blunderbuss's and the Gatling Gun's own bullets, and a plasma of A Call Beyond's star or Blacksky Eye's shard; their blasts throw the player (rocket and grenade jumps, plasma climbing), and the gun that is up is drawn at the lower right with Quake 3's bob and kick. Field of view, mouse sensitivity, gravity and knockback are settings. |
+| `quake` | Off until turned on. First person with Quake 3's movement and view: strafe jumping, bunny hopping (hold jump to keep hopping), crouching, the walls only characters meet (the invisible ones along ledges) as solid as the rest, creatures as solid as Quake 3's players, and a choice of physics - Quake 3 (VQ3, the default), CPMA, Quake 1 + CPMA, QuakeWorld and DeFRaG's. Five guns made of Bloodborne's (Cannon, Church Cannon, Piercing Rifle, Blunderbuss, Gatling Gun), always +10, firing from the view with each gun's own flash and sound: rockets and grenades at Quake 3's speeds (the grenade bouncing until its fuse), the Blunderbuss's and the Gatling Gun's own bullets, and a plasma of A Call Beyond's star or Blacksky Eye's shard; their blasts throw the player (rocket and grenade jumps, plasma climbing), and the gun that is up is drawn at the lower right with Quake 3's bob and kick. Field of view, mouse sensitivity, gravity and knockback are settings. While another plugin holds the world, or its camera has the picture (a free camera's, the world held or running), Quake holds too: the player stays where they were and the view as it was, and the keys and the mouse fly that camera alone. |
 | `lohit` | Off until turned on. The map's lo-hit collision drawn in place of the map's own geometry (the game's own WorldHitMan debug draw, with GROUP MASK > Map off): every part loaded (Whole map, the default), or the part you stand on and the parts connected to it, one step out; Hi-hit shows the detailed collision characters and objects use instead. Each mesh is built once into a vertex buffer of its own and drawn with two draws a frame, where the game's debug draw rebuilt every triangle each frame and copied it twice (the triangles' edges the game drew over the faces, a second draw costing the GPU more than the faces, are left out). Its depth (plugin API 17) is drawn ahead of the scene's objects too, so the game's occlusion culling skips what is behind its walls, as the map's own geometry would. It is drawn inside the scene ahead of its effects so fire, sparks, blood and mist show over it, by default in the launcher's deep violet (walls) and dark blue (floors); the Colours sliders set both (0-255, as they come out on the screen) for the lo-hit and the hi-hit. Pair it with Performance mode (the setup window's main page) for the post-effects off. |
 | `ps1` | Off until turned on. Bloodborne PS1: the 3D drawn as the first PlayStation drew it, the HUD and the menus left sharp at the window's size: its vertices snapped to a grid of the screen as it moves (Vertex snap: 240p, the PS1's own screen, by default; 480p, 360p, 120p or off), its textures unfiltered (no bilinear, trilinear or anisotropic filtering), its colour targets 8 bits a channel (8-bit colour, as the rgba8f patch makes them; the colour grading then steps between its table's entries too, where it is smooth without it), and the 3D at its own Resolution - Native (the Resolution setting, at most the window's), 480p, 360p or 240p, each as wide as the window's shape gives - brought up to the window pixel for pixel, with no smoothing. Upscaling and the anti-aliasing stand aside while it is on. Old-hardware sound (off by default) makes everything the game plays sound like an old console's sound chip: PS1 (22050 Hz, 12 bits, muffled above 10 kHz), Crunchy (11025 Hz, 8 bits, no low-pass going in, so it aliases) or Custom (a rate and bits of its own). Each option changes in the game (F9). |
+| `hunter_cam` | Off until turned on. Hunter Cam: the hunter from closer in. Over the shoulder: a close third-person camera over the right or left shoulder, as Silent Hill 2's remake frames its hero, pulled in at walls by the game's own sphere cast, with a key that swaps shoulders while playing (Tab by default), the wheel zooming it and the middle button resetting the zoom. First person (Z toggles it): the view from the hunter's eyes with only their gloves (the arm armour) and weapons drawn, Head bob riding the view on the head's bone, the mouse turning it and the view free to look 80 degrees up and down (the game's aim stops at 35 and 40; Look up/down limit sets it). Only where the camera stands moves: the stick, the lock-on and the aim keep the game's turning; Right stick speed multiplies it. Always face the camera keeps the hunter facing where the camera looks (the monocular's precision-shooting state) while the script is answered as locked on, so they strafe, run and sprint at full speed; X still opens, picks up and talks there, items (Blood Vials, papers, tools) take effect, the mouse turns the view (its own sensitivity and Y reverse), and Crosshair shows or hides the monocular's sight. Dodge is a slider: 0 always the roll, locked on too, and the stick's way while facing the camera or in first person; 1 a sidestep in the stick's direction (the omni-roll); the Modern Movement Lite patch keeps working beside it. Distance, side offset, height, eye height, fields of view (+% wider, as F10's Field of view) and swap time are settings, all live. During a cutscene, and while another plugin's camera has the picture (a free camera's), the camera, the facing and the body are the game's again - that camera's pictures show the whole hunter - and its keys and the mouse do nothing; Hunter Cam takes them up again after. |
+| Photo mode | Not one of bbhost's plugins: Nox-'s [bbhost-photo-mode-plugin](https://github.com/Noxde/bbhost-photo-mode-plugin) carries on bbphoto, the photo mode plugin API 29's calls were made for - the world held still and stepped, the controller and the keyboard read as its own, the HUD left out of the picture, a look over the area's own and its settings as the game's own dialog at the bottom right. A `photo_mode` plugin in a plugins folder, not switched off (`photo_mode = false` under `[plugins]`), keeps bbhost from loading bbphoto beside it, so the two never both answer L3 and P. |
 | `debug_menu` | Restores the developers' debug menu (`` ` `` opens it), in English or the developers' Japanese, and makes the debug font it draws with from the public-domain X11 fonts k14 and 7x14, so nothing has to be downloaded. Cheating against other players with it gets an account banned; trying it out online with friends is fine. |
 
 The gameplay plugins - all five - announce themselves in the session's

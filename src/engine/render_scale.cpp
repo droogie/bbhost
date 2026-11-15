@@ -437,17 +437,19 @@ RenderScale wanted(std::uint32_t output_w, std::uint32_t output_h, bool upscaler
         return rs;
     }
     rs.quality = upscaler ? quality : 0;
-    // The 3D's base: the output, or with an upscaler a Resolution smaller
-    // than it (host_opt_output_size: the output is then the window's), fitted
-    // to the output's shape - then the quality's share of that.
+    // The 3D's base: the output, or a Resolution smaller than it
+    // (host_opt_output_size: the output is then the window's), fitted to the
+    // output's shape - then, with an upscaler, the quality's share of that.
+    // With no upscaler running (Upscaling Off, one this machine cannot run, a
+    // plugin's own anti-aliasing) YEBIS's copy stretches the 3D up itself.
     std::uint32_t base_w = output_w, base_h = output_h;
     int res_w = 0, res_h = 0;
-    if (upscaler && host_opt_resolution(&res_w, &res_h) && res_w > 0 && res_h > 0 &&
+    if (host_opt_resolution(&res_w, &res_h) && res_w > 0 && res_h > 0 &&
         static_cast<std::uint64_t>(res_w) * static_cast<std::uint32_t>(res_h) < static_cast<std::uint64_t>(output_w) * output_h) {
         const double k = std::min(static_cast<double>(res_w) / output_w, static_cast<double>(res_h) / output_h);
         base_w = std::max<std::uint32_t>(static_cast<std::uint32_t>(output_w * k) & ~3u, 4);
         base_h = std::max<std::uint32_t>(static_cast<std::uint32_t>(output_h * k) & ~3u, 4);
-        rs.quality = std::max(rs.quality, 1);  // drawn smaller than the output: the upscaler brings it up
+        if (upscaler) rs.quality = std::max(rs.quality, 1);  // drawn smaller than the output: the upscaler brings it up
     }
     render_scale_size(quality && upscaler ? quality : 0, base_w, base_h, &rs.render_w, &rs.render_h);
     return rs;
@@ -487,8 +489,9 @@ void settings_changed(const HostSettings& s) {
     const int quality = s.upscaler == 4                     ? 0  // TAA: the Resolution's size
                         : std::getenv("BBHOST_UPSCALE_QUALITY") ? now.quality
                                                             : std::clamp(s.upscale_quality, 0, 3);
-    // The upscaler on or off moves the game's own size too (host_opt_output_size:
-    // the window's with one and a smaller Resolution, the Resolution without).
+    // The game's own size (host_opt_output_size: the window's with a smaller
+    // Resolution, upscaler or not) can still move with a setting (the window
+    // mode's screen, a plugin's look), so it is asked for again here.
     int ow = 0, oh = 0;
     if (host_opt_output_size(&ow, &oh) && (static_cast<std::uint32_t>(ow) != now.output_w || static_cast<std::uint32_t>(oh) != now.output_h)) {
         live_resolution_request(static_cast<unsigned>(ow), static_cast<unsigned>(oh));
@@ -633,7 +636,7 @@ bool render_scale_retarget(std::uint32_t output_w, std::uint32_t output_h, std::
     const bool scaled = rs.render_w != rs.output_w || rs.render_h != rs.output_h;
     host_log("render scale: the 3D at %ux%u for %ux%u (%s)", rs.render_w, rs.render_h, output_w, output_h,
              scene_look_scale() ? (scaled ? "a plugin's look: brought up nearest" : "a plugin's look: the full size")
-             : !runs            ? "no upscaler running: the full size"
+             : !runs            ? (scaled ? "no upscaler running: the Resolution, stretched by YEBIS's copy" : "no upscaler running: the full size")
              : scaled           ? "upscaled"
                                 : "Native AA");
     return true;

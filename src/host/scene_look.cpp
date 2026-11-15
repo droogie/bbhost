@@ -4,10 +4,13 @@
 #include "host/pixel_cutaway.h"
 #include "host/upscaler.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -92,6 +95,44 @@ float scene_look_object_cut() { return g_object_cut.load(std::memory_order_relax
 std::atomic<std::uint32_t> g_dither{0};
 void scene_look_set_dither(std::uint32_t bits) { g_dither.store(bits >= 1 && bits <= 8 ? bits : 0, std::memory_order_relaxed); }
 std::uint32_t scene_look_dither() { return g_dither.load(std::memory_order_relaxed); }
+
+// The HUD left out, or shown (plugin API 29's hud_hide): the plugins that
+// ask, by name - each one's last ask.
+namespace {
+std::mutex g_hud_mu;
+std::vector<std::string> g_hud_owners;        // under g_hud_mu: left out
+std::vector<std::string> g_hud_shown_owners;  // under g_hud_mu: shown
+std::atomic<bool> g_hud_hidden{false}, g_hud_shown{false};
+
+void hud_ask_locked(std::vector<std::string>& owners, const char* owner, bool on) {
+    const auto it = std::find(owners.begin(), owners.end(), owner);
+    if (on && it == owners.end()) owners.emplace_back(owner);
+    if (!on && it != owners.end()) owners.erase(it);
+}
+}  // namespace
+
+void scene_look_set_hud_hidden(const char* owner, bool hidden) {
+    if (!owner || !owner[0]) return;
+    std::lock_guard<std::mutex> lk(g_hud_mu);
+    hud_ask_locked(g_hud_owners, owner, hidden);
+    if (hidden) hud_ask_locked(g_hud_shown_owners, owner, false);
+    g_hud_hidden.store(!g_hud_owners.empty(), std::memory_order_relaxed);
+    g_hud_shown.store(!g_hud_shown_owners.empty(), std::memory_order_relaxed);
+}
+void scene_look_set_hud_shown(const char* owner, bool shown) {
+    if (!owner || !owner[0]) return;
+    std::lock_guard<std::mutex> lk(g_hud_mu);
+    hud_ask_locked(g_hud_shown_owners, owner, shown);
+    if (shown) hud_ask_locked(g_hud_owners, owner, false);
+    g_hud_hidden.store(!g_hud_owners.empty(), std::memory_order_relaxed);
+    g_hud_shown.store(!g_hud_shown_owners.empty(), std::memory_order_relaxed);
+}
+bool scene_look_hud_hidden() { return g_hud_hidden.load(std::memory_order_relaxed); }
+bool scene_look_hud_shown() { return g_hud_shown.load(std::memory_order_relaxed) && !scene_look_hud_hidden(); }
+void scene_look_drop_hud(const char* owner) {
+    scene_look_set_hud_hidden(owner, false);
+    scene_look_set_hud_shown(owner, false);
+}
 
 bool scene_look_pixel_cut(PixelCut* out) {
     if (!g_pixel_cut_on.load(std::memory_order_acquire)) return false;

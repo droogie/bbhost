@@ -32,3 +32,8 @@ bool player_origin(int* origin);
 // From the frame-time manager's hook: the one line with the loaded
 // character's numbers, once.
 void player_data_tick();
+// The game's own HUD option ([GameDataMan + 0x48] + 9: 1 shows the HUD, 0
+// hides it) held at `want` (1 on, 0 off) while it is 0 or 1, the player's
+// value put back once it is -1. Once a frame, from the main thread
+// (plugins_frame).
+void player_hud_option_hold(int want);
