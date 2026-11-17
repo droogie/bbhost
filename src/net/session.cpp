@@ -433,8 +433,9 @@ void peers_upsert(const Peer& p) {
         std::lock_guard<std::mutex> lk(g_pmu);
         Peer& slot = g_peers[p.member_id];
         before = slot;
-        const unsigned conn = p.conn_id ? p.conn_id : slot.conn_id;
-        const int sig = p.sig_status ? p.sig_status : slot.sig_status;
+        const bool same_player = slot.online_id == p.online_id;
+        const unsigned conn = p.conn_id ? p.conn_id : same_player ? slot.conn_id : 0;
+        const int sig = p.conn_id ? p.sig_status : same_player ? slot.sig_status : 0;
         slot = p;
         slot.conn_id = conn;
         slot.sig_status = sig;
@@ -472,12 +473,20 @@ bool peers_find_conn(unsigned conn_id, Peer* out) {
     return false;
 }
 
-void peers_set_conn(std::uint16_t member_id, unsigned conn_id, int sig_status) {
+void peers_bind_conn(const std::string& online_id, unsigned conn_id, int sig_status) {
     std::lock_guard<std::mutex> lk(g_pmu);
-    auto it = g_peers.find(member_id);
-    if (it == g_peers.end()) return;
-    it->second.conn_id = conn_id;
-    it->second.sig_status = sig_status;
+    for (auto& [member, peer] : g_peers) {
+        if (peer.online_id != online_id) continue;
+        peer.conn_id = conn_id;
+        peer.sig_status = sig_status;
+    }
+}
+
+void peers_set_conn(const std::string& online_id, unsigned conn_id, int sig_status) {
+    std::lock_guard<std::mutex> lk(g_pmu);
+    for (auto& [member, peer] : g_peers) {
+        if (peer.online_id == online_id && peer.conn_id == conn_id) peer.sig_status = sig_status;
+    }
 }
 
 void peers_erase(std::uint16_t member_id) {
