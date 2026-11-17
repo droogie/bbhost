@@ -97,8 +97,16 @@ constexpr int kM2ErrTerminatedByMyself = static_cast<int>(0x80550E18);
 // Matching2's DEAD for that player when its connection closes, after
 // NpSignaling's own DEAD on the same queue (shadPS4's
 // CloseConnectionAndDispatchDead -> QueueMatching2DeadForTransport).
-void queue_m2_dead(const std::string& who, int error) {
-    net::dispatch_after(0, net::Prio::Signaling, [who, error] { hle_np_matching2_transport_dead(who, error); });
+void queue_m2_dead(unsigned transport, int error) {
+    const auto epoch = hle_np_matching2_room_epoch();
+    net::dispatch_after(0, net::Prio::Signaling,
+                        [transport, epoch, error] { hle_np_matching2_transport_dead(transport, epoch, error); });
+}
+
+void queue_m2_up(unsigned transport) {
+    const auto epoch = hle_np_matching2_room_epoch();
+    net::dispatch_after(kM2EstablishDelayMs, net::Prio::Signaling,
+                        [transport, epoch] { hle_np_matching2_transport_up(transport, epoch); });
 }
 
 enum class State { Inactive, SendingOffer, WaitOffer, SendingAccept, WaitAccept, ConnCheck, Established };
@@ -109,7 +117,6 @@ struct Ctx {
 };
 struct Transport {
     std::string online_id;
-    std::uint16_t member_id = 0;  // the peer table's entry, 0 until known
     std::uint32_t addr = 0;       // network order
     std::uint16_t port = 0;       // host order
     State state = State::SendingOffer;
@@ -123,7 +130,6 @@ struct Conn {
     unsigned ctx = 0;
     std::string online_id;
     unsigned transport = 0;
-    std::uint16_t member_id = 0;
     bool locally_activated = false;  // the game activated it
     bool peer_activated = false;     // the peer's game activated its own (its ActivationRequest)
     bool established_fired = false;
@@ -250,7 +256,6 @@ unsigned ensure_transport_locked(const std::string& online_id, std::uint32_t add
     t.port = port;
     net::Peer p;
     if (net::peers_find_online(online_id, &p)) {
-        t.member_id = p.member_id;
         if (!t.addr && p.addr && p.port) {
             t.addr = p.addr;
             t.port = p.port;
@@ -268,17 +273,16 @@ unsigned find_conn_locked(const std::string& online_id, unsigned ctx = 0) {
     return 0;
 }
 
-// The peer's current address from the room's peer table, if it is there.
+// Used when activating/binding a player, never to reinterpret a saved room slot.
 void refresh_addr_locked(Transport& t) {
     net::Peer p;
-    if (t.member_id && net::peers_get(t.member_id, &p) && p.addr && p.port) {
+    if (net::peers_find_online(t.online_id, &p) && p.addr && p.port) {
         t.addr = p.addr;
         t.port = p.port;
     }
 }
 
 void send_locked(Transport& t, Kind kind, Reason reason = kDeactivate, std::uint64_t nonce = 0) {
-    refresh_addr_locked(t);
     if (!t.addr || !t.port) return;
     std::uint8_t pkt[kPacketLen] = {};
     std::memcpy(pkt, kSignalMagic, sizeof(kSignalMagic));
@@ -294,7 +298,7 @@ void send_locked(Transport& t, Kind kind, Reason reason = kDeactivate, std::uint
 // The peer table's view of the game's connections to that player.
 void set_peer_status_locked(unsigned tid, int status) {
     for (const auto& [id, c] : g_conn) {
-        if (c.transport == tid && !c.dead && c.locally_activated && c.member_id) net::peers_set_conn(c.member_id, id, status);
+        if (c.transport == tid && !c.dead && c.locally_activated) net::peers_set_conn(c.online_id, id, status);
     }
 }
 
@@ -344,9 +348,8 @@ void step(unsigned tid) {
             if (t.waited_ms >= kGiveUpMs) {
                 host_log("np: transport %u to %s: handshake not done in %d s: DEAD (timeout)", tid, t.online_id.c_str(),
                          kGiveUpMs / 1000);
-                const std::string who = t.online_id;
                 close_transport_dead_locked(tid, kErrTimeout, events);  // erases the transport
-                net::dispatch_after(0, net::Prio::Signaling, [who] { hle_np_matching2_transport_dead(who, kM2ErrTimeout); });
+                queue_m2_dead(tid, kM2ErrTimeout);
             } else {
                 send_handshake_locked(t);
                 t.waited_ms += kStepMs;
@@ -369,8 +372,7 @@ void establish_locked(unsigned tid, bool peer_activated_hint, std::vector<Event>
         t.established_fired = true;
         send_locked(t, kEstablishedMsg);
         set_peer_status_locked(tid, 2);
-        const std::string who = t.online_id;
-        net::dispatch_after(kM2EstablishDelayMs, net::Prio::Signaling, [who] { hle_np_matching2_transport_up(who); });
+        queue_m2_up(tid);
     }
     for (auto& [id, c] : g_conn) {
         if (c.transport != tid || c.dead) continue;
@@ -397,7 +399,7 @@ void close_conn_dead_locked(unsigned conn_id, int error, std::vector<Event>& eve
     auto tr = g_tr.find(c.transport);
     if (tr != g_tr.end()) tr->second.state = State::Inactive;
     c.dead = true;
-    if (c.member_id) net::peers_set_conn(c.member_id, conn_id, 0);
+    net::peers_set_conn(c.online_id, conn_id, 0);
     events.emplace_back(c.ctx, conn_id, kEvDead, error);
     g_conn.erase(it);
 }
@@ -414,7 +416,7 @@ void close_transport_dead_locked(unsigned tid, int error, std::vector<Event>& ev
     for (unsigned id : conns) {
         Conn& c = g_conn[id];
         c.dead = true;
-        if (c.member_id) net::peers_set_conn(c.member_id, id, 0);
+        net::peers_set_conn(c.online_id, id, 0);
         events.emplace_back(c.ctx, id, kEvDead, error);
         g_conn.erase(id);
     }
@@ -432,15 +434,6 @@ void activation(unsigned conn_id) {
         if (it == g_conn.end() || it->second.dead) return;
         Transport& t = g_tr[it->second.transport];
         refresh_addr_locked(t);
-        if (!t.addr || !t.port) {
-            net::Peer p;
-            if (net::peers_find_online(t.online_id, &p) && p.addr && p.port) {
-                t.member_id = p.member_id;
-                it->second.member_id = p.member_id;
-                t.addr = p.addr;
-                t.port = p.port;
-            }
-        }
         if (!t.addr || !t.port) peer = t.online_id;
     }
     if (!peer.empty()) {
@@ -459,9 +452,7 @@ void activation(unsigned conn_id) {
             Conn& c = it->second;
             Transport& t = g_tr[c.transport];
             if (ok && !t.addr) {
-                const net::Peer p = net::peers_provisional(peer, addr, port);
-                t.member_id = p.member_id;
-                c.member_id = p.member_id;
+                net::peers_provisional(peer, addr, port);
                 t.addr = addr;
                 t.port = port;
                 host_log("np: conn %u to %s resolved %u.%u.%u.%u:%u", conn_id, peer.c_str(), addr & 0xff,
@@ -489,7 +480,7 @@ void activation(unsigned conn_id) {
         const unsigned tid = c.transport;
         Transport& t = g_tr[tid];
         if (!t.addr || !t.port) return;
-        if (c.member_id) net::peers_set_conn(c.member_id, conn_id, status_of(t));
+        net::peers_bind_conn(c.online_id, conn_id, status_of(t));
         send_locked(t, kActivationRequest);
         if (c.start_handshake) {
             c.start_handshake = false;
@@ -553,7 +544,6 @@ GUEST_ABI int sig_activate(unsigned ctx, const void* npid, unsigned* conn_out) {
             c.ctx = ctx;
             c.online_id = peer;
             c.transport = tid;
-            c.member_id = t.member_id;
             c.locally_activated = true;
             c.start_handshake = t.state != State::Established;
             g_conn[id] = c;
@@ -563,7 +553,6 @@ GUEST_ABI int sig_activate(unsigned ctx, const void* npid, unsigned* conn_out) {
             const bool was_local = c.locally_activated;
             c.transport = tid;
             c.locally_activated = true;
-            if (!c.member_id) c.member_id = t.member_id;
             if (t.state != State::Established) {
                 if (t.state == State::Inactive || t.state == State::WaitOffer) t.state = State::SendingOffer;
                 c.start_handshake = true;
@@ -585,7 +574,7 @@ GUEST_ABI int sig_activate(unsigned ctx, const void* npid, unsigned* conn_out) {
 // deactivate is CONN_NOT_FOUND). NpMatching2's DEAD for that player is kept
 // for its LeaveRoom.
 GUEST_ABI int sig_deactivate(unsigned ctx, unsigned conn) {
-    std::string peer;
+    unsigned transport = 0;
     std::vector<Event> events;
     {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -596,14 +585,14 @@ GUEST_ABI int sig_deactivate(unsigned ctx, unsigned conn) {
         }
         Conn& c = it->second;
         host_log("sceNpSignalingDeactivateConnection conn %u (%s)", conn, c.online_id.c_str());
-        peer = c.online_id;
+        transport = c.transport;
         auto tr = g_tr.find(c.transport);
         if (tr != g_tr.end() && tr->second.state == State::Established && !c.dead) send_locked(tr->second, kClose, kDeactivate);
         close_conn_dead_locked(conn, kErrTerminatedByMyself, events);
     }
-    hle_np_matching2_peer_closed(peer);
+    hle_np_matching2_peer_closed(transport);
     queue_all(std::move(events));
-    queue_m2_dead(peer, kM2ErrTerminatedByMyself);
+    queue_m2_dead(transport, kM2ErrTerminatedByMyself);
     return 0;
 }
 
@@ -622,7 +611,6 @@ GUEST_ABI int sig_status(unsigned ctx, unsigned conn, int* st, std::uint32_t* ad
                 Transport& t = tr->second;
                 status = status_of(t);
                 if (status == 2) {
-                    refresh_addr_locked(t);
                     a = t.addr;
                     p = static_cast<std::uint16_t>((t.port << 8) | (t.port >> 8));
                 }
@@ -646,6 +634,12 @@ void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::ui
     std::string from(reinterpret_cast<const char*>(data + kFromAt), kIdLen);
     from.resize(std::strlen(from.c_str()));
     if (from.empty()) return;
+    std::string to(reinterpret_cast<const char*>(data + kToAt), kIdLen);
+    to.resize(std::strlen(to.c_str()));
+    if (to != net::online_id()) {
+        if (g_trace) host_log("np: signaling %s from %s addressed to %s: ignored", kind_name(kind), from.c_str(), to.c_str());
+        return;
+    }
     std::uint64_t nonce = 0;
     std::memcpy(&nonce, data + kNonceAt, sizeof(nonce));
     const std::uint16_t from_port = static_cast<std::uint16_t>((port << 8) | (port >> 8));
@@ -671,7 +665,6 @@ void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::ui
                 c.ctx = ctx;
                 c.online_id = from;
                 c.transport = tid;
-                c.member_id = t.member_id;
                 c.peer_activated = true;
                 g_conn[cid] = c;
             }
@@ -739,7 +732,7 @@ void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::ui
             } else {
                 if (cid) close_conn_dead_locked(cid, kErrTerminatedByPeer, events);
                 else g_tr[tid].state = State::Inactive;
-                queue_m2_dead(from, kM2ErrTerminatedByPeer);
+                queue_m2_dead(tid, kM2ErrTerminatedByPeer);
             }
             break;
         }
@@ -750,13 +743,14 @@ void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::ui
     fire_all(events);
 }
 
-bool hle_np_signaling_live(const std::string& online_id) {
+unsigned hle_np_signaling_live_transport(const std::string& online_id) {
     std::lock_guard<std::mutex> lk(g_mu);
-    return find_conn_locked(online_id) != 0;
+    const unsigned conn = find_conn_locked(online_id);
+    return conn ? g_conn[conn].transport : 0;
 }
 
 // shadPS4's StartMatching2, for one member.
-void hle_np_signaling_m2_connect(const std::string& online_id) {
+unsigned hle_np_signaling_m2_connect(const std::string& online_id) {
     std::lock_guard<std::mutex> lk(g_mu);
     const unsigned tid = ensure_transport_locked(online_id, 0, 0);
     Transport& t = g_tr[tid];
@@ -764,18 +758,21 @@ void hle_np_signaling_m2_connect(const std::string& online_id) {
     if (t.state == State::WaitOffer) t.state = State::SendingOffer;
     if (g_trace) host_log("np: matching2 signaling to %s: transport %u status %d", online_id.c_str(), tid, status_of(t));
     if (t.state == State::Established) {
-        const std::string who = online_id;
-        net::dispatch_after(kM2EstablishDelayMs, net::Prio::Signaling, [who] { hle_np_matching2_transport_up(who); });
-        return;
+        queue_m2_up(tid);
+        return tid;
     }
     send_handshake_locked(t);
     start_stepping_locked(tid);
+    return tid;
 }
 
-int hle_np_signaling_transport_status(const std::string& online_id) {
+int hle_np_signaling_transport_status(unsigned transport, std::uint32_t* addr, std::uint16_t* port) {
     std::lock_guard<std::mutex> lk(g_mu);
-    const unsigned tid = find_transport_locked(online_id);
-    return tid ? status_of(g_tr[tid]) : 0;
+    const auto it = g_tr.find(transport);
+    const int status = it != g_tr.end() ? status_of(it->second) : 0;
+    if (addr) *addr = status == 2 ? it->second.addr : 0;
+    if (port) *port = status == 2 ? static_cast<std::uint16_t>((it->second.port << 8) | (it->second.port >> 8)) : 0;
+    return status;
 }
 
 // shadPS4's StopMatching2, for one member: the transport closes unless an
@@ -796,7 +793,6 @@ void hle_np_signaling_peer_known(std::uint16_t member_id) {
         std::lock_guard<std::mutex> lk(g_mu);
         for (auto& [id, t] : g_tr) {
             if (t.online_id != p.online_id || t.state == State::Inactive) continue;
-            t.member_id = member_id;
             if (p.addr && p.port) {
                 t.addr = p.addr;
                 t.port = p.port;
@@ -804,7 +800,9 @@ void hle_np_signaling_peer_known(std::uint16_t member_id) {
         }
         for (auto& [id, c] : g_conn) {
             if (c.dead || c.online_id != p.online_id) continue;
-            c.member_id = member_id;
+            if (c.locally_activated && c.transport == find_transport_locked(p.online_id)) {
+                net::peers_bind_conn(c.online_id, id, status_of(g_tr[c.transport]));
+            }
             if (c.start_handshake) waiting.push_back(id);
         }
     }

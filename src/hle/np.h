@@ -32,27 +32,30 @@ void hle_np_signaling_peer_dead(const std::string& online_id);
 // A control datagram from another bbhost's NpSignaling (hle/net.cpp,
 // kSignalMagic), from addr (network order):port (network order).
 void hle_np_signaling_control(const std::uint8_t* data, std::size_t len, std::uint32_t addr, std::uint16_t port);
-// Whether the game has a live NpSignaling connection to this player
+// The transport of the game's live NpSignaling connection to this player, or 0
 // (NpMatching2's leave keeps that player's DEAD until the game closes it).
-bool hle_np_signaling_live(const std::string& online_id);
+unsigned hle_np_signaling_live_transport(const std::string& online_id);
 // NpSignaling closed the game's connection to this player: NpMatching2 sends
 // the DEAD it kept for that player at its LeaveRoom, before NpSignaling's own.
-void hle_np_matching2_peer_closed(const std::string& online_id);
+void hle_np_matching2_peer_closed(unsigned transport);
 
 // Matching2 signaling rides NpSignaling's transport to each player, as
 // shadPS4's (signaling_handler.cpp StartMatching2 / SyncMatching2Peers /
 // StopMatching2):
 // A room member to connect to: its transport made (or kept) and its handshake
 // started; hle_np_matching2_transport_up once it is Established.
-void hle_np_signaling_m2_connect(const std::string& online_id);
-// The transport's status to that player: 0 inactive, 1 pending, 2 active.
-int hle_np_signaling_transport_status(const std::string& online_id);
+unsigned hle_np_signaling_m2_connect(const std::string& online_id);
+// Status: 0 inactive, 1 pending, 2 active. An active transport's endpoint
+// is returned in network byte order; otherwise the endpoint is zero.
+int hle_np_signaling_transport_status(unsigned transport, std::uint32_t* addr = nullptr, std::uint16_t* port = nullptr);
 // Our room is over for that player: its transport closed, unless the game
 // still has an NpSignaling connection on it.
 void hle_np_signaling_m2_stop(const std::string& online_id);
-// The transport to that player has been Established for a second:
-// NpMatching2's ESTABLISHED (0x5102) for that member, once.
-void hle_np_matching2_transport_up(const std::string& online_id);
+// Read without the Matching2 mutex: signaling queues callbacks while holding its own mutex.
+std::uint64_t hle_np_matching2_room_epoch();
+// The transport has been Established for a second: ESTABLISHED (0x5102)
+// only for the member still bound to it, in the room that queued the event.
+void hle_np_matching2_transport_up(unsigned transport, std::uint64_t room_epoch);
 // The transport to that player gave up (handshake timeout): NpMatching2's
 // DEAD (0x5101) for that member with this error.
-void hle_np_matching2_transport_dead(const std::string& online_id, int error);
+void hle_np_matching2_transport_dead(unsigned transport, std::uint64_t room_epoch, int error);

@@ -51,11 +51,13 @@ struct Peer {
 
 // The peer table. All calls lock internally.
 void peers_clear();
-void peers_upsert(const Peer& p);          // by member_id; keeps conn_id/sig_status when the caller left them 0
+void peers_upsert(const Peer& p);          // keeps signaling state only for the same player
 bool peers_get(std::uint16_t member_id, Peer* out);
 bool peers_find_online(const std::string& online_id, Peer* out);
 bool peers_find_conn(unsigned conn_id, Peer* out);
-void peers_set_conn(std::uint16_t member_id, unsigned conn_id, int sig_status);
+void peers_bind_conn(const std::string& online_id, unsigned conn_id, int sig_status);
+// Status changes must still name the connection currently bound to this player.
+void peers_set_conn(const std::string& online_id, unsigned conn_id, int sig_status);
 std::vector<Peer> peers_all();
 void peers_erase(std::uint16_t member_id);
 std::int64_t now_ms();
@@ -83,8 +85,8 @@ bool server_signaling_resolve(const std::string& online_id, std::uint32_t* addr,
 // A peer known by address before it is a room member (the host activates a
 // connection to the guest it summons before the guest joins). Takes a member
 // id from the provisional range 0xff00.. so the table can hold it; the real
-// member record replaces nothing - both entries stay, the connection keeps
-// the provisional one and the address is the same.
+// member record replaces nothing - both entries stay and bind to the same
+// player's connection. The transport itself retains that player's endpoint.
 Peer peers_provisional(const std::string& online_id, std::uint32_t addr, std::uint16_t port);
 
 // The event poller: it asks /np/events/poll for the next matching2 event for
