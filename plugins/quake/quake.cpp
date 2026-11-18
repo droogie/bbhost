@@ -89,7 +89,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.24",
+    "0.3.25",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -2587,6 +2587,7 @@ struct Viewmodel {
     int cur = 0;
     std::uint8_t* hidden[kPartSlots] = {};  // display entities hidden here, shown again on release
     std::int32_t original = 0;      // the hunter's own left weapon while a Quake gun stands in (0: none)
+    int original_slot = 0;          // the left-hand slot (0..2) it was in, and the Quake gun is in
     double kick_ms = -1e9;          // the last shot
 } vm;
 std::uint64_t g_pulls = 0;
@@ -2600,10 +2601,27 @@ int vm_pull(BbHookCtx* c, void*) {
     return 1;
 }
 
-std::int32_t* left_weapon_id() {
+// The equipment (GameDataMan +0x8 -> +0x240): the left hand's selected slot
+// at +0xc and the right's at +0x10 (0..2), then the ids from +0x64 in hand
+// order - left 1, right 1, left 2, right 2, left 3, right 3. The weapon in the
+// hand is ids[2 * slot] (0x1a5e027 reads them so). Quake's gun goes in the
+// selected left slot: written into the first one alone, a hunter who had the
+// second or third slot up kept their own weapon in hand, and no gun was seen.
+std::uint8_t* equipment() {
     std::uint8_t* man = ptr_at(kGameDataMan);
     std::uint8_t* record = man ? at<std::uint8_t*>(man, 0x8) : nullptr;
-    return record ? &at<std::int32_t>(record, 0x240 + 0x64) : nullptr;
+    return record ? record + 0x240 : nullptr;
+}
+
+int left_slot() {
+    std::uint8_t* eq = equipment();
+    const std::int32_t slot = eq ? at<std::int32_t>(eq, 0xc) : 0;
+    return slot >= 0 && slot <= 2 ? slot : 0;
+}
+
+std::int32_t* left_weapon_id(int slot) {
+    std::uint8_t* eq = equipment();
+    return eq && slot >= 0 && slot <= 2 ? &at<std::int32_t>(eq, 0x64 + 8 * static_cast<std::size_t>(slot)) : nullptr;
 }
 
 bool is_quake_gun(std::int32_t id) {
@@ -2617,48 +2635,72 @@ std::string original_file() {
     return dir ? std::string(dir) + "/left_weapon.txt" : std::string();
 }
 
+// The file: "<id> <slot>" (0.3.23 and before wrote the id alone, always slot 0).
+bool read_original(std::int32_t& id, int& slot) {
+    const std::string file = original_file();
+    FILE* f = file.empty() ? nullptr : std::fopen(file.c_str(), "rb");
+    if (!f) return false;
+    id = 0;
+    slot = 0;
+    const int n = std::fscanf(f, "%d %d", &id, &slot);
+    std::fclose(f);
+    if (slot < 0 || slot > 2) slot = 0;
+    return n >= 1 && id != 0;
+}
+
 // The hunter's left weapon given back (or found from the last session's file).
 void vm_unequip() {
-    std::int32_t* id = left_weapon_id();
     std::int32_t original = vm.original;
-    const std::string file = original_file();
-    if (!original && !file.empty()) {
-        if (FILE* f = std::fopen(file.c_str(), "rb")) {
-            if (std::fscanf(f, "%d", &original) != 1) original = 0;
-            std::fclose(f);
-        }
-    }
+    int slot = vm.original_slot;
+    if (!original) read_original(original, slot);
+    std::int32_t* id = left_weapon_id(slot);
     if (id && original && is_quake_gun(*id)) {
-        g.log("quake: the hunter's left weapon back: %d (was %d)", original, *id);
+        g.log("quake: the hunter's left weapon back: %d in left slot %d (was %d)", original, slot + 1, *id);
         *id = original;
     }
     if (id && (vm.original || original)) {
         vm.original = 0;
+        vm.original_slot = 0;
+        const std::string file = original_file();
         if (!file.empty()) std::remove(file.c_str());
     }
 }
 
-// The Quake gun `weapon` in the left hand (its +10 row). A weapon the
-// player equips there meanwhile (the game's menu) becomes the one given back.
+// The Quake gun `weapon` in the selected left slot (its +10 row). A weapon
+// the player equips there meanwhile (the game's menu) becomes the one given
+// back; another slot picked meanwhile gets its own weapon back first.
 void vm_equip(int weapon) {
-    std::int32_t* id = left_weapon_id();
+    const int slot = left_slot();
+    if (vm.original && slot != vm.original_slot) vm_unequip();
+    if (!vm.original) {
+        // A session that ended with a Quake gun in another slot (the first,
+        // where 0.3.23 and before always put it): that slot's weapon back.
+        std::int32_t original = 0;
+        int was = 0;
+        if (read_original(original, was) && was != slot) vm_unequip();
+    }
+    std::int32_t* id = left_weapon_id(slot);
     if (!id) return;
     const auto want = static_cast<std::int32_t>(kWeapons[weapon].weapon + 1000);
     if (*id == want) return;
     const std::string file = original_file();
     if (!is_quake_gun(*id)) {
-        if (vm.original != *id) g.log("quake: the hunter's left weapon %d stands aside for the Quake guns", *id);
+        if (vm.original != *id)
+            g.log("quake: the hunter's left weapon %d (left slot %d) stands aside for the Quake guns", *id, slot + 1);
         vm.original = *id;
+        vm.original_slot = slot;
         if (FILE* f = file.empty() ? nullptr : std::fopen(file.c_str(), "wb")) {
-            std::fprintf(f, "%d\n", vm.original);
+            std::fprintf(f, "%d %d\n", vm.original, vm.original_slot);
             std::fclose(f);
         }
-    } else if (!vm.original && !file.empty()) {
+    } else if (!vm.original) {
         // A Quake gun already there: a session that ended with it in hand;
         // the hunter's own is in the plugin's folder.
-        if (FILE* f = std::fopen(file.c_str(), "rb")) {
-            if (std::fscanf(f, "%d", &vm.original) != 1) vm.original = 0;
-            std::fclose(f);
+        std::int32_t original = 0;
+        int was = 0;
+        if (read_original(original, was) && was == slot) {
+            vm.original = original;
+            vm.original_slot = slot;
         }
     }
     *id = want;
