@@ -1,10 +1,10 @@
-/* The plugin API's version 29 structures as a C compiler lays them out - the
+/* The plugin API's version 30 structures as a C compiler lays them out - the
  * layout plugins are built against, which a host may append to and never
  * move: their sizes, the places of the fields read most, and the API table's
  * version 27 calls right after version 26's camera_zoom - the frame's three,
  * then the shaders' five, followed by version 28's camera target hook and
  * version 29's world pause, controller, world state and menus, ending with
- * its cutscene().
+ * its cutscene(), and version 30's screen_shapes().
  * Built as C99, so the header stays C. */
 #include "bbhost_plugin.h"
 
@@ -60,7 +60,9 @@ _Static_assert(offsetof(BbHostApi, panel_rows) == offsetof(BbHostApi, input_as) 
 _Static_assert(offsetof(BbHostApi, panel_value) == offsetof(BbHostApi, panel_rows) + sizeof(void*), "panel_value after panel_rows");
 _Static_assert(offsetof(BbHostApi, panel_open) == offsetof(BbHostApi, panel_value) + sizeof(void*), "panel_open after panel_value");
 _Static_assert(offsetof(BbHostApi, cutscene) == offsetof(BbHostApi, panel_open) + sizeof(void*), "cutscene after panel_open");
-_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, cutscene) + sizeof(void*), "cutscene ends the API table");
+_Static_assert(offsetof(BbHostApi, screen_shapes) == offsetof(BbHostApi, cutscene) + sizeof(void*), "screen_shapes after cutscene");
+_Static_assert(sizeof(BbHostApi) == offsetof(BbHostApi, screen_shapes) + sizeof(void*), "screen_shapes ends the API table");
+_Static_assert(sizeof(BbScreenTri) == 28 && offsetof(BbScreenTri, rgba) == 24, "BbScreenTri");
 _Static_assert(BB_OPT_PANEL == 0x400u && BB_PANEL_DEFAULTS == 1u && BB_PANEL_CORNER == 2u, "the panel's flags");
 _Static_assert(BB_OPT_MENU == 0x800u && BB_OPT_SUBPAGE == 0x1000u && BB_OPT_OPEN == 0x2000u && BB_OPT_CONFIRM == 0x4000u &&
                    BB_OPT_INFO == 8,

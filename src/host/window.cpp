@@ -15,6 +15,7 @@
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/overlay.h"
+#include "host/plugins.h"
 #include "host/perf_meter.h"
 #include "host/present_pass.h"
 #include "host/ingame_menu.h"
@@ -2737,6 +2738,19 @@ bool host_window_pump() {
     // The host overlay's contents for this frame. Rebuilt from scratch each
     // pump; when nothing draws, the presenter's path is exactly as it was.
     host_overlay_reset();
+    // The plugins' 2D (plugin API 30's screen_shapes: Quake's crosshair) under
+    // everything else the overlay draws.
+    {
+        float dw = 1920.0f, dh = 1080.0f;
+        {
+            std::lock_guard<std::mutex> ml(g_mouse_mu);
+            if (g_display_w && g_display_h) {
+                dw = static_cast<float>(g_display_w);
+                dh = static_cast<float>(g_display_h);
+            }
+        }
+        plugins_draw_screen_shapes(dw, dh);
+    }
     // The FPS counter, top right, under everything else the overlay draws: the
     // game's frame rate (host_fps_frame_start's average), refreshed three
     // times a second - every frame, it flickers between neighbours and cannot

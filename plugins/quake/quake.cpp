@@ -89,7 +89,7 @@ extern "C" BB_PLUGIN_EXPORT const BbPluginInfo bb_plugin_info = {
     BB_PLUGIN_OPT_IN | BB_PLUGIN_GAMEPLAY,
     "quake",
     "Quake",
-    "0.3.24",
+    "0.3.26",
     "Kyo",
     "First person with Quake 3's movement and view: strafe jumping, bunny hopping, crouching, and the bob, roll and "
     "landing dip of Quake 3's camera.",
@@ -2901,7 +2901,10 @@ void take_input(bool on, bool moving = true) {
     g.api->input_take(keys, n, kMouseLeft | kMouseRight, 1, 1);
 }
 
+void crosshair_off();  // the crosshair's 2D taken away (below)
+
 void release() {
+    crosshair_off();
     g_on_ladder = false;
     g_ladder_exit_ms = -1.0;
     // The held character's switches and parts go back only while it is still
@@ -3177,10 +3180,73 @@ void debug_disc(std::uint8_t* lists, V3 c, V3 right, V3 up, V3 forward, float r)
     g.api->call_guest(kDrawSphere, &regs);
 }
 
+// Plugin API 30's screen_shapes: the host's own 2D over the picture, after the
+// HUD - frame generation, the upscalers and the TAA take it for UI, where the
+// debug shapes are drawn into the 3D and generated frames smeared the ring.
+bool screen_shapes_ok() {
+    return g.api->version >= 30 && g.api->size >= offsetof(BbHostApi, screen_shapes) + sizeof(void*) && g.api->screen_shapes;
+}
+
+bool g_screen_shown = false;
+
+void crosshair_off() {
+    if (!g_screen_shown) return;
+    g_screen_shown = false;
+    if (screen_shapes_ok()) g.api->screen_shapes("quake", nullptr, 0);
+}
+
+// A band from radius r0 to r1 round (cx, cy), in the picture's 0..1: `rx` and
+// `ry` turn one of Quake 3's 480-line pixels into a share across and down.
+void ring_band(std::vector<BbScreenTri>& out, float cx, float cy, float rx, float ry, float r0, float r1, std::uint32_t rgba) {
+    constexpr int kSegments = 48;
+    for (int i = 0; i < kSegments; ++i) {
+        const float a0 = 2.0f * kPi * static_cast<float>(i) / kSegments, a1 = 2.0f * kPi * static_cast<float>(i + 1) / kSegments;
+        const float c0 = std::cos(a0), s0 = std::sin(a0), c1 = std::cos(a1), s1 = std::sin(a1);
+        const float ix0 = cx + c0 * r0 * rx, iy0 = cy + s0 * r0 * ry, ox0 = cx + c0 * r1 * rx, oy0 = cy + s0 * r1 * ry;
+        const float ix1 = cx + c1 * r0 * rx, iy1 = cy + s1 * r0 * ry, ox1 = cx + c1 * r1 * rx, oy1 = cy + s1 * r1 * ry;
+        out.push_back({{ix0, ox0, ox1}, {iy0, oy0, oy1}, rgba});
+        out.push_back({{ix0, ox1, ix1}, {iy0, oy1, iy1}, rgba});
+    }
+}
+
+// The same crosshair as the host's 2D: the ring a solid band one 480-line
+// pixel wide with fainter edges - what the debug lines' halo of circles drew -
+// and the dot a filled disc, at the middle of the picture.
+void crosshair_2d(const BbCamera& cam) {
+    const float aspect = cam.aspect > 0.1f && cam.aspect < 10.0f ? cam.aspect : 16.0f / 9.0f;
+    const float ry = 1.0f / 480.0f, rx = ry / aspect;
+    const float ring = s.crosshair_size * 0.375f, dot_r = std::max(s.crosshair_size * 0.03f, 0.5f);
+    const auto colour = [](float a) {
+        return 0xffffff00u | static_cast<std::uint32_t>(std::lround(std::clamp(a, 0.0f, 1.0f) * 255.0f));
+    };
+    const float a = s.crosshair_alpha;
+    std::vector<BbScreenTri> tris;
+    tris.reserve(48 * 6 + 24);
+    ring_band(tris, 0.5f, 0.5f, rx, ry, ring - 0.5f, ring - 0.17f, colour(a * 0.45f));
+    ring_band(tris, 0.5f, 0.5f, rx, ry, ring - 0.17f, ring + 0.17f, colour(a));
+    ring_band(tris, 0.5f, 0.5f, rx, ry, ring + 0.17f, ring + 0.5f, colour(a * 0.45f));
+    constexpr int kDot = 24;
+    for (int i = 0; i < kDot; ++i) {
+        const float a0 = 2.0f * kPi * static_cast<float>(i) / kDot, a1 = 2.0f * kPi * static_cast<float>(i + 1) / kDot;
+        tris.push_back({{0.5f, 0.5f + std::cos(a0) * dot_r * rx, 0.5f + std::cos(a1) * dot_r * rx},
+                        {0.5f, 0.5f + std::sin(a0) * dot_r * ry, 0.5f + std::sin(a1) * dot_r * ry},
+                        colour(a)});
+    }
+    g_screen_shown = g.api->screen_shapes("quake", tris.data(), tris.size()) == 0;
+}
+
 // Quake 3's crosshair at the middle of the view: a dot in a ring, its size in
-// the 640x480 screen's pixels (cg_crosshairSize), white.
+// the 640x480 screen's pixels (cg_crosshairSize), white. As the host's 2D where
+// it has screen_shapes; else as the game's debug shapes, in the 3D.
 void draw_crosshair(const BbCamera& cam) {
-    if (!s.crosshair || s.crosshair_alpha <= 0.0f) return;
+    if (!s.crosshair || s.crosshair_alpha <= 0.0f) {
+        crosshair_off();
+        return;
+    }
+    if (screen_shapes_ok()) {
+        crosshair_2d(cam);
+        return;
+    }
     std::uint8_t* lists = debug_lists();
     if (!lists) return;
     const V3 eye{cam.position[0], cam.position[1], cam.position[2]};
@@ -3462,6 +3528,7 @@ void camera(BbCamera& cam) {
     vm_frame(chr, !dead);
     if (vm.out) vm_place(cam, yaw, pitch, roll);
     if (!dead) draw_crosshair(cam);
+    else crosshair_off();
 
     if (g_log && g_now >= g_next_log) {
         g_next_log = g_now + 0.25;

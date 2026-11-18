@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 29
+#define BB_PLUGIN_API_VERSION 30
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -486,6 +486,15 @@ typedef struct BbPanel {
                                   menu that holds `page` (BB_OPT_MENU), or all its pages without one */
     uint32_t page_count;
 } BbPanel;
+/* Version 30: a triangle of a plugin's 2D over the picture (screen_shapes):
+ * its corners in the game's picture, 0 to 1 across (x, from the left) and
+ * down (y, from the top), whatever the window's or the picture's size; its
+ * colour 0xRRGGBBAA, blended over what is beneath by its alpha. */
+typedef struct BbScreenTri {
+    float x[3], y[3];
+    uint32_t rgba;
+} BbScreenTri;
+
 typedef struct BbPanelState {
     uint32_t size;      /* set to sizeof(BbPanelState) before the call: the host fills as much as both know */
     int32_t shown;      /* 1 while the panel is up */
@@ -1196,6 +1205,19 @@ typedef struct BbHostApi {
      * on_view is not called while it is 1 (on_camera still is, so a plugin
      * can see it begin and end). Any thread. */
     int (*cutscene)(void);
+
+    /* Version 30: a plugin's 2D over the picture. The triangles (BbScreenTri)
+     * the plugin named `name` shows, in place of the ones it gave before;
+     * n = 0 takes them away. The host draws them with its own overlay (the
+     * FPS counter's, the pointer's) over every frame it presents, after the
+     * game's HUD and under the host's text boxes, menus and pointer - never
+     * into the 3D: frame generation, the upscalers, the motion blur and the
+     * TAA leave them alone, as they leave the HUD. They stay up a quarter of a
+     * second after the last call, so a plugin keeps them up by calling each
+     * frame (on_camera, on_frame) and they go by themselves once it stops;
+     * also while the plugin is off. At most 2048 triangles. Main thread. 0 on
+     * success; 1 for a bad argument, too many, or a plugin that is off. */
+    int (*screen_shapes)(const char* name, const BbScreenTri* tris, size_t n);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

@@ -77,6 +77,9 @@ std::string plugins_ruleset();
 // The plugin of that name is loaded and on for this run (not a visitor):
 // what host features a plugin turns on ask (engine/debug_menu.h).
 bool plugins_active(const std::string& name);
+// The plugins' 2D over the picture (plugin API 30's screen_shapes) into the
+// host overlay being built, at the display buffer's size: the window's pump.
+void plugins_draw_screen_shapes(float display_w, float display_h);
 // Plugins that do not work together (Quake, Isometric and Hunter Cam: each owns the
 // camera): the warnings `name`'s page shows - one a line - while it and a plugin it clashes
 // with are both turned on with their main switch on, among `list` (the
