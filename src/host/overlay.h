@@ -12,6 +12,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cstddef>
 #include <cstdint>
 
 // Colours are 0xRRGGBBAA. The window's pump builds a frame's overlay from
@@ -26,6 +27,8 @@ void host_overlay_tri(float x0, float y0, float x1, float y1, float x2, float y2
 void host_overlay_cursor(float x, float y);
 // Nothing committed to draw: one atomic load, no lock.
 bool host_overlay_empty();
+// Vertices still free in this frame's buffer; a frame over it is not drawn at all.
+std::size_t host_overlay_room();
 
 // Presenter side. `init` is safe to call repeatedly; `draw` records into a
 // command buffer that is already in dynamic rendering's expected layout and
