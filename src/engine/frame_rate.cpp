@@ -1,3 +1,4 @@
+#include "engine/play_history.h"
 #include "guest_abi.h"
 #include "engine/frame_rate.h"
 #include "engine/frame_rate_step.h"
@@ -1894,6 +1895,7 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
     rebirth_tick();     // the altar's rebirth: the host's half of its talk script (engine/rebirth.h)
     world_chr_tick();   // a test warp a plugin queued this frame (BBHOST_TEST_WARP, engine/world_chr.h)
     loading_tick(hle_video_flip_count());  // the loading screens' lengths and the first in-game frame (engine/loading.h)
+    play_history_tick();  // after plugins and loading state
     auto* f = reinterpret_cast<SprjFlipper*>(static_cast<std::uintptr_t>(saved[5]));
     // A rate or an effect timing chosen in the menus since the last frame; from
     // the game's own 30, the conversion the start would have made.

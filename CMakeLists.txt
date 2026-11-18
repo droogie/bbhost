@@ -101,6 +101,9 @@ add_executable(bbhost
   src/core/legacy_cpu.cpp
   src/core/legacy_cpu_code.cpp
   src/core/config.cpp
+  src/core/trophies.cpp
+  src/core/play_history.cpp
+  src/core/chalice_history.cpp
   src/core/config_move.cpp
   src/engine/image_text.cpp
   src/core/sha256.cpp
@@ -118,6 +121,7 @@ add_executable(bbhost
   src/engine/paramdef.cpp
   src/engine/lua_events.cpp
   src/engine/event_flags.cpp
+  src/engine/play_history.cpp
   src/engine/player_data.cpp
   src/engine/world_chr.cpp
   src/engine/playlog.cpp
@@ -227,6 +231,7 @@ add_executable(bbhost
   src/hle/net.cpp
   src/hle/http.cpp
   src/hle/ajm.cpp
+  src/hle/trophy.cpp
   src/hle/system.cpp
   src/host/label_landing.cpp
 )
@@ -1641,3 +1646,15 @@ else()
     DEPENDS bbhost
     USES_TERMINAL)
 endif()
+
+# Local trophies and campaign/chalice histories; no game files required.
+foreach(history_test trophies play_history chalice_history)
+  add_executable(${history_test}_test tests/${history_test}_test.cpp src/core/${history_test}.cpp)
+  target_include_directories(${history_test}_test PRIVATE src include)
+  target_link_libraries(${history_test}_test PRIVATE Threads::Threads)
+  add_test(NAME ${history_test}_test COMMAND ${history_test}_test)
+endforeach()
+target_sources(trophies_test PRIVATE src/hle/trophy.cpp)
+target_sources(chalice_history_test PRIVATE src/core/play_history.cpp)
+
+target_sources(bbhost PRIVATE src/host/trophy_ui.cpp src/host/play_history_ui.cpp)

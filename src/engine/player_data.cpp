@@ -1,3 +1,4 @@
+#include "engine/play_history.h"
 #include "engine/player_data.h"
 
 #include "core/elf.h"
@@ -67,6 +68,7 @@ const Stat* find(const char* name) {
 void player_data_install(ElfImage* image) {
     g_slide = image->mem.slide;
     g_ok = image->sha256 == kEboot109Sha256;
+    play_history_install(image);
 }
 
 bool player_stat_get(const char* name, std::int64_t* value) {

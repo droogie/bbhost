@@ -1,3 +1,4 @@
+#include "engine/play_history.h"
 #include "engine/event_flags.h"
 
 #include "core/elf.h"
@@ -101,6 +102,7 @@ void event_flags_tick() {
             for (std::size_t i = 0; i < n; ++i) {
                 if (g_log) host_log("event flag %u -> %u", changes[i].id, changes[i].value);
                 plugins_event_flag(changes[i].id, changes[i].value != 0);
+                play_history_event_flag(changes[i].id, changes[i].value != 0);
             }
             g_logged += n;
         }

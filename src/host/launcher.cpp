@@ -1,3 +1,5 @@
+#include "host/play_history_ui.h"
+#include "host/trophy_ui.h"
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/launcher.h"
 
@@ -75,7 +77,7 @@ constexpr int kTextSizes[] = {100, 125, 150, 175, 200, 250, 300, 350, 400};
 const char* const kTextSizeLabels[] = {"100%", "125%", "150%", "175%", "200%", "250%", "300%", "350%", "400%"};
 
 // The window's pages, as the sidebar lists them.
-enum Page { kPageGame, kPageGraphics, kPageControls, kPageEnhancements, kPagePatches, kPageShaders, kPagePlugins, kPageSettings, kPageCount };
+enum Page { kPageGame, kPageGraphics, kPageControls, kPageEnhancements, kPagePatches, kPageShaders, kPagePlugins, kPageTrophies, kPageHistory, kPageSettings, kPageCount };
 struct PageInfo {
     const char* name;
     const char* slug;  // its picture's name (BBHOST_SETUP_TEST=shot)
@@ -89,6 +91,8 @@ constexpr PageInfo kPages[kPageCount] = {
     {"Patches", "patches", launcher_ui::Icon::Patches},
     {"Shaders", "shaders", launcher_ui::Icon::Shaders},
     {"Plugins", "plugins", launcher_ui::Icon::Plugins},
+    {"Trophies", "trophies", launcher_ui::Icon::Enhance},
+    {"Play history", "play-history", launcher_ui::Icon::Game},
     {"Settings", "settings", launcher_ui::Icon::Settings},
 };
 
@@ -456,6 +460,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     std::string app0_seen;
     App0Version app0_ver;
     PluginUi plugin_ui;
+    TrophyUi trophy_ui;
+    PlayHistoryUi history_ui;
     bool plugin_seen = false;
     // The settings folder's move (core/config_move.h): told at the top of
     // every page until it is dismissed.
@@ -473,6 +479,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     // does, then closes once the server has answered.
     const char* test = std::getenv("BBHOST_SETUP_TEST");
     int frames = 0;
+    if (test && !std::strcmp(test, "trophies")) page = kPageTrophies;
+    if (test && !std::strcmp(test, "play-history")) page = kPageHistory;
+    if (test && !std::strcmp(test, "chalice-history")) { page = kPageHistory; history_ui.chalice = true; }
     // link: starts a Discord link as its button does and, once the code is
     // up, cancels it and closes.
     const std::string test_create = test && !std::strncmp(test, "create:", 7) ? test + 7 : "";
@@ -2264,6 +2273,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
             ImGui::PopStyleColor();
             ui::child_cards();
             plugin_seen = true;
+        } else if (page == kPageTrophies) {
+            trophy_ui_draw(trophy_ui, f[kData].str().empty() ? config_default_data_dir() : f[kData].str(), 0.0f);
+        } else if (page == kPageHistory) {
+            play_history_ui_draw(history_ui, f[kData].str().empty() ? config_default_data_dir() : f[kData].str());
         } else if (page == kPageSettings) {
             const float w = ImGui::GetContentRegionAvail().x;
             ui::card_begin("##folders", ImVec2(w, 0), "FOLDERS");
@@ -2391,6 +2404,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         }
         ImGui::End();
 
+        if (test && (!std::strcmp(test, "trophies") || !std::strcmp(test, "play-history") || !std::strcmp(test, "chalice-history")) && ++frames > 30) done = true;
         ImGui::Render();
         // Menu hue and Menu vibrance, on everything the frame draws.
         float hue = 0.0f, vibrance = 0.0f;

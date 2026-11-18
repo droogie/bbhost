@@ -1,3 +1,6 @@
+#include "core/chalice_history.h"
+#include "core/play_history.h"
+#include "core/trophies.h"
 #include "engine/frame_pool.h"
 #include "engine/key_prompts.h"
 #include "decomp/decomp.h"
@@ -270,6 +273,8 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
             if (windowed) sampler_note_pump();  // the watchdog's "Not Responding" stacks (host/sampler.h)
             if (windowed && !host_window_pump()) {
                 host_log("window closed");
+                play_history::runtime().flush();
+                chalice_history::runtime().flush();
                 exit_wait_for_saves(true);
                 exit_deadline(0, 15.0);
                 exit_test_stall();
@@ -313,6 +318,8 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 // not stopped (that waits for the GPU lock the command
                 // processor may hold), the process just ends.
                 host_log("exit: flip %llu reached (BBHOST_EXIT_FLIP)", static_cast<unsigned long long>(exit_flip));
+                play_history::runtime().flush();
+                chalice_history::runtime().flush();
                 g_exit_pumps.store(windowed);
                 exit_wait_for_saves(windowed);
                 exit_deadline(0, 30.0);
@@ -1363,6 +1370,9 @@ int main(int argc, char** argv) {
                      "the game stops when it reads a file only the update has.",
                      v.app_ver.c_str());
     }
+    trophies::runtime().open(std::filesystem::u8path(cfg.data) / "trophies.txt");
+    play_history::runtime().open(std::filesystem::u8path(cfg.data) / "play-history.txt");
+    chalice_history::runtime().open(std::filesystem::u8path(cfg.data) / "chalice-history.txt");
     hle_fs_set_roots(cfg.app0.c_str(), cfg.data.empty() ? nullptr : cfg.data.c_str(),
                      cfg.tmp.empty() ? nullptr : cfg.tmp.c_str(), eboot,
                      cfg.mods.empty() ? nullptr : cfg.mods.c_str());
@@ -1436,6 +1446,8 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(image.entry), kGuestMainStack);
     run_guest_start(reinterpret_cast<GuestStart>(image.entry), stack.data(), windowed);
     host_log("_start returned");
+    play_history::runtime().flush();
+    chalice_history::runtime().flush();
     host_window_stop();
     engine_bind(nullptr);
     unload_elf(&image);
