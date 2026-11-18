@@ -224,3 +224,5 @@ game's code or data.
 - Thanks to the many contributors and testers, incomplete and in no 
   particular order: Metr1k, Kyo, Schorched Knight, ancat, Nox-, Astrelle, 
   BlitzWOLF, CrunchyCheese, foxyhooligans, gkberk, sen, Ultra, droogie
+
+Local progress: [trophies](docs/trophies.md) and [play and chalice history](docs/play-history.md), available in setup and the F10 menu.

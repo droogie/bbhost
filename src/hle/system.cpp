@@ -1,3 +1,4 @@
+#include "hle/trophy.h"
 #include "hle/common.h"
 #include "hle/np.h"
 #include "hle/np_score.h"
@@ -1175,115 +1176,6 @@ GUEST_ABI int hle_save_dialog_open(const void*) {
 }
 GUEST_ABI int hle_save_dialog_update() { return 3; }  // SCE_COMMON_DIALOG_STATUS_FINISHED
 
-int g_trophy_ctx = 1;
-int g_trophy_handle = 1;
-GUEST_ABI int hle_trophy_ctx(int* ctx, int, unsigned, std::uint64_t) {
-    if (!ctx) {
-        return static_cast<int>(0x805D0002);
-    }
-    *ctx = g_trophy_ctx++;
-    host_log("sceNpTrophyCreateContext -> %d", *ctx);
-    return 0;
-}
-GUEST_ABI int hle_trophy_handle(int* h) {
-    if (!h) {
-        return static_cast<int>(0x805D0002);
-    }
-    *h = g_trophy_handle++;
-    host_log("sceNpTrophyCreateHandle -> %d", *h);
-    return 0;
-}
-// Trophies persist as one line per id in <data>/trophies.txt.
-std::mutex g_trophy_mu;
-std::string trophy_file() { return hle_fs_map_path("/data/trophies.txt"); }
-bool trophy_unlocked(int id, std::int64_t* when) {
-    std::FILE* f = std::fopen(trophy_file().c_str(), "r");
-    if (!f) {
-        return false;
-    }
-    int tid;
-    long long ts;
-    bool found = false;
-    while (std::fscanf(f, "%d %lld", &tid, &ts) == 2) {
-        if (tid == id) {
-            found = true;
-            if (when) {
-                *when = ts;
-            }
-        }
-    }
-    std::fclose(f);
-    return found;
-}
-// sceNpTrophyUnlockTrophy(ctx, handle, trophyId, SceNpTrophyId* platinumId)
-GUEST_ABI int hle_trophy_unlock(int ctx, int handle, int id, int* platinum_id) {
-    std::lock_guard<std::mutex> lock(g_trophy_mu);
-    if (platinum_id) {
-        *platinum_id = -1;  // SCE_NP_TROPHY_INVALID_TROPHY_ID: platinum not (yet) awarded
-    }
-    if (trophy_unlocked(id, nullptr)) {
-        return static_cast<int>(0x80551513u);  // SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED
-    }
-    std::FILE* f = std::fopen(trophy_file().c_str(), "a");
-    if (f) {
-        std::fprintf(f, "%d %lld\n", id, static_cast<long long>(std::time(nullptr)));
-        std::fclose(f);
-    }
-    host_log("sceNpTrophyUnlockTrophy ctx=%d handle=%d id=%d", ctx, handle, id);
-    return 0;
-}
-// SceNpTrophyGameDetails { size, numGroups, numTrophies, numPlatinum, numGold, numSilver, numBronze, title[128], description[1024] }
-// SceNpTrophyGameData { size, unlockedTrophies, unlockedPlatinum, unlockedGold, unlockedSilver, unlockedBronze, progressPercentage }
-GUEST_ABI int hle_trophy_game_info(int, int, std::uint8_t* details, std::uint8_t* data) {
-    constexpr std::uint32_t kTrophies = 40;
-    if (details) {
-        std::memset(details + 8, 0, 0x480 - 8);
-        std::uint32_t v[7] = {0x488, 1, kTrophies, 1, 3, 8, 28};
-        std::memcpy(details + 8, v + 1, 24);
-        std::strncpy(reinterpret_cast<char*>(details + 32), "Bloodborne", 127);
-    }
-    if (data) {
-        std::uint32_t unlocked = 0;
-        std::lock_guard<std::mutex> lock(g_trophy_mu);
-        for (int id = 0; id < static_cast<int>(kTrophies); ++id) {
-            if (trophy_unlocked(id, nullptr)) {
-                ++unlocked;
-            }
-        }
-        std::memset(data + 8, 0, 24);
-        std::uint32_t u[6] = {unlocked, 0, 0, 0, unlocked, unlocked * 100 / kTrophies};
-        std::memcpy(data + 8, u, 24);
-    }
-    return 0;
-}
-// SceNpTrophyDetails { size, trophyId, trophyGrade, groupId, hidden, reserved[3], name[128], description[1024] }
-// SceNpTrophyData { size, trophyId, unlocked, reserved[3], timestamp }
-GUEST_ABI int hle_trophy_info(int, int, int id, std::uint8_t* details, std::uint8_t* data) {
-    if (details) {
-        std::memset(details + 8, 0, 0x490 - 8);
-        std::int32_t* d = reinterpret_cast<std::int32_t*>(details + 8);
-        d[0] = id;
-        d[1] = 4;  // bronze
-        d[2] = 0;
-        std::snprintf(reinterpret_cast<char*>(details + 24), 127, "Trophy %d", id);
-    }
-    if (data) {
-        std::int64_t when = 0;
-        bool unlocked;
-        {
-            std::lock_guard<std::mutex> lock(g_trophy_mu);
-            unlocked = trophy_unlocked(id, &when);
-        }
-        std::int32_t* d = reinterpret_cast<std::int32_t*>(data + 8);
-        d[0] = id;
-        d[1] = unlocked ? 1 : 0;
-        d[2] = d[3] = d[4] = 0;
-        std::uint64_t ts = unlocked ? static_cast<std::uint64_t>(when) * 1000000ull + kRtcUnixEpochTicks : 0;
-        std::memcpy(data + 32, &ts, 8);
-    }
-    return 0;
-}
-
 // Leaderboards: no server yet. Contexts and requests are real handles; the
 // synchronous queries report the community server as unreachable.
 constexpr int kScoreErrOffline = static_cast<int>(0x80550605u);  // SCE_NP_COMMUNITY_ERROR_UNKNOWN? treated as failure
@@ -1380,11 +1272,6 @@ GUEST_ABI int hle_npauth_get_code(int, const void*, char* code, int* issuer) {
     if (issuer) {
         *issuer = 10;
     }
-    return 0;
-}
-
-GUEST_ABI int hle_trophy_register(int ctx, int, std::uint64_t, void*) {
-    host_log("sceNpTrophyRegisterContext ctx=%d", ctx);
     return 0;
 }
 
@@ -2299,6 +2186,7 @@ void hle_np_set_online_id(const char* id) {
 }
 
 void hle_register_system() {
+    hle_register_trophies();
 #define REG(name, fn) register_hle_fn(name, reinterpret_cast<void*>(fn))
     REG("sceSysmoduleLoadModule", hle_sysmodule_load);
     REG("sceSysmoduleUnloadModule", hle_sysmodule_unload);
@@ -2398,12 +2286,6 @@ void hle_register_system() {
     REG("sceSaveDataDialogTerminate", hle_save_dialog_term);
     REG("sceSaveDataDialogOpen", hle_save_dialog_open);
     REG("sceSaveDataDialogUpdateStatus", hle_save_dialog_update);
-    REG("sceNpTrophyCreateContext", hle_trophy_ctx);
-    REG("sceNpTrophyCreateHandle", hle_trophy_handle);
-    REG("sceNpTrophyRegisterContext", hle_trophy_register);
-    REG("sceNpTrophyUnlockTrophy", hle_trophy_unlock);
-    REG("sceNpTrophyGetGameInfo", hle_trophy_game_info);
-    REG("sceNpTrophyGetTrophyInfo", hle_trophy_info);
     REG("sceNpScoreDeleteNpTitleCtx", hle_score_delete_title_ctx);
     REG("sceNpScoreCreateRequest", hle_score_create_request);
     REG("sceNpScoreDeleteRequest", hle_score_delete_request);

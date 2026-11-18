@@ -1,4 +1,4 @@
-/* bbhost plugin API, version 29.
+/* bbhost plugin API, version 30.
  *
  * A plugin is a shared library (.so on Linux, .dll on Windows) in
  * <exe dir>/plugins or <data>/plugins. The host loads every one at start and
@@ -38,7 +38,7 @@
 extern "C" {
 #endif
 
-#define BB_PLUGIN_API_VERSION 29
+#define BB_PLUGIN_API_VERSION 30
 
 #if defined(_WIN32)
 #define BB_PLUGIN_EXPORT __declspec(dllexport)
@@ -1196,6 +1196,10 @@ typedef struct BbHostApi {
      * on_view is not called while it is 1 (on_camera still is, so a plugin
      * can see it begin and end). Any thread. */
     int (*cutscene)(void);
+    /* Version 30: main thread only. Pause campaign and chalice history while
+     * a practice plugin changes world state. Each plugin owns its pause;
+     * pass 0 to release it. Does not alter the game's save or play clock. */
+    int (*campaign_tracking_pause)(const char* plugin, int paused);
 } BbHostApi;
 
 #define BB_SNAP_PIXELS 0xffffffffu /* version 18: scene_snap's grid the 3D's own pixels */

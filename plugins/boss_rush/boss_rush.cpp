@@ -1219,6 +1219,9 @@ void tick() {
         if (g_test_practice) practice();
         else begin();
     }
+    if (g.api->version >= 30 && g.api->size >= offsetof(BbHostApi, campaign_tracking_pause) + sizeof(g.api->campaign_tracking_pause) &&
+        g.api->campaign_tracking_pause)
+        g.api->campaign_tracking_pause("boss_rush", g_state != State::Waiting && g_state != State::Done);
     if (g_in_world && !g_banner.empty()) {
         g.message(g_banner, g_banner_s);
         g_banner.clear();

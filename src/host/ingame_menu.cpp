@@ -1,3 +1,5 @@
+#include "host/play_history_ui.h"
+#include "host/trophy_ui.h"
 #define IMGUI_DEFINE_MATH_OPERATORS
 #include "host/ingame_menu.h"
 
@@ -61,6 +63,8 @@ bool g_vk_ready = false;
 VkFormat g_format = VK_FORMAT_UNDEFINED;
 std::uint32_t g_images = 0;
 PluginUi g_ui;
+TrophyUi g_trophy_ui;
+PlayHistoryUi g_history_ui;
 std::chrono::steady_clock::time_point g_last;
 
 ImGuiKey key_of(SDL_Keycode k) {
@@ -546,6 +550,7 @@ void patches_page(PatchMenu& m) {
 // Its pages: the settings' (host_options_page_*) - Input's rows on the
 // Controls page, over the bindings - with the patches and the plugins after
 // PC Enhancements.
+int g_trophies_page = -1, g_history_page = -1;
 int g_page = 0;
 double g_page_at = -100.0;
 int g_patches_page = -1, g_plugins_page = -1, g_controls_page = -1;  // their places among the pages
@@ -588,6 +593,8 @@ const std::vector<Page>& menu_pages() {
     }
     if (g_controls_page < 0) add_controls();  // no Graphics page: at the end
     if (g_patches_page < 0) add_mods();  // no PC Enhancements page: at the end
+    own(&g_trophies_page, {"Trophies", ui::Icon::Enhance, "Local trophies, requirements, and unlock times."});
+    own(&g_history_page, {"Play history", ui::Icon::Game, "Playtime, boss attempts, and chalice records for each character."});
     return pages;
 }
 
@@ -603,6 +610,10 @@ bool draw_menu() {
     return shell("##menu", "MENU", pages.data(), static_cast<int>(pages.size()), &g_page, &g_page_at, g_page != g_plugins_page, [] {
         if (g_page == g_patches_page) {
             patches_page(g_patches);
+        } else if (g_page == g_trophies_page) {
+            trophy_ui_draw(g_trophy_ui, config().data);
+        } else if (g_page == g_history_page) {
+            play_history_ui_draw(g_history_ui, config().data, true);
         } else if (g_page == g_controls_page) {
             controls_page_draw(false);
         } else if (g_page == g_plugins_page) {
