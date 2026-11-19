@@ -32,6 +32,13 @@
 #include <math.h>  // libstdc++'s: std::abs(float) and the other overloads in the global namespace too
 #include <string>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wliteral-suffix"
+constexpr unsigned long long operator""ui64(unsigned long long val) {
+    return val;
+}
+#pragma GCC diagnostic pop
+
 #define FFX_UNUSED(x) ((void)(x))  // (ffx_util.h's own, which ffx_message.cpp uses without including it)
 #define UNREFERENCED_PARAMETER(x) ((void)(x))
 #define __declspec(x) __attribute__((visibility("default")))

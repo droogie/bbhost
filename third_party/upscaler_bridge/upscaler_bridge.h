@@ -40,6 +40,8 @@ extern "C" {
 
 #if defined(_WIN32)
 #define UB_CALL __cdecl
+#elif defined(__x86_64__)
+#define UB_CALL __attribute__((ms_abi))
 #else
 #define UB_CALL
 #endif
