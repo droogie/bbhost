@@ -1,0 +1,25 @@
+The AppImage's runtime
+======================
+
+The first part of the bbhost AppImage, the program that mounts the rest of
+the file and starts bbhost from it, is AppImage's type-2 runtime, release
+20251108 (commit dd6cebedcbddde9c82f89b011e8e1d40b6e43868), unmodified:
+https://github.com/AppImage/type2-runtime/releases/tag/20251108
+MIT licence, Copyright (c) 2004-23 probonopd: LICENSE-runtime.txt.
+
+It is a static executable with these libraries linked into it:
+
+  - libfuse 3.15.0, with the runtime's patch to mount.c
+    (patches/libfuse/mount.c.diff in the runtime's repository), under the
+    GNU Lesser General Public License, version 2.1:
+    LICENSE-libfuse-LGPL-2.1.txt. Its source:
+    https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz
+    and the patch and the build that links it, at the release above.
+  - squashfuse 0.5.2 (BSD 2-clause), https://github.com/vasi/squashfuse
+  - zstd (BSD 3-clause) and zlib (zlib licence), from Alpine Linux
+  - mimalloc (MIT), from Alpine Linux
+  - musl libc (MIT), from Alpine Linux
+
+The runtime's repository builds it from these sources
+(scripts/common/install-dependencies.sh and scripts/chroot/build.sh at the
+release above). None of it is part of bbhost or under bbhost's licence.

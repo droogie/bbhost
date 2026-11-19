@@ -15,6 +15,10 @@
 # a few percent more frame rate where the command processor is the limit.
 # The tests (build.yml) build without it.
 #
+# The AppImage (tools/package_appimage.sh) is the Linux tarball as one file,
+# made in the publish job from that tarball; tools/check_release_bundle.sh
+# checks its files as it checks the tarball's.
+#
 # Push a tag v* to publish them as a GitHub release; "Run workflow" on the
 # Actions page builds the same files as artifacts of the run, no release.
 # The tag is annotated and its message holds the release notes:
@@ -135,11 +139,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-      - name: the Steam Deck kit and the updater's executables
+      - name: the Steam Deck kit, the AppImage and the updater's executables
         run: |
           tools/package_steamdeck.sh dist/linux/*.tar.gz dist/steamdeck
+          command -v mksquashfs > /dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq squashfs-tools; }
+          tools/package_appimage.sh dist/linux/*.tar.gz dist/appimage
           mkdir -p dist/release dist/x
-          cp dist/windows/* dist/linux/* dist/steamdeck/* dist/release/
+          cp dist/windows/* dist/linux/* dist/steamdeck/* dist/appimage/* dist/release/
           # The stripped executables out of the packages, named the same in every release.
           w=$(ls dist/windows/bbhost-win-*.zip); v=$(basename "$w" .zip); v=${v#bbhost-win-}
           unzip -q -j "$w" "bbhost-win-$v/bbhost.exe" -d dist/x
@@ -168,6 +174,11 @@ jobs:
           retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
           name: steamdeck
           path: dist/steamdeck/*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: ${{ github.event_name == 'pull_request' && 14 || 90 }}
+          name: appimage
+          path: dist/appimage/*.AppImage
       - name: the bundles go to the live server
         run: tools/check_release_bundle.sh dist/release
       - name: sign
@@ -197,8 +208,8 @@ jobs:
           SHA: ${{ github.event.pull_request.head.sha }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          body="**Test build** of ${SHA:0:7}: Windows zip, Linux tarball and Steam Deck kit, unsigned, kept 14 days.
-          Download \`windows\`, \`linux\` or \`steamdeck\` (each with its package), or \`release\` (everything), from the bottom of the run page:
+          body="**Test build** of ${SHA:0:7}: Windows zip, Linux tarball, AppImage and Steam Deck kit, unsigned, kept 14 days.
+          Download \`windows\`, \`linux\`, \`appimage\` or \`steamdeck\` (each with its package), or \`release\` (everything), from the bottom of the run page:
           $RUN#artifacts"
           gh pr comment "$PR" --edit-last --body "$body" 2>/dev/null || gh pr comment "$PR" --body "$body"
       - name: GitHub release

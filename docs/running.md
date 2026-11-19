@@ -220,8 +220,9 @@ name box starts from `[player] name`, which the first key typed replaces;
 ## Logs
 
 bbhost logs to standard error. The packages' `run-bbhost.bat` (Windows) and
-`run-bbhost.sh` (Linux) write each session's log to `logs/`. A bug report is
-most useful with that log attached.
+`run-bbhost.sh` (Linux) write each session's log to `logs/`; the AppImage
+writes it, and F12's frame dumps, to `~/.local/share/bbhost/logs/`. A bug
+report is most useful with that log attached.
 
 The game's own prints go to the console too. A line it prints over and over
 (YEBIS's depth-of-field error in parts of Cainhurst comes every frame) is
