@@ -35,6 +35,7 @@ int g_fail = 0;
     } while (0)
 
 constexpr std::uintptr_t kMiB = 1u << 20;
+constexpr std::size_t kPage = 4096;
 constexpr int kAnon = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
 constexpr int kRW = PROT_READ | PROT_WRITE;
 
@@ -284,6 +285,37 @@ void test_taken() {
     munmap(f, 2 * kMiB);
 }
 
+// Pages of [p, p + len) in memory now.
+std::size_t resident(void* p, std::size_t len) {
+    std::vector<unsigned char> v(len / kPage);
+    if (mincore(p, len, v.data()) != 0) {
+        return 0;
+    }
+    std::size_t n = 0;
+    for (unsigned char b : v) {
+        n += b & 1;
+    }
+    return n;
+}
+
+// A memfd's fresh pages come in; a PROT_NONE range fails.
+void test_populate() {
+    const std::size_t len = 8 * kMiB;
+    const long fd = syscall(SYS_memfd_create, "linux_vm_test", 0);
+    CHECK(fd >= 0 && ftruncate(static_cast<int>(fd), static_cast<off_t>(len)) == 0);
+    void* p = mmap(nullptr, len, kRW, MAP_SHARED, static_cast<int>(fd), 0);
+    CHECK(p != MAP_FAILED);
+    CHECK(resident(p, len) == 0);
+    CHECK(linux_vm_populate(p, len));
+    CHECK(resident(p, len) == len / kPage);
+    munmap(p, len);
+    close(static_cast<int>(fd));
+
+    void* none = mmap(nullptr, len, PROT_NONE, kAnon, -1, 0);
+    CHECK(!linux_vm_populate(none, len));
+    munmap(none, len);
+}
+
 }  // namespace
 
 int main() {
@@ -294,6 +326,7 @@ int main() {
     test_edges();
     test_race();
     test_taken();
+    test_populate();
     if (g_fail) {
         std::printf("linux_vm_test: %d failure(s)\n", g_fail);
         return 1;

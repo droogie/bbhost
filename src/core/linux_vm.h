@@ -55,6 +55,9 @@ void* linux_vm_mmap(void* at, std::size_t len, int prot, int flags, int fd, std:
 // back to the reservation. Returns 0, or -1 when a part failed.
 int linux_vm_munmap(void* at, std::size_t len);
 
+// Faults [p, p + len) in for writing. False when the kernel cannot.
+bool linux_vm_populate(void* p, std::size_t len);
+
 // The bytes the windows hold, and of them the bytes mapped now.
 std::uint64_t linux_vm_reserved_bytes();
 std::uint64_t linux_vm_mapped_bytes();

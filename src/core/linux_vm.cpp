@@ -17,6 +17,9 @@
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
 #ifndef PR_SET_VMA
 #define PR_SET_VMA 0x53564d41
 #endif
@@ -320,6 +323,10 @@ int linux_vm_munmap(void* at, std::size_t len) {
         rc = -1;
     }
     return rc;
+}
+
+bool linux_vm_populate(void* p, std::size_t len) {
+    return madvise(p, len, MADV_POPULATE_WRITE) == 0;
 }
 
 std::uint64_t linux_vm_reserved_bytes() {
